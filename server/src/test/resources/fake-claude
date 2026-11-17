@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""
+fake-claude: a stand-in for the `claude` CLI that speaks the same stream-json protocol with canned
+behaviour. Point FACTORY_CLAUDE_BIN at it to develop the UI or run end-to-end tests without spending
+tokens. It understands the flags Agern passes (-p, --output-format stream-json, --input-format
+stream-json, --resume, --json-schema, --append-system-prompt, --mcp-config, --model, ...).
+
+Behaviour
+  Chat (--input-format stream-json): every user message gets a streamed reply "You said: <text>".
+    - text containing "slow"  -> streams ~10 s of output (try interrupting it)
+    - text containing "tool"  -> also emits a Bash tool_use + tool_result
+    - text containing "mcp"   -> calls the factory MCP endpoint (initialize + tools/list) with the
+                                 bearer token from --mcp-config and lists the tools it sees
+    - text containing "crash" -> exits with status 3
+    - text containing "env"   -> replies with the names of its environment variables
+    - text containing "install" -> files a software request through the MCP tool factory_request_software
+    - control_request {subtype: interrupt} stops the current turn
+  Conversations are remembered under $HOME/.fake-claude/sessions/<id>. Like the real CLI,
+  --resume <id> of an unknown conversation fails at once ("No conversation found with session ID").
+  A Claude credential containing "invalid" is rejected like a bad key ("Invalid API key").
+  One-shot (prompt on stdin), role taken from "# Role: <role>" in --append-system-prompt:
+    - spec-writer: prints a small spec
+    - builder: appends a line to AGERN_FAKE.md and commits it (if the cwd is a git repository)
+    - reviewers (--json-schema with PASS/CHANGES): PASS, unless the prompt contains
+        "fake:changes" (CHANGES before the first fix round) or "fake:always-changes"
+    - approver (--json-schema with APPROVE/ESCALATE): APPROVE, unless "fake:escalate"
+    - "fake:fail-<role>" anywhere in the prompt makes that role exit with status 1 and no result
+    - "fake:hang-<role>" makes that role hang until it is killed (stage time limit, cancel)
+    - "fake:slow" makes every stage take ~1.5 s, so the pipeline can be watched advancing
+"""
+import json
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import uuid
+
+args = sys.argv[1:]
+
+
+def opt(name):
+    if name in args:
+        i = args.index(name)
+        if i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
+interactive = opt("--input-format") == "stream-json"
+resume = opt("--resume")
+schema = opt("--json-schema")
+system_prompt = opt("--append-system-prompt") or ""
+model = opt("--model") or "fake-model"
+mcp_config = opt("--mcp-config")
+session_id = resume or str(uuid.uuid4())
+role = "chat"
+for line in system_prompt.splitlines():
+    if line.startswith("# Role:"):
+        role = line.split(":", 1)[1].strip()
+        break
+
+out_lock = threading.Lock()
+total_cost = 0.0
+
+
+def emit(obj):
+    with out_lock:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+
+
+SESSIONS_DIR = os.path.join(os.environ.get("HOME", "."), ".fake-claude", "sessions")
+
+
+def remember_session():
+    try:
+        os.makedirs(SESSIONS_DIR, exist_ok=True)
+        open(os.path.join(SESSIONS_DIR, session_id), "w").close()
+    except OSError:
+        pass
+
+
+def init_event():
+    remember_session()
+    emit({"type": "system", "subtype": "init", "cwd": os.getcwd(), "session_id": session_id, "model": model,
+          "tools": ["Bash", "Read", "Edit", "Write"], "mcp_servers": [{"name": "factory", "status": "connected"}],
+          "permissionMode": "bypassPermissions", "apiKeySource": "none", "claude_code_version": "fake",
+          "uuid": str(uuid.uuid4())})
+
+
+def msg_id():
+    return "msg_fake_" + uuid.uuid4().hex[:16]
+
+
+def stream_text(text, chunk_delay=0.0, chunks=None, interrupted=lambda: False):
+    """Streams text as stream_event deltas, then the complete assistant message. Returns False if interrupted."""
+    mid = msg_id()
+    emit({"type": "stream_event", "event": {"type": "message_start", "message": {"id": mid, "role": "assistant", "model": model, "content": []}},
+          "session_id": session_id, "parent_tool_use_id": None, "uuid": str(uuid.uuid4())})
+    emit({"type": "stream_event", "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+          "session_id": session_id, "parent_tool_use_id": None, "uuid": str(uuid.uuid4())})
+    parts = chunks or [text[i:i + 12] for i in range(0, len(text), 12)]
+    sent = ""
+    for p in parts:
+        if interrupted():
+            return False, sent
+        emit({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": p}},
+              "session_id": session_id, "parent_tool_use_id": None, "uuid": str(uuid.uuid4())})
+        sent += p
+        if chunk_delay:
+            time.sleep(chunk_delay)
+    emit({"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}, "session_id": session_id,
+          "parent_tool_use_id": None, "uuid": str(uuid.uuid4())})
+    emit({"type": "assistant", "message": {"id": mid, "type": "message", "role": "assistant", "model": model,
+                                           "content": [{"type": "text", "text": text}], "stop_reason": None,
+                                           "usage": {"input_tokens": 10, "output_tokens": len(text) // 4}},
+          "parent_tool_use_id": None, "session_id": session_id, "uuid": str(uuid.uuid4())})
+    return True, sent
+
+
+def tool_roundtrip(command):
+    tid = "toolu_fake_" + uuid.uuid4().hex[:12]
+    emit({"type": "assistant", "message": {"id": msg_id(), "type": "message", "role": "assistant", "model": model,
+                                           "content": [{"type": "tool_use", "id": tid, "name": "Bash", "input": {"command": command, "description": "Run " + command}}]},
+          "parent_tool_use_id": None, "session_id": session_id, "uuid": str(uuid.uuid4())})
+    try:
+        output = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=10).stdout[:2000]
+    except Exception as e:  # noqa
+        output = str(e)
+    emit({"type": "user", "message": {"role": "user", "content": [{"tool_use_id": tid, "type": "tool_result", "content": output}]},
+          "parent_tool_use_id": None, "session_id": session_id, "uuid": str(uuid.uuid4())})
+
+
+def result(text, subtype="success", is_error=False, structured=None, turns=1, cost=0.0123):
+    global total_cost
+    total_cost += cost
+    r = {"type": "result", "subtype": subtype, "is_error": is_error, "duration_ms": 50, "duration_api_ms": 40,
+         "num_turns": turns, "result": text, "stop_reason": "end_turn" if not is_error else None,
+         "session_id": session_id, "total_cost_usd": round(total_cost, 6),
+         "usage": {"input_tokens": 10, "output_tokens": 20}, "permission_denials": [], "uuid": str(uuid.uuid4())}
+    if structured is not None:
+        r["structured_output"] = structured
+    emit(r)
+
+
+def mcp_call(method, params, req_id):
+    with open(mcp_config) as f:
+        cfg = json.load(f)
+    server = list(cfg["mcpServers"].values())[0]
+    body = json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}).encode()
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    headers.update(server.get("headers", {}))
+    req = urllib.request.Request(server["url"], data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode())
+
+
+# --------------------------------------------------------------------------- chat mode
+
+def chat_mode():
+    inbox = queue.Queue()
+
+    def reader():
+        for line in sys.stdin:
+            line = line.strip()
+            if line:
+                try:
+                    inbox.put(json.loads(line))
+                except ValueError:
+                    pass
+        inbox.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    pending = []
+    interrupt_flag = {"set": False}
+
+    def drain_controls():
+        while True:
+            try:
+                m = inbox.get_nowait()
+            except queue.Empty:
+                return
+            if m is None:
+                pending.append(None)
+            elif m.get("type") == "control_request":
+                handle_control(m)
+            else:
+                pending.append(m)
+
+    def handle_control(m):
+        if m.get("request", {}).get("subtype") == "interrupt":
+            interrupt_flag["set"] = True
+        emit({"type": "control_response", "response": {"subtype": "success", "request_id": m.get("request_id"), "response": {}}})
+
+    while True:
+        if pending:
+            m = pending.pop(0)
+        else:
+            m = inbox.get()
+        if m is None:
+            return
+        if m.get("type") == "control_request":
+            handle_control(m)
+            continue
+        if m.get("type") != "user":
+            continue
+        content = m.get("message", {}).get("content", "")
+        if isinstance(content, list):
+            content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+        interrupt_flag["set"] = False
+        init_event()
+        if "crash" in content:
+            sys.stderr.write("fake-claude: crashing as requested\n")
+            sys.exit(3)
+        if "tool" in content:
+            tool_roundtrip("echo hello from fake-claude && pwd")
+        reply = "You said: " + content
+        if "env" in content:
+            reply += "\nENV: " + ",".join(sorted(os.environ.keys()))
+        if "mcp" in content and mcp_config:
+            try:
+                init = mcp_call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake-claude", "version": "0"}}, 1)
+                tools = mcp_call("tools/list", {}, 2)
+                names = [t["name"] for t in tools["result"]["tools"]]
+                reply += "\nMCP server: %s\nTools: %s" % (init["result"]["serverInfo"]["name"], ", ".join(names))
+            except Exception as e:  # noqa
+                reply += "\nMCP call failed: %s" % e
+        if "install" in content and mcp_config:
+            try:
+                mcp_call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake-claude", "version": "0"}}, 1)
+                res = mcp_call("tools/call", {"name": "factory_request_software", "arguments": {
+                    "name": "fake-toolchain", "reason": "fake-claude was asked to install something"}}, 2)
+                reply += "\n" + res["result"]["content"][0]["text"]
+            except Exception as e:  # noqa
+                reply += "\nMCP call failed: %s" % e
+        if "slow" in content:
+            chunks = ["%d " % i for i in range(1, 41)]
+            ok, sent = stream_text("".join(chunks), chunk_delay=0.25, chunks=chunks,
+                                   interrupted=lambda: (drain_controls() or interrupt_flag["set"]))
+        else:
+            ok, sent = stream_text(reply)
+        if not ok:
+            emit({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]},
+                  "parent_tool_use_id": None, "session_id": session_id, "uuid": str(uuid.uuid4())})
+            result(None, subtype="error_during_execution", is_error=True, turns=1, cost=0.001)
+        else:
+            result(reply)
+
+
+# --------------------------------------------------------------------------- one-shot mode
+
+def one_shot():
+    prompt = sys.stdin.read()
+    init_event()
+    if ("fake:fail-%s" % role) in prompt:
+        sys.stderr.write("fake-claude: failing %s as requested\n" % role)
+        sys.exit(1)
+    if ("fake:hang-%s" % role) in prompt:
+        stream_text("Thinking very hard (fake hang)...")
+        while True:
+            time.sleep(1)
+    if "fake:slow" in prompt:
+        time.sleep(1.5)
+    if schema and "APPROVE" in schema:
+        verdict = "ESCALATE" if "fake:escalate" in prompt else "APPROVE"
+        out = {"verdict": verdict, "summary": "Fake approver says %s." % verdict}
+        stream_text("Checked the change.")
+        result(json.dumps(out), structured=out)
+        return
+    if schema and "PASS" in schema:
+        changes = "fake:always-changes" in prompt or ("fake:changes" in prompt and "after fix round" not in prompt)
+        if changes:
+            out = {"verdict": "CHANGES", "summary": "Fake %s reviewer wants changes." % role,
+                   "findings": [{"severity": "major", "file": "AGERN_FAKE.md", "detail": "Fake finding from %s." % role}]}
+        else:
+            out = {"verdict": "PASS", "summary": "Fake %s reviewer is happy." % role, "findings": []}
+        stream_text("Reviewed the diff.")
+        result(json.dumps(out), structured=out)
+        return
+    if role == "builder":
+        tool_roundtrip("git status --short | head -5")
+        if os.path.isdir(".git") or os.path.isfile(".git"):
+            with open("AGERN_FAKE.md", "a") as f:
+                f.write("fake build at %s\n" % time.strftime("%Y-%m-%dT%H:%M:%S"))
+            subprocess.run(["git", "add", "AGERN_FAKE.md"], check=False)
+            subprocess.run(["git", "commit", "-q", "-m", "Fake build commit"], check=False)
+        text = "Implemented the change (fake). Ran no tests because I am a stub."
+        stream_text(text)
+        result(text)
+        return
+    if role == "spec-writer":
+        text = "## Summary\nA fake spec.\n\n## Acceptance criteria\n- [ ] Something happens\n"
+        stream_text(text)
+        result(text)
+        return
+    text = "Done (fake)."
+    stream_text(text)
+    result(text)
+
+
+def credential_rejected():
+    cred = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "") + os.environ.get("ANTHROPIC_API_KEY", "")
+    return "invalid" in cred
+
+
+if __name__ == "__main__":
+    if resume and not os.path.exists(os.path.join(SESSIONS_DIR, resume)):
+        sys.stderr.write("No conversation found with session ID: %s\n" % resume)
+        sys.exit(1)
+    if credential_rejected():
+        if interactive:
+            sys.stdin.readline()
+        else:
+            sys.stdin.read()
+        emit({"type": "result", "subtype": "success", "is_error": True, "duration_ms": 10, "num_turns": 1,
+              "result": "Invalid API key · Please run /login", "session_id": session_id, "total_cost_usd": 0})
+        sys.exit(1)
+    if interactive:
+        chat_mode()
+    else:
+        one_shot()

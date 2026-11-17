@@ -1,0 +1,47 @@
+# Agern — the software factory. Installed by install.sh from packaging/service/agern.service;
+# @NAME@ placeholders are filled in at install time. Local changes: `systemctl edit agern`.
+[Unit]
+Description=Agern - the software factory
+Documentation=https://github.com/Egernet-CS/agern
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+# FACTORY_* configuration. Root-only file; systemd reads it before dropping privileges.
+EnvironmentFile=@ENV_FILE@
+Environment=PATH=@PATH@
+Environment=AGERN_PREFIX=@PREFIX@
+WorkingDirectory=@DATA_DIR@
+ExecStart=@PREFIX@/bin/agern run
+# SIGTERM to the server first (it stops its agents), then everything left in the cgroup.
+KillMode=mixed
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+UMask=0027
+LimitNOFILE=65536
+
+# Hardening that leaves agents able to work: they write the data directory (workspaces, their
+# HOME with tool caches), run toolchains and may use Docker and device nodes (emulators) to test
+# what they build. Hence no ProtectSystem=strict, PrivateDevices, MemoryDenyWriteExecute (the JVM
+# and other JITs need it), SystemCallFilter or RestrictNamespaces.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+ReadWritePaths=@DATA_DIR@ @LOG_DIR@
+
+[Install]
+WantedBy=multi-user.target

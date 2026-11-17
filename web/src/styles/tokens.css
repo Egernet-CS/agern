@@ -1,0 +1,52 @@
+/* Agern design tokens — a factory floor at night. */
+:root {
+  color-scheme: dark;
+
+  --bg: #0b0e14;
+  --bg-2: #0e121a;
+  --surface: #121722;
+  --surface-2: #171d2a;
+  --surface-3: #1d2434;
+  --line: #222a3a;
+  --line-2: #2d374b;
+  --line-3: #3b475e;
+
+  --text: #e7eaf0;
+  --text-2: #aeb7c7;
+  --text-3: #8490a3; /* ≥ 5:1 on --bg */
+  --text-4: #5d687b; /* decorative only */
+
+  /* molten amber: the one activity accent */
+  --amber: #ffb14a;
+  --amber-hi: #ffd08a;
+  --amber-lo: #ff8a24;
+  --amber-ink: #1a1206;
+  --amber-glow: rgba(255, 160, 60, 0.38);
+  --amber-wash: rgba(255, 170, 70, 0.08);
+
+  /* verdicts */
+  --pass: #5ad6a0;
+  --pass-wash: rgba(90, 214, 160, 0.1);
+  --changes: #8fb4ff;
+  --changes-wash: rgba(143, 180, 255, 0.11);
+  --escalate: #ff78ae;
+  --escalate-wash: rgba(255, 120, 174, 0.11);
+  --fail: #ff6464;
+  --fail-wash: rgba(255, 100, 100, 0.1);
+
+  --kind-feature: #9ad7ff;
+  --kind-bug: #ff8f8f;
+  --kind-task: #c6b8ff;
+
+  --font-ui: 'Hanken Grotesk Variable', 'Hanken Grotesk', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
+  --r-sm: 6px;
+  --r: 10px;
+  --r-lg: 16px;
+  --shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 12px 40px -12px rgba(0, 0, 0, 0.6);
+  --focus: 0 0 0 2px var(--bg), 0 0 0 4px var(--amber-hi);
+
+  --topbar-h: 58px;
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+}

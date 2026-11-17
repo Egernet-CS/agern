@@ -1,0 +1,659 @@
+/* ------------------------------------------------------------------ terminal chat */
+.chat {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background:
+    radial-gradient(800px 300px at 50% 120%, rgba(255, 150, 50, 0.045), transparent 70%),
+    #090c11;
+  font-family: var(--font-mono);
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--text);
+  font-variant-ligatures: none;
+}
+.chat--embedded {
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+}
+.chat-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(18, 23, 34, 0.6);
+  font-family: var(--font-ui);
+}
+.chat-head-title {
+  color: var(--text-3);
+  font-size: 0.8rem;
+  flex: 1;
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-pick select {
+  height: 30px;
+  padding: 0 28px 0 10px;
+  font-size: 0.8rem;
+  max-width: 260px;
+  background-color: var(--bg-2);
+}
+.chat-banner {
+  padding: 8px 16px;
+  background: linear-gradient(90deg, rgba(143, 180, 255, 0.12), transparent);
+  border-bottom: 1px solid rgba(143, 180, 255, 0.25);
+  color: var(--changes);
+  font-size: 12.5px;
+}
+.chat-banner strong {
+  color: var(--text);
+}
+.chat-banner-sub {
+  color: var(--text-3);
+}
+.eye {
+  margin-right: 4px;
+}
+.chat-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-2) transparent;
+  border-radius: 0;
+}
+.chat-scroll:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--amber-hi);
+  border-radius: 0;
+}
+.chat-log {
+  padding: 16px 18px 8px;
+  max-width: 980px;
+}
+
+/* lines */
+.t-line,
+.t-text {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+}
+.t-text,
+.t-tool,
+.t-thinking,
+.t-user,
+.t-system,
+.t-result-line,
+.t-meta,
+.t-unknown {
+  margin: 0 0 12px;
+}
+.t-dot {
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.95;
+}
+.t-dot--text {
+  color: var(--text-2);
+}
+.t-tool--ok .t-dot {
+  color: var(--pass);
+}
+.t-tool--error .t-dot {
+  color: var(--fail);
+}
+.t-tool--pending .t-dot {
+  color: var(--amber);
+  animation: pulse 1s ease-in-out infinite;
+}
+.t-tool-name {
+  font-weight: 700;
+  color: var(--text);
+}
+.t-tool-args {
+  color: var(--text-2);
+  word-break: break-word;
+}
+.t-result {
+  display: grid;
+  grid-template-columns: 18px 18px minmax(0, 1fr);
+  color: var(--text-3);
+}
+.t-result .t-elbow {
+  grid-column: 2;
+}
+.t-result-body {
+  min-width: 0;
+}
+.t-elbow {
+  color: var(--text-4);
+}
+.t-out {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+.t-tool--error .t-out {
+  color: #ffa0a0;
+}
+.t-out--full {
+  max-height: 420px;
+  overflow: auto;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: var(--text-2);
+}
+.t-summary {
+  color: var(--text-3);
+}
+.t-expand {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-4);
+  cursor: pointer;
+  display: block;
+}
+.t-expand:hover {
+  color: var(--amber-hi);
+}
+.t-todos {
+  list-style: none;
+  margin: 2px 0 0 36px;
+  padding: 0;
+  color: var(--text-2);
+}
+.todo--completed {
+  color: var(--text-4);
+  text-decoration: line-through;
+}
+.todo--in_progress {
+  color: var(--amber-hi);
+}
+
+/* assistant markdown */
+.md {
+  min-width: 0;
+  color: var(--text);
+}
+.md > :last-child {
+  margin-bottom: 0;
+}
+.md p {
+  margin: 0 0 8px;
+}
+.md-h {
+  font-size: 13.5px;
+  font-weight: 700;
+  margin: 10px 0 6px;
+  color: var(--amber-hi);
+}
+.md ul,
+.md ol {
+  margin: 0 0 8px;
+  padding-left: 20px;
+}
+.md li.task {
+  list-style: none;
+  margin-left: -18px;
+}
+.task-box {
+  margin-right: 6px;
+  color: var(--text-3);
+}
+.md-code {
+  color: var(--changes);
+  background: rgba(143, 180, 255, 0.08);
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 0.95em;
+}
+.md strong {
+  color: #fff;
+}
+.md em {
+  color: var(--text-2);
+}
+.md a {
+  color: var(--amber-hi);
+  text-decoration: underline;
+  text-decoration-color: rgba(255, 208, 138, 0.4);
+  text-underline-offset: 2px;
+}
+.md blockquote {
+  margin: 0 0 8px;
+  padding-left: 12px;
+  border-left: 2px solid var(--line-3);
+  color: var(--text-2);
+}
+.md hr {
+  border: 0;
+  border-top: 1px dashed var(--line-2);
+  margin: 10px 0;
+}
+.md-pre {
+  position: relative;
+  margin: 4px 0 10px;
+  background: #0d1118;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.md-pre pre {
+  margin: 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: #d8dee9;
+}
+.md-lang {
+  position: absolute;
+  right: 8px;
+  top: 6px;
+  font-size: 10.5px;
+  color: var(--text-4);
+  text-transform: lowercase;
+}
+.md-table-wrap {
+  overflow-x: auto;
+  margin: 2px 0 10px;
+}
+.md-table {
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.md-table th,
+.md-table td {
+  border: 1px solid var(--line-2);
+  padding: 3px 10px;
+  text-align: left;
+}
+.md-table th {
+  color: var(--text-2);
+  background: rgba(255, 255, 255, 0.02);
+}
+.caret {
+  display: inline-block;
+  width: 7px;
+  height: 1.05em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--amber);
+  animation: blink 1s steps(2) infinite;
+}
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* thinking */
+.t-thinking {
+  color: var(--text-4);
+  font-style: italic;
+}
+.t-thinking-head {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  font-style: italic;
+  color: var(--text-3);
+  cursor: pointer;
+}
+.t-thinking-head:disabled {
+  cursor: default;
+}
+.t-thinking-body {
+  padding-left: 18px;
+  color: var(--text-3);
+  opacity: 0.8;
+  white-space: pre-wrap;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.t-thinking-body.is-open {
+  display: block;
+}
+
+/* user prompt echo */
+.t-user {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  padding: 8px 12px 8px 10px;
+  margin-left: -10px;
+  margin-right: -10px;
+  background: rgba(255, 255, 255, 0.035);
+  border-left: 2px solid var(--line-3);
+  border-radius: 0 6px 6px 0;
+}
+.t-prompt {
+  color: var(--amber);
+  font-weight: 700;
+}
+.t-user-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #fff;
+}
+.t-user--cmd .t-user-text {
+  color: var(--amber-hi);
+}
+.t-user--pending {
+  opacity: 0.55;
+}
+.t-user-name {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-left: 10px;
+  align-self: center;
+}
+
+/* system / meta */
+.t-system {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  color: var(--text-2);
+}
+.t-system pre {
+  margin: 0;
+  white-space: pre-wrap;
+  font: inherit;
+}
+.t-system--warn {
+  color: var(--amber-hi);
+}
+.t-system--error {
+  color: var(--fail);
+}
+.t-meta {
+  color: var(--text-4);
+  font-size: 12px;
+}
+.t-cwd {
+  color: var(--text-3);
+}
+.t-meta--status {
+  text-align: center;
+}
+.t-result-line {
+  color: var(--text-4);
+  font-size: 12px;
+  padding-left: 18px;
+}
+.t-result-line > span:first-child {
+  color: var(--pass);
+}
+.t-result-line--err > span:first-child {
+  color: var(--fail);
+}
+.t-unknown {
+  font-size: 11.5px;
+  color: var(--text-4);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding-left: 18px;
+}
+.t-unknown-label {
+  color: var(--text-3);
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+
+/* spinner */
+.t-spinner {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  color: var(--amber);
+  margin: 4px 0 12px;
+}
+.t-spinner-glyph {
+  width: 10px;
+  display: inline-block;
+  text-align: center;
+  text-shadow: 0 0 10px var(--amber-glow);
+}
+.t-spinner-verb {
+  font-weight: 600;
+  background: linear-gradient(90deg, var(--amber-lo), var(--amber-hi), var(--amber-lo));
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer 2s linear infinite;
+}
+@keyframes shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+.t-spinner-meta {
+  color: var(--text-3);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+/* prompt */
+.prompt {
+  position: relative;
+  padding: 8px 14px 6px;
+}
+.prompt-box {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 4px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  padding: 9px 8px 9px 12px;
+  background: #0d1118;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+.prompt-box:focus-within {
+  border-color: rgba(255, 177, 74, 0.6);
+  box-shadow: 0 0 0 3px rgba(255, 177, 74, 0.12);
+}
+.prompt.is-working .prompt-box {
+  border-style: dashed;
+}
+.prompt-caret {
+  color: var(--amber);
+  font-weight: 700;
+  line-height: 24px;
+}
+.prompt textarea {
+  border: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+  resize: none;
+  font: 13.5px/24px var(--font-mono) !important;
+  color: #fff;
+  min-height: 24px;
+  max-height: 240px;
+  border-radius: 0 !important;
+}
+.prompt-btn {
+  width: 28px;
+  height: 24px;
+  border-radius: 6px;
+  border: 1px solid var(--line-2);
+  background: var(--surface-2);
+  color: var(--text-2);
+  cursor: pointer;
+  font: 13px var(--font-mono);
+}
+.prompt-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.prompt-btn--stop {
+  color: var(--fail);
+  border-color: rgba(255, 100, 100, 0.4);
+}
+.prompt-suggest {
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: calc(100% - 2px);
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  box-shadow: 0 -12px 30px -10px rgba(0, 0, 0, 0.7);
+  z-index: 5;
+}
+.prompt-suggest li {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12.5px;
+}
+.prompt-suggest li.is-sel {
+  background: rgba(255, 177, 74, 0.12);
+}
+.ps-usage {
+  color: var(--amber-hi);
+  white-space: nowrap;
+}
+.ps-help {
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-disabled {
+  margin: 8px 14px;
+  padding: 10px 14px;
+  border: 1px dashed var(--line-2);
+  border-radius: 10px;
+  color: var(--text-2);
+  font: 13px/1.5 var(--font-ui);
+}
+.chat-error {
+  margin: 0 14px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--fail-wash);
+  color: var(--fail);
+  font-size: 12.5px;
+  display: flex;
+  justify-content: space-between;
+}
+
+/* footer */
+.chat-footer {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  padding: 6px 16px 9px;
+  font-size: 11.5px;
+  color: var(--text-3);
+  border-top: 1px solid rgba(34, 42, 58, 0.6);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.cf-k {
+  color: var(--text-4);
+}
+.cf-conn {
+  color: var(--text-4);
+}
+.cf-conn--live > span {
+  color: var(--pass);
+}
+.cf-conn--reconnecting > span,
+.cf-conn--connecting > span {
+  color: var(--amber);
+  animation: pulse 1s infinite;
+}
+.cf-hints {
+  margin-left: auto;
+  color: var(--text-4);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* empty chat */
+.chat--empty {
+  font-family: var(--font-ui);
+}
+.chat-start {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 24px;
+  gap: 10px;
+  max-width: 520px;
+  margin: 0 auto;
+}
+.chat-start h3 {
+  font-size: 1.2rem;
+}
+.ascii {
+  color: var(--amber);
+  font-size: 13px;
+  margin: 0 0 6px;
+  text-shadow: 0 0 14px var(--amber-glow);
+}
+
+@media (max-width: 760px) {
+  .chat {
+    font-size: 13px;
+  }
+  .chat-log {
+    padding: 12px 12px 6px;
+  }
+  .cf-hints {
+    display: none;
+  }
+  .chat-head-title {
+    display: none;
+  }
+  .chat-pick {
+    flex: 1;
+  }
+  .chat-pick select {
+    max-width: none;
+  }
+  .prompt {
+    padding: 6px 10px 4px;
+  }
+  .t-user {
+    margin-left: -6px;
+    margin-right: -6px;
+  }
+}
+.chat-resume {
+  margin: 8px 14px 0;
+  font: 12.5px/1.5 var(--font-ui);
+}

@@ -1,0 +1,696 @@
+#!/usr/bin/env bash
+# agern — control an installed Agern (the software factory).
+#
+#   agern start|stop|restart|status     control the service
+#   agern logs [-f] [-n LINES]          show the server log
+#   agern version                       installed, previous and running version
+#   agern upgrade [VERSION] [--force]   download a release, verify, swap, restart, health check
+#   agern rollback                      switch back to the previous version
+#   agern doctor                        check the host
+#   agern run                           run the server in the foreground (used by the service)
+#
+# Layout (prefix /opt/agern unless AGERN_PREFIX is set):
+#   <prefix>/agern.conf                 written by install.sh (paths, service user, service manager)
+#   <prefix>/versions/<version>/        one unpacked release each (agern.jar, this script, ...)
+#   <prefix>/current, <prefix>/previous symlinks into versions/
+#   <prefix>/bin/agern                  -> ../current/agern
+#
+# Environment overrides (mostly for testing):
+#   AGERN_PREFIX              install prefix
+#   AGERN_RELEASE_BASE_URL    where releases are downloaded from
+#                             (default https://github.com/Egernet-CS/agern/releases; file:// works)
+#   AGERN_HEALTH_TIMEOUT      seconds to wait for /api/health after a (re)start (default 120)
+#
+# Bash 3.2 compatible (macOS /bin/bash).
+# shellcheck disable=SC2015 # 'test && ok || bad': ok/meh always succeed
+
+set -euo pipefail
+
+AGERN_REPO_DEFAULT_BASE="https://github.com/Egernet-CS/agern/releases"
+LAUNCHD_LABEL="dk.egernet.agern"
+SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+
+# ---------------------------------------------------------------------------------------------
+# helpers
+
+say()  { printf '%s\n' "$*"; }
+info() { printf 'agern: %s\n' "$*"; }
+warn() { printf 'agern: warning: %s\n' "$*" >&2; }
+die()  { printf 'agern: error: %s\n' "$*" >&2; exit 1; }
+
+is_root() { [ "$(id -u)" -eq 0 ]; }
+
+# Directory of this script with symlinks resolved (bin/agern -> ../current/agern -> versions/X/agern).
+script_dir() {
+    local self="$0" link
+    while [ -L "$self" ]; do
+        link=$(readlink "$self")
+        case $link in
+            /*) self=$link ;;
+            *) self=$(dirname "$self")/$link ;;
+        esac
+    done
+    (cd -P "$(dirname "$self")" && pwd -P)
+}
+
+detect_prefix() {
+    if [ -n "${AGERN_PREFIX:-}" ]; then
+        printf '%s\n' "$AGERN_PREFIX"
+        return
+    fi
+    local dir
+    dir=$(script_dir)
+    if [ "$(basename "$(dirname "$dir")")" = "versions" ]; then
+        dirname "$(dirname "$dir")"
+    else
+        printf '%s\n' /opt/agern
+    fi
+}
+
+PREFIX=$(detect_prefix)
+CONF_FILE="$PREFIX/agern.conf"
+
+# Defaults; agern.conf (written by install.sh) overrides them.
+AGERN_ENV_FILE=/etc/agern/agern.env
+AGERN_DATA_DIR=/var/lib/agern
+AGERN_LOG_DIR=/var/log/agern
+AGERN_USER=agern
+AGERN_SERVICE=none
+if [ -r "$CONF_FILE" ]; then
+    # shellcheck source=/dev/null
+    . "$CONF_FILE"
+fi
+LOG_FILE="$AGERN_LOG_DIR/agern.log"
+PID_FILE="$PREFIX/run/agern.pid"
+SYSTEMD_UNIT=agern.service
+LAUNCHD_PLIST="/Library/LaunchDaemons/$LAUNCHD_LABEL.plist"
+
+# Read KEY=VALUE lines (systemd EnvironmentFile style: no shell expansion, optional surrounding
+# quotes, '#' comments on their own line) and export them. Never evaluates the file as shell.
+load_env_file() {
+    local file=$1 line key val
+    [ -r "$file" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line#"${line%%[![:space:]]*}"}
+        case $line in '' | '#'*) continue ;; esac
+        case $line in *=*) ;; *) continue ;; esac
+        key=${line%%=*}
+        val=${line#*=}
+        key=${key%"${key##*[![:space:]]}"}
+        [[ $key =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        if [ ${#val} -ge 2 ]; then
+            case $val in
+                \"*\") val=${val:1:${#val}-2} ;;
+                \'*\') val=${val:1:${#val}-2} ;;
+            esac
+        fi
+        export "$key=$val"
+    done <"$file"
+    return 0
+}
+
+ENV_LOADED=0
+ensure_env() {
+    if [ "$ENV_LOADED" = 0 ] && load_env_file "$AGERN_ENV_FILE"; then
+        ENV_LOADED=1
+    fi
+    return 0
+}
+
+health_url() {
+    ensure_env
+    local host=${FACTORY_HOST:-0.0.0.0} port=${FACTORY_PORT:-8080}
+    case $host in '' | 0.0.0.0 | '::' | '[::]') host=127.0.0.1 ;; esac
+    case $host in *:*) case $host in \[*) ;; *) host="[$host]" ;; esac ;; esac
+    printf 'http://%s:%s/api/health\n' "$host" "$port"
+}
+
+# Prints the version the running server reports, or nothing.
+running_version() {
+    command -v curl >/dev/null 2>&1 || return 0
+    curl -fsS --max-time 3 "$(health_url)" 2>/dev/null |
+        sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' || true
+}
+
+installed_version() {
+    local which=${1:-current}
+    if [ -r "$PREFIX/$which/VERSION" ]; then tr -d '[:space:]' <"$PREFIX/$which/VERSION"; fi
+}
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        openssl dgst -sha256 "$1" | awk '{print $NF}'
+    fi
+}
+
+need_root_for_service() {
+    if [ "$AGERN_SERVICE" != none ] && ! is_root; then
+        die "this needs root (the service is managed by $AGERN_SERVICE); try: sudo $0 $*"
+    fi
+}
+
+# ---------------------------------------------------------------------------------------------
+# service control
+
+svc_is_running() {
+    case $AGERN_SERVICE in
+        systemd) systemctl is-active --quiet "$SYSTEMD_UNIT" ;;
+        launchd) launchctl print "system/$LAUNCHD_LABEL" 2>/dev/null | grep -q 'state = running' ;;
+        *)
+            [ -r "$PID_FILE" ] || return 1
+            local pid
+            pid=$(cat "$PID_FILE" 2>/dev/null || true)
+            [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+            ;;
+    esac
+}
+
+svc_start() {
+    case $AGERN_SERVICE in
+        systemd) systemctl start "$SYSTEMD_UNIT" ;;
+        launchd)
+            if launchctl print "system/$LAUNCHD_LABEL" >/dev/null 2>&1; then
+                launchctl kickstart "system/$LAUNCHD_LABEL"
+            else
+                launchctl bootstrap system "$LAUNCHD_PLIST"
+            fi
+            ;;
+        *)
+            if svc_is_running; then
+                info "already running (pid $(cat "$PID_FILE"))"
+                return 0
+            fi
+            mkdir -p "$PREFIX/run" "$AGERN_LOG_DIR"
+            nohup "$PREFIX/bin/agern" run </dev/null >>"$LOG_FILE" 2>&1 &
+            echo $! >"$PID_FILE"
+            ;;
+    esac
+}
+
+svc_stop() {
+    case $AGERN_SERVICE in
+        systemd) systemctl stop "$SYSTEMD_UNIT" ;;
+        launchd)
+            if launchctl print "system/$LAUNCHD_LABEL" >/dev/null 2>&1; then
+                launchctl bootout "system/$LAUNCHD_LABEL" || true
+            fi
+            ;;
+        *)
+            svc_is_running || { rm -f "$PID_FILE"; return 0; }
+            local pid i=0
+            pid=$(cat "$PID_FILE")
+            kill -TERM "$pid" 2>/dev/null || true
+            while kill -0 "$pid" 2>/dev/null; do
+                i=$((i + 1))
+                if [ "$i" -ge 60 ]; then
+                    warn "pid $pid did not stop within 30 s; killing it"
+                    kill -KILL "$pid" 2>/dev/null || true
+                    break
+                fi
+                sleep 0.5
+            done
+            rm -f "$PID_FILE"
+            ;;
+    esac
+}
+
+svc_restart() {
+    case $AGERN_SERVICE in
+        systemd) systemctl restart "$SYSTEMD_UNIT" ;;
+        launchd)
+            if launchctl print "system/$LAUNCHD_LABEL" >/dev/null 2>&1; then
+                launchctl kickstart -k "system/$LAUNCHD_LABEL"
+            else
+                launchctl bootstrap system "$LAUNCHD_PLIST"
+            fi
+            ;;
+        *) svc_stop && svc_start ;;
+    esac
+}
+
+# wait_healthy [expected-version] — waits until /api/health answers (with that version).
+wait_healthy() {
+    local want=${1:-} timeout=${AGERN_HEALTH_TIMEOUT:-120} waited=0 got
+    while [ "$waited" -lt "$timeout" ]; do
+        got=$(running_version)
+        if [ -n "$got" ] && { [ -z "$want" ] || [ "$got" = "$want" ]; }; then
+            info "healthy: version $got at $(health_url)"
+            return 0
+        fi
+        if [ "$AGERN_SERVICE" = none ] && ! svc_is_running; then
+            warn "the server process exited (see $LOG_FILE)"
+            return 1
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    warn "no healthy answer${want:+ with version $want} from $(health_url) within ${timeout}s${got:+ (got $got)}"
+    return 1
+}
+
+# ---------------------------------------------------------------------------------------------
+# version switching
+
+link_target() { # prints "versions/X" for a link, or nothing
+    [ -L "$PREFIX/$1" ] && readlink "$PREFIX/$1" || true
+}
+
+set_link() { # set_link name target-or-empty
+    if [ -n "$2" ]; then ln -sfn "$2" "$PREFIX/$1"; else rm -f "$PREFIX/$1"; fi
+}
+
+prune_versions() {
+    local cur prev d name
+    cur=$(link_target current)
+    prev=$(link_target previous)
+    for d in "$PREFIX"/versions/*; do
+        [ -d "$d" ] || continue
+        name="versions/$(basename "$d")"
+        if [ "$name" != "$cur" ] && [ "$name" != "$prev" ]; then
+            rm -rf "$d"
+        fi
+    done
+}
+
+acquire_lock() {
+    LOCK_DIR="$PREFIX/.lock"
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        die "another upgrade/rollback seems to be running (remove $LOCK_DIR if not)"
+    fi
+    trap 'rm -rf "$LOCK_DIR" ${TMP_DIR:+"$TMP_DIR"}' EXIT
+}
+
+# activate VERSION [--no-start] — called by install.sh after it has placed versions/VERSION.
+# Makes it current (old current becomes previous), restarts, and switches back automatically
+# when the new version does not report itself healthy.
+cmd_activate() {
+    local v=${1:-} start=1
+    [ -n "$v" ] || die "usage: agern activate VERSION [--no-start]"
+    [ "${2:-}" = "--no-start" ] && start=0
+    [ -f "$PREFIX/versions/$v/agern.jar" ] || die "$PREFIX/versions/$v is not an unpacked release"
+    local old_cur old_prev
+    old_cur=$(link_target current)
+    old_prev=$(link_target previous)
+    if [ "$old_cur" != "versions/$v" ]; then
+        set_link previous "$old_cur"
+        set_link current "versions/$v"
+    fi
+    mkdir -p "$PREFIX/bin"
+    ln -sfn ../current/agern "$PREFIX/bin/agern"
+    if [ "$start" = 0 ]; then
+        info "installed version $v (not started)"
+        prune_versions
+        return 0
+    fi
+    info "restarting with version $v"
+    if svc_restart && wait_healthy "$v"; then
+        prune_versions
+        local prev
+        prev=$(link_target previous)
+        info "now running $v${prev:+ (previous: ${prev#versions/}, 'agern rollback' switches back)}"
+        return 0
+    fi
+    if [ -z "$old_cur" ] || [ "$old_cur" = "versions/$v" ]; then
+        die "version $v did not come up and there is nothing to roll back to (see 'agern logs')"
+    fi
+    warn "version $v did not come up; rolling back to ${old_cur#versions/}"
+    set_link current "$old_cur"
+    set_link previous "$old_prev"
+    if svc_restart && wait_healthy "${old_cur#versions/}"; then
+        prune_versions
+        die "upgrade to $v failed and was rolled back; ${old_cur#versions/} is running again (see 'agern logs')"
+    fi
+    die "upgrade to $v failed and the rollback to ${old_cur#versions/} did not come up either (see 'agern logs')"
+}
+
+cmd_rollback() {
+    need_root_for_service rollback
+    acquire_lock
+    local cur prev
+    cur=$(link_target current)
+    prev=$(link_target previous)
+    [ -n "$prev" ] && [ -d "$PREFIX/$prev" ] || die "no previous version to roll back to"
+    info "rolling back from ${cur#versions/} to ${prev#versions/}"
+    set_link current "$prev"
+    set_link previous "$cur"
+    svc_restart
+    wait_healthy "${prev#versions/}" || die "${prev#versions/} did not come up (see 'agern logs'); 'agern rollback' again switches back"
+    info "now running ${prev#versions/} (rollback again to return to ${cur#versions/})"
+}
+
+# ---------------------------------------------------------------------------------------------
+# upgrade
+
+download() { # download URL FILE
+    curl -fsSL --retry 3 --connect-timeout 15 -o "$2" "$1" || die "download failed: $1"
+}
+
+cmd_upgrade() {
+    local want="" force=0 arg
+    for arg in "$@"; do
+        case $arg in
+            --force) force=1 ;;
+            -*) die "unknown option $arg" ;;
+            *) want=${arg#v} ;;
+        esac
+    done
+    if [ -n "$want" ] && ! [[ $want =~ $SEMVER_RE ]]; then die "not a version: $want"; fi
+    need_root_for_service upgrade
+    command -v curl >/dev/null 2>&1 || die "curl is required"
+    command -v tar >/dev/null 2>&1 || die "tar is required"
+    acquire_lock
+    TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/agern-upgrade.XXXXXX")
+
+    local base=${AGERN_RELEASE_BASE_URL:-$AGERN_REPO_DEFAULT_BASE} sums_url
+    base=${base%/}
+    if [ -n "$want" ]; then
+        sums_url="$base/download/v$want/SHA256SUMS"
+    else
+        sums_url="$base/latest/download/SHA256SUMS"
+    fi
+    info "fetching $sums_url"
+    download "$sums_url" "$TMP_DIR/SHA256SUMS"
+
+    local tarball version expected actual
+    tarball=$(awk '{sub(/^\*/, "", $2); print $2}' "$TMP_DIR/SHA256SUMS" | grep -E '^agern-.+\.tar\.gz$' | head -n 1 || true)
+    [ -n "$tarball" ] || die "SHA256SUMS lists no agern-<version>.tar.gz"
+    version=${tarball#agern-}
+    version=${version%.tar.gz}
+    [[ $version =~ $SEMVER_RE ]] || die "unexpected release file name: $tarball"
+    if [ -n "$want" ] && [ "$version" != "$want" ]; then die "release v$want contains $tarball"; fi
+
+    local current
+    current=$(installed_version current)
+    if [ "$version" = "$current" ] && [ "$force" = 0 ]; then
+        info "version $version is already installed (use --force to reinstall it)"
+        return 0
+    fi
+
+    local tar_url
+    tar_url="$(dirname "$sums_url")/$tarball"
+    info "downloading $tar_url"
+    download "$tar_url" "$TMP_DIR/$tarball"
+    expected=$(awk -v f="$tarball" '{n=$2; sub(/^\*/, "", n); if (n == f) {print $1; exit}}' "$TMP_DIR/SHA256SUMS")
+    actual=$(sha256_of "$TMP_DIR/$tarball")
+    if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+        die "checksum mismatch for $tarball (expected ${expected:-none}, got $actual); nothing was changed"
+    fi
+    info "checksum OK ($actual)"
+
+    mkdir "$TMP_DIR/x"
+    tar -xzf "$TMP_DIR/$tarball" -C "$TMP_DIR/x"
+    local dir="$TMP_DIR/x/agern-$version"
+    [ -f "$dir/agern.jar" ] && [ -f "$dir/install.sh" ] || die "$tarball does not look like an Agern release"
+    [ "$(tr -d '[:space:]' <"$dir/VERSION")" = "$version" ] || die "$tarball: VERSION file does not say $version"
+
+    # The new release's installer places the files and calls its own 'agern activate'
+    # (restart, health check, automatic switch back on failure).
+    AGERN_PREFIX="$PREFIX" bash "$dir/install.sh" --upgrade
+}
+
+# ---------------------------------------------------------------------------------------------
+# run (foreground)
+
+resolve_java() {
+    if [ -n "${AGERN_JAVA:-}" ]; then
+        printf '%s\n' "$AGERN_JAVA"
+    elif [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+        printf '%s\n' "$JAVA_HOME/bin/java"
+    else
+        command -v java || true
+    fi
+}
+
+cmd_run() {
+    if is_root && [ "${AGERN_ALLOW_ROOT:-}" != 1 ]; then
+        die "refusing to run as root: agents would run as root. Run as the '$AGERN_USER' user (the service does)."
+    fi
+    # Under systemd the unit's EnvironmentFile already provided the variables and the file is
+    # root-only; under launchd or without a service manager we read it ourselves.
+    load_env_file "$AGERN_ENV_FILE" || true
+    # PATH for the server (and thereby for finding 'claude') follows FACTORY_AGENT_PATH when set.
+    if [ -n "${FACTORY_AGENT_PATH:-}" ]; then export PATH="$FACTORY_AGENT_PATH"; fi
+    : "${FACTORY_DATA_DIR:=$AGERN_DATA_DIR}"
+    export FACTORY_DATA_DIR
+    mkdir -p "$FACTORY_DATA_DIR"
+    cd "$FACTORY_DATA_DIR"
+    local java
+    java=$(resolve_java)
+    [ -n "$java" ] || die "java not found (set AGERN_JAVA or JAVA_HOME in $AGERN_ENV_FILE)"
+    # shellcheck disable=SC2086 # AGERN_JAVA_OPTS is a list of options
+    exec "$java" ${AGERN_JAVA_OPTS:-} -jar "$PREFIX/current/agern.jar"
+}
+
+# ---------------------------------------------------------------------------------------------
+# status, logs, version
+
+cmd_status() {
+    local cur prev run
+    cur=$(installed_version current)
+    prev=$(installed_version previous)
+    say "prefix:     $PREFIX"
+    say "installed:  ${cur:-none}${prev:+ (previous: $prev)}"
+    say "service:    $AGERN_SERVICE"
+    if svc_is_running; then say "state:      running"; else say "state:      stopped"; fi
+    run=$(running_version)
+    if [ -n "$run" ]; then
+        say "health:     ok, version $run ($(health_url))"
+    else
+        say "health:     no answer ($(health_url))"
+    fi
+    case $AGERN_SERVICE in
+        systemd) systemctl status "$SYSTEMD_UNIT" --no-pager -n 0 2>/dev/null || true ;;
+    esac
+    [ -n "$run" ]
+}
+
+cmd_logs() {
+    local follow=0 lines=200
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -f | --follow) follow=1 ;;
+            -n) shift; lines=${1:?-n needs a number} ;;
+            *) die "usage: agern logs [-f] [-n LINES]" ;;
+        esac
+        shift
+    done
+    if [ "$AGERN_SERVICE" = systemd ]; then
+        if [ "$follow" = 1 ]; then exec journalctl -u "$SYSTEMD_UNIT" -n "$lines" -f; fi
+        exec journalctl -u "$SYSTEMD_UNIT" -n "$lines" --no-pager
+    fi
+    [ -r "$LOG_FILE" ] || die "no log at $LOG_FILE"
+    if [ "$follow" = 1 ]; then exec tail -n "$lines" -F "$LOG_FILE"; fi
+    exec tail -n "$lines" "$LOG_FILE"
+}
+
+cmd_version() {
+    local cur prev run
+    cur=$(installed_version current)
+    prev=$(installed_version previous)
+    run=$(running_version)
+    say "installed: ${cur:-none}"
+    say "previous:  ${prev:-none}"
+    say "running:   ${run:-not answering}"
+}
+
+# ---------------------------------------------------------------------------------------------
+# doctor
+
+DOCTOR_FAILS=0
+DOCTOR_WARNS=0
+ok()   { printf '  ok    %s\n' "$*"; }
+bad()  { printf '  FAIL  %s\n' "$*"; DOCTOR_FAILS=$((DOCTOR_FAILS + 1)); }
+meh()  { printf '  warn  %s\n' "$*"; DOCTOR_WARNS=$((DOCTOR_WARNS + 1)); }
+
+owner_of() { stat -c %U "$1" 2>/dev/null || stat -f %Su "$1"; }
+mode_of()  { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+
+b64_len() {
+    local n
+    n=$(printf '%s' "$1" | base64 -d 2>/dev/null | wc -c) || n=0
+    if [ "${n// /}" = 0 ]; then
+        n=$(printf '%s' "$1" | openssl base64 -d -A 2>/dev/null | wc -c) || n=0
+    fi
+    printf '%s\n' "${n// /}"
+}
+
+cmd_doctor() {
+    say "Agern doctor ($PREFIX)"
+
+    say "installation"
+    local cur
+    cur=$(installed_version current)
+    if [ -n "$cur" ] && [ -f "$PREFIX/current/agern.jar" ]; then ok "version $cur installed"; else bad "no current version under $PREFIX"; fi
+    case $AGERN_SERVICE in
+        systemd) [ -f "/etc/systemd/system/$SYSTEMD_UNIT" ] && ok "systemd unit installed" || bad "/etc/systemd/system/$SYSTEMD_UNIT missing" ;;
+        launchd) [ -f "$LAUNCHD_PLIST" ] && ok "launchd daemon installed" || bad "$LAUNCHD_PLIST missing" ;;
+        *) meh "no service manager: Agern does not start at boot (managed with a pid file)" ;;
+    esac
+    if [ "$AGERN_USER" = root ]; then bad "service user is root — agents must never run as root"; else ok "service user: $AGERN_USER"; fi
+
+    say "configuration ($AGERN_ENV_FILE)"
+    if [ ! -e "$AGERN_ENV_FILE" ]; then
+        bad "$AGERN_ENV_FILE does not exist"
+    elif ensure_env && [ "$ENV_LOADED" = 0 ]; then
+        meh "cannot read $AGERN_ENV_FILE as $(id -un) — run 'sudo agern doctor' for the configuration checks"
+    else
+        local m
+        m=$(mode_of "$AGERN_ENV_FILE")
+        if [ "$m" = 600 ] || [ "$m" = 400 ]; then ok "file mode $m"; else bad "file mode is $m, expected 600"; fi
+        if [ -z "${FACTORY_MASTER_KEY:-}" ]; then
+            bad "FACTORY_MASTER_KEY is not set"
+        elif [ "$(b64_len "$FACTORY_MASTER_KEY")" = 32 ]; then
+            ok "FACTORY_MASTER_KEY is 32 bytes"
+        else
+            bad "FACTORY_MASTER_KEY does not decode to 32 bytes"
+        fi
+        if [ -n "${FACTORY_GITHUB_ORG:-}" ]; then ok "FACTORY_GITHUB_ORG=$FACTORY_GITHUB_ORG"; else bad "FACTORY_GITHUB_ORG is not set"; fi
+        local twofa auth
+        twofa=$(printf '%s' "${FACTORY_2FA:-required}" | tr '[:upper:]' '[:lower:]')
+        auth=$(printf '%s' "${FACTORY_AUTH:-os}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+        if [ "$twofa" = off ]; then bad "FACTORY_2FA=off — second factor disabled (tests only)"; else ok "2FA required"; fi
+        case ",$auth," in *,dev,*) bad "FACTORY_AUTH contains 'dev' (static development users)" ;; esac
+        case ${FACTORY_DEV_FAKE_GITHUB:-} in 1 | true | TRUE | yes) bad "FACTORY_DEV_FAKE_GITHUB is on (fake GitHub)" ;; esac
+        if [ -z "${FACTORY_ADMINS:-}" ]; then meh "FACTORY_ADMINS is empty — nobody can use the admin pages"; fi
+        if [ "$(uname -s)" = Linux ]; then
+            case ",$auth," in
+                *,os,*)
+                    if id -nG "$AGERN_USER" 2>/dev/null | tr ' ' '\n' | grep -qx shadow; then
+                        ok "$AGERN_USER is in group 'shadow' (PAM password checks)"
+                    else
+                        meh "FACTORY_AUTH has 'os' but $AGERN_USER is not in group 'shadow'; PAM cannot check other users' passwords"
+                    fi
+                    ;;
+            esac
+        fi
+    fi
+
+    say "java"
+    local java jv major
+    java=$(resolve_java)
+    if [ -z "$java" ]; then
+        bad "java not found (install Java 17+, or set AGERN_JAVA / JAVA_HOME in the env file)"
+    else
+        jv=$("$java" -version 2>&1 | sed -n 's/.*version "\([^"]*\)".*/\1/p' | head -n 1)
+        major=${jv%%.*}
+        [ "$major" = 1 ] && major=$(printf '%s' "$jv" | cut -d. -f2)
+        major=${major%%[!0-9]*}
+        if [ -n "$major" ] && [ "$major" -ge 17 ]; then ok "$java ($jv)"; else bad "$java is version '${jv:-unknown}', need 17+"; fi
+    fi
+
+    say "postgresql"
+    local url=${FACTORY_DB_URL:-jdbc:postgresql://localhost:5432/factory} hostport host port db
+    hostport=${url#jdbc:postgresql://}
+    db=${hostport#*/}
+    db=${db%%\?*}
+    hostport=${hostport%%/*}
+    host=${hostport%:*}
+    port=${hostport##*:}
+    [ "$port" = "$hostport" ] && port=5432
+    [ -n "$host" ] || host=localhost
+    if (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; then
+        ok "$host:$port accepts connections"
+        if command -v psql >/dev/null 2>&1; then
+            if PGPASSWORD=${FACTORY_DB_PASSWORD:-factory} PGCONNECT_TIMEOUT=5 psql -h "$host" -p "$port" -U "${FACTORY_DB_USER:-factory}" -d "$db" -Atqc 'select 1' >/dev/null 2>&1; then
+                ok "logged in to database '$db' as '${FACTORY_DB_USER:-factory}'"
+            else
+                bad "cannot log in to database '$db' as '${FACTORY_DB_USER:-factory}' (create the role and database, see README)"
+            fi
+        else
+            meh "psql not installed; only checked that the port is open"
+        fi
+    else
+        bad "cannot connect to PostgreSQL at $host:$port"
+    fi
+
+    say "agent tools (PATH the server and agents get)"
+    local apath=${FACTORY_AGENT_PATH:-$PATH} tool claude_bin=${FACTORY_CLAUDE_BIN:-claude} found
+    if [ "$AGERN_SERVICE" = systemd ] && [ -z "${FACTORY_AGENT_PATH:-}" ]; then
+        apath=$(systemctl show -p Environment "$SYSTEMD_UNIT" 2>/dev/null | tr ' ' '\n' | sed -n 's/^\(Environment=\)\{0,1\}PATH=//p')
+        apath=${apath:-$PATH}
+    elif [ "$AGERN_SERVICE" = launchd ] && [ -z "${FACTORY_AGENT_PATH:-}" ] && [ -r "$LAUNCHD_PLIST" ]; then
+        apath=$(awk '/<key>PATH<\/key>/{getline; gsub(/.*<string>|<\/string>.*/, ""); print; exit}' "$LAUNCHD_PLIST")
+        apath=${apath:-$PATH}
+    fi
+    for tool in "$claude_bin" git gh; do
+        found=$(PATH=$apath command -v "$tool" 2>/dev/null || true)
+        if [ -n "$found" ]; then ok "$tool: $found"; else bad "$tool not found on $apath"; fi
+    done
+    command -v curl >/dev/null 2>&1 && ok "curl (for upgrades)" || meh "curl not found ('agern upgrade' needs it)"
+
+    say "data directory"
+    local data=${FACTORY_DATA_DIR:-$AGERN_DATA_DIR}
+    if [ ! -d "$data" ]; then
+        bad "$data does not exist"
+    else
+        local owner
+        owner=$(owner_of "$data")
+        if [ "$(id -un)" = "$AGERN_USER" ]; then
+            [ -w "$data" ] && ok "$data is writable by $AGERN_USER" || bad "$data is not writable by $AGERN_USER"
+        elif [ "$owner" = "$AGERN_USER" ]; then
+            ok "$data is owned by $AGERN_USER (mode $(mode_of "$data"))"
+        else
+            bad "$data is owned by $owner, not $AGERN_USER"
+        fi
+    fi
+
+    say "service"
+    if svc_is_running; then
+        local rv
+        rv=$(running_version)
+        if [ -n "$rv" ]; then
+            [ "$rv" = "$cur" ] && ok "running, /api/health reports $rv" || meh "running $rv but $cur is installed (restart?)"
+        else
+            bad "running but $(health_url) does not answer"
+        fi
+    else
+        meh "not running ('agern start')"
+    fi
+
+    say ""
+    if [ "$DOCTOR_FAILS" -gt 0 ]; then
+        say "$DOCTOR_FAILS problem(s), $DOCTOR_WARNS warning(s)"
+        return 1
+    fi
+    say "no problems ($DOCTOR_WARNS warning(s))"
+}
+
+usage() {
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# ---------------------------------------------------------------------------------------------
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case $cmd in
+    start)
+        need_root_for_service start
+        svc_start
+        wait_healthy
+        ;;
+    stop)
+        need_root_for_service stop
+        svc_stop
+        info "stopped"
+        ;;
+    restart)
+        need_root_for_service restart
+        svc_restart
+        wait_healthy
+        ;;
+    status) cmd_status ;;
+    logs) cmd_logs "$@" ;;
+    version | --version) cmd_version ;;
+    upgrade) cmd_upgrade "$@" ;;
+    rollback) cmd_rollback ;;
+    doctor) cmd_doctor ;;
+    run) cmd_run ;;
+    activate) cmd_activate "$@" ;;
+    '' | help | -h | --help) usage ;;
+    *) usage >&2; exit 2 ;;
+esac

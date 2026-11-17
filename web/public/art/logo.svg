@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" color="#ffb347" fill="none" role="img" aria-label="Agern">
+  <!-- Agern mark: an acorn whose cap is a sawtooth factory roof (the stem doubles as a chimney)
+       and whose nut carries a terminal prompt. Uses currentColor; defaults to amber #ffb347. -->
+  <defs>
+    <mask id="agern-prompt" maskUnits="userSpaceOnUse" x="0" y="0" width="32" height="32">
+      <rect width="32" height="32" fill="#fff"/>
+      <path d="M10.6 19.4 L13.9 22.1 L10.6 24.8" stroke="#000" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+      <path d="M16.2 24.8 H20.6" stroke="#000" stroke-width="2.3" stroke-linecap="round" fill="none"/>
+    </mask>
+  </defs>
+  <!-- stem / chimney -->
+  <rect x="14.75" y="2" width="2.5" height="6" rx="0.6" fill="currentColor"/>
+  <!-- cap: three-tooth sawtooth roof -->
+  <path d="M4 14.2 V10.4 L12 6.2 V10.4 L20 6.2 V10.4 L28 6.2 V14.2 Q28 15 27.2 15 H4.8 Q4 15 4 14.2 Z" fill="currentColor"/>
+  <!-- nut with the >_ prompt cut out -->
+  <path d="M6.6 16.6 H25.4 C26.6 21.4 24.2 27.6 16 30.8 C7.8 27.6 5.4 21.4 6.6 16.6 Z" fill="currentColor" mask="url(#agern-prompt)"/>
+</svg>

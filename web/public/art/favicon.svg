@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" fill="none">
+  <!-- Agern favicon: the logo mark in amber on a dark tile so it stays legible on light tab bars. -->
+  <defs>
+    <mask id="p" maskUnits="userSpaceOnUse" x="0" y="0" width="32" height="32">
+      <rect width="32" height="32" fill="#fff"/>
+      <path d="M11.2 19.3 L14.2 21.8 L11.2 24.3" stroke="#000" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+      <path d="M16.4 24.3 H20.4" stroke="#000" stroke-width="2.4" stroke-linecap="round" fill="none"/>
+    </mask>
+  </defs>
+  <rect width="32" height="32" rx="7" fill="#0b0e14"/>
+  <g fill="#ffb347">
+    <rect x="14.8" y="3" width="2.4" height="5" rx="0.6"/>
+    <path d="M5.5 13.9 V10.4 L12.5 6.8 V10.4 L19.5 6.8 V10.4 L26.5 6.8 V13.9 Q26.5 14.7 25.7 14.7 H6.3 Q5.5 14.7 5.5 13.9 Z"/>
+    <path d="M7.7 16.2 H24.3 C25.4 20.6 23.2 26.1 16 29.1 C8.8 26.1 6.6 20.6 7.7 16.2 Z" mask="url(#p)"/>
+  </g>
+</svg>

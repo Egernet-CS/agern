@@ -1,0 +1,171 @@
+package dk.egernet.factory
+
+import dk.egernet.factory.agent.AgentIdentity
+import dk.egernet.factory.agent.AgentLauncher
+import dk.egernet.factory.agent.AgentProcess
+import dk.egernet.factory.agent.LaunchSpec
+import dk.egernet.factory.db.Db
+import dk.egernet.factory.db.UserRecord
+import dk.egernet.factory.git.GitOps
+import dk.egernet.factory.github.FakeGitHub
+import io.zonky.test.db.postgres.embedded.EmbeddedPostgres
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ReceiveChannel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.putJsonObject
+import kotlinx.serialization.json.addJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import java.nio.file.Files
+import java.nio.file.Path
+import java.util.Base64
+import java.util.UUID
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
+
+object TestDb {
+    private val pg: EmbeddedPostgres by lazy { EmbeddedPostgres.builder().start() }
+    private val counter = AtomicInteger()
+
+    /** A fresh, migrated database per call. */
+    fun fresh(): Db {
+        val name = "t${System.nanoTime()}_${counter.incrementAndGet()}"
+        pg.postgresDatabase.connection.use { c -> c.createStatement().use { it.execute("CREATE DATABASE $name") } }
+        return Db.connect(pg.getJdbcUrl("postgres", name), "postgres", "postgres", poolSize = 5)
+    }
+}
+
+/** A scripted agent process. */
+class FakeProcess(val spec: LaunchSpec, private val onInput: (FakeProcess, String) -> Unit = { _, _ -> }) : AgentProcess {
+    private val ch = Channel<String>(Channel.UNLIMITED)
+    private val exit = CompletableDeferred<Int>()
+    @Volatile var killed = false
+
+    fun emit(obj: JsonObject) { ch.trySend(obj.toString()) }
+    fun exit(code: Int) {
+        ch.close()
+        exit.complete(code)
+    }
+
+    fun init(sessionId: String = spec.resumeClaudeSessionId ?: "claude-${UUID.randomUUID()}") = emit(buildJsonObject {
+        put("type", "system"); put("subtype", "init"); put("session_id", sessionId); put("model", spec.model)
+    })
+
+    fun assistantText(text: String) = emit(buildJsonObject {
+        put("type", "assistant")
+        putJsonObject("message") {
+            put("role", "assistant")
+            putJsonArray("content") { addJsonObject { put("type", "text"); put("text", text) } }
+        }
+    })
+
+    fun result(text: String?, structured: JsonObject? = null, isError: Boolean = false) = emit(buildJsonObject {
+        put("type", "result"); put("subtype", if (isError) "error_during_execution" else "success"); put("is_error", isError)
+        put("result", text); put("num_turns", 1); put("total_cost_usd", 0.01)
+        if (structured != null) put("structured_output", structured)
+    })
+
+    override val lines: ReceiveChannel<String> get() = ch
+    override fun send(line: String) = onInput(this, line)
+    override fun closeInput() { if (spec.interactive) exit(0) }
+    override fun kill() {
+        killed = true
+        if (!exit.isCompleted) exit(143)
+    }
+    override suspend fun awaitExit(): Int = exit.await()
+    override fun stderrTail(): String = "fake stderr"
+}
+
+/**
+ * Launcher whose one-shot behaviour is supplied per test. Chat sessions echo their input.
+ * [stage] runs on its own thread so it may block (e.g. to simulate a hanging builder).
+ */
+class FakeLauncher(var stage: (FakeProcess) -> Unit = { it.init(); it.result("ok"); it.exit(0) }) : AgentLauncher {
+    val launched = CopyOnWriteArrayList<FakeProcess>()
+
+    override fun launch(spec: LaunchSpec): AgentProcess {
+        val p = if (spec.interactive) {
+            FakeProcess(spec) { proc, line ->
+                val o = AppJson.parseToJsonElement(line).jsonObject
+                if (o["type"]?.jsonPrimitive?.contentOrNull == "user") {
+                    val text = o["message"]!!.jsonObject["content"]!!.jsonPrimitive.content
+                    proc.init(proc.spec.resumeClaudeSessionId ?: "chat-claude-${proc.spec.sessionId}")
+                    proc.assistantText("echo: $text")
+                    proc.result("echo: $text")
+                }
+            }
+        } else FakeProcess(spec)
+        launched += p
+        if (!spec.interactive) thread(isDaemon = true) { stage(p) }
+        return p
+    }
+
+    fun byRole(role: String) = launched.filter { it.spec.kind == role }
+}
+
+class FakeGitOps : GitOps {
+    val pushes = CopyOnWriteArrayList<String>()
+    @Volatile var commits = 1
+    override fun ensureClone(id: AgentIdentity, cloneUrl: String, dir: Path, home: Path) { Files.createDirectories(dir) }
+    override fun createWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, defaultBranch: String, home: Path): String {
+        Files.createDirectories(worktree)
+        return "origin/$defaultBranch"
+    }
+    override fun commitsAhead(worktree: Path, baseRef: String, home: Path) = commits
+    override fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path) { pushes += branch }
+    override fun removeWorktree(mainDir: Path, worktree: Path, home: Path) {}
+}
+
+fun testConfig(dataDir: Path, twoFactor: Boolean = true, devUsers: Map<String, String> = mapOf("alice" to "pw-a", "bob" to "pw-b", "root" to "pw-r")) = Config(
+    masterKey = Base64.getDecoder().decode("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="),
+    githubOrg = "test-org",
+    authProviders = listOf("dev"),
+    admins = setOf("root"),
+    devUsers = devUsers,
+    dataDir = dataDir,
+    twoFactorRequired = twoFactor,
+    chatIdleMinutes = 30,
+)
+
+class TestWorld(
+    twoFactor: Boolean = true,
+    tweak: (Config) -> Config = { it },
+    loginThrottle: dk.egernet.factory.auth.LoginThrottle = dk.egernet.factory.auth.LoginThrottle(stepDelay = java.time.Duration.ZERO),
+) {
+    val dataDir: Path = Files.createTempDirectory("agern-test")
+    val cfg = tweak(testConfig(dataDir, twoFactor))
+    val github = FakeGitHub.seeded("test-org")
+    val git = FakeGitOps()
+    val launcher = FakeLauncher()
+    val services = Services(cfg, TestDb.fresh(), github, git, launcher, loginThrottle = loginThrottle)
+
+    /** Creates a user with credentials registered, as if they had logged in and filled in Settings. */
+    fun user(name: String, admin: Boolean = false, claude: Boolean = true, github: Boolean = true): UserRecord {
+        val u = services.users.upsertOnLogin(name, name.replaceFirstChar { it.uppercase() }, admin)
+        if (claude) services.users.setClaude(u.id, "oauth_token", services.box.encrypt("sk-ant-oat-$name-secret", name))
+        if (github) services.users.setGithub(u.id, name, services.box.encrypt("fake-$name", name))
+        return services.users.byId(u.id)!!
+    }
+
+    fun awaitRun(id: UUID, statuses: Set<String>, timeoutMs: Long = 10_000) = runBlocking {
+        withTimeout(timeoutMs) {
+            while (true) {
+                val r = services.runs.get(id)!!
+                if (r.status in statuses) return@withTimeout r
+                delay(20)
+            }
+            @Suppress("UNREACHABLE_CODE") error("unreachable")
+        }
+    }
+
+    fun close() = services.stop()
+}

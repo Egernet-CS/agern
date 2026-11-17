@@ -1,0 +1,365 @@
+/* ------------------------------------------------------------------ pipeline diagram */
+.pipeline {
+  position: relative;
+  border-radius: 20px;
+  border: 1px solid var(--line);
+  background:
+    radial-gradient(900px 340px at 50% 0%, rgba(255, 150, 50, 0.05), transparent 70%),
+    linear-gradient(180deg, #0a0d13, #0b0f16);
+  overflow: hidden;
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.03) inset,
+    0 30px 60px -30px rgba(0, 0, 0, 0.8);
+}
+.pipeline svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  font-family: var(--font-mono);
+}
+.pipeline--v svg {
+  max-width: 460px;
+  margin: 0 auto;
+}
+.pgrid-dot {
+  fill: rgba(255, 255, 255, 0.06);
+}
+
+/* edges */
+.pe path {
+  fill: none;
+}
+.pe-track {
+  stroke: #1a2130;
+  stroke-width: 6;
+  stroke-linecap: round;
+}
+.pe-line {
+  stroke: #2b3548;
+  stroke-width: 1.5;
+  stroke-dasharray: 3 5;
+}
+.pe--done .pe-line {
+  stroke: #56627a;
+  stroke-dasharray: none;
+}
+.pe--flow .pe-line,
+.pe--warn .pe-line {
+  stroke: var(--amber);
+  stroke-width: 2.2;
+  stroke-dasharray: 8 9;
+  animation: belt 0.9s linear infinite;
+}
+.pe--warn .pe-line {
+  stroke: var(--escalate);
+}
+.pe-glow {
+  stroke: var(--amber);
+  stroke-width: 6;
+  opacity: 0.45;
+}
+.pe--warn .pe-glow {
+  stroke: var(--escalate);
+}
+.pe--flow .pe-track {
+  stroke: #2a2014;
+}
+@keyframes belt {
+  to {
+    stroke-dashoffset: -17;
+  }
+}
+.parrow--idle {
+  fill: #2b3548;
+}
+.parrow--done {
+  fill: #56627a;
+}
+.parrow--flow {
+  fill: var(--amber);
+}
+.parrow--warn {
+  fill: var(--escalate);
+}
+.pe-label {
+  font-size: 11px;
+  fill: var(--text-4);
+  letter-spacing: 0.04em;
+}
+.pe--flow .pe-label,
+.pe--done.pe--loop .pe-label {
+  fill: var(--changes);
+}
+.pe--loop.pe--flow .pe-line {
+  stroke: var(--changes);
+}
+.pe--loop.pe--flow .pe-glow {
+  stroke: var(--changes);
+}
+.pe--loop.pe--done .pe-line {
+  stroke: rgba(143, 180, 255, 0.55);
+}
+.pe-label--round {
+  fill: var(--text-3);
+}
+
+/* nodes */
+.pn {
+  cursor: default;
+  outline: none;
+}
+.pn.is-selectable {
+  cursor: pointer;
+}
+.pn-box {
+  fill: #121824;
+  stroke: #2a3346;
+  stroke-width: 1.2;
+  transition:
+    stroke 0.25s,
+    fill 0.25s;
+}
+.pn-glow {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 2;
+}
+.pn-role {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  fill: var(--text-2);
+}
+.pn-model {
+  font-size: 11px;
+  fill: var(--text-3);
+}
+.pn-main {
+  font-size: 20px;
+  font-weight: 700;
+  fill: var(--text);
+}
+.pn-sub {
+  font-size: 11.5px;
+  fill: var(--text-3);
+}
+.pn-status {
+  font-size: 13px;
+  fill: var(--text-2);
+}
+.pn-icon {
+  font-weight: 700;
+}
+.pn-time {
+  fill: var(--text-3);
+  font-size: 11.5px;
+}
+.pn-verdict rect {
+  fill: transparent;
+}
+.pn-verdict text {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+}
+.pn-verdict--pass rect {
+  fill: var(--pass-wash);
+  stroke: rgba(90, 214, 160, 0.4);
+}
+.pn-verdict--pass text {
+  fill: var(--pass);
+}
+.pn-verdict--changes rect {
+  fill: var(--changes-wash);
+  stroke: rgba(143, 180, 255, 0.45);
+}
+.pn-verdict--changes text {
+  fill: var(--changes);
+}
+.pn-verdict--escalate rect {
+  fill: var(--escalate-wash);
+  stroke: rgba(255, 120, 174, 0.45);
+}
+.pn-verdict--escalate text {
+  fill: var(--escalate);
+}
+
+/* states */
+.pn--pending .pn-box,
+.pn--skipped .pn-box {
+  fill: #0e131c;
+  stroke: #232b3a;
+  stroke-dasharray: 4 4;
+}
+.pn--pending .pn-role,
+.pn--skipped .pn-role {
+  fill: var(--text-3);
+}
+.pn--pending .pn-status,
+.pn--skipped .pn-status {
+  fill: var(--text-4);
+}
+.pn--stale .pn-box {
+  fill: #0e131c;
+  stroke: #2a3346;
+  stroke-dasharray: 2 4;
+}
+.pn--stale .pn-status {
+  fill: var(--text-3);
+}
+.pn--done .pn-box {
+  stroke: #3a465c;
+}
+.pn--done .pn-icon {
+  fill: var(--pass);
+}
+.pn--failed .pn-box {
+  stroke: var(--fail);
+  fill: #1a1115;
+}
+.pn--failed .pn-icon,
+.pn--failed .pn-status {
+  fill: var(--fail);
+}
+.pn--running .pn-box {
+  fill: #19150f;
+  stroke: var(--amber);
+  stroke-width: 1.6;
+}
+.pn--running .pn-icon {
+  fill: var(--amber);
+}
+.pn--running .pn-status {
+  fill: var(--amber-hi);
+}
+.pn--running .pn-role {
+  fill: var(--amber-hi);
+}
+.pn--running .pn-glow {
+  stroke: var(--amber);
+  opacity: 0.5;
+  filter: drop-shadow(0 0 8px var(--amber));
+  animation: nodepulse 1.8s ease-in-out infinite;
+}
+@keyframes nodepulse {
+  0%,
+  100% {
+    opacity: 0.15;
+  }
+  50% {
+    opacity: 0.65;
+  }
+}
+.pn-scan {
+  fill: var(--amber);
+  opacity: 0.9;
+  transform-box: fill-box;
+  transform-origin: left center;
+  animation: scan 1.6s ease-in-out infinite;
+}
+@keyframes scan {
+  0% {
+    transform: scaleX(0);
+    opacity: 0.9;
+  }
+  70% {
+    transform: scaleX(1);
+    opacity: 0.9;
+  }
+  100% {
+    transform: scaleX(1);
+    opacity: 0;
+  }
+}
+
+.pn--done.pn--tone-pass .pn-box {
+  stroke: rgba(90, 214, 160, 0.55);
+}
+.pn--done.pn--tone-changes .pn-box {
+  stroke: rgba(143, 180, 255, 0.6);
+}
+.pn--done.pn--tone-escalate .pn-box {
+  stroke: rgba(255, 120, 174, 0.6);
+}
+
+/* gate */
+.pn--gate .pn-role {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+.pn--gate .pn-status {
+  font-size: 12px;
+  font-weight: 700;
+}
+.pn--gate.pn--tone-pass .pn-status {
+  fill: var(--pass);
+}
+.pn--gate.pn--tone-changes .pn-status {
+  fill: var(--changes);
+}
+
+/* outcomes */
+.pn--merge.pn--done .pn-box {
+  fill: #0f1d18;
+  stroke: var(--pass);
+  stroke-width: 1.6;
+}
+.pn--merge.pn--done .pn-status,
+.pn--merge.pn--done .pn-icon {
+  fill: var(--pass);
+}
+.pn--merge.pn--done .pn-glow {
+  stroke: var(--pass);
+  opacity: 0.35;
+  filter: drop-shadow(0 0 10px var(--pass));
+}
+.pn--human.pn--running .pn-box {
+  fill: #1d1018;
+  stroke: var(--escalate);
+}
+.pn--human.pn--running .pn-status,
+.pn--human.pn--running .pn-icon,
+.pn--human.pn--running .pn-role {
+  fill: var(--escalate);
+}
+.pn--human.pn--running .pn-glow {
+  stroke: var(--escalate);
+  filter: drop-shadow(0 0 8px var(--escalate));
+}
+.pn--human.pn--done .pn-status,
+.pn--human.pn--done .pn-icon {
+  fill: var(--pass);
+}
+
+/* interaction */
+.pn.is-selectable:hover .pn-box {
+  stroke: var(--line-3);
+}
+.pn.is-selectable.pn--running:hover .pn-box {
+  stroke: var(--amber-hi);
+}
+.pn.is-selected .pn-box {
+  stroke: var(--text) !important;
+  stroke-width: 2;
+  stroke-dasharray: none;
+}
+.pn.is-selected .pn-glow {
+  stroke: rgba(231, 234, 240, 0.25);
+  opacity: 1;
+}
+.pn:focus-visible .pn-glow {
+  stroke: var(--amber-hi);
+  stroke-width: 2.5;
+  opacity: 1;
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pe--flow .pe-line,
+  .pe--warn .pe-line {
+    stroke-dasharray: none;
+  }
+  .pn-scan {
+    display: none;
+  }
+}

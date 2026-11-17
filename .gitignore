@@ -1,0 +1,17 @@
+.DS_Store
+data/
+.env
+.env.*
+!.env.example
+node_modules/
+web/dist/
+build/
+.gradle/
+.idea/
+*.iml
+.kotlin/
+*.blend1
+
+# Playwright end-to-end suite output
+web/test-results/
+web/playwright-report/

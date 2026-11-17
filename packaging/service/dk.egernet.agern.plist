@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Agern — the software factory. Installed by install.sh as
+     /Library/LaunchDaemons/@LABEL@.plist; @NAME@ placeholders are filled in at install time.
+     `agern run` reads the FACTORY_* configuration from @ENV_FILE@ (owned by @USER@, mode 0600). -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>@LABEL@</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>@PREFIX@/bin/agern</string>
+        <string>run</string>
+    </array>
+    <key>UserName</key>
+    <string>@USER@</string>
+    <key>GroupName</key>
+    <string>@GROUP@</string>
+    <key>WorkingDirectory</key>
+    <string>@DATA_DIR@</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>@PATH@</string>
+        <key>AGERN_PREFIX</key>
+        <string>@PREFIX@</string>
+        <key>HOME</key>
+        <string>@DATA_DIR@</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+    <key>Umask</key>
+    <integer>23</integer>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>@LOG_DIR@/agern.log</string>
+    <key>StandardErrorPath</key>
+    <string>@LOG_DIR@/agern.log</string>
+</dict>
+</plist>

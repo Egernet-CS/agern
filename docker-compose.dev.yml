@@ -1,0 +1,29 @@
+# Throwaway PostgreSQL for LOCAL DEVELOPMENT AND TESTS ONLY.
+# Production runs Agern directly on its host against a natively installed PostgreSQL;
+# nothing in the factory itself is containerised (see docs/ARCHITECTURE.md, "Docker policy").
+#
+#   docker compose -f docker-compose.dev.yml up -d
+#   export FACTORY_DB_URL=jdbc:postgresql://localhost:54329/factory
+#
+# Host port 54329 avoids clashing with a PostgreSQL already listening on 5432.
+name: agern-dev
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: factory
+      POSTGRES_USER: factory
+      POSTGRES_PASSWORD: factory
+    ports:
+      - "127.0.0.1:54329:5432"
+    volumes:
+      - agern-dev-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U factory -d factory"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  agern-dev-pg:

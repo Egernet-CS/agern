@@ -1,0 +1,438 @@
+# Agern — Architecture & API contract
+
+Agern ("acorn" in Danish) is a software factory: a self-hosted web system where people put Claude agents to work building
+software. A GitHub organization is the source of truth: **repositories are projects** and
+**issues are tasks / features / bugs**. Each project has a CLI-like chat with a Claude agent, and
+that agent (or a human) can start *pipeline runs* in which a team of agents takes an issue from
+spec to merged pull request.
+
+This document is the contract between the backend (`server/`), the frontend (`web/`) and the
+artwork (`art/`). Change it first, then the code.
+
+## 1. Repository layout
+
+```
+server/              Kotlin + Ktor backend (Gradle, JDK 17)
+web/                 React + TypeScript + Vite frontend
+art/                 Blender scripts and source renders
+docs/                This document
+docker-compose.dev.yml   PostgreSQL for local development and tests only
+```
+
+**Docker policy.** In production the factory runs directly on its host and uses a natively
+installed PostgreSQL; nothing in the factory itself is containerised. Docker's role on the factory
+host is as a tool *for the agents*: testing the software they build on different devices and
+platforms. `docker-compose.dev.yml` exists only so a developer can get a throwaway database.
+
+## 2. Stack
+
+| Concern | Choice |
+|---|---|
+| Backend | Kotlin, Ktor 3 (Netty), kotlinx.serialization, coroutines |
+| Database | PostgreSQL 16, Flyway migrations, HikariCP, plain JDBC (no ORM) |
+| Frontend | React 18, TypeScript, Vite, React Router; no heavy UI kit |
+| Agents | The `claude` CLI in headless mode (`-p`, stream-json in and out) |
+| Realtime | WebSocket for output, REST for input |
+
+All persistent state lives in PostgreSQL. The only things on disk are git workspaces and the
+per-user Claude home directories, both under `FACTORY_DATA_DIR`.
+
+## 3. Configuration (environment variables)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `FACTORY_HOST` | `0.0.0.0` | Bind address. When it is one specific address other than `127.0.0.1` (e.g. a LAN address), the server also listens on `127.0.0.1:<port>`, because agents reach MCP over loopback (§9) |
+| `FACTORY_PORT` | `8080` | HTTP port |
+| `FACTORY_DB_URL` | `jdbc:postgresql://localhost:5432/factory` | JDBC URL (native PostgreSQL; development overrides it to port `54329`, see `docker-compose.dev.yml`) |
+| `FACTORY_DB_USER` / `FACTORY_DB_PASSWORD` | `factory` / `factory` | DB credentials |
+| `FACTORY_MASTER_KEY` | — (required) | Base64, 32 bytes. Encrypts user secrets (AES-256-GCM) |
+| `FACTORY_GITHUB_ORG` | — (required) | The GitHub organization, e.g. `Egernet-CS` |
+| `FACTORY_AUTH` | `os` | Comma list of login providers: `os`, `ldap`, `dev` |
+| `FACTORY_2FA` | `required` | `required` or `off`; `off` is accepted only when `FACTORY_AUTH=dev` (sole provider), otherwise the server refuses to start |
+| `FACTORY_PAM_SERVICE` | `chkpasswd` (macOS) / `login` (other) | PAM service used by the `os` provider |
+| `FACTORY_ADMINS` | empty | Comma list of usernames that are admins |
+| `FACTORY_LDAP_URL`, `FACTORY_LDAP_USER_DN_TEMPLATE`, `FACTORY_LDAP_BASE_DN`, `FACTORY_LDAP_USER_FILTER`, `FACTORY_LDAP_BIND_DN`, `FACTORY_LDAP_BIND_PASSWORD` | — | LDAP. Either a DN template (`uid={0},ou=people,dc=x`) or search-then-bind |
+| `FACTORY_DEV_USERS` | — | `alice:pw,bob:pw`. Only read when `dev` is in `FACTORY_AUTH`. Never for production |
+| `FACTORY_DATA_DIR` | `./data` | Workspaces and per-user homes |
+| `FACTORY_WEB_DIR` | unset | Built frontend directory, served with SPA fallback. Unset: the frontend embedded in `agern.jar` (classpath `web/`) is served; with neither, non-API paths answer 404 |
+| `FACTORY_CLAUDE_BIN` | `claude` | Path of the Claude CLI (tests point this at a stub) |
+| `FACTORY_PUBLIC_URL` | `http://localhost:8080` | The URL browsers use. Cookie is `Secure` only when it is `https`; mutating requests and WebSocket upgrades with a different `Origin` are rejected (403). Agents reach MCP over loopback (`http://127.0.0.1:<port>/mcp`), not through this URL |
+| `FACTORY_ALLOWED_ORIGINS` | empty | Extra allowed browser origins, comma list (e.g. `http://localhost:5173` for the Vite dev server) |
+| `FACTORY_MAX_AGENTS_PER_USER` | `8` | Concurrent agent processes per user |
+| `FACTORY_CHAT_IDLE_MINUTES` | `30` | Idle chat processes are stopped and resumed on next input |
+| `FACTORY_STAGE_TIMEOUT_MINUTES` | `60` | Wall-clock limit for one pipeline stage agent (1–1440). On timeout the agent is stopped, the stage is `failed` and the run `failed` with an error that says so |
+| `FACTORY_AGENT_PATH` | the server's `PATH` | `PATH` value handed to agent and git processes (the only value taken from the server environment) |
+| `FACTORY_GITHUB_API_URL` | `https://api.github.com` | GitHub REST base URL (GitHub Enterprise: `https://host/api/v3`) |
+| `FACTORY_DEV_FAKE_GITHUB` | `false` | Development only, requires `FACTORY_AUTH=dev`: in-memory fake GitHub (org with `demo-app` and `private-lab`, tokens `fake-<login>` = classic with `repo`, `read:org`; `fake-<login>~<scope>,…` = only those scopes), local `git init` instead of clones, pushes skipped |
+
+## 4. Identity and secrets
+
+**Login.** Username + password checked by the configured providers in order.
+- *Rate limit.* Failed passwords count per username (case-insensitive) and per client address
+  within a 15-minute window. Five failures for a username, or twenty from one address, lock that
+  key: login is then refused with 429 `too_many_attempts` (and `lockedUntil`) before any password is
+  checked. A lock lasts 1 minute and doubles on each repeat, capped at 15 minutes, so an attacker can
+  delay a user but never lock them out for good. Each failed attempt is answered after a short,
+  growing delay. A correct password clears the username's counter (not the address's). Failures
+  (`login_failed`) and locks (`login_locked`) are written to the audit table. The counters are kept
+  in memory (a restart forgets them); behind a reverse proxy all clients share the proxy's address.
+- `os`: a user account on the machine the factory runs on (PAM on Linux; on macOS PAM or
+  `dscl . -authonly`). The password must never appear in a process argument list.
+- `ldap`: bind against the directory.
+- `dev`: static users from `FACTORY_DEV_USERS`, for local development and tests. The server logs a
+  loud warning at startup when it is enabled.
+
+**Two-factor authentication.** Mandatory for every user, from the first login. The second factor
+is TOTP (RFC 6238, SHA-1, 6 digits, 30 s, ±1 step) from an authenticator app — it works over plain
+HTTP on a LAN, which WebAuthn/passkeys do not (they can be added once Agern is served over HTTPS).
+- After a correct password the session is only *pending*: it can call the two TOTP endpoints and
+  nothing else (everything else, including WebSockets, answers 401).
+- A user without a confirmed TOTP secret must enrol before getting in: the server generates a
+  secret, the UI shows it as a QR code (rendered in the browser from the `otpauth://` URI) and as
+  text, and the user confirms with a code. Ten single-use recovery codes are then shown once.
+- The TOTP secret is encrypted like other secrets; recovery codes are stored hashed. A code cannot
+  be reused within its time step. Five failed second-factor attempts lock the account's second
+  factor for 15 minutes. Failures and resets are written to an audit table.
+- An admin can reset a user's 2FA (the user enrols again at next login); admins cannot read secrets.
+- `FACTORY_2FA` is `required` by default. `off` exists for automated tests and is accepted only
+  when `dev` is the sole login provider; otherwise the server refuses to start.
+
+Sessions are server-side rows in PostgreSQL referenced by an opaque random id in an `HttpOnly`,
+`SameSite=Lax` cookie named `sf_session`. Every mutating request must carry the header
+`X-Factory-Request: 1` (CSRF guard); the server rejects it otherwise with 403.
+
+**Per-user credentials.** Each user registers their own:
+- *Claude credential* — either a long-lived OAuth token from `claude setup-token`
+  (`kind = oauth_token`, passed to agents as `CLAUDE_CODE_OAUTH_TOKEN`) or an Anthropic API key
+  (`kind = api_key`, passed as `ANTHROPIC_API_KEY`).
+- *GitHub token* — a personal access token. The server calls `GET /user` to learn the login.
+
+Both are stored encrypted with AES-256-GCM under `FACTORY_MASTER_KEY` (random 12-byte nonce per
+value, username as associated data). They are never returned by any API, never logged, and never
+written to disk in plaintext.
+
+**The ownership rule.** An agent process always runs with the credentials of the user who started
+it — the *owner*. There is no API through which user A can cause a process to start with user B's
+credential: only the owner may send input to, resume, or approve work in their sessions and runs
+(admins may stop, never drive). Everyone else gets read-only observation.
+
+**Visibility.** A user may see a project, its issues, runs, sessions and transcripts if and only if
+their own GitHub token can read that repository (`GET /repos/{org}/{repo}` → 200; cached 60 s per
+user+repo). All GitHub calls made for a user use that user's token, so GitHub itself enforces
+access. A user without a GitHub token sees no projects.
+
+## 5. Agent runtime
+
+An agent is one `claude` child process. `AgentLauncher` is an interface so that the local process
+launcher can later be replaced by a container- or `sudo -u`-based one.
+
+Launch rules:
+- The environment is built **from scratch** (never inherited): `PATH`, `HOME`, `LANG`, `TERM`,
+  the owner's Claude credential variable, and git auth. `HOME` is
+  `$FACTORY_DATA_DIR/homes/<username>` so Claude session files are per user.
+- Git over HTTPS authenticates with the owner's GitHub token through environment-only config
+  (`GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` with an `http.extraheader`, or
+  `GIT_ASKPASS`). The token is not written into `.git/config` or the remote URL. `GH_TOKEN` is set
+  too so `gh` works.
+- Command line: `claude -p --output-format stream-json --verbose --model <model>
+  --permission-mode bypassPermissions --strict-mcp-config --mcp-config <file> …`. The MCP config
+  (which contains the per-process bearer token) is written to a `0600` file under the owner's
+  `HOME/.agern/` and deleted when the process exits, so the token is not in the argument list.
+  The role prompt is passed with `--append-system-prompt`. Pipeline agents read their task prompt
+  from stdin (text input, stdin closed afterwards); reviewers and the approver add `--json-schema`
+  and `--disallowedTools Edit,Write,NotebookEdit` (the spec-writer is read-only too). The verdict is
+  read from the `result` event's `structured_output`.
+- Chat input is written to stdin as `{"type":"user","message":{"role":"user","content":<text>}}`.
+  Interrupt sends `{"type":"control_request","request_id":…,"request":{"subtype":"interrupt"}}`;
+  the CLI ends the turn with a `result` of subtype `error_during_execution`. `total_cost_usd` in
+  `result` is cumulative per process, `num_turns` is per turn.
+  Chat sessions add `--input-format stream-json --include-partial-messages` and stay alive between
+  turns. A later launch of the same conversation uses `--resume <claudeSessionId>`. If that launch
+  dies before its `init` event (e.g. "No conversation found with session ID" after the CLI, the
+  user's home or the CLI version changed), the stored id is cleared, a `system` warn event says the
+  previous conversation could not be resumed, and the CLI is launched once more without `--resume`
+  with the unanswered input — no retry loop. A rejected Claude credential ("Invalid API key", expired
+  OAuth token, …) is reported as a `system` error telling the user to update it in Settings, for
+  chats and pipeline stages alike. A process the server stops itself (stop, idle, shutdown) is
+  reported as a neutral notice, never as an error exit code.
+- Each stdout line is one JSON object. Complete messages are persisted as events; partial
+  `stream_event` deltas are broadcast live but not persisted.
+
+Workspaces: `$FACTORY_DATA_DIR/workspaces/<username>/<repo>/main` is the owner's clone used by
+chat. A pipeline run works in a git worktree `…/<repo>/runs/<runId>` on branch
+`factory/issue-<number>-<slug>`.
+
+**Known limitation (v1).** All agents run under the server's OS user with permissions bypassed.
+The factory must run on a dedicated machine or VM. Per-user OS accounts or containers are the
+planned hardening and are why `AgentLauncher` is an interface.
+
+**Software installation.** Global setting `agentsMayInstallSoftware` (default `false`). When
+false, agents are instructed not to install system-wide software and are given the MCP tool
+`factory_request_software`, which files a request an admin handles manually. When true the
+instruction is dropped.
+
+## 6. The pipeline
+
+```
+issue → spec-writer (opus) → builder (opus) ─┬→ security  (opus)   ┐
+                              ▲              ├→ ux        (sonnet) │ wait for all 4
+                              │              ├→ ui-design (sonnet) │
+                              │              └→ code      (sonnet) ┘
+                              └── any CHANGES: resume builder (max 2 rounds)
+                                             all PASS → approver (opus)
+                                                          ├ APPROVE  → merge to main
+                                                          └ ESCALATE → needs-human ← /factory approve
+```
+
+- **spec-writer** reads the issue and the repo and writes a spec; it is posted as an issue comment.
+- **builder** implements the spec on the run branch and commits. The orchestrator pushes the branch
+  and opens a pull request after the first build.
+- **reviewers** run in parallel, cannot edit files (`--disallowedTools Edit,Write,NotebookEdit`),
+  and answer through `--json-schema` with
+  `{ "verdict": "PASS" | "CHANGES", "summary": string, "findings": [{ "severity", "file", "detail" }] }`.
+- If any reviewer says `CHANGES`, the **same** builder conversation is resumed with all findings:
+  each fix round is a **new** builder `AgentSession` (own transcript, `parentSessionId` = the previous
+  builder session) whose CLI is launched with `--resume <claudeSessionId of the previous builder>`.
+  At most `maxFixRounds` (default 2) fix rounds; if reviewers still want changes after the last one,
+  the approver is `skipped` and the run goes to `needs_human`.
+- **Rounds** are numbered by fix rounds: `Run.round` and `Stage.round` are `0` for the initial
+  build/review, `1..maxRounds` for fix rounds. The UI shows "build" for round 0 and "fix round N of
+  max" after.
+- **Time limit.** Every stage agent is stopped after `FACTORY_STAGE_TIMEOUT_MINUTES` (default 60) of
+  wall-clock time (waiting for a free agent slot does not count). The stage becomes `failed` with
+  summary "Timed out: …", and the run `failed` with error "<role> failed: Timed out: …".
+- **approver** answers `{ "verdict": "APPROVE" | "ESCALATE", "summary": string }`. `APPROVE`
+  squash-merges the PR and closes the issue. `ESCALATE` labels the issue `needs-human`, comments,
+  and waits for the owner's `/factory approve`.
+- Models per role are a global setting (`pipelineModels`) with the defaults shown above.
+- Orchestration is a deterministic state machine in the server, not something an LLM decides. On
+  server restart, unfinished runs are marked `failed` with a clear reason (v1).
+
+Run `status`: `queued`, `spec`, `building`, `reviewing`, `approving`, `merged`, `needs_human`,
+`failed`, `cancelled`.
+
+Stage `role`: `spec-writer`, `builder`, `security`, `ux`, `ui-design`, `code`, `approver`.
+Stage `status`: `pending`, `running`, `done`, `failed`, `skipped`.
+Stage `verdict`: `PASS`, `CHANGES`, `APPROVE`, `ESCALATE` or null.
+
+## 7. Chat agent ↔ factory (MCP)
+
+The server exposes an MCP endpoint (`POST /mcp`, streamable HTTP, JSON responses). Every agent
+process gets its own bearer token in its `--mcp-config`; the token maps to the session and thereby
+to the owner and the repo, and dies with the process.
+
+Tools: `factory_list_issues`, `factory_get_issue`, `factory_create_issue`, `factory_start_run`,
+`factory_list_runs`, `factory_get_run`, `factory_approve_run`, `factory_cancel_run`,
+`factory_request_software`. Pipeline-stage agents get only `factory_get_issue` and
+`factory_request_software`.
+
+Chat input starting with `/factory` is handled by the server and not sent to Claude:
+`/factory run <issue>`, `/factory status`, `/factory approve [runId]`, `/factory cancel <runId>`,
+`/factory help`. The reply is appended to the transcript as a `system` event.
+
+## 8. HTTP API
+
+JSON, camelCase, ISO-8601 UTC timestamps, ids are UUID strings unless noted. Errors:
+`{ "error": { "code": string, "message": string } }` with 400/401/403/404/409/422/500.
+`{repo}` is the bare repository name inside the configured organization.
+
+### Types
+
+```ts
+type User = { id: string; username: string; displayName: string; isAdmin: boolean;
+  githubLogin: string | null; hasGithubToken: boolean;
+  hasClaudeCredential: boolean; claudeCredentialKind: 'oauth_token' | 'api_key' | null;
+  twoFactorEnabled: boolean;
+  twoFactorLockedUntil: string | null;    // set while the second factor is locked (too many wrong codes)
+  githubTokenKind: 'classic' | 'fine_grained' | null;  // from the prefix: ghp_ → classic, github_pat_ → fine_grained
+  githubTokenScopes: string[] | null };   // classic tokens: GitHub's X-OAuth-Scopes at registration; null otherwise
+
+type LoginStep =
+  | { next: 'totp' }                                             // enter a code
+  | { next: 'enroll'; secret: string; otpauthUri: string }       // first login: set up the authenticator
+  | { next: 'done'; user: User; recoveryCodes?: string[] };      // recoveryCodes only right after enrolment
+
+type Project = { name: string; fullName: string; description: string | null; private: boolean;
+  defaultBranch: string; language: string | null; openIssues: number; pushedAt: string | null;
+  htmlUrl: string; activeAgents: number; activeRuns: number };
+
+type IssueKind = 'feature' | 'bug' | 'task';      // from labels: bug → bug; enhancement/feature → feature; else task
+type Issue = { number: number; title: string; state: 'open' | 'closed'; kind: IssueKind;
+  labels: { name: string; color: string }[]; author: string; assignees: string[]; comments: number;
+  createdAt: string; updatedAt: string; htmlUrl: string; body?: string; activeRunId: string | null };
+
+type SessionKind = 'chat' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
+type SessionStatus = 'starting' | 'running' | 'idle' | 'done' | 'failed' | 'stopped';
+type AgentSession = { id: string; repo: string; kind: SessionKind; model: string; status: SessionStatus;
+  owner: { username: string; displayName: string }; title: string | null;
+  runId: string | null; parentSessionId: string | null; issueNumber: number | null;
+  createdAt: string; updatedAt: string; endedAt: string | null;
+  costUsd: number | null; numTurns: number | null; lastActivity: string | null;  // lastActivity: short text, e.g. "Bash: ./gradlew test"
+  live: boolean };  // an agent process exists right now
+// status: `starting` = process launching; `running` = mid-turn (busy); `idle` = waiting for input
+// (a chat between turns, with a process if `live`, else resumed on the next input); `stopped` = stopped by
+// a person (a chat resumes on its owner's next input); `done` / `failed` = a pipeline agent finished.
+
+type Stage = { id: string; role: Exclude<SessionKind, 'chat'>;
+  round: number;             // 0 = initial build/review, 1..maxRounds = fix rounds
+  model: string;             // the model the stage runs (or ran) with; set when the stage is created
+  status: 'pending' | 'running' | 'done' | 'failed' | 'skipped';
+  verdict: 'PASS' | 'CHANGES' | 'APPROVE' | 'ESCALATE' | null; summary: string | null;
+  findings: { severity: string; file: string | null; detail: string }[];
+  sessionId: string | null; startedAt: string | null; endedAt: string | null };
+
+type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; issueKind: IssueKind;
+  status: 'queued' | 'spec' | 'building' | 'reviewing' | 'approving' | 'merged' | 'needs_human' | 'failed' | 'cancelled';
+  round: number;             // fix rounds so far (0 = initial build)
+  maxRounds: number; branch: string | null; prNumber: number | null; prUrl: string | null;
+  owner: { username: string; displayName: string }; startedBySessionId: string | null;
+  error: string | null; createdAt: string; updatedAt: string; endedAt: string | null;
+  stages: Stage[] };
+
+type Event = { seq: number; sessionId: string; ts: string;
+  type: 'user' | 'claude' | 'system' | 'status'; payload: unknown };
+//  user:   { text: string, username: string }
+//  claude: one raw stream-json object from the CLI ({type:'system'|'assistant'|'user'|'result'|'stream_event', …})
+//  system: { level: 'info' | 'warn' | 'error', text: string }
+//  status: { status: SessionStatus }
+
+type Settings = { agentsMayInstallSoftware: boolean; chatModel: string;
+  pipelineModels: Record<Exclude<SessionKind, 'chat'>, string>; maxFixRounds: number };
+
+type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
+  requestedBy: string; sessionId: string | null;
+  status: 'pending' | 'installed' | 'denied'; note: string | null; createdAt: string; resolvedAt: string | null };
+```
+
+### Endpoints
+
+| Method & path | Body → Response | Notes |
+|---|---|---|
+| `GET /api/health` | → `{ status: 'ok', version, name: 'agern' }` | no auth |
+| `GET /api/auth/providers` | → `{ providers: string[], org: string, twoFactor: boolean }` | no auth |
+| `POST /api/auth/login` | `{ username, password }` → `LoginStep` | sets cookie (pending until 2FA passes) |
+| `POST /api/auth/totp` | `{ code }` → `LoginStep` | pending session; `code` is a TOTP code or a recovery code; 423 when locked |
+| `POST /api/auth/totp/enroll` | `{ code }` → `LoginStep` | pending session in `enroll`; `done` step carries `recoveryCodes` |
+| `POST /api/me/recovery-codes` | `{ code }` → `{ recoveryCodes: string[] }` | regenerate; needs a current TOTP code |
+| `POST /api/admin/users/{id}/reset-2fa` | → `User` | admin |
+| `POST /api/auth/logout` | → 204 | |
+| `GET /api/me` | → `User` | 401 when not logged in |
+| `PUT /api/me/claude-credential` | `{ kind, value }` → `User` | |
+| `DELETE /api/me/claude-credential` | → `User` | |
+| `PUT /api/me/github-token` | `{ token }` → `User` | 422 if GitHub rejects it. `GET /user` succeeds with any scope, so the token's kind and (classic) scopes are recorded and shown; Settings warns when a classic token lacks `repo` (public repositories only, no push) and explains the grants a fine-grained token needs |
+| `DELETE /api/me/github-token` | → `User` | |
+| `GET /api/projects` | → `Project[]` | repos of the org visible to the user |
+| `GET /api/projects/{repo}` | → `Project` | |
+| `GET /api/projects/{repo}/issues?state=open\|closed\|all` | → `Issue[]` | pull requests excluded |
+| `GET /api/projects/{repo}/issues/{number}` | → `Issue` (with `body`) | |
+| `POST /api/projects/{repo}/issues` | `{ title, body, kind }` → `Issue` | |
+| `GET /api/projects/{repo}/runs` | → `Run[]` | newest first |
+| `POST /api/projects/{repo}/runs` | `{ issueNumber }` → `Run` | needs Claude credential; 409 if the issue has an active run |
+| `GET /api/runs?active=true&status=<s>` | → `Run[]` | across visible repos, newest first (max 200). `active=true`: not finished, i.e. `queued`, `spec`, `building`, `reviewing`, `approving` or `needs_human`. `status`: only these statuses, repeatable and/or comma list (`?status=needs_human`); unknown status → 400. Both given: both apply |
+| `GET /api/runs/{id}` | → `Run` | |
+| `POST /api/runs/{id}/approve` | → `Run` | owner only, only in `needs_human` |
+| `POST /api/runs/{id}/cancel` | → `Run` | owner or admin |
+| `GET /api/projects/{repo}/sessions?kind=chat` | → `AgentSession[]` | |
+| `POST /api/projects/{repo}/sessions` | `{ model? }` → `AgentSession` | new chat; needs Claude credential |
+| `GET /api/agents?active=true` | → `AgentSession[]` | all kinds, across visible repos. `active=true`: `live` (a process exists, e.g. a chat idling between turns) or `starting`/`running` |
+| `GET /api/sessions/{id}` | → `AgentSession` | |
+| `GET /api/sessions/{id}/events?after=<seq>&limit=<n>` | → `Event[]` | ascending |
+| `POST /api/sessions/{id}/input` | `{ text }` → 202 | owner only, chat only; accepted mid-turn too (delivered after the current turn); a `stopped` or process-less chat resumes |
+| `POST /api/sessions/{id}/interrupt` | → 202 | owner only; stops the current turn (chat only; 409 for pipeline agents — cancel the run instead) |
+| `POST /api/sessions/{id}/stop` | → `AgentSession` | owner or admin |
+| `GET /api/admin/settings` · `PUT /api/admin/settings` | `Settings` | admin |
+| `GET /api/admin/users` | → `User[]` | admin |
+| `GET /api/admin/software-requests` | → `SoftwareRequest[]` | admin |
+| `POST /api/admin/software-requests/{id}` | `{ status, note? }` → `SoftwareRequest` | admin |
+
+**Details pinned down by the backend implementation:**
+- `POST` endpoints that create something (`…/issues`, `…/runs`, `…/sessions`) answer `201`.
+- Error bodies may carry extra fields: `{ "error": { "code", "message", "lockedUntil"? } }`.
+- Login errors (the frontend relies on these exact codes):
+
+  | Step | Status | `code` | Meaning |
+  |---|---|---|---|
+  | password | 401 | `invalid_credentials` | wrong username or password |
+  | password | 429 | `too_many_attempts` | rate limited (§4); `lockedUntil` says until when |
+  | TOTP / enrol / recovery codes | 422 | `invalid_code` | wrong, malformed or replayed code (counts towards the lock) |
+  | TOTP / enrol / recovery codes | 423 | `locked` | five wrong codes: second factor locked for 15 minutes; `lockedUntil` (ISO) |
+  | TOTP / enrol | 409 | `wrong_login_step` | the pending session is in the other step (`totp` vs `enroll`): start again |
+  | TOTP / enrol | 401 | `unauthorized` | no pending session (never logged in, or it expired after 10 minutes): start again |
+  | TOTP | 422 | `not_enrolled` | the account has no confirmed TOTP secret |
+  | enrol | 422 | `no_enrolment` | no enrolment in progress: start again |
+- "Needs Claude credential" → 422 `claude_credential_required`; too many agents → 409
+  `too_many_agents`; issue already has an active run → 409 `active_run_exists`; missing CSRF header
+  → 403 `csrf`; foreign `Origin` → 403 `bad_origin`.
+- A new chat session starts `idle` without a process; the first input launches the CLI
+  (`starting` → `running` → `idle` after each turn). A `stopped` chat resumes (`--resume`) on the
+  next input from its owner.
+- When a run is created, its stages for round 0 are created as `pending` (spec-writer, builder,
+  four reviewers, approver); fix rounds add a builder and four reviewer stages with `round = n` when
+  round n starts; the approver's `round` becomes the round it runs in. Stages are returned ordered by
+  round, then role. On failure or cancel, `pending` stages become `skipped` and `running` ones `failed`.
+- For `needs_human` runs, `error` carries the human-readable reason (escalation summary, reviewers
+  still requesting changes, or a failed merge). Approval clears it.
+- MCP tools always act on the repository of the agent's session, as its owner.
+
+### WebSockets (cookie-authenticated)
+
+- `GET /api/ws/sessions/{id}?after=<seq>` — replays persisted events with `seq > after`, then
+  streams live. Frames are `Event` JSON. Live-only partial deltas are sent as
+  `{ seq: -1, type: 'claude', payload: { type: 'stream_event', … } }`.
+- `GET /api/ws/feed` — frames `{ type: 'session', session: AgentSession }` and
+  `{ type: 'run', run: Run }` whenever one the user may see changes.
+
+## 9. Deployment and release
+
+**Where it runs.** To begin with Agern runs on one machine on a local network, reached by browser
+at `FACTORY_PUBLIC_URL` (plain HTTP on the LAN is supported: the session cookie is marked `Secure`
+only when that URL is `https`). The server binds `FACTORY_HOST` (default `0.0.0.0`). Agents reach
+the MCP endpoint over loopback (`127.0.0.1:<port>`), never through the public URL; when `FACTORY_HOST`
+is one specific non-loopback address the server additionally listens on `127.0.0.1:<port>` (logged
+at startup) rather than refusing to start. WebSocket and mutating requests are
+rejected when their `Origin` does not match `FACTORY_PUBLIC_URL`.
+
+**Sandboxes (later).** The network has sandbox machines where agents will be able to try things
+out. Not part of v1; they will plug in behind `AgentLauncher` / as agent tools.
+
+**Release artifact.** One self-contained `agern.jar` (server with the built frontend embedded on
+the classpath) — the host needs only Java 17 and PostgreSQL. `FACTORY_WEB_DIR` overrides the
+embedded frontend when set.
+
+**Cutting a release.** `./scripts/release.sh <version>` checks that the version is semantic, the
+tree is clean, `main` is level with `origin/main` and the tag is new, then creates and pushes the
+annotated tag `v<version>` (`--dry-run` only checks). GitHub Actions (`.github/workflows/release.yml`)
+then checks and tests frontend and server, builds with `scripts/package.sh <version>` (the same
+script works locally) and publishes a GitHub Release with `agern-<version>.tar.gz` (`agern.jar`,
+the `agern` CLI, `install.sh`, the systemd unit and launchd plist templates, `.env.example`,
+`VERSION`), `install.sh` on its own (for bootstrapping) and `SHA256SUMS` covering both. Versions
+with a suffix (`-rc.1`) are published as pre-releases.
+
+**Installing and upgrading a host** (`packaging/`). `install.sh` either runs from an unpacked
+release or, downloaded alone, fetches the latest (or `--version`) release, verifies it against
+`SHA256SUMS` and runs the installer inside it. As root it creates the unprivileged service user
+`agern` (the service never runs as root), unpacks to `/opt/agern/versions/<version>` with symlinks
+`current` and `previous`, creates `/etc/agern/agern.env` on first install (generated
+`FACTORY_MASTER_KEY`, mode `0600`, never overwritten or printed), creates the data directory
+(`/var/lib/agern`, macOS `/usr/local/var/agern`) and registers a service: systemd on Linux (the
+env file is root-owned and read via `EnvironmentFile`), launchd on macOS (`dk.egernet.agern`; the
+env file is owned by `agern` and read by `agern run`). `agern upgrade [version]` downloads a
+release, verifies its checksum, unpacks it, switches `current` (the old one becomes `previous`),
+restarts and waits for `/api/health` to report the new version — switching back automatically if
+it does not; `agern rollback` swaps `current` and `previous`. `AGERN_PREFIX` relocates everything
+for an unprivileged, service-manager-less install (pid file), and `AGERN_RELEASE_BASE_URL`
+replaces `https://github.com/Egernet-CS/agern/releases` (any URL with the same `latest/download/…`
+and `download/v<version>/…` layout, `file://` included). Database migrations run on startup and
+are not undone by a rollback. The reported version comes from the build.
+
+## 10. Frontend
+
+Routes: `/login`, `/` (projects), `/p/:repo` (issues · CLI chat · agents), `/p/:repo/runs/:runId`
+(pipeline diagram with live stages; selecting a stage shows that agent's transcript),
+`/agents` (everything running), `/settings` (own credentials), `/admin`.
+
+The chat renders the Claude stream the way the terminal does: prompt line, streamed assistant
+text, tool calls as `⏺ Tool(args)` with collapsible results, thinking, cost/turn footer. Sessions
+owned by someone else are shown read-only with an "observing <user>" banner.
+
+Artwork is served from `web/public/art/` (see `art/README.md`).
