@@ -68,7 +68,9 @@ tests `FACTORY_2FA=off` is accepted when `dev` is the only provider.
   * chat: replies "You said: …" as streamed deltas; `slow` streams for ~10 s (try Interrupt),
     `tool` adds a Bash tool call, `mcp` calls the factory MCP endpoint and lists its tools, `install`
     files a software request through MCP (`factory_request_software`), `env` lists the environment
-    variable names it received, `crash` exits with status 3;
+    variable names it received, `crash` exits with status 3, `long` answers with 80 lines; a message with
+    attachments gets a report of what arrived (`IMAGE 1: image/png 32x16, … bytes` per decoded image block,
+    `FILE ok <name> <n> bytes` per listed path found on disk, `FILE missing …` otherwise);
   * pipeline: the spec-writer prints a small spec, the builder commits to `AGERN_FAKE.md`,
     reviewers answer PASS and the approver APPROVE. Put `fake:changes` in the issue body for one
     round of CHANGES, `fake:always-changes` to exhaust the fix rounds (→ `needs_human`),

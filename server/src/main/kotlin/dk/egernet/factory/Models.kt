@@ -135,6 +135,47 @@ data class SoftwareRequestDto(
     val sessionId: String?, val status: String, val note: String?, val createdAt: String, val resolvedAt: String?,
 )
 
+/** What a user chose for themselves; null / missing = use the admin default. */
+@Serializable
+data class PreferenceOverridesDto(
+    val chatModel: String? = null,
+    val pipelineModels: Map<String, String> = emptyMap(),
+    val maxFixRounds: Int? = null,
+)
+
+/** One effective value and where it comes from. */
+@Serializable data class EffectiveModelDto(val value: String, val source: String)
+
+@Serializable
+data class EffectiveRoundsDto(
+    val value: Int, val source: String,
+    /** The admin's default, which is also the largest value a user may choose. */
+    val max: Int,
+    /** The user's choice was above the current maximum and is capped to it. */
+    val clamped: Boolean,
+)
+
+@Serializable data class EffectivePreferencesDto(val chatModel: EffectiveModelDto, val pipelineModels: Map<String, EffectiveModelDto>, val maxFixRounds: EffectiveRoundsDto)
+
+@Serializable
+data class PreferencesDto(val overrides: PreferenceOverridesDto, val effective: EffectivePreferencesDto, val suggestions: List<String>)
+
+/** A file or image attached to a chat message (also the upload response). */
+@Serializable
+data class AttachmentDto(
+    val id: String, val name: String, val mediaType: String, val size: Long,
+    /** `image` = png/jpeg/gif/webp (shown inline); `file` = anything else (download only). */
+    val kind: String,
+    val width: Int?, val height: Int?,
+    /** How the model sees an image: `original`, `downscaled` copy, or `none` (only as a file). Always `none` for files. */
+    val inline: String,
+    /** Why an image was downscaled or is not shown to the model inline; null otherwise. */
+    val note: String?,
+)
+
+@Serializable data class AttachmentLimitsDto(val maxFileBytes: Long, val maxMessageBytes: Long, val maxCount: Int, val imageTypes: List<String>)
+@Serializable data class ClientConfigDto(val attachments: AttachmentLimitsDto)
+
 @Serializable data class FeedFrame(val type: String, val session: AgentSessionDto? = null, val run: RunDto? = null)
 
 object RunStatus {

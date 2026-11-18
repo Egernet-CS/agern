@@ -1,10 +1,12 @@
 // In-memory simulation of the Agern backend. Only loaded when VITE_MOCK=1.
 import type {
   AgentSession,
+  Attachment,
   FactoryEvent,
   FeedFrame,
   Issue,
   IssueKind,
+  PreferenceOverrides,
   Project,
   Run,
   SessionKind,
@@ -117,7 +119,20 @@ export const db = {
     maxFixRounds: 2,
   } as Settings,
   softwareRequests: [] as SoftwareRequest[],
+  /** Personal choices per username (like the backend's user_preferences). */
+  prefs: new Map<string, PreferenceOverrides>(),
 };
+
+/** Same rule as the backend: the user's choice, else the admin default; fix rounds capped by the admin value. */
+export function effective(username: string) {
+  const o = db.prefs.get(username) ?? { chatModel: null, pipelineModels: {}, maxFixRounds: null };
+  const s = db.settings;
+  return {
+    chatModel: o.chatModel ?? s.chatModel,
+    model: (role: StageRole) => o.pipelineModels[role] ?? s.pipelineModels[role],
+    maxFixRounds: Math.min(o.maxFixRounds ?? s.maxFixRounds, s.maxFixRounds),
+  };
+}
 
 const ownerOf = (u: User) => ({ username: u.username, displayName: u.displayName });
 
@@ -306,7 +321,7 @@ function newSession(
     id: uid(),
     repo,
     kind,
-    model: kind === 'chat' ? db.settings.chatModel : db.settings.pipelineModels[kind as StageRole],
+    model: kind === 'chat' ? effective(owner.username).chatModel : effective(owner.username).model(kind as StageRole),
     status: 'starting',
     owner: ownerOf(owner),
     title: null,
@@ -339,7 +354,7 @@ function systemReply(s: AgentSession, text: string, level: 'info' | 'warn' | 'er
   emit(s.id, 'system', { level, text }, iso(Date.now()));
 }
 
-export function chatInput(s: AgentSession, text: string, by: User) {
+export function chatInput(s: AgentSession, text: string, by: User, attachments: Attachment[] = []) {
   const ts = iso(Date.now());
   if (text.trim().startsWith('/factory')) {
     emit(s.id, 'user', { text, username: by.username }, ts);
@@ -369,6 +384,19 @@ export function chatInput(s: AgentSession, text: string, by: User) {
         systemReply(s, (e as Error).message, 'error');
       }
     }, 250);
+    return;
+  }
+  if (attachments.length) {
+    // Like the backend: the user event carries the attachments; the reply says what the agent received.
+    emit(s.id, 'user', { text, username: by.username, attachments }, ts);
+    const imgs = attachments.filter((a) => a.kind === 'image' && a.inline !== 'none').length;
+    const steps: Step[] = [
+      { kind: 'think', text: 'The user attached files; they are saved outside the repository.' },
+      { kind: 'text', text: `I received ${attachments.length} attachment${attachments.length === 1 ? '' : 's'}${imgs ? ` (${imgs} shown to me as image${imgs === 1 ? '' : 's'})` : ''}: ${attachments.map((a) => `\`${a.name}\``).join(', ')}. ${text.trim() ? 'What would you like me to do with them?' : 'Tell me what to do with them.'}` },
+    ];
+    const p = new Player('live', Date.now());
+    db.players.set(s.id, p);
+    play(s, steps, p, { init: (db.events.get(s.id) ?? []).every((e) => e.type !== 'claude'), onDone: () => (db.players.delete(s.id), setStatus(s, 'idle', iso(Date.now()))) });
     return;
   }
   if (db.players.has(s.id)) {
@@ -449,7 +477,7 @@ function setRunStatus(r: Run, status: Run['status'], ts: string) {
 
 /** Like the backend: stages exist as `pending` before they run (round 0 at creation, fix rounds when they start). */
 function pendingStage(r: Run, role: StageRole, round: number): Stage {
-  const st: Stage = { id: uid(), role, round, model: db.settings.pipelineModels[role], status: 'pending', verdict: null, summary: null, findings: [], sessionId: null, startedAt: null, endedAt: null };
+  const st: Stage = { id: uid(), role, round, model: effective(r.owner.username).model(role), status: 'pending', verdict: null, summary: null, findings: [], sessionId: null, startedAt: null, endedAt: null };
   r.stages.push(st);
   return st;
 }
@@ -573,7 +601,7 @@ function makeRun(repo: string, issue: Issue, owner: User, createdMs: number, sta
     issueKind: issue.kind,
     status: 'queued',
     round: 0,
-    maxRounds: db.settings.maxFixRounds,
+    maxRounds: effective(owner.username).maxFixRounds,
     branch: `factory/issue-${issue.number}-${slug}`,
     prNumber: null,
     prUrl: null,

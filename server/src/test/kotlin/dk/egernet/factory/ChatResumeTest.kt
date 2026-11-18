@@ -76,6 +76,23 @@ class ChatResumeTest {
     }
 
     @Test
+    fun `a message with attachments sent mid-turn is delivered after the current turn, image and file intact`() {
+        val alice = user("carol", "sk-ant-oat-carol")
+        val chat = s.agents.createChat(alice, "demo-app", null)
+        s.agents.sendInput(alice, chat, "go slow")
+        await(chat.id, "slow turn streaming") { s.sessions.get(chat.id)!!.status == SessionStatus.RUNNING }
+        val img = s.attachments.upload(chat.id, alice.id, "red-blue.png", png(32, 16))
+        val txt = s.attachments.upload(chat.id, alice.id, "notes.txt", "hello agent\n".toByteArray())
+        s.agents.sendInput(alice, s.sessions.get(chat.id)!!, "what is attached", listOf(img.id, txt.id))
+        s.agents.interrupt(alice, s.sessions.get(chat.id)!!)
+        await(chat.id, "reply to the queued message") { ev -> ev.any { it.second.contains("IMAGE 1: image/png 32x16") } }
+        val reply = texts(chat.id).last { it.second.contains("IMAGE 1") }.second
+        assertTrue(reply.contains("FILE ok notes.txt 12 bytes"), reply)
+        assertTrue(reply.contains("FILE ok red-blue.png"), reply)
+        assertTrue(!reply.contains("INSIDE THE REPO"), reply)
+    }
+
+    @Test
     fun `a rejected Claude credential tells the user to update it in Settings, without a retry loop`() {
         val bob = user("bob", "sk-ant-oat-invalid-bob")
         val chat = s.agents.createChat(bob, "demo-app", null)

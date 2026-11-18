@@ -59,9 +59,23 @@
 .eye {
   margin-right: 4px;
 }
-.chat-scroll {
+.chat {
+  position: relative;
+}
+.chat-scroll-wrap {
+  position: relative;
   flex: 1;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.chat-scroll {
+  /* containing block for absolutely positioned bits in the transcript (e.g. .sr-only text), which would
+     otherwise extend the chat pane's own scroll area */
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overscroll-behavior: contain;
   overflow-y: auto;
   overflow-x: hidden;
   scrollbar-width: thin;
@@ -459,7 +473,7 @@
 }
 .prompt-box {
   display: grid;
-  grid-template-columns: 18px minmax(0, 1fr) auto;
+  grid-template-columns: 18px minmax(0, 1fr) auto auto;
   align-items: start;
   gap: 4px;
   border: 1px solid var(--line-2);
@@ -491,7 +505,9 @@
   font: 13.5px/24px var(--font-mono) !important;
   color: #fff;
   min-height: 24px;
-  max-height: 240px;
+  /* the input grows with its text up to this, then scrolls inside; the transcript shrinks instead */
+  max-height: min(240px, 28dvh);
+  overflow-y: auto !important;
   border-radius: 0 !important;
 }
 .prompt-btn {
@@ -656,4 +672,262 @@
 .chat-resume {
   margin: 8px 14px 0;
   font: 12.5px/1.5 var(--font-ui);
+}
+
+/* ------------------------------------------------------------------ jump to latest */
+.chat-jump {
+  position: absolute;
+  right: 16px;
+  bottom: 10px;
+  z-index: 3;
+  font: 600 11.5px/1 var(--font-mono);
+  padding: 7px 11px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 177, 74, 0.45);
+  background: rgba(18, 23, 34, 0.94);
+  color: var(--amber-hi);
+  cursor: pointer;
+  box-shadow: 0 6px 20px -6px rgba(0, 0, 0, 0.8);
+}
+.chat-jump:hover {
+  border-color: var(--amber);
+}
+
+/* ------------------------------------------------------------------ attachments: composer */
+.prompt-btn--attach {
+  font-size: 15px;
+  line-height: 1;
+}
+.prompt-btn--attach:hover {
+  color: var(--amber-hi);
+  border-color: rgba(255, 177, 74, 0.5);
+}
+.prompt-blocked {
+  margin: 0 2px 6px;
+  font-family: var(--font-ui);
+}
+.att-chips {
+  list-style: none;
+  margin: 0 0 6px;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-height: min(132px, 22dvh);
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.att-chip {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 260px;
+  min-width: 0;
+  padding: 4px 4px 4px 4px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: #0d1118;
+  overflow: hidden;
+}
+.att-chip--error {
+  border-color: rgba(255, 100, 100, 0.5);
+  background: var(--fail-wash);
+}
+.att-chip-thumb,
+.att-chip-icon {
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border-radius: 5px;
+  object-fit: cover;
+  background: var(--surface-2);
+}
+.att-chip-icon {
+  display: grid;
+  place-items: center;
+  color: var(--text-3);
+  font-size: 16px;
+}
+.att-chip-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.35;
+}
+.att-chip-name {
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.att-chip-meta {
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.att-chip--error .att-chip-meta {
+  color: var(--fail);
+  white-space: normal;
+}
+.att-chip-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--line);
+}
+.att-chip-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--amber);
+  transition: width 0.15s;
+}
+.att-chip-x {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-3);
+  font: 16px/1 var(--font-mono);
+  cursor: pointer;
+}
+.att-chip-x:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+/* drop target */
+.chat-drop {
+  position: absolute;
+  inset: 6px;
+  z-index: 10;
+  display: grid;
+  place-items: center;
+  border: 2px dashed var(--amber);
+  border-radius: 12px;
+  background: rgba(9, 12, 17, 0.82);
+  color: var(--amber-hi);
+  font-weight: 600;
+  pointer-events: none;
+}
+.chat-drop span {
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: var(--amber-wash);
+}
+
+/* ------------------------------------------------------------------ attachments: transcript */
+.t-user-body {
+  min-width: 0;
+}
+.t-att {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.t-user-body > .t-att:first-child {
+  margin-top: 0;
+}
+.t-att-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.t-att-figure {
+  margin: 0;
+  max-width: 220px;
+  min-width: 0;
+}
+.t-att-img {
+  display: block;
+  padding: 0;
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  background: #0d1118;
+  cursor: zoom-in;
+  overflow: hidden;
+}
+.t-att-img:hover {
+  border-color: rgba(255, 177, 74, 0.6);
+}
+.t-att-img img {
+  display: block;
+  max-width: 220px;
+  max-height: 160px;
+  object-fit: contain;
+}
+.t-att-figure figcaption {
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
+.t-att-note {
+  color: var(--amber-hi);
+}
+.t-att-files {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.t-att-file {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  max-width: 100%;
+  padding: 3px 9px;
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  background: #0d1118;
+  color: var(--text-2);
+  font-size: 12px;
+  text-decoration: none;
+}
+.t-att-file:hover {
+  color: var(--text);
+  border-color: rgba(255, 177, 74, 0.6);
+}
+.t-att-file .t-att-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.t-att-size {
+  color: var(--text-3);
+  flex: none;
+}
+.att-lightbox img {
+  display: block;
+  max-width: 100%;
+  max-height: 70dvh;
+  margin: 0 auto 10px;
+  border-radius: 6px;
+  background: #0d1118;
+}
+
+@media (max-width: 760px) {
+  .att-chip {
+    max-width: 100%;
+  }
+  .t-att-figure,
+  .t-att-img img {
+    max-width: 160px;
+  }
+  .chat-jump {
+    right: 10px;
+  }
 }

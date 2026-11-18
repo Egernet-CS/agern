@@ -7,14 +7,14 @@ test('admin changes a setting and it sticks', async ({ page }) => {
   await login(page, 'alice');
   await page.goto(`${BASE()}/admin`);
   const card = page.locator('.settings-card', { hasText: 'Factory settings' });
-  await expect(card.getByLabel('max fix rounds')).toHaveValue('2');
+  await expect(card.getByLabel('default and maximum fix rounds')).toHaveValue('2');
   await card.getByLabel('ux').selectOption('haiku');
-  await card.getByLabel('max fix rounds').fill('3');
+  await card.getByLabel('default and maximum fix rounds').fill('3');
   await card.getByRole('button', { name: 'Save settings' }).click();
   await expect(card.getByRole('status')).toHaveText('Saved. Applies to agents started from now on.');
   await page.reload();
   await expect(card.getByLabel('ux')).toHaveValue('haiku');
-  await expect(card.getByLabel('max fix rounds')).toHaveValue('3');
+  await expect(card.getByLabel('default and maximum fix rounds')).toHaveValue('3');
   const s = await (await page.request.get(`${BASE()}/api/admin/settings`)).json();
   expect(s.pipelineModels.ux).toBe('haiku');
   expect(s.maxFixRounds).toBe(3);

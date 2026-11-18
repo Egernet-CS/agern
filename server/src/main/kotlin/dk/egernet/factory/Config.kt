@@ -33,6 +33,12 @@ data class Config(
     val fakeGithub: Boolean = false,
     val pamService: String? = null,
     val agentPath: String = defaultAgentPath(),
+    /** FACTORY_ATTACHMENT_MAX_MB: largest single chat attachment. */
+    val attachmentMaxBytes: Long = 20L shl 20,
+    /** FACTORY_ATTACHMENT_MAX_MESSAGE_MB: all attachments of one message together. */
+    val attachmentMaxMessageBytes: Long = 50L shl 20,
+    /** FACTORY_ATTACHMENT_MAX_COUNT: attachments per message. */
+    val attachmentMaxCount: Int = 10,
 ) {
     /** Agents reach the MCP endpoint over loopback, never through the public URL. */
     val mcpUrl: String get() = "http://127.0.0.1:$port/mcp"
@@ -53,7 +59,8 @@ data class Config(
     override fun toString(): String =
         "Config(host=$host, port=$port, dbUrl=$dbUrl, dbUser=$dbUser, githubOrg=$githubOrg, auth=$authProviders, " +
             "admins=$admins, dataDir=$dataDir, webDir=$webDir, claudeBin=$claudeBin, publicUrl=$publicUrl, " +
-            "maxAgentsPerUser=$maxAgentsPerUser, chatIdleMinutes=$chatIdleMinutes, stageTimeoutMs=$stageTimeoutMs, fakeGithub=$fakeGithub)"
+            "maxAgentsPerUser=$maxAgentsPerUser, chatIdleMinutes=$chatIdleMinutes, stageTimeoutMs=$stageTimeoutMs, fakeGithub=$fakeGithub, " +
+            "attachments=${attachmentMaxCount}x${attachmentMaxBytes shr 20}MB/${attachmentMaxMessageBytes shr 20}MB)"
 
     companion object {
         fun defaultAgentPath(): String =
@@ -121,7 +128,22 @@ data class Config(
                 fakeGithub = fakeGithub,
                 pamService = get("FACTORY_PAM_SERVICE"),
                 agentPath = get("FACTORY_AGENT_PATH") ?: defaultAgentPath(),
-            )
+                attachmentMaxBytes = mb(get("FACTORY_ATTACHMENT_MAX_MB"), "FACTORY_ATTACHMENT_MAX_MB", 20),
+                attachmentMaxMessageBytes = mb(get("FACTORY_ATTACHMENT_MAX_MESSAGE_MB"), "FACTORY_ATTACHMENT_MAX_MESSAGE_MB", 50),
+                attachmentMaxCount = (get("FACTORY_ATTACHMENT_MAX_COUNT")?.toIntOrNull() ?: get("FACTORY_ATTACHMENT_MAX_COUNT")?.let {
+                    throw IllegalArgumentException("FACTORY_ATTACHMENT_MAX_COUNT must be a whole number")
+                } ?: 10).also { require(it in 1..20) { "FACTORY_ATTACHMENT_MAX_COUNT must be between 1 and 20" } },
+            ).also {
+                require(it.attachmentMaxMessageBytes >= it.attachmentMaxBytes) {
+                    "FACTORY_ATTACHMENT_MAX_MESSAGE_MB must be at least FACTORY_ATTACHMENT_MAX_MB"
+                }
+            }
+        }
+
+        private fun mb(v: String?, name: String, default: Long): Long {
+            val n = if (v == null) default else v.toLongOrNull() ?: throw IllegalArgumentException("$name must be a whole number of megabytes")
+            require(n in 1..512) { "$name must be between 1 and 512" }
+            return n shl 20
         }
 
         /** `https://Host:8443/path` -> `https://host:8443` (default ports dropped). */

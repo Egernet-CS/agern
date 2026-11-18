@@ -68,8 +68,10 @@ class Services(
     val mcpRegistry = McpRegistry()
     val prompts = Prompts(cfg.githubOrg)
     val workspaces = Workspaces(cfg, git, github)
-    val agents = AgentManager(cfg, sessions, events, access, launcher, bus, mcpRegistry, settings, prompts, workspaces, scope)
-    val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope)
+    val attachments = dk.egernet.factory.agent.Attachments(cfg, dk.egernet.factory.db.AttachmentStore(db))
+    val preferences = dk.egernet.factory.db.PreferenceStore(db, settings)
+    val agents = AgentManager(cfg, sessions, events, access, launcher, bus, mcpRegistry, settings, prompts, workspaces, scope, attachments, preferences)
+    val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences)
     val factory = FactoryService(cfg, access, runs, orchestrator, agents, softwareRequests)
     val mcp = McpServer(mcpRegistry, users, sessions, factory, BuildInfo.version)
 
@@ -88,6 +90,7 @@ class Services(
     fun start() {
         recoverAfterRestart()
         agents.startIdleReaper()
+        attachments.startReaper(scope)
     }
 
     fun stop() {

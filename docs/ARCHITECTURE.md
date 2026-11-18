@@ -34,8 +34,9 @@ platforms. `docker-compose.dev.yml` exists only so a developer can get a throwaw
 | Agents | The `claude` CLI in headless mode (`-p`, stream-json in and out) |
 | Realtime | WebSocket for output, REST for input |
 
-All persistent state lives in PostgreSQL. The only things on disk are git workspaces and the
-per-user Claude home directories, both under `FACTORY_DATA_DIR`.
+All persistent state lives in PostgreSQL. The only things on disk are git workspaces, the
+per-user Claude home directories and the agents' copies of chat attachments (a cache of the database,
+§5), all under `FACTORY_DATA_DIR`.
 
 ## 3. Configuration (environment variables)
 
@@ -63,6 +64,9 @@ per-user Claude home directories, both under `FACTORY_DATA_DIR`.
 | `FACTORY_STAGE_TIMEOUT_MINUTES` | `60` | Wall-clock limit for one pipeline stage agent (1–1440). On timeout the agent is stopped, the stage is `failed` and the run `failed` with an error that says so |
 | `FACTORY_AGENT_PATH` | the server's `PATH` | `PATH` value handed to agent and git processes (the only value taken from the server environment) |
 | `FACTORY_GITHUB_API_URL` | `https://api.github.com` | GitHub REST base URL (GitHub Enterprise: `https://host/api/v3`) |
+| `FACTORY_ATTACHMENT_MAX_MB` | `20` | Largest single chat attachment (1–512) |
+| `FACTORY_ATTACHMENT_MAX_MESSAGE_MB` | `50` | All attachments of one message together (1–512, at least the per-file limit) |
+| `FACTORY_ATTACHMENT_MAX_COUNT` | `10` | Attachments per message (1–20) |
 | `FACTORY_DEV_FAKE_GITHUB` | `false` | Development only, requires `FACTORY_AUTH=dev`: in-memory fake GitHub (org with `demo-app` and `private-lab`, tokens `fake-<login>` = classic with `repo`, `read:org`; `fake-<login>~<scope>,…` = only those scopes), local `git init` instead of clones, pushes skipped |
 
 ## 4. Identity and secrets
@@ -143,6 +147,21 @@ Launch rules:
   and `--disallowedTools Edit,Write,NotebookEdit` (the spec-writer is read-only too). The verdict is
   read from the `result` event's `structured_output`.
 - Chat input is written to stdin as `{"type":"user","message":{"role":"user","content":<text>}}`.
+  A message with attachments has an array as `content` instead: one `image` block
+  (`{"type":"image","source":{"type":"base64","media_type":…,"data":…}}`) per image that goes inline,
+  then the user's text (if any) as a `text` block, then a `text` block starting `[Attachments]` that lists
+  every attachment with its name, type, size, pixel size and its `path:` on disk. Every attachment, images
+  included, is written to `$FACTORY_DATA_DIR/attachments/<sessionId>/<attachmentId>-<safe-name>` — outside
+  the git working tree, so it never lands in a commit unless the agent is asked to copy it in. These files
+  are a cache: the bytes live in PostgreSQL and are written again when missing (on send, and for all of a
+  chat's attachments when its process starts or resumes).
+  *Inline images:* png/jpeg/gif/webp up to 2000 px on the longest edge and 3.75 MB (5 MB of base64, the
+  strictest platform limit) go as they are. The API rejects images over 8000 px, and over 2000 px once a
+  request holds more than 20 images — and the CLI resends every earlier image with each request — so larger
+  ones are downscaled by the server to 2000 px (JPEG, or PNG when transparent) for the inline copy; the
+  original stays available as the file. Images that cannot be resized safely (WebP, more than 50 megapixels,
+  undecodable) are passed as files only. Either way the attachment's `note` says so and the transcript shows it.
+  Verified against Claude Code 2.1.326: an `image` block in a stream-json user message is accepted and seen.
   Interrupt sends `{"type":"control_request","request_id":…,"request":{"subtype":"interrupt"}}`;
   the CLI ends the turn with a `result` of subtype `error_during_execution`. `total_cost_usd` in
   `result` is cumulative per process, `num_turns` is per turn.
@@ -204,7 +223,20 @@ issue → spec-writer (opus) → builder (opus) ─┬→ security  (opus)   ┐
 - **approver** answers `{ "verdict": "APPROVE" | "ESCALATE", "summary": string }`. `APPROVE`
   squash-merges the PR and closes the issue. `ESCALATE` labels the issue `needs-human`, comments,
   and waits for the owner's `/factory approve`.
-- Models per role are a global setting (`pipelineModels`) with the defaults shown above.
+- **Whose models.** Every agent runs on its owner's Claude account, so model choices are personal. The
+  global settings (`chatModel`, `pipelineModels`, `maxFixRounds`) are the admin's *defaults* — the models
+  shown above unless an admin changes them. Each user may override any of them for themselves
+  (`/api/me/preferences`); each value is optional. Effective value for an agent = its **owner's** preference
+  if set, else the admin default. A run uses the preferences of the user who starts it: its `maxRounds` is
+  resolved once when the run is created and never changes afterwards (also not when the preference is edited
+  mid-run); each stage's `model` is resolved when the stage is created (round-0 stages and the approver when
+  the run is created, fix-round stages when their round starts), and the stage's agent runs with exactly that
+  model, so `Stage.model` is always what ran (or will run). A new chat uses its owner's `chatModel` unless
+  the create call names a model. One user's preferences never affect another user's agents.
+- **Fix rounds** per run: the admin `maxFixRounds` is the default **and** the upper bound; a user may choose
+  `0..maxFixRounds` (422 `max_fix_rounds_out_of_range` otherwise). If an admin later lowers the bound below a
+  stored preference, the effective value is clamped to it (and reported as `clamped`). `0` means no fix rounds:
+  any `CHANGES` after the first review sends the run straight to `needs_human` (approver `skipped`).
 - Orchestration is a deterministic state machine in the server, not something an LLM decides. On
   server restart, unfinished runs are marked `failed` with a clear reason (v1).
 
@@ -226,7 +258,8 @@ Tools: `factory_list_issues`, `factory_get_issue`, `factory_create_issue`, `fact
 `factory_request_software`. Pipeline-stage agents get only `factory_get_issue` and
 `factory_request_software`.
 
-Chat input starting with `/factory` is handled by the server and not sent to Claude:
+Chat input starting with `/factory` is handled by the server and not sent to Claude (with attachments it
+is rejected with 422 `attachments_not_allowed`; they stay unsent so the owner can send them in a normal message):
 `/factory run <issue>`, `/factory status`, `/factory approve [runId]`, `/factory cancel <runId>`,
 `/factory help`. The reply is appended to the transcript as a `system` event.
 
@@ -284,20 +317,41 @@ type Stage = { id: string; role: Exclude<SessionKind, 'chat'>;
 type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; issueKind: IssueKind;
   status: 'queued' | 'spec' | 'building' | 'reviewing' | 'approving' | 'merged' | 'needs_human' | 'failed' | 'cancelled';
   round: number;             // fix rounds so far (0 = initial build)
-  maxRounds: number; branch: string | null; prNumber: number | null; prUrl: string | null;
+  maxRounds: number;         // the starting user's effective maxFixRounds, fixed when the run is created
+  branch: string | null; prNumber: number | null; prUrl: string | null;
   owner: { username: string; displayName: string }; startedBySessionId: string | null;
   error: string | null; createdAt: string; updatedAt: string; endedAt: string | null;
   stages: Stage[] };
 
+type Attachment = { id: string; name: string;   // name: sanitised (no path, control/bidi characters or leading dots; ≤ 120 chars)
+  mediaType: string;                 // decided by sniffing the bytes: image/png|jpeg|gif|webp, application/pdf, application/zip,
+                                     // text/plain (UTF-8 without NUL) or application/octet-stream — never the client's Content-Type
+  size: number; kind: 'image' | 'file';           // image = one of the four raster types
+  width: number | null; height: number | null;
+  inline: 'original' | 'downscaled' | 'none';     // how the model sees an image (§5); always 'none' for files
+  note: string | null };                          // why an image was downscaled / is file only
+
+type ClientConfig = { attachments: { maxFileBytes: number; maxMessageBytes: number; maxCount: number; imageTypes: string[] } };
+
 type Event = { seq: number; sessionId: string; ts: string;
   type: 'user' | 'claude' | 'system' | 'status'; payload: unknown };
-//  user:   { text: string, username: string }
+//  user:   { text: string, username: string, attachments?: Attachment[] }   // attachments only when there are some
 //  claude: one raw stream-json object from the CLI ({type:'system'|'assistant'|'user'|'result'|'stream_event', …})
 //  system: { level: 'info' | 'warn' | 'error', text: string }
 //  status: { status: SessionStatus }
 
-type Settings = { agentsMayInstallSoftware: boolean; chatModel: string;
-  pipelineModels: Record<Exclude<SessionKind, 'chat'>, string>; maxFixRounds: number };
+type Settings = { agentsMayInstallSoftware: boolean;
+  chatModel: string; pipelineModels: Record<Exclude<SessionKind, 'chat'>, string>;   // defaults for users without their own choice
+  maxFixRounds: number };                                                             // default and maximum (0–10)
+
+// Model values: an alias or a full model id, /^[A-Za-z0-9._\[\]-]{1,100}$/ (same rule for settings and preferences).
+type PreferenceOverrides = { chatModel: string | null;            // null / missing = admin default
+  pipelineModels: Partial<Record<Exclude<SessionKind, 'chat'>, string>>; maxFixRounds: number | null };
+type Preferences = { overrides: PreferenceOverrides;
+  effective: { chatModel: { value: string; source: 'user' | 'default' };
+    pipelineModels: Record<Exclude<SessionKind, 'chat'>, { value: string; source: 'user' | 'default' }>;
+    maxFixRounds: { value: number; source: 'user' | 'default'; max: number; clamped: boolean } };
+  suggestions: string[] };                                       // 'opus', 'sonnet', 'haiku', 'fable'; free text is fine
 
 type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   requestedBy: string; sessionId: string | null;
@@ -321,6 +375,8 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `DELETE /api/me/claude-credential` | → `User` | |
 | `PUT /api/me/github-token` | `{ token }` → `User` | 422 if GitHub rejects it. `GET /user` succeeds with any scope, so the token's kind and (classic) scopes are recorded and shown; Settings warns when a classic token lacks `repo` (public repositories only, no push) and explains the grants a fine-grained token needs |
 | `DELETE /api/me/github-token` | → `User` | |
+| `GET /api/me/preferences` | → `Preferences` | the caller's own model / fix-round choices and the effective values |
+| `PUT /api/me/preferences` | `PreferenceOverrides` → `Preferences` | replaces the caller's choices; 400 for an invalid model or unknown role, 422 `max_fix_rounds_out_of_range` |
 | `GET /api/projects` | → `Project[]` | repos of the org visible to the user |
 | `GET /api/projects/{repo}` | → `Project` | |
 | `GET /api/projects/{repo}/issues?state=open\|closed\|all` | → `Issue[]` | pull requests excluded |
@@ -333,11 +389,15 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `POST /api/runs/{id}/approve` | → `Run` | owner only, only in `needs_human` |
 | `POST /api/runs/{id}/cancel` | → `Run` | owner or admin |
 | `GET /api/projects/{repo}/sessions?kind=chat` | → `AgentSession[]` | |
-| `POST /api/projects/{repo}/sessions` | `{ model? }` → `AgentSession` | new chat; needs Claude credential |
+| `POST /api/projects/{repo}/sessions` | `{ model? }` → `AgentSession` | new chat; needs Claude credential; without `model` the owner's effective `chatModel` |
 | `GET /api/agents?active=true` | → `AgentSession[]` | all kinds, across visible repos. `active=true`: `live` (a process exists, e.g. a chat idling between turns) or `starting`/`running` |
 | `GET /api/sessions/{id}` | → `AgentSession` | |
 | `GET /api/sessions/{id}/events?after=<seq>&limit=<n>` | → `Event[]` | ascending |
-| `POST /api/sessions/{id}/input` | `{ text }` → 202 | owner only, chat only; accepted mid-turn too (delivered after the current turn); a `stopped` or process-less chat resumes |
+| `GET /api/config` | → `ClientConfig` | limits the frontend checks before uploading |
+| `POST /api/sessions/{id}/input` | `{ text, attachmentIds? }` → 202 | owner only, chat only; accepted mid-turn too (delivered after the current turn); a `stopped` or process-less chat resumes. `text` may be empty when `attachmentIds` is not. The attachments are bound to this message when it is accepted, so a message queued mid-turn keeps its own |
+| `POST /api/sessions/{id}/attachments?name=<file name>` | raw bytes → 201 `Attachment` | owner only, chat only; see "Attachments" below |
+| `GET /api/sessions/{id}/attachments/{aid}?preview=1` | → bytes | anyone who may see the session once it is sent; before that only its uploader. `preview=1`: the downscaled copy if there is one |
+| `DELETE /api/sessions/{id}/attachments/{aid}` | → 204 | owner only; unsent only (409 `attachment_sent`) |
 | `POST /api/sessions/{id}/interrupt` | → 202 | owner only; stops the current turn (chat only; 409 for pipeline agents — cancel the run instead) |
 | `POST /api/sessions/{id}/stop` | → `AgentSession` | owner or admin |
 | `GET /api/admin/settings` · `PUT /api/admin/settings` | `Settings` | admin |
@@ -373,6 +433,23 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 - For `needs_human` runs, `error` carries the human-readable reason (escalation summary, reviewers
   still requesting changes, or a failed merge). Approval clears it.
 - MCP tools always act on the repository of the agent's session, as its owner.
+
+**Attachments.** Uploads are untrusted:
+- Same central checks as everything else: `requireUser`, session visibility (404 otherwise), owner for
+  upload/delete/send (403), the CSRF header and Origin guard (it is a mutating request).
+- Limits (§3): a declared `Content-Length` over the per-file limit is refused before reading; the body is
+  read with a cap and abandoned as soon as it exceeds it (413 `attachment_too_large`). The uploader's unsent
+  attachments in a session count as the next message: more than `maxCount` → 409 `too_many_attachments`,
+  more than the per-message total → 413 `attachments_too_large` (checked under a per-session lock). Empty
+  file → 400 `empty_attachment`.
+- Sending: `attachmentIds` must all be unsent uploads of this session by the sender, without duplicates,
+  else 409 `attachment_unavailable` (all or nothing). The user event carries them as `attachments`.
+- Serving: only the four raster image types are served as what they are, `Content-Disposition: inline`;
+  everything else (SVG, HTML, PDF, …) is `application/octet-stream` with `Content-Disposition: attachment`.
+  Always `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; img-src 'self';
+  style-src 'unsafe-inline'; sandbox`, `Cross-Origin-Resource-Policy: same-origin`, private immutable caching.
+- Uploads never sent are deleted after 24 hours (and right away when the composer removes them or the page
+  is left).
 
 ### WebSockets (cookie-authenticated)
 
@@ -429,10 +506,30 @@ are not undone by a rollback. The reported version comes from the build.
 
 Routes: `/login`, `/` (projects), `/p/:repo` (issues · CLI chat · agents), `/p/:repo/runs/:runId`
 (pipeline diagram with live stages; selecting a stage shows that agent's transcript),
-`/agents` (everything running), `/settings` (own credentials), `/admin`.
+`/agents` (everything running), `/settings` (own credentials, and "Models & cost": the user's own model per
+role and fix rounds, with presets — *Default* clears every choice, *Economy* picks Sonnet for chat and spec,
+Haiku for the four reviewers and one fix round), `/admin` ("Factory settings": the default models and the
+default and maximum fix rounds; installing software stays admin-only).
 
 The chat renders the Claude stream the way the terminal does: prompt line, streamed assistant
 text, tool calls as `⏺ Tool(args)` with collapsible results, thinking, cost/turn footer. Sessions
 owned by someone else are shown read-only with an "observing <user>" banner.
+
+The owner attaches files by pasting (a pasted screenshot is named `screenshot-<date>-<time>.png`),
+dropping them anywhere on the chat pane (which shows a drop target) or with the `+` button. Each becomes a
+removable chip above the input that uploads at once with progress; per-file errors (too large, too many) show
+on the chip and block sending until removed; sending waits for uploads. In the transcript images show as
+thumbnails that open larger, other files as chips with name and size that download. Observers see them too
+but have no attach affordances.
+
+**Layout.** The project page is an app shell exactly the viewport tall (`100dvh`, or the visual viewport's
+height while an on-screen keyboard is open): the top bar, the project header and (on narrow screens) the tabs
+stay at the top, the chat prompt and its footer line stay at the bottom of the chat pane, and only the
+transcript scrolls — the issues and agents/runs panes each scroll on their own; the document never scrolls.
+The transcript sticks to the bottom while the agent streams unless the reader has scrolled up, then offers
+"jump to latest". The input grows with its text and attachment chips up to a cap and then scrolls inside,
+so the transcript shrinks rather than the prompt being pushed off screen. Other pages (projects, run,
+agents, settings, admin) scroll normally under a sticky top bar; the run page's transcript is its own
+scrolling pane with the same stick-to-bottom behaviour.
 
 Artwork is served from `web/public/art/` (see `art/README.md`).

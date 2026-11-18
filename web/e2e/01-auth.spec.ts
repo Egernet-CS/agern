@@ -56,6 +56,8 @@ test('a wrong code is rejected; five wrong codes show the locked state', async (
   // Even the right code is refused while locked; the API answers 423 with lockedUntil.
   await page.getByRole('button', { name: 'Back to sign in' }).click();
   await submitPassword(page, 'carol');
+  // The password step must have finished (pending-session cookie set) before calling the TOTP endpoint.
+  await expect(page.getByRole('heading', { name: 'Two-factor code' })).toBeVisible();
   const res = await page.request.post(`${BASE()}/api/auth/totp`, { headers: { 'X-Factory-Request': '1' }, data: { code: good } });
   expect(res.status()).toBe(423);
   const body = await res.json();

@@ -79,6 +79,7 @@ class Orchestrator(
     private val prompts: Prompts,
     private val bus: EventBus,
     private val scope: CoroutineScope,
+    private val preferences: dk.egernet.factory.db.PreferenceStore,
 ) {
     private val log = LoggerFactory.getLogger(Orchestrator::class.java)
     private val jobs = ConcurrentHashMap<UUID, Job>()
@@ -99,11 +100,12 @@ class Orchestrator(
         access.requireVisible(owner, repo)
         val client = access.requireClient(owner)
         val issue = withContext(Dispatchers.IO) { client.getIssue(org, repo, issueNumber) } ?: throw notFound("Issue #$issueNumber not found")
-        val s = settings.get()
+        // The starting user's own choices (else the admin defaults), fixed for this run: max rounds now, models per stage.
+        val eff = preferences.effective(owner.id)
         val run = runs.createIfNoActive(
-            repo, issueNumber, issue.title, issueKindFromLabels(issue.labels.map { it.name }), s.maxFixRounds, owner.id, startedBySession,
+            repo, issueNumber, issue.title, issueKindFromLabels(issue.labels.map { it.name }), eff.maxFixRounds, owner.id, startedBySession,
         ) ?: throw conflict("Issue #$issueNumber already has an active run", "active_run_exists")
-        for (role in listOf("spec-writer", "builder") + REVIEWER_ROLES + "approver") runs.createStage(run.id, role, 0, modelFor(s, role))
+        for (role in listOf("spec-writer", "builder") + REVIEWER_ROLES + "approver") runs.createStage(run.id, role, 0, eff.model(role))
         publish(run.id)
         val job = scope.launch { execute(run.id) }
         jobs[run.id] = job
@@ -182,7 +184,7 @@ class Orchestrator(
         val owner = owner(run)
         val id = identity(owner)
         val client = gh(owner)
-        val s = settings.get()
+        val maxRounds = run.maxRounds
 
         // Workspace: owner's clone + a worktree on the run branch.
         val repoInfo = withContext(Dispatchers.IO) { client.getRepo(org, run.repo) } ?: throw StageFailed("Repository not accessible")
@@ -202,7 +204,7 @@ class Orchestrator(
 
         // 1. Spec
         setStatus(run.id, RunStatus.SPEC)
-        val specRes = stage(run.id, "spec-writer", 0, owner, ctx, specPrompt(ctx), model = s.pipelineModels["spec-writer"],
+        val specRes = stage(run.id, "spec-writer", 0, owner, ctx, specPrompt(ctx),
             disallowed = READ_ONLY_TOOLS)
         val spec = specRes.resultText?.trim().takeUnless { it.isNullOrEmpty() } ?: throw StageFailed("spec-writer produced no spec")
         finishStage(run.id, "spec-writer", 0, null, firstParagraph(spec), emptyList())
@@ -220,12 +222,13 @@ class Orchestrator(
             runs.setRound(run.id, round)
             setStatus(run.id, RunStatus.BUILDING)
             if (round > 0) {
-                runs.createStage(run.id, "builder", round, modelFor(s, "builder"))
-                REVIEWER_ROLES.forEach { runs.createStage(run.id, it, round, modelFor(s, it)) }
+                val eff = preferences.effective(owner.id)
+                runs.createStage(run.id, "builder", round, eff.model("builder"))
+                REVIEWER_ROLES.forEach { runs.createStage(run.id, it, round, eff.model(it)) }
                 publish(run.id)
             }
-            val prompt = if (round == 0) buildPrompt(ctx, spec) else fixPrompt(ctx, round, s.maxFixRounds, findingsForBuilder)
-            val b = stage(run.id, "builder", round, owner, ctx, prompt, model = s.pipelineModels["builder"],
+            val prompt = if (round == 0) buildPrompt(ctx, spec) else fixPrompt(ctx, round, maxRounds, findingsForBuilder)
+            val b = stage(run.id, "builder", round, owner, ctx, prompt,
                 resume = builderClaudeSession, parent = builderSessionId)
             builderClaudeSession = b.claudeSessionId ?: builderClaudeSession
             builderSessionId = b.session.id
@@ -257,8 +260,7 @@ class Orchestrator(
             lastReviews = coroutineScope {
                 REVIEWER_ROLES.map { role ->
                     async {
-                        val r = stage(run.id, role, round, owner, ctx, reviewPrompt(ctx, role, round, spec, builderSummary),
-                            model = s.pipelineModels[role], schema = Schemas.REVIEW, disallowed = READ_ONLY_TOOLS)
+                        val r = stage(run.id, role, round, owner, ctx, reviewPrompt(ctx, role, round, spec, builderSummary), schema = Schemas.REVIEW, disallowed = READ_ONLY_TOOLS)
                         val v = parseVerdict(r, setOf("PASS", "CHANGES"))
                         if (v == null) {
                             finishStage(run.id, role, round, null, "No valid verdict in the agent's output", emptyList(), failed = true)
@@ -275,7 +277,7 @@ class Orchestrator(
             }
             val changes = lastReviews.filterValues { it.verdict == "CHANGES" }
             if (changes.isEmpty()) break
-            if (round >= s.maxFixRounds) {
+            if (round >= maxRounds) {
                 skipStage(run.id, "approver")
                 needsHuman(
                     runs.get(run.id)!!, owner,
@@ -291,8 +293,7 @@ class Orchestrator(
         setStatus(run.id, RunStatus.APPROVING)
         runs.setStageRound(run.id, "approver", round)
         run = runs.get(run.id)!!
-        val a = stage(run.id, "approver", round, owner, ctx, approvalPrompt(ctx, spec, lastReviews, round, s.maxFixRounds, run.prUrl),
-            model = s.pipelineModels["approver"], schema = Schemas.APPROVAL, disallowed = READ_ONLY_TOOLS)
+        val a = stage(run.id, "approver", round, owner, ctx, approvalPrompt(ctx, spec, lastReviews, round, maxRounds, run.prUrl), schema = Schemas.APPROVAL, disallowed = READ_ONLY_TOOLS)
         val v = parseVerdict(a, setOf("APPROVE", "ESCALATE"))
         if (v == null) {
             finishStage(run.id, "approver", round, null, "No valid verdict in the agent's output", emptyList(), failed = true)
@@ -315,14 +316,15 @@ class Orchestrator(
     /** Runs one stage's agent and marks the stage running/failed. The caller records the outcome on success. */
     private suspend fun stage(
         runId: UUID, role: String, round: Int, owner: UserRecord, ctx: RunContext, prompt: String,
-        model: String?, schema: String? = null, disallowed: List<String> = emptyList(),
+        schema: String? = null, disallowed: List<String> = emptyList(),
         resume: String? = null, parent: UUID? = null,
     ): StageAgentResult {
         val st = stageRecord(runId, role, round)
         val s = settings.get()
         val res = agents.runStageAgent(
             StageAgentRequest(
-                owner = owner, repo = ctx.repo, role = role, model = model ?: modelFor(s, role), runId = runId,
+                // The model recorded on the stage when it was created, so Stage.model is what actually ran.
+                owner = owner, repo = ctx.repo, role = role, model = st.model, runId = runId,
                 issueNumber = ctx.issue.number, parentSessionId = parent, workDir = ctx.worktree,
                 systemPrompt = prompts.system(role, ctx.repo, s.agentsMayInstallSoftware), prompt = prompt,
                 jsonSchema = schema, disallowedTools = disallowed, resumeClaudeSessionId = resume,
@@ -341,7 +343,8 @@ class Orchestrator(
     }
 
     private fun stageRecord(runId: UUID, role: String, round: Int): StageRecord =
-        runs.stages(runId).lastOrNull { it.role == role && it.round == round } ?: runs.createStage(runId, role, round, modelFor(settings.get(), role))
+        runs.stages(runId).lastOrNull { it.role == role && it.round == round }
+            ?: runs.createStage(runId, role, round, preferences.effective(runs.get(runId)!!.ownerId).model(role))
 
     private fun finishStage(runId: UUID, role: String, round: Int, verdict: String?, summary: String?, findings: List<FindingDto>, failed: Boolean = false) {
         val st = stageRecord(runId, role, round)

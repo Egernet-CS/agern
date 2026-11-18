@@ -1,5 +1,6 @@
 import { memo, useState } from 'react';
 import { cost, duration, modelLabel } from '../../lib/format';
+import { MessageAttachments } from './attachments';
 import { Markdown } from './Markdown';
 import { toolArgs, toolDisplayName, toolSummary, type Item } from './model';
 
@@ -74,14 +75,17 @@ function Thinking({ item }: { item: Extract<Item, { k: 'thinking' }> }) {
   );
 }
 
-const TranscriptItem = memo(function TranscriptItem({ item, me }: { item: Item; me?: string }) {
+const TranscriptItem = memo(function TranscriptItem({ item, me, sessionId }: { item: Item; me?: string; sessionId: string }) {
   switch (item.k) {
     case 'user': {
       const cmd = item.text.trim().startsWith('/');
       return (
         <div className={`t-user ${cmd ? 't-user--cmd' : ''}`}>
           <span className="t-prompt" aria-hidden>&gt;</span>
-          <div className="t-user-text">{item.text}</div>
+          <div className="t-user-body">
+            {item.text && <div className="t-user-text">{item.text}</div>}
+            <MessageAttachments sessionId={sessionId} list={item.attachments} />
+          </div>
           {item.username && item.username !== me && <span className="t-user-name">{item.username}</span>}
         </div>
       );
@@ -136,11 +140,11 @@ const TranscriptItem = memo(function TranscriptItem({ item, me }: { item: Item; 
   }
 });
 
-export function TranscriptItems({ items, me }: { items: Item[]; me?: string }) {
+export function TranscriptItems({ items, me, sessionId }: { items: Item[]; me?: string; sessionId: string }) {
   return (
     <>
       {items.map((it) => (
-        <TranscriptItem key={it.id} item={it} me={me} />
+        <TranscriptItem key={it.id} item={it} me={me} sessionId={sessionId} />
       ))}
     </>
   );

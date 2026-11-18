@@ -78,14 +78,48 @@ function LiveCount() {
   );
 }
 
+/** Pages laid out as an app shell: exactly the viewport tall, only their panes scroll (the project page). */
+const APP_SHELL = /^\/p\/[^/]+\/?$/;
+
+/**
+ * While an app-shell page is shown the document itself never scrolls, and the shell's height follows the
+ * visual viewport, so the prompt stays above an on-screen keyboard (iOS does not resize the layout viewport;
+ * Android does with `interactive-widget=resizes-content`, where `100dvh` alone would do).
+ */
+function useAppShell(on: boolean) {
+  useEffect(() => {
+    if (!on) return;
+    const root = document.documentElement;
+    root.classList.add('app-locked');
+    const vv = window.visualViewport;
+    const sync = () => {
+      if (!vv) return;
+      // Pinch zoom also shrinks the visual viewport; only follow it at scale 1 (i.e. the keyboard).
+      if (Math.abs(vv.scale - 1) < 0.01) root.style.setProperty('--app-h', `${Math.round(vv.height)}px`);
+      if (window.scrollY !== 0) window.scrollTo(0, 0);
+    };
+    sync();
+    vv?.addEventListener('resize', sync);
+    vv?.addEventListener('scroll', sync);
+    return () => {
+      root.classList.remove('app-locked');
+      root.style.removeProperty('--app-h');
+      vv?.removeEventListener('resize', sync);
+      vv?.removeEventListener('scroll', sync);
+    };
+  }, [on]);
+}
+
 function Shell() {
   const { me, logout } = useAuth();
   const [menu, setMenu] = useState(false);
   const loc = useLocation();
   useEffect(() => setMenu(false), [loc.pathname]);
+  const appShell = APP_SHELL.test(loc.pathname);
+  useAppShell(appShell);
   if (!me) return null;
   return (
-    <div className="shell">
+    <div className={`shell ${appShell ? 'shell--app' : ''}`}>
       <a href="#main" className="skip">Skip to content</a>
       <header className="topbar">
         <Wordmark />

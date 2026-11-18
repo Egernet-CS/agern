@@ -1,8 +1,9 @@
 // Mock implementation of the Api interface. Enabled with VITE_MOCK=1 (npm run dev:mock).
 // Scenarios via ?mock=default|fresh|noclaude|observer|loggedout (remembered per tab).
 import { ApiError, type Api, type Channel } from '../api/api';
-import { isRunActive, isSessionActive, type AgentSession, type Issue, type LoginStep, type Run, type User } from '../api/types';
+import { isRunActive, isSessionActive, type AgentSession, type Attachment, type ClientConfig, type Issue, type LoginStep, type Preferences, type Run, type StageRole, type User } from '../api/types';
 import {
+  effective,
   approveRun,
   cancelRun,
   chatInput,
@@ -96,6 +97,49 @@ function run(id: string): Run {
   if (!r) throw new MockError(404, 'not_found', 'Run not found');
   return r;
 }
+// ---------------------------------------------------------------- attachments (same rules as the backend)
+
+const LIMITS: ClientConfig['attachments'] = { maxFileBytes: 20 << 20, maxMessageBytes: 50 << 20, maxCount: 10, imageTypes: ['image/png', 'image/jpeg', 'image/gif', 'image/webp'] };
+type MockAttachment = { meta: Attachment; sessionId: string; owner: string; sent: boolean; url: string };
+const attachments = new Map<string, MockAttachment>();
+
+function sanitizeName(raw: string): string {
+  // eslint-disable-next-line no-control-regex
+  let n = (raw.split(/[\\/]/).pop() ?? '').replace(/[\u0000-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g, '').replace(/[:*?"<>|]/g, '_');
+  n = n.replace(/\s+/g, ' ').trim().replace(/^[.\s]+/, '');
+  return (n.length > 120 ? n.slice(0, 120) : n) || 'attachment';
+}
+
+async function imageSize(file: File): Promise<{ width: number; height: number } | null> {
+  try {
+    const bmp = await createImageBitmap(file);
+    const r = { width: bmp.width, height: bmp.height };
+    bmp.close();
+    return r;
+  } catch {
+    return null;
+  }
+}
+
+const ROLES: StageRole[] = ['spec-writer', 'builder', 'security', 'ux', 'ui-design', 'code', 'approver'];
+const MODEL_RE = /^[A-Za-z0-9._[\]-]{1,100}$/;
+
+function preferences(): Preferences {
+  const u = me().username;
+  const o = db.prefs.get(u) ?? { chatModel: null, pipelineModels: {}, maxFixRounds: null };
+  const e = effective(u);
+  const max = db.settings.maxFixRounds;
+  return {
+    overrides: o,
+    effective: {
+      chatModel: { value: e.chatModel, source: o.chatModel ? 'user' : 'default' },
+      pipelineModels: Object.fromEntries(ROLES.map((r) => [r, { value: e.model(r), source: o.pipelineModels[r] ? 'user' : 'default' }])) as Preferences['effective']['pipelineModels'],
+      maxFixRounds: { value: e.maxFixRounds, source: o.maxFixRounds != null ? 'user' : 'default', max, clamped: o.maxFixRounds != null && o.maxFixRounds > max },
+    },
+    suggestions: ['opus', 'sonnet', 'haiku', 'fable'],
+  };
+}
+
 const byNewest = <T extends { createdAt: string }>(a: T, b: T) => b.createdAt.localeCompare(a.createdAt);
 
 export const mockApi: Api = {
@@ -177,6 +221,21 @@ export const mockApi: Api = {
     }),
   deleteGithubToken: () => ok(() => Object.assign(me(), { hasGithubToken: false, githubLogin: null, githubTokenKind: null, githubTokenScopes: null })),
 
+  preferences: () => ok(preferences),
+  putPreferences: (p) =>
+    ok(() => {
+      const chat = p.chatModel?.trim() || null;
+      const models: Record<string, string> = {};
+      for (const [k, v] of Object.entries(p.pipelineModels ?? {})) if (v?.trim()) models[k] = v.trim();
+      if (Object.keys(models).some((k) => !ROLES.includes(k as StageRole))) throw new MockError(400, 'bad_request', 'Unknown role');
+      if ([chat, ...Object.values(models)].some((m) => m && !MODEL_RE.test(m))) throw new MockError(400, 'bad_request', 'Invalid model');
+      const max = db.settings.maxFixRounds;
+      if (p.maxFixRounds != null && (p.maxFixRounds < 0 || p.maxFixRounds > max)) {
+        throw new MockError(422, 'max_fix_rounds_out_of_range', `maxFixRounds must be between 0 and ${max} (the factory's maximum)`);
+      }
+      db.prefs.set(me().username, { chatModel: chat, pipelineModels: models, maxFixRounds: p.maxFixRounds ?? null });
+      return preferences();
+    }),
   projects: () => ok(() => (visible() ? db.projects.map((p) => project(p.name)) : [])),
   project: (repo) => ok(() => project(repo)),
   issues: (repo, state = 'open') =>
@@ -245,14 +304,64 @@ export const mockApi: Api = {
     ok(() => (visible() ? [...db.sessions.values()].filter((s) => !activeOnly || isSessionActive(s)).sort(byNewest) : [])),
   session: (id) => ok(() => session(id)),
   events: (id, after = 0, limit = 1000) => ok(() => (db.events.get(session(id).id) ?? []).filter((e) => e.seq > after).slice(0, limit)),
-  sendInput: (id, text) =>
+  sendInput: (id, text, attachmentIds = []) =>
     ok(() => {
       const s = session(id);
       if (s.owner.username !== me().username) throw new MockError(403, 'forbidden', 'Only the owner can send input.');
       if (s.kind !== 'chat') throw new MockError(409, 'conflict', 'Only chat sessions accept input');
+      if (!text.trim() && attachmentIds.length === 0) throw new MockError(400, 'bad_request', 'text must not be empty');
+      if (text.trim().startsWith('/factory') && attachmentIds.length) {
+        throw new MockError(422, 'attachments_not_allowed', '/factory commands do not take attachments. Remove them, or send them in a normal message.');
+      }
       if (!text.trim().startsWith('/factory')) needClaude();
-      chatInput(s, text, me());
+      const list = attachmentIds.map((a) => attachments.get(a));
+      if (new Set(attachmentIds).size !== attachmentIds.length || list.some((a) => !a || a.sent || a.sessionId !== id || a.owner !== me().username)) {
+        throw new MockError(409, 'attachment_unavailable', 'An attachment is unknown, belongs to another session, or was already sent');
+      }
+      list.forEach((a) => (a!.sent = true));
+      chatInput(s, text, me(), list.map((a) => a!.meta));
     }),
+  async uploadAttachment(sessionId, file, opts) {
+    const s = session(sessionId);
+    if (s.owner.username !== me().username) throw new ApiError(403, 'forbidden', 'Only the owner of this session can attach files');
+    const unsent = [...attachments.values()].filter((a) => a.sessionId === sessionId && !a.sent);
+    if (unsent.length >= LIMITS.maxCount) throw new ApiError(409, 'too_many_attachments', `At most ${LIMITS.maxCount} attachments per message`);
+    if (file.size > LIMITS.maxFileBytes) throw new ApiError(413, 'attachment_too_large', 'The file is larger than 20.0 MB');
+    if (file.size + unsent.reduce((n, a) => n + a.meta.size, 0) > LIMITS.maxMessageBytes) throw new ApiError(413, 'attachments_too_large', 'Attachments of one message may total at most 50.0 MB');
+    if (file.size === 0) throw new ApiError(400, 'empty_attachment', 'The file is empty');
+    for (let i = 1; i <= 5; i++) {
+      if (opts?.signal?.aborted) throw new ApiError(0, 'aborted', 'Upload cancelled');
+      await wait(90);
+      opts?.onProgress?.(Math.round((file.size * i) / 5), file.size);
+    }
+    const image = LIMITS.imageTypes.includes(file.type);
+    const dims = image ? await imageSize(file) : null;
+    const big = !!dims && (dims.width > 2000 || dims.height > 2000);
+    const meta: Attachment = {
+      id: crypto.randomUUID(),
+      name: sanitizeName(file.name),
+      mediaType: image ? file.type : file.type.startsWith('text/') ? 'text/plain' : 'application/octet-stream',
+      size: file.size,
+      kind: image ? 'image' : 'file',
+      width: dims?.width ?? null,
+      height: dims?.height ?? null,
+      inline: image ? (big ? 'downscaled' : 'original') : 'none',
+      note: big ? 'Shown to the model as a downscaled copy; the original is available as a file.' : null,
+    };
+    attachments.set(meta.id, { meta, sessionId, owner: me().username, sent: false, url: URL.createObjectURL(file) });
+    return clone(meta);
+  },
+  deleteAttachment: (sessionId, id) =>
+    ok(() => {
+      const a = attachments.get(id);
+      if (!a || a.sessionId !== sessionId) throw new MockError(404, 'not_found', 'Attachment not found');
+      if (a.owner !== me().username) throw new MockError(403, 'forbidden', 'Only the owner of this session can remove attachments');
+      if (a.sent) throw new MockError(409, 'attachment_sent', 'The attachment was already sent');
+      URL.revokeObjectURL(a.url);
+      attachments.delete(id);
+    }),
+  attachmentUrl: (_sessionId, id) => attachments.get(id)?.url ?? '/art/favicon.svg',
+  config: () => ok(() => ({ attachments: LIMITS })),
   interrupt: (id) =>
     ok(() => {
       const s = session(id);
