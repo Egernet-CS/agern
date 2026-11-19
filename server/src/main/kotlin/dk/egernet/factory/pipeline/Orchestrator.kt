@@ -176,13 +176,13 @@ class Orchestrator(
         jobs[runId]?.let { it.cancel(); it.join() }
         val after = runs.get(runId)!!
         if (after.status in RunStatus.TERMINAL) return after
+        withContext(Dispatchers.IO) { cleanupWorktree(runId, merged = false) }
         runs.setStatus(runId, RunStatus.CANCELLED, "Cancelled by ${user.username}")
         runs.closeOpenStages(runId)
         val owner = users.byId(run.ownerId)!!
         withContext(Dispatchers.IO) {
             bestEffort { gh(owner).removeLabel(org, run.repo, run.issueNumber, "needs-human") }
-            bestEffort { gh(owner).comment(org, run.repo, run.issueNumber, "**Agern:** run `${run.id}` was cancelled by @${user.username}.") }
-            cleanupWorktree(runs.get(runId)!!, owner)
+            commentEnded(runId, "**Agern:** run `${run.id}` was cancelled by @${user.username}.")
         }
         publish(runId)
         settled(runId)
@@ -198,7 +198,11 @@ class Orchestrator(
             throw e
         } catch (e: Exception) {
             log.warn("Run {} failed: {}", runId, e.message)
-            fail(runId, e.message ?: e.javaClass.simpleName)
+            val reason = e.message ?: e.javaClass.simpleName
+            // Clean up first, so a run shown as ended has left nothing behind.
+            withContext(Dispatchers.IO) { cleanupWorktree(runId, merged = false) }
+            fail(runId, reason)
+            withContext(Dispatchers.IO) { commentEnded(runId, "**Agern:** run `$runId` failed: $reason") }
             val sf = e as? StageFailed
             settled(runId, sf?.usageLimit, sf?.credentialRejected == true)
             return
@@ -211,6 +215,25 @@ class Orchestrator(
         runs.closeOpenStages(runId)
         publish(runId)
     }
+
+    /**
+     * A run ended failed or cancelled: comment on the issue, naming the pull request it leaves behind. Its pushed branch
+     * and open pull request stay on GitHub untouched — they may hold useful commits — and a new run never reuses them
+     * (docs/ARCHITECTURE.md §6 "Worktrees and branches"). Blocking.
+     */
+    private fun commentEnded(runId: UUID, headline: String) {
+        val run = runs.get(runId) ?: return
+        val owner = users.byId(run.ownerId) ?: return
+        val left = if (run.prUrl == null) "" else "\n\nIts pull request ${run.prUrl} (branch `${run.branch}`) is left open as it is; " +
+            "a new run of this issue starts on a new branch with a new pull request."
+        bestEffort { gh(owner).comment(org, run.repo, run.issueNumber, headline + left) }
+    }
+
+    /** Live = has a coroutine in this server or an active status (a `needs_human` run still owns its worktree). */
+    private fun isLive(runId: UUID): Boolean = jobs.containsKey(runId) || runs.get(runId)?.status in RunStatus.ACTIVE
+
+    /** At server start: removes the worktrees of runs that have ended (and prunes stale worktree entries). Blocking. */
+    fun reapWorktrees(): List<UUID> = workspaces.reapAllRunWorktrees(::isLive)
 
     private fun owner(run: RunRecord) = users.byId(run.ownerId) ?: error("Run owner no longer exists")
     private fun gh(owner: UserRecord): GitHubClient =
@@ -240,11 +263,13 @@ class Orchestrator(
         // A release run starts from and merges into its release branch; a single run uses the default branch.
         val target = run.baseBranch ?: repoInfo.defaultBranch
         val releaseName = run.baseBranch?.takeIf { run.releaseId != null }?.removePrefix("release/")
-        val branch = runBranch(run.issueNumber, issue.title, releaseName)
+        val branch = runBranch(run.issueNumber, issue.title, releaseName, run.id)
         val worktree = workspaces.runDir(owner.username, run.repo, run.id)
         val baseRef = withContext(Dispatchers.IO) {
             val main = workspaces.ensureMain(id, run.repo)
             workspaces.withRepoLock(owner.username, run.repo) {
+                // Leftovers of runs that have ended (e.g. after a crash) never block a new run; live runs keep theirs.
+                workspaces.reapRunWorktrees(owner.username, run.repo) { it != run.id && isLive(it) }
                 workspaces.git.createWorktree(id, main, worktree, branch, target, workspaces.home(owner.username))
             }
         }
@@ -287,8 +312,10 @@ class Orchestrator(
             val builderSummary = b.resultText?.trim() ?: ""
             val ahead = withContext(Dispatchers.IO) { workspaces.git.commitsAhead(worktree, baseRef, workspaces.home(owner.username)) }
             if (ahead == 0) {
-                finishStage(run.id, "builder", round, null, "No commits on the branch", emptyList(), failed = true)
-                throw StageFailed("The builder made no commits on $branch")
+                // The builder's own words say why (e.g. the issue is blocked on another one); show them with the failure.
+                val why = firstParagraph(builderSummary).takeIf { it.isNotEmpty() }
+                finishStage(run.id, "builder", round, null, why?.let { "No commits on the branch. $it" } ?: "No commits on the branch", emptyList(), failed = true)
+                throw StageFailed("The builder made no commits on $branch" + (why?.let { ". The builder said: $it" } ?: ""))
             }
             finishStage(run.id, "builder", round, null, firstParagraph(builderSummary), emptyList())
 
@@ -298,9 +325,13 @@ class Orchestrator(
                 if (run.prNumber == null) {
                     // A release run's pull request must not close the issue: that happens when the release is merged.
                     val lead = if (releaseName != null) "Issue #${issue.number} · release `$releaseName`" else "Closes #${issue.number}"
+                    val earlier = runs.earlierUnmergedPulls(run.repo, run.issueNumber, run.id)
+                        .takeIf { it.isNotEmpty() }
+                        ?.let { prs -> "Earlier runs of this issue left " + prs.joinToString(", ") { "#$it" } + " open; close them if this one supersedes them.\n\n" }
+                        .orEmpty()
                     val pr = client.findOpenPull(org, run.repo, branch) ?: client.createPull(
                         org, run.repo, branch, target, "${issue.title} (#${issue.number})",
-                        "$lead\n\nBuilt by Agern run `${run.id}` for @${owner.githubLogin ?: owner.username}.\n\n" +
+                        "$lead\n\nBuilt by Agern run `${run.id}` for @${owner.githubLogin ?: owner.username}.\n\n" + earlier +
                             "<details><summary>Spec</summary>\n\n$spec\n\n</details>",
                     )
                     runs.setPr(run.id, pr.number, pr.htmlUrl)
@@ -461,15 +492,24 @@ class Orchestrator(
             bestEffort { client.comment(org, run.repo, run.issueNumber, "**Agern: merged** pull request #$pr$approval.") }
             bestEffort { client.closeIssue(org, run.repo, run.issueNumber) }
         }
+        cleanupWorktree(run.id, merged = true)
         runs.setStatus(run.id, RunStatus.MERGED, clearError = true)
-        cleanupWorktree(run, owner)
     }
 
-    private fun cleanupWorktree(run: RunRecord, owner: UserRecord) {
+    /**
+     * Removes the run's worktree and its local branch. A merged run's branch always goes (its work is merged); an
+     * unmerged one's is kept only if it holds commits that exist nowhere else (never pushed). Blocking.
+     */
+    private fun cleanupWorktree(runId: UUID, merged: Boolean) {
+        val run = runs.get(runId) ?: return
+        val owner = users.byId(run.ownerId) ?: return
         bestEffort {
-            val main = workspaces.mainDir(owner.username, run.repo)
-            val wt = workspaces.runDir(owner.username, run.repo, run.id)
-            if (java.nio.file.Files.exists(wt)) workspaces.git.removeWorktree(main, wt, workspaces.home(owner.username))
+            workspaces.withRepoLock(owner.username, run.repo) {
+                workspaces.git.removeWorktree(
+                    workspaces.mainDir(owner.username, run.repo), workspaces.runDir(owner.username, run.repo, run.id),
+                    workspaces.home(owner.username), keepUnpushed = !merged,
+                )
+            }
         }
     }
 
@@ -602,9 +642,14 @@ class Orchestrator(
         fun modelFor(s: dk.egernet.factory.SettingsDto, role: String): String =
             s.pipelineModels[role] ?: dk.egernet.factory.DEFAULT_PIPELINE_MODELS[role] ?: "sonnet"
 
-        /** `factory/issue-<n>-<slug>`; a release run's is `factory/release-<name>/issue-<n>-<slug>`, so it never reuses a single run's pull request. */
-        fun runBranch(issueNumber: Int, title: String, releaseName: String?): String =
-            (if (releaseName != null) "factory/release-$releaseName/" else "factory/") + "issue-$issueNumber-${slug(title)}"
+        /**
+         * `factory/issue-<n>-<slug>-<run>`; a release run's is `factory/release-<name>/issue-<n>-<slug>-<run>`, where
+         * `<run>` is the first 8 hex digits of the run id. Every run has its own branch, so a run never reuses (or
+         * force-pushes over) the branch, pull request or worktree of an earlier run of the same issue.
+         */
+        fun runBranch(issueNumber: Int, title: String, releaseName: String?, runId: UUID): String =
+            (if (releaseName != null) "factory/release-$releaseName/" else "factory/") +
+                "issue-$issueNumber-${slug(title)}-${runId.toString().take(8)}"
 
         fun slug(title: String): String =
             title.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-').take(40).trim('-').ifEmpty { "work" }

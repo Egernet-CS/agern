@@ -676,8 +676,11 @@ function pipeline(r: Run, plan: Plan, owner: User, startMs: number) {
 
 function makeRun(repo: string, issue: Issue, owner: User, createdMs: number, startedBy: string | null, release: Release | null): Run {
   const slug = issue.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 30);
+  const id = uid();
+  // Like the server: every run has its own branch, suffixed with the first 8 characters of its id.
+  const suffix = id.replace(/[^a-z0-9]/gi, '').slice(0, 8).toLowerCase();
   const r: Run = {
-    id: uid(),
+    id,
     repo,
     issueNumber: issue.number,
     issueTitle: issue.title,
@@ -685,7 +688,9 @@ function makeRun(repo: string, issue: Issue, owner: User, createdMs: number, sta
     status: 'queued',
     round: 0,
     maxRounds: effective(owner.username).maxFixRounds,
-    branch: release ? `factory/release-${release.name}/issue-${issue.number}-${slug}` : `factory/issue-${issue.number}-${slug}`,
+    branch: release
+      ? `factory/release-${release.name}/issue-${issue.number}-${slug}-${suffix}`
+      : `factory/issue-${issue.number}-${slug}-${suffix}`,
     prNumber: null,
     prUrl: null,
     owner: ownerOf(owner),

@@ -9,6 +9,9 @@ import java.util.concurrent.TimeUnit
 
 class GitException(message: String) : RuntimeException(message)
 
+/** One entry of `git worktree list`: its path as git reports it and its branch (null when detached). */
+data class WorktreeInfo(val path: Path, val branch: String?)
+
 /** Git operations the server performs itself (the agents run git on their own). */
 interface GitOps {
     /** Clones the repo into [dir] or fetches if it is already there. */
@@ -20,7 +23,14 @@ interface GitOps {
     fun createWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, baseBranch: String, home: Path): String
     fun commitsAhead(worktree: Path, baseRef: String, home: Path): Int
     fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path)
-    fun removeWorktree(mainDir: Path, worktree: Path, home: Path)
+    /** The worktrees registered in [mainDir] (the main working tree included). Prunes stale entries first. */
+    fun listWorktrees(mainDir: Path, home: Path): List<WorktreeInfo>
+    /**
+     * Removes [worktree] (registered or not), prunes stale worktree entries and deletes the worktree's local branch,
+     * unless [keepUnpushed] is set and the branch holds commits that are on no other local branch and no
+     * remote-tracking branch (work that exists nowhere else). Never throws.
+     */
+    fun removeWorktree(mainDir: Path, worktree: Path, home: Path, keepUnpushed: Boolean = true)
 }
 
 /**
@@ -96,8 +106,45 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
         git(worktree, home, id, "push", "--force-with-lease", "origin", "HEAD:refs/heads/$branch")
     }
 
-    override fun removeWorktree(mainDir: Path, worktree: Path, home: Path) {
-        runCatching { git(mainDir, home, null, "worktree", "remove", "--force", worktree.toString()) }
-            .onFailure { log.warn("Could not remove worktree {}: {}", worktree, it.message) }
+    override fun listWorktrees(mainDir: Path, home: Path): List<WorktreeInfo> {
+        if (!Files.isDirectory(mainDir.resolve(".git"))) return emptyList()
+        git(mainDir, home, null, "worktree", "prune")
+        val out = git(mainDir, home, null, "worktree", "list", "--porcelain")
+        return out.split(Regex("\n\\s*\n")).mapNotNull { block ->
+            val lines = block.lines()
+            val path = lines.firstOrNull { it.startsWith("worktree ") }?.removePrefix("worktree ") ?: return@mapNotNull null
+            val branch = lines.firstOrNull { it.startsWith("branch ") }?.removePrefix("branch ")?.removePrefix("refs/heads/")
+            WorktreeInfo(Path.of(path), branch)
+        }
+    }
+
+    override fun removeWorktree(mainDir: Path, worktree: Path, home: Path, keepUnpushed: Boolean) {
+        try {
+            // Match by the last two segments (`runs/<runId>`): git may report the path with symlinks resolved.
+            val entry = runCatching { listWorktrees(mainDir, home) }.getOrDefault(emptyList())
+                .firstOrNull { it.path.fileName == worktree.fileName && it.path.parent?.fileName == worktree.parent?.fileName }
+            if (entry != null) {
+                runCatching { git(mainDir, home, null, "worktree", "remove", "--force", "--force", entry.path.toString()) }
+                    .onFailure { log.warn("Could not remove worktree {}: {}", worktree, it.message) }
+            }
+            // A directory git does not know (any more), or could not remove, goes too.
+            if (Files.exists(worktree)) worktree.toFile().deleteRecursively()
+            if (Files.isDirectory(mainDir.resolve(".git"))) runCatching { git(mainDir, home, null, "worktree", "prune") }
+            val branch = entry?.branch ?: return
+            if (keepUnpushed) {
+                val unique = runCatching {
+                    git(mainDir, home, null, "rev-list", "--count", "refs/heads/$branch", "--not", "--exclude=$branch", "--branches", "--remotes")
+                        .trim().toInt()
+                }.getOrDefault(1)
+                if (unique > 0) {
+                    log.info("Keeping local branch {}: it has {} commit(s) found on no other branch", branch, unique)
+                    return
+                }
+            }
+            runCatching { git(mainDir, home, null, "branch", "-D", branch) }
+                .onFailure { log.warn("Could not delete local branch {}: {}", branch, it.message) }
+        } catch (e: Exception) {
+            log.warn("Cleaning up worktree {} failed: {}", worktree, e.message)
+        }
     }
 }
