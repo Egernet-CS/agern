@@ -166,5 +166,11 @@ class SandboxDefinitionTest {
         assertFailsWith<IllegalArgumentException> { cfgOf("FACTORY_SANDBOX_MAX_MEMORY" to "1m") }
         assertFailsWith<IllegalArgumentException> { cfgOf("FACTORY_SANDBOX_MAX_CONCURRENT" to "0") }
         assertFailsWith<IllegalArgumentException> { cfgOf("FACTORY_SANDBOX_REGISTRIES" to "not a host") }
+        assertEquals(null, d.cgroupParent)
+        assertEquals("/system.slice/agern-sandbox.service/containers",
+            cfgOf("FACTORY_SANDBOX_CGROUP_PARENT" to "/system.slice/agern-sandbox.service/containers").cgroupParent)
+        for (bad in listOf("containers", "/a/../b", "/system.slice", "/a b", "/a/")) {
+            assertFailsWith<IllegalArgumentException>(bad) { cfgOf("FACTORY_SANDBOX_CGROUP_PARENT" to bad) }
+        }
     }
 }

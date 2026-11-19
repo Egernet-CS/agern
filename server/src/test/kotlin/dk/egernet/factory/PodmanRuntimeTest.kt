@@ -84,6 +84,17 @@ class PodmanRuntimeTest {
     }
 
     @Test
+    fun `a cgroup parent when configured`() {
+        val withParent = remote.copy(cgroupParent = "/system.slice/agern-sandbox.service/containers")
+        val args = PodmanRuntime.runArgs(withParent, manager.serviceSpec(runId, "demo-app", def.services[0], def))
+        val i = args.indexOf("--cgroup-parent")
+        assertTrue(i > 0, "no --cgroup-parent in $args")
+        assertEquals("/system.slice/agern-sandbox.service/containers", args[i + 1])
+        assertEquals("--pull=missing", args[i - 1])
+        assertFalse(PodmanRuntime.runArgs(cfg, manager.serviceSpec(runId, "demo-app", def.services[0], def)).contains("--cgroup-parent"))
+    }
+
+    @Test
     fun `nothing that widens the boundary is ever passed`() {
         val all = listOf(
             PodmanRuntime.runArgs(cfg, manager.mainSpec(runId, "r", Paths.get("/w"), def)),
@@ -105,7 +116,8 @@ class PodmanRuntimeTest {
         assertEquals(listOf("podman", "exec", "--workdir", "/workspace", "agern-run-x", "sh", "-lc", "./gradlew test"),
             PodmanRuntime.execArgs(cfg, "agern-run-x", "/workspace", listOf("sh", "-lc", "./gradlew test")))
         assertEquals(listOf("podman", "restart", "--time", "0", "agern-run-x"), PodmanRuntime.restartArgs(cfg, "agern-run-x"))
-        assertEquals(listOf("podman", "rm", "--force", "--ignore", "a", "b"), PodmanRuntime.removeContainersArgs(cfg, listOf("a", "b")))
+        // --volumes: anonymous volumes (e.g. a sidecar image's VOLUME) go with the container; named cache volumes stay.
+        assertEquals(listOf("podman", "rm", "--force", "--ignore", "--volumes", "a", "b"), PodmanRuntime.removeContainersArgs(cfg, listOf("a", "b")))
         assertEquals(listOf("podman", "network", "rm", "--force", "agern-run-x"), PodmanRuntime.removeNetworkArgs(cfg, "agern-run-x"))
         assertEquals(listOf("podman", "volume", "exists", "v"), PodmanRuntime.volumeExistsArgs(cfg, "v"))
         assertEquals(listOf("podman", "volume", "create", "--label", "agern.repo=r", "v"), PodmanRuntime.createVolumeArgs(cfg, "v", mapOf("agern.repo" to "r")))

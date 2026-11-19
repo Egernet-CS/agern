@@ -173,6 +173,7 @@ class PodmanRuntime(
                 "--stop-timeout", "5",
                 "--pull=missing",
             )
+            cfg.cgroupParent?.let { a += listOf("--cgroup-parent", it) }
             s.workdir?.let { a += listOf("--workdir", it) }
             s.entrypoint?.let { a += listOf("--entrypoint", it) }
             for ((k, v) in s.env) a += listOf("--env", "$k=$v")
@@ -193,7 +194,7 @@ class PodmanRuntime(
 
         fun restartArgs(cfg: SandboxConfig, name: String) = base(cfg) + listOf("restart", "--time", "0", name)
 
-        fun removeContainersArgs(cfg: SandboxConfig, names: List<String>) = base(cfg) + listOf("rm", "--force", "--ignore") + names
+        fun removeContainersArgs(cfg: SandboxConfig, names: List<String>) = base(cfg) + listOf("rm", "--force", "--ignore", "--volumes") + names
 
         fun removeNetworkArgs(cfg: SandboxConfig, name: String) = base(cfg) + listOf("network", "rm", "--force", name)
 
