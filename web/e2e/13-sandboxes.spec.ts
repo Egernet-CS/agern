@@ -10,6 +10,9 @@ test.describe.configure({ mode: 'serial' });
 const tag = Date.now().toString(36);
 const v1 = `image: docker.io/library/eclipse-temurin:21-jdk\nsetup: |\n  echo installing the toolchain ${tag}\nservices:\n  postgres:\n    image: docker.io/library/postgres:17\n    env: { POSTGRES_PASSWORD: dev }\ncaches: [ /root/.gradle ]\n`;
 const v2 = v1.replace('eclipse-temurin:21-jdk', 'eclipse-temurin:25-jdk') + 'resources: { cpus: 1, memory: 2g }\n';
+// Step 4: a platform (inheriting the setup), a non-root user and a readiness check on the service.
+const v3 = v2.replace('    env: { POSTGRES_PASSWORD: dev }\n', '    env: { POSTGRES_PASSWORD: dev }\n    ready: { command: "pg_isready -h 127.0.0.1", timeoutSeconds: 30 }\n') +
+  'user: builder\nplatforms:\n  jdk17:\n    image: docker.io/library/eclipse-temurin:17-jdk\n';
 
 /** Puts `.agern/sandbox.yml` on demo-app's default branch in the fake GitHub (null removes it). */
 function definition(content: string | null) {
@@ -133,7 +136,7 @@ test('an admin stops a running sandbox; the run goes on', async ({ page }) => {
   const item = card.locator('.sbx-run', { hasText: title });
   await expect(item).toContainText('eclipse-temurin:25-jdk');
   await expect(item).toContainText('postgres');
-  await expect(card).toContainText(/1 of 2 in use|2 of 2 in use/);
+  await expect(card).toContainText(/[12] of 2 containers in use/);
   await item.getByRole('button', { name: /^Stop the sandbox of run #\d+ in demo-app$/ }).click();
   const dialog = page.getByRole('dialog', { name: /Stop the sandbox of run #\d+\?/ });
   await expect(dialog).toContainText('The run itself continues');
@@ -147,4 +150,57 @@ test('an admin stops a running sandbox; the run goes on', async ({ page }) => {
   await page.goto(`${BASE()}/p/demo-app/runs/${runId}?stage=builder`);
   await expect(page.locator('.stage-detail .chat-log')).toContainText("An admin (alice) stopped this run's sandbox");
   expect((await page.request.post(`${BASE()}/api/runs/${runId}/cancel`, { headers: mutate })).status()).toBe(200);
+});
+
+test('platforms: on the sandbox page, in the approval, on the run and live in the admin overview', async ({ page }) => {
+  definition(v3);
+  await login(page, 'alice');
+  await page.goto(`${BASE()}/p/demo-app/sandbox`);
+  await expect(pill(page)).toHaveText('changed');
+  const grid = page.locator('.sbx-dl-grid');
+  await expect(grid).toContainText('jdk17');
+  await expect(grid).toContainText('docker.io/library/eclipse-temurin:17-jdk');
+  await expect(grid).toContainText('setup: the top-level script');
+  await expect(grid).toContainText(/commands run as builder \(uid 1000\); setup runs as root/);
+  await expect(grid).toContainText('ready when pg_isready -h 127.0.0.1 succeeds (waits up to 30 s)');
+  await expect(page.locator('.sbx-diff .sbx-dl--add', { hasText: 'jdk17:' })).toHaveCount(1);
+  await page.getByRole('button', { name: 'Approve…' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Approve the sandbox of demo-app?' });
+  await expect(dialog.locator('.sbx-images li')).toHaveText([
+    'default docker.io/library/eclipse-temurin:25-jdk',
+    'platform jdk17 docker.io/library/eclipse-temurin:17-jdk',
+    'service postgres docker.io/library/postgres:17',
+  ]);
+  await expect(dialog).toContainText('Setup script of the default image and jdk17');
+  await dialog.getByRole('button', { name: 'Approve this version' }).click();
+  await expect(pill(page)).toHaveText('approved');
+
+  // The admin overview is open before the run starts: the sandbox appears and goes without a reload (the poll is slow).
+  await page.goto(`${BASE()}/admin`);
+  const card = page.locator('section', { has: page.locator('#sb-h') });
+  await expect(card).toContainText('0 of 2 containers in use');
+  const title = `Platform build ${tag}`;
+  const runId = await startRun(page, title, 'Test on every platform. fake:sandbox fake:platform=jdk17 fake:hang-security');
+  const item = card.locator('.sbx-run', { hasText: title });
+  await expect(item).toBeVisible({ timeout: 45_000 });
+  await expect(item.locator('.sbx-run-containers li')).toHaveText(['default eclipse-temurin:25-jdk', 'jdk17 eclipse-temurin:17-jdk'], { timeout: 20_000 });
+  await expect(item).toContainText('2 slots · 1 CPU · 2g per container · up to 6g in all');
+  await expect(card).toContainText('2 of 2 containers in use');
+
+  // The run page: the sandbox line names the platform used; the command block says where it ran.
+  const run = await page.context().newPage();
+  await run.goto(`${BASE()}/p/demo-app/runs/${runId}?stage=builder`);
+  await expect(run.locator('.run-sbx')).toContainText('platforms');
+  await expect(run.locator('.run-sbx .run-sbx-plat--used')).toHaveText('✓ jdk17');
+  const blocks = run.locator('.stage-detail .chat-log .t-sbx', { hasText: 'echo built in the sandbox && ls' });
+  await expect(blocks).toHaveCount(2);
+  await expect(blocks.nth(0).locator('.t-sbx-plat')).toHaveText('default');
+  await expect(blocks.nth(1).locator('.t-sbx-plat')).toHaveText('jdk17');
+  await expect(run.locator('.stage-detail .chat-log .t-sbx', { hasText: 'setup script' }).locator('.t-sbx-plat')).toHaveText(['default', 'jdk17']);
+  await run.close();
+
+  // Cancelling the run removes the sandbox; the overview follows live.
+  expect((await page.request.post(`${BASE()}/api/runs/${runId}/cancel`, { headers: mutate })).status()).toBe(200);
+  await expect(item).toHaveCount(0, { timeout: 10_000 });
+  await expect(card).toContainText('0 of 2 containers in use');
 });

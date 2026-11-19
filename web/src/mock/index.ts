@@ -496,7 +496,8 @@ export const mockApi: Api = {
   },
   openFeed(handlers): Channel {
     let closed = false;
-    const sub = (f: Parameters<typeof handlers.onFrame>[0]) => !closed && db.loggedIn && db.me.hasGithubToken && handlers.onFrame(f);
+    // Like the backend: `sandboxes` frames go to admins only.
+    const sub = (f: Parameters<typeof handlers.onFrame>[0]) => !closed && db.loggedIn && db.me.hasGithubToken && (f.type !== 'sandboxes' || db.me.isAdmin) && handlers.onFrame(f);
     const t = setTimeout(() => {
       handlers.onOpen?.();
       db.feedSubs.add(sub);

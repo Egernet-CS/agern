@@ -173,4 +173,109 @@ class SandboxDefinitionTest {
             assertFailsWith<IllegalArgumentException>(bad) { cfgOf("FACTORY_SANDBOX_CGROUP_PARENT" to bad) }
         }
     }
+
+    @Test
+    fun `platforms, a non-root user and readiness checks`() {
+        val d = valid(
+            """
+            image: docker.io/library/eclipse-temurin:21-jdk
+            setup: echo top
+            user: builder
+            services:
+              db:
+                image: docker.io/library/postgres:17
+                ready: { command: "pg_isready -U postgres", timeoutSeconds: 90 }
+              cache:
+                image: docker.io/library/redis:7
+                ready: { command: "redis-cli ping" }
+            platforms:
+              jdk17:
+                image: docker.io/library/eclipse-temurin:17-jdk
+              debian12:
+                image: docker.io/library/debian:12
+                setup: |
+                  apt-get update
+              bare:
+                image: docker.io/library/alpine:3.20
+                setup:
+            """.trimIndent(),
+        )
+        assertEquals("builder", d.user!!.name)
+        assertEquals(1000, d.user!!.uid)
+        assertEquals(listOf("jdk17", "debian12", "bare"), d.platforms.map { it.name })
+        assertEquals("echo top", d.platforms[0].setup)
+        assertTrue(d.platforms[0].setupInherited)
+        assertEquals("apt-get update\n", d.platforms[1].setup)
+        assertFalse(d.platforms[1].setupInherited)
+        assertNull(d.platforms[2].setup, "an empty setup: means none")
+        assertEquals("pg_isready -U postgres", d.services[0].ready!!.command)
+        assertEquals(90, d.services[0].ready!!.timeoutSeconds)
+        assertEquals(60, d.services[1].ready!!.timeoutSeconds)
+        assertEquals(1001, valid("image: docker.io/library/debian:12\nuser: 1001").user!!.uid)
+        assertNull(valid("image: docker.io/library/debian:12\nuser: 1001").user!!.name)
+        // A step-1 definition has neither.
+        val old = valid("image: docker.io/library/debian:12")
+        assertTrue(old.platforms.isEmpty() && old.user == null)
+    }
+
+    @Test
+    fun `platforms, users and readiness checks are validated like the rest`() {
+        val e = errors(
+            """
+            image: docker.io/library/debian:12
+            user: root
+            services:
+              db:
+                image: docker.io/library/postgres:17
+                ready: { command: "", timeoutSeconds: 9999, interval: 2 }
+              db2:
+                image: docker.io/library/postgres:17
+                ready: pg_isready
+            platforms:
+              default: { image: docker.io/library/debian:13 }
+              Bad_Name: { image: docker.io/library/debian:13 }
+              noimage: { setup: echo }
+              unqualified: { image: debian:13 }
+              other-registry: { image: registry.example.com/x:1 }
+              extra: { image: docker.io/library/debian:13, env: { A: b } }
+            """.trimIndent(),
+        )
+        val joined = e.joinToString("\n")
+        for (expected in listOf(
+            "user: 'root' is what commands run as", "services.db.ready.interval: unknown key", "services.db.ready.command: must not be empty",
+            "services.db2.ready: must be a mapping", "platforms.default:", "platforms.Bad_Name:", "platforms.noimage.image: required",
+            "platforms.unqualified.image: 'debian:13' is not fully qualified", "platforms.other-registry.image: registry 'registry.example.com' is not allowed",
+            "platforms.extra.env: unknown key", "platforms: at most 4",
+        )) assertTrue(joined.contains(expected), "missing '$expected' in:\n$joined")
+        assertTrue(errors("image: docker.io/library/debian:12\nservices:\n  db:\n    image: docker.io/library/postgres:17\n    ready: { command: x, timeoutSeconds: 0 }")
+            .single().contains("timeoutSeconds: a whole number of seconds between 1 and 600"))
+        for (bad in listOf("0", "70000", "-1", "Bad User", "a:b")) {
+            assertTrue(errors("image: docker.io/library/debian:12\nuser: \"$bad\"").single().startsWith("user:"), bad)
+        }
+        // The cap is the server's; 0 forbids platforms.
+        val two = "image: docker.io/library/debian:12\nplatforms:\n  a: { image: docker.io/library/debian:13 }\n  b: { image: docker.io/library/debian:11 }"
+        valid(two, cfg.copy(maxPlatforms = 2))
+        assertTrue(errors(two, cfg.copy(maxPlatforms = 1)).single().contains("at most 1 on this server"))
+        assertTrue(errors(two, cfg.copy(maxPlatforms = 0)).single().contains("at most 0"))
+    }
+
+    @Test
+    fun `the platform cap from the environment`() {
+        assertEquals(4, SandboxConfig.fromEnv(mapOf<String, String>()::get).maxPlatforms)
+        assertEquals(0, SandboxConfig.fromEnv(mapOf("FACTORY_SANDBOX_MAX_PLATFORMS" to "0")::get).maxPlatforms)
+        assertFailsWith<IllegalArgumentException> { SandboxConfig.fromEnv(mapOf("FACTORY_SANDBOX_MAX_PLATFORMS" to "21")::get) }
+        assertFailsWith<IllegalArgumentException> { SandboxConfig.fromEnv(mapOf("FACTORY_SANDBOX_MAX_PLATFORMS" to "many")::get) }
+    }
+
+    @Test
+    fun `Agern's own definition is valid`() {
+        // Gradle runs the tests in server/; the file is at the repository root.
+        val file = listOf(java.nio.file.Paths.get("../.agern/sandbox.yml"), java.nio.file.Paths.get(".agern/sandbox.yml")).first { java.nio.file.Files.exists(it) }
+        val d = valid(java.nio.file.Files.readString(file))
+        assertEquals("docker.io/library/eclipse-temurin:17-jdk", d.image, "the server's Gradle toolchain is JDK 17")
+        assertEquals("ubuntu", d.user!!.name)
+        assertEquals(listOf("postgres"), d.services.map { it.name })
+        assertTrue(d.services[0].ready != null)
+        assertTrue(d.caches.all { it.startsWith("/home/ubuntu/") }, d.caches.toString())
+    }
 }

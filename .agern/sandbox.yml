@@ -1,0 +1,66 @@
+# Agern builds and tests itself in this sandbox (docs/SANDBOXES.md). An admin approves this exact file
+# before runs use it.
+#
+# Commands, from /workspace (the run's worktree):
+#   ./gradlew build                                      server: compile, tests (embedded PostgreSQL)
+#   cd web && npm ci && npm run typecheck && npm run lint && npm run build
+#   cd web && npx playwright install chromium-headless-shell && npm run e2e
+#                                                        end-to-end suite against the postgres service
+
+# JDK 17: the server's Gradle toolchain (server/build.gradle.kts), so Gradle downloads no other JDK.
+image: docker.io/library/eclipse-temurin:17-jdk
+
+# The embedded PostgreSQL of the server tests (initdb) refuses to run as root. The image is Ubuntu, whose
+# account 'ubuntu' has uid 1000.
+user: ubuntu
+
+# Runs as root once per sandbox: Node.js (the version CI uses), git and Python (the e2e suite's fake
+# GitHub and fake Claude CLI), the PostgreSQL client (the e2e suite creates and drops its database) and
+# the system libraries Playwright's Chromium needs.
+setup: |
+  set -eu
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends ca-certificates curl xz-utils git python3 postgresql-client >/dev/null
+  node_version=v24.22.3
+  case "$(uname -m)" in
+    x86_64) node_arch=x64 ;;
+    aarch64) node_arch=arm64 ;;
+    *) echo "unsupported architecture $(uname -m)" >&2; exit 1 ;;
+  esac
+  curl -fsSL "https://nodejs.org/dist/$node_version/node-$node_version-linux-$node_arch.tar.xz" |
+    tar -xJ -C /usr/local --strip-components=1 --exclude=CHANGELOG.md --exclude=LICENSE --exclude=README.md
+  playwright_version=$(node -p "require('./web/package-lock.json').packages['node_modules/playwright'].version")
+  npx --yes "playwright@$playwright_version" install-deps chromium >/dev/null
+  rm -rf /root/.npm
+  apt-get clean
+  rm -rf /var/lib/apt/lists/*
+
+env:
+  CI: "true"
+  # npm ci must not fetch every Playwright browser; the e2e step installs the one it needs.
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+  # web/e2e/server.mjs: the database is the postgres service, created and dropped with psql over TCP.
+  E2E_DB_HOST: postgres
+  E2E_DB_HOST_PORT: "5432"
+  E2E_PG_CONTAINER_CMD: env PGHOST=postgres PGPASSWORD=factory
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16
+    env:
+      POSTGRES_DB: factory
+      POSTGRES_USER: factory
+      POSTGRES_PASSWORD: factory
+    ready:
+      command: pg_isready -h 127.0.0.1 -U factory -d factory
+      timeoutSeconds: 60
+
+caches:
+  - /home/ubuntu/.gradle
+  - /home/ubuntu/.npm
+  - /home/ubuntu/.cache/ms-playwright
+
+resources:
+  cpus: 2
+  memory: 4g

@@ -6,7 +6,8 @@
 //   npm run e2e                    the Playwright suite starts and stops it by itself (e2e/global-setup.ts)
 //
 // Environment: E2E_PG_CONTAINER_CMD overrides how psql is run (default: docker compose exec on the dev
-// compose file), E2E_DB_HOST_PORT (default 54329), E2E_SKIP_BUILD=1 reuses existing server/frontend builds.
+// compose file), E2E_DB_HOST (default localhost) and E2E_DB_HOST_PORT (default 54329) where the server reaches that
+// PostgreSQL (in Agern's own sandbox: the postgres service), E2E_SKIP_BUILD=1 reuses existing server/frontend builds.
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
@@ -78,7 +79,7 @@ export async function startServer({ log = false } = {}) {
     FACTORY_HOST: '127.0.0.1',
     FACTORY_PORT: String(port),
     FACTORY_PUBLIC_URL: url,
-    FACTORY_DB_URL: `jdbc:postgresql://localhost:${process.env.E2E_DB_HOST_PORT ?? '54329'}/${db}`,
+    FACTORY_DB_URL: `jdbc:postgresql://${process.env.E2E_DB_HOST ?? 'localhost'}:${process.env.E2E_DB_HOST_PORT ?? '54329'}/${db}`,
     FACTORY_DB_USER: 'factory',
     FACTORY_DB_PASSWORD: 'factory',
     FACTORY_MASTER_KEY: randomBytes(32).toString('base64'),

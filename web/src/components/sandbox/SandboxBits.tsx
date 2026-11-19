@@ -56,6 +56,7 @@ export function RunSandboxLine({ run }: { run: Run }) {
           <span className="run-sbx-why">
             definition <code>{shortHash(sb.sha256)}</code>
           </span>
+          {(sb.platforms?.length ?? 0) > 0 && <RunPlatforms declared={sb.platforms} used={sb.platformsUsed ?? []} />}
         </>
       ) : (
         <span className="run-sbx-why">none — {WHY_NONE[sb.state] ?? sb.reason}; built and tested on the host</span>
@@ -64,5 +65,26 @@ export function RunSandboxLine({ run }: { run: Run }) {
         settings
       </Link>
     </p>
+  );
+}
+
+/** The definition's platforms on the run line: which ones the builder ran commands on, and which it did not (yet). */
+function RunPlatforms({ declared, used }: { declared: string[]; used: string[] }) {
+  const unused = declared.filter((p) => !used.includes(p));
+  return (
+    <span className="run-sbx-why run-sbx-plats">
+      platforms{' '}
+      {used.filter((p) => p !== 'default').map((p) => (
+        <span key={p} className="sbx-plat run-sbx-plat--used" title={`Commands ran on ${p}`}>
+          ✓ {p}
+        </span>
+      ))}
+      {unused.map((p) => (
+        <span key={p} className="sbx-plat run-sbx-plat--unused" title={`No command ran on ${p}`}>
+          {p}
+        </span>
+      ))}
+      {unused.length > 0 && <span className="run-sbx-plat-note"> · {unused.length === declared.length ? 'none used yet' : `${unused.length} not used`}</span>}
+    </span>
   );
 }

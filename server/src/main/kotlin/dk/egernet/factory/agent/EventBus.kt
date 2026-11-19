@@ -33,6 +33,12 @@ sealed class FeedItem(val repo: String) {
 
     /** A project's sandbox approval after an admin approved or revoked it (null: revoked). */
     class SandboxApproval(repo: String, val approval: dk.egernet.factory.SandboxApprovalDto?) : FeedItem(repo)
+
+    /**
+     * A container of a run's sandbox was created or removed, or an admin stopped the sandbox ([change]: `created`,
+     * `removed`, `stopped`). Sent to admins only (whatever they can see, like the overview), so the admin page updates live.
+     */
+    class Sandboxes(repo: String, val runId: String, val change: String) : FeedItem(repo)
 }
 
 /** In-process fan-out of live events. Persisted state is in PostgreSQL; this only carries notifications. */

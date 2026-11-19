@@ -13,8 +13,29 @@ import dk.egernet.factory.security.Tokens
 /** Where a project describes its sandbox, relative to the repository root of the base branch. */
 const val SANDBOX_FILE = ".agern/sandbox.yml"
 
+/**
+ * How the server learns that a sidecar accepts connections: [command] is run with `sh -c` inside the service's
+ * container (e.g. `pg_isready -h 127.0.0.1`) until it exits 0, for at most [timeoutSeconds].
+ */
+data class SandboxReady(val command: String, val timeoutSeconds: Int)
+
 /** A sidecar container, reachable from the sandbox under its [name]. */
-data class SandboxService(val name: String, val image: String, val env: Map<String, String>)
+data class SandboxService(val name: String, val image: String, val env: Map<String, String>, val ready: SandboxReady? = null)
+
+/**
+ * A named extra image the builder can run commands in (`platforms:`), e.g. another runtime version or distribution.
+ * [setup] is the platform's own script, or the top-level one when the platform names none ([setupInherited]).
+ */
+data class SandboxPlatform(val name: String, val image: String, val setup: String?, val setupInherited: Boolean)
+
+/**
+ * The account commands run as (`user:`): [uid] inside the container, mapped to the service user on the host. [name]
+ * is null when the definition gave a uid (the image's account with that uid is used, or `sandbox` is created).
+ */
+data class SandboxUser(val name: String?, val uid: Int) {
+    /** As written in the file. */
+    val display: String get() = name ?: uid.toString()
+}
 
 /**
  * A validated `.agern/sandbox.yml` (docs/ARCHITECTURE.md §5 "Sandboxes"). [cpus] and [memoryBytes] are the effective
@@ -30,6 +51,10 @@ data class SandboxDefinition(
     val requestedMemoryBytes: Long?,
     val cpus: Double,
     val memoryBytes: Long,
+    /** Extra images besides [image], in file order; each runs in its own container, created on first use. */
+    val platforms: List<SandboxPlatform> = emptyList(),
+    /** Null: commands run as root inside the container (the service user on the host), as before `user:` existed. */
+    val user: SandboxUser? = null,
 ) {
     /** True when the file asked for more than the server allows. */
     val capped: Boolean get() = (requestedCpus != null && requestedCpus > cpus) || (requestedMemoryBytes != null && requestedMemoryBytes > memoryBytes)
@@ -51,9 +76,21 @@ object SandboxDefinitions {
     const val MAX_SERVICES = 5
     const val MAX_CACHES = 10
     const val MAX_ENV = 100
+    const val MAX_READY_COMMAND_CHARS = 4096
+    const val DEFAULT_READY_TIMEOUT_SECONDS = 60
+    const val MAX_READY_TIMEOUT_SECONDS = 600
+    /** The uid a `user:` given by name gets inside the container. */
+    const val DEFAULT_UID = 1000
+    const val MAX_UID = 60_000
+    /** What `factory_sandbox_exec` calls the top-level image when a `platform` is named explicitly. */
+    const val DEFAULT_PLATFORM = "default"
 
-    private val TOP_KEYS = listOf("image", "setup", "env", "services", "caches", "resources")
-    private val SERVICE_KEYS = listOf("image", "env")
+    private val TOP_KEYS = listOf("image", "setup", "env", "services", "caches", "resources", "platforms", "user")
+    private val SERVICE_KEYS = listOf("image", "env", "ready")
+    private val READY_KEYS = listOf("command", "timeoutSeconds")
+    private val PLATFORM_KEYS = listOf("image", "setup")
+    private val PLATFORM_NAME_RE = Regex("^[a-z][a-z0-9-]{0,30}$")
+    private val USER_NAME_RE = Regex("^[a-z_][a-z0-9_-]{0,31}$")
     private val RESOURCE_KEYS = listOf("cpus", "memory")
     private val ENV_KEY_RE = Regex("^[A-Za-z_][A-Za-z0-9_]{0,127}$")
     private val SERVICE_NAME_RE = Regex("^[a-z][a-z0-9-]{0,30}$")
@@ -93,12 +130,7 @@ object SandboxDefinitions {
                 else -> scalar(node, "image", errors)?.let { checkImage(it, "image", cfg, errors) }
             }
         }
-        val setup = top.get<YamlNode>("setup")?.takeUnless { it is YamlNull }?.let { node ->
-            scalar(node, "setup", errors)?.also {
-                if (it.length > MAX_SETUP_CHARS) errors += "setup: longer than $MAX_SETUP_CHARS characters"
-                if ('\u0000' in it) errors += "setup: contains a NUL character"
-            }?.takeIf { it.isNotBlank() }
-        }
+        val setup = top.get<YamlNode>("setup")?.takeUnless { it is YamlNull }?.let { setupScript(it, "setup", errors) }
         val env = top.get<YamlNode>("env")?.takeUnless { it is YamlNull }?.let { envMap(it, "env", errors) } ?: emptyMap()
 
         val services = mutableListOf<SandboxService>()
@@ -122,7 +154,8 @@ object SandboxDefinitions {
                         ?.let { checkImage(it, "$path.image", cfg, errors) }
                     if (sm.get<YamlNode>("image") == null || sm.get<YamlNode>("image") is YamlNull) errors += "$path.image: required"
                     val senv = sm.get<YamlNode>("env")?.takeUnless { it is YamlNull }?.let { envMap(it, "$path.env", errors) } ?: emptyMap()
-                    if (simg != null) services += SandboxService(name, simg, senv)
+                    val ready = sm.get<YamlNode>("ready")?.takeUnless { it is YamlNull }?.let { ready(it, "$path.ready", errors) }
+                    if (simg != null) services += SandboxService(name, simg, senv, ready)
                 }
             }
         }
@@ -170,6 +203,53 @@ object SandboxDefinitions {
             }
         }
 
+        val platforms = mutableListOf<SandboxPlatform>()
+        top.get<YamlNode>("platforms")?.takeUnless { it is YamlNull }?.let { node ->
+            val m = node as? YamlMap
+            if (m == null) errors += "platforms: must be a mapping of platform name to { image, setup }"
+            else {
+                if (m.entries.size > cfg.maxPlatforms) {
+                    errors += "platforms: at most ${cfg.maxPlatforms} on this server (FACTORY_SANDBOX_MAX_PLATFORMS)"
+                }
+                for ((k, v) in m.entries) {
+                    val name = k.content
+                    val path = "platforms.$name"
+                    if (!PLATFORM_NAME_RE.matches(name) || name == DEFAULT_PLATFORM) {
+                        errors += "$path: platform names are lower-case letters, digits and '-', start with a letter, at most 31 characters, " +
+                            "and not '$DEFAULT_PLATFORM' (the top-level image)"
+                        continue
+                    }
+                    val pm = v as? YamlMap
+                    if (pm == null) { errors += "$path: must be a mapping with `image:` (and optionally `setup:`)"; continue }
+                    unknownKeys(pm, PLATFORM_KEYS, "$path.", errors)
+                    val pimgNode = pm.get<YamlNode>("image")?.takeUnless { it is YamlNull }
+                    if (pimgNode == null) errors += "$path.image: required"
+                    val pimg = pimgNode?.let { scalar(it, "$path.image", errors) }?.let { checkImage(it, "$path.image", cfg, errors) }
+                    // No `setup:` key: the top-level script. `setup:` present but empty: none.
+                    val setupNode = pm.get<YamlNode>("setup")
+                    val inherited = setupNode == null
+                    val psetup = if (inherited) setup else setupNode.takeUnless { it is YamlNull }?.let { setupScript(it, "$path.setup", errors) }
+                    if (pimg != null) platforms += SandboxPlatform(name, pimg, psetup, inherited)
+                }
+            }
+        }
+
+        val user = top.get<YamlNode>("user")?.takeUnless { it is YamlNull }?.let { node ->
+            scalar(node, "user", errors)?.trim()?.let { u ->
+                val n = u.toLongOrNull()
+                when {
+                    n != null && n == 0L -> { errors += "user: 0 is root, which commands run as without `user:`"; null }
+                    n != null && (n < 1 || n > MAX_UID) -> { errors += "user: a uid must be between 1 and $MAX_UID"; null }
+                    n != null -> SandboxUser(null, n.toInt())
+                    u == "root" -> { errors += "user: 'root' is what commands run as without `user:`"; null }
+                    !USER_NAME_RE.matches(u) -> {
+                        errors += "user: '$u' is neither a uid nor a user name (lower-case letters, digits, '_' and '-', at most 32 characters)"; null
+                    }
+                    else -> SandboxUser(u, DEFAULT_UID)
+                }
+            }
+        }
+
         if (errors.isNotEmpty() || image == null) return ParsedDefinition.Invalid(hash, errors.ifEmpty { listOf("image: required") })
         return ParsedDefinition.Valid(
             hash,
@@ -177,6 +257,7 @@ object SandboxDefinitions {
                 image = image, setup = setup, env = env, services = services, caches = caches,
                 requestedCpus = cpus, requestedMemoryBytes = memory,
                 cpus = minOf(cpus ?: cfg.maxCpus, cfg.maxCpus), memoryBytes = minOf(memory ?: cfg.maxMemoryBytes, cfg.maxMemoryBytes),
+                platforms = platforms, user = user,
             ),
         )
     }
@@ -224,6 +305,32 @@ object SandboxDefinitions {
         }
         if (path.isEmpty() || path.length > 255) return false
         return path.split('/').all { PATH_COMPONENT_RE.matches(it) }
+    }
+
+    private fun setupScript(node: YamlNode, path: String, errors: MutableList<String>): String? =
+        scalar(node, path, errors)?.also {
+            if (it.length > MAX_SETUP_CHARS) errors += "$path: longer than $MAX_SETUP_CHARS characters"
+            if ('\u0000' in it) errors += "$path: contains a NUL character"
+        }?.takeIf { it.isNotBlank() }
+
+    private fun ready(node: YamlNode, path: String, errors: MutableList<String>): SandboxReady? {
+        val m = node as? YamlMap
+        if (m == null) { errors += "$path: must be a mapping with `command:` (and optionally `timeoutSeconds:`)"; return null }
+        unknownKeys(m, READY_KEYS, "$path.", errors)
+        val command = m.get<YamlNode>("command")?.takeUnless { it is YamlNull }?.let { scalar(it, "$path.command", errors) }
+        if (command == null) { if (m.get<YamlNode>("command").let { it == null || it is YamlNull }) errors += "$path.command: required"; return null }
+        if (command.isBlank()) { errors += "$path.command: must not be empty"; return null }
+        if (command.length > MAX_READY_COMMAND_CHARS || '\u0000' in command) { errors += "$path.command: too long or contains NUL"; return null }
+        var timeout = DEFAULT_READY_TIMEOUT_SECONDS
+        m.get<YamlNode>("timeoutSeconds")?.takeUnless { it is YamlNull }?.let { scalar(it, "$path.timeoutSeconds", errors) }?.let { t ->
+            val v = t.trim().toIntOrNull()
+            if (v == null || v < 1 || v > MAX_READY_TIMEOUT_SECONDS) {
+                errors += "$path.timeoutSeconds: a whole number of seconds between 1 and $MAX_READY_TIMEOUT_SECONDS"
+                return null
+            }
+            timeout = v
+        }
+        return SandboxReady(command, timeout)
     }
 
     private fun unknownKeys(m: YamlMap, allowed: List<String>, prefix: String, errors: MutableList<String>) {

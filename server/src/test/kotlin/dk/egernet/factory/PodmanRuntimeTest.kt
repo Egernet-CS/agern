@@ -170,4 +170,40 @@ class PodmanRuntimeTest {
         rt.removeContainers(emptyList())
         assertFalse(rec.calls.last().contains("rm"), "no rm without names")
     }
+
+    @Test
+    fun `a platform container with a non-root user`() {
+        val withUser = def.copy(
+            platforms = listOf(dk.egernet.factory.sandbox.SandboxPlatform("jdk17", "docker.io/library/eclipse-temurin:17-jdk", "true", true)),
+            user = dk.egernet.factory.sandbox.SandboxUser("builder", 1000),
+        )
+        val spec = manager.commandSpec(runId, "demo-app", Paths.get("/w"), withUser, withUser.platforms[0])
+        val cacheVolume = manager.cacheVolumeName("demo-app", "/root/.gradle", "jdk17")
+        assertTrue(cacheVolume != manager.cacheVolumeName("demo-app", "/root/.gradle"), "platforms have their own cache volumes")
+        assertEquals(
+            listOf(
+                "podman", "run", "--detach", "--name", "agern-run-$runId--jdk17",
+                "--label", "agern.run=$runId", "--label", "agern.repo=demo-app", "--label", "agern.role=platform", "--label", "agern.platform=jdk17",
+                "--network", "agern-run-$runId", "--userns", "keep-id:uid=1000,gid=1000", "--user", "0:0",
+                "--security-opt", "no-new-privileges", "--pids-limit", "4096", "--cpus", "1.5", "--memory", "2g", "--memory-swap", "2g",
+                "--stop-timeout", "5", "--pull=missing",
+                "--workdir", "/workspace", "--entrypoint", "sh",
+                "--env", "CI=true",
+                "--mount", "type=bind,source=/w,target=/workspace",
+                "--mount", "type=volume,source=$cacheVolume,target=/root/.gradle",
+                "docker.io/library/eclipse-temurin:17-jdk",
+                "-c", "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait \$!; done",
+            ),
+            PodmanRuntime.runArgs(cfg, spec),
+        )
+        // The default container of the same definition: same user mapping; services never get one.
+        assertTrue(PodmanRuntime.runArgs(cfg, manager.mainSpec(runId, "demo-app", Paths.get("/w"), withUser)).containsAll(listOf("keep-id:uid=1000,gid=1000", "0:0")))
+        assertFalse(PodmanRuntime.runArgs(cfg, manager.serviceSpec(runId, "demo-app", withUser.services[0], withUser)).contains("--userns"))
+        assertEquals(
+            listOf("podman", "exec", "--user", "1000:1000", "--env", "HOME=/home/builder", "--env", "USER=builder", "--env", "LOGNAME=builder",
+                "--workdir", "/workspace", "agern-run-x", "true"),
+            PodmanRuntime.execArgs(cfg, "agern-run-x", "/workspace", listOf("true"), dk.egernet.factory.sandbox.ExecUser(1000, 1000, "builder", "/home/builder")),
+        )
+        assertEquals(listOf("podman", "logs", "--tail", "30", "agern-run-x-db"), PodmanRuntime.logsArgs(cfg, "agern-run-x-db", 30))
+    }
 }

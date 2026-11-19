@@ -48,6 +48,8 @@ dependencies {
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
     testImplementation("io.zonky.test:embedded-postgres:2.1.0")
     testImplementation(enforcedPlatform("io.zonky.test.postgres:embedded-postgres-binaries-bom:16.6.0"))
+    // Linux on arm64 is not among embedded-postgres' default binaries (e.g. Agern's own sandbox on an arm64 host).
+    testImplementation("io.zonky.test.postgres:embedded-postgres-binaries-linux-arm64v8")
 }
 
 kotlin {

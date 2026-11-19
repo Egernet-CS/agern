@@ -319,7 +319,9 @@ CPU and memory). Once an admin has approved that file, the builder agent of each
 and tests in that run's own container through two MCP tools, with the run's worktree mounted at
 `/workspace` and nothing else from the host. Projects then need no toolchain installed on the
 machine, a test database is per run, and a memory-hungry test is killed in its container instead of
-taking the machine down. The details are in [ARCHITECTURE.md §5](ARCHITECTURE.md#sandboxes).
+taking the machine down. How a project writes its `.agern/sandbox.yml` (platforms, services and their
+readiness checks, a non-root user, caches, examples) is in [SANDBOXES.md](SANDBOXES.md); the server's
+side is in [ARCHITECTURE.md §5](ARCHITECTURE.md#sandboxes).
 
 **What they are not, in this release.** The agent itself still runs on the host as the `agern`
 user, with its permissions bypassed. It can reach everything that user can — including Podman and
@@ -387,14 +389,18 @@ All in `/etc/agern/agern.env` (restart Agern after a change):
 |---|---|---|
 | `FACTORY_SANDBOX_MAX_CPUS` | `2` | CPUs per container (cap and default) |
 | `FACTORY_SANDBOX_MAX_MEMORY` | `4g` | memory per container, no swap on top |
-| `FACTORY_SANDBOX_MAX_CONCURRENT` | `2` | sandboxes at the same time; a builder over the cap is told to wait |
+| `FACTORY_SANDBOX_MAX_CONCURRENT` | `2` | containers that run commands at the same time, over all runs: a run's sandbox counts one, and one more per platform it uses; a builder over the cap is told to wait (a run that holds several gives up its own idle ones first) |
+| `FACTORY_SANDBOX_MAX_PLATFORMS` | `4` | platforms a definition may name besides its default image (`0` forbids them) |
 | `FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES` | `30` | longest single command |
 | `FACTORY_SANDBOX_REGISTRIES` | `docker.io,ghcr.io,quay.io,mcr.microsoft.com` | registries images may come from |
 | `AGERN_SANDBOX_PRUNE_HOURS` | `168` | age after which unused images and volumes are removed |
 
-Every container also gets a limit of 4096 processes. Sidecars have the same limits as the sandbox,
-so a run with one database uses up to twice the memory. Size the machine for
-`FACTORY_SANDBOX_MAX_CONCURRENT × (1 + sidecars) × FACTORY_SANDBOX_MAX_MEMORY` on top of the agents.
+Every container also gets a limit of 4096 processes. Sidecars and platform containers have the same
+limits as the sandbox, so a run with one database uses up to twice the memory, and three times when
+it also tests on a platform. Sidecars do not take a slot of `FACTORY_SANDBOX_MAX_CONCURRENT`, so size
+the machine for about `(FACTORY_SANDBOX_MAX_CONCURRENT + concurrent runs × sidecars) ×
+FACTORY_SANDBOX_MAX_MEMORY` on top of the agents. The admin page shows, per run, its containers and
+the memory they may use together.
 To cap all sandboxes together, give their unit a limit, e.g. `sudo systemctl edit agern-sandbox`:
 
 ```ini

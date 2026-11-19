@@ -10,14 +10,28 @@ import { timeAgo } from '../lib/format';
 import { useFeedReconnects, useSandboxApprovalFeed, withApproval } from '../lib/realtime';
 
 const EXAMPLE = `image: docker.io/library/eclipse-temurin:21-jdk
+user: builder                      # optional: commands run as this user, setup as root
 setup: |
   apt-get update && apt-get install -y nodejs npm
 services:
   postgres:
     image: docker.io/library/postgres:17
     env: { POSTGRES_PASSWORD: dev }
-caches: [ /root/.gradle, /root/.npm ]
-resources: { cpus: 2, memory: 4g }`;
+    ready: { command: "pg_isready -h 127.0.0.1", timeoutSeconds: 60 }
+caches: [ /home/builder/.gradle, /home/builder/.npm ]
+resources: { cpus: 2, memory: 4g }
+platforms:                         # optional: more images to test on
+  jdk17:
+    image: docker.io/library/eclipse-temurin:17-jdk`;
+
+/** Every image an approval lets run: the default one, the platforms', the services'. */
+function imagesOf(def: SandboxDefinition): { role: string; image: string }[] {
+  return [
+    { role: 'default', image: def.image },
+    ...def.platforms.map((p) => ({ role: `platform ${p.name}`, image: p.image })),
+    ...def.services.map((s) => ({ role: `service ${s.name}`, image: s.image })),
+  ];
+}
 
 /** A project's sandbox definition, its approval and (for admins) approve / revoke (docs/ARCHITECTURE.md §10). */
 export function SandboxPage() {
@@ -73,6 +87,7 @@ export function SandboxPage() {
   const changed = st.state === 'pending' && !!st.approval;
   const canApprove = me.isAdmin && st.state === 'pending' && !!st.sha256;
   const canRevoke = me.isAdmin && !!st.approval;
+  const setups = setupScripts(st.definition);
   const approvers = st.approvers.map((a) => a.displayName && a.displayName !== a.username ? `${a.displayName} (${a.username})` : a.username);
 
   return (
@@ -146,19 +161,24 @@ export function SandboxPage() {
         <div className="form">
           <p>
             <strong>
-              The images below{st.definition?.setup ? ' and the setup script' : ''} will run on the factory host, in rootless containers, for every run of {repo}
+              The images below{setups.length ? ` and the setup script${setups.length === 1 ? '' : 's'}` : ''} will run on the factory host, in rootless containers, for every run of {repo}
             </strong>{' '}
             until the file changes or the approval is revoked.
           </p>
           <ul className="sbx-images">
-            {st.definition && [st.definition.image, ...st.definition.services.map((s) => s.image)].map((im, i) => <li key={i}><code>{im}</code></li>)}
+            {st.definition &&
+              imagesOf(st.definition).map((im, i) => (
+                <li key={i}>
+                  <span className="muted small sbx-img-role">{im.role}</span> <code>{im.image}</code>
+                </li>
+              ))}
           </ul>
-          {st.definition?.setup && (
-            <>
-              <p className="muted small">Setup script (runs when a run’s sandbox is created):</p>
-              <pre className="sbx-pre sbx-pre--small">{st.definition.setup}</pre>
-            </>
-          )}
+          {setups.map((x) => (
+            <div key={x.label}>
+              <p className="muted small">Setup script {x.label} (runs as root when that container is created):</p>
+              <pre className="sbx-pre sbx-pre--small">{x.script}</pre>
+            </div>
+          ))}
           <p className="muted small">
             You approve exactly this version (sha256 <code>{shortHash(st.sha256)}</code>); any change to the file needs a new approval. The sandbox gives the project its toolchain, services and
             limits — it does not contain the agent itself.
@@ -191,6 +211,16 @@ export function SandboxPage() {
       </Dialog>
     </div>
   );
+}
+
+/** The distinct setup scripts that will run: the top-level one (also for platforms that inherit it) and platforms' own. */
+function setupScripts(def: SandboxDefinition | null): { label: string; script: string }[] {
+  if (!def) return [];
+  const out: { label: string; script: string }[] = [];
+  const inheriting = def.platforms.filter((p) => p.setupInherited).map((p) => p.name);
+  if (def.setup) out.push({ label: inheriting.length ? `of the default image and ${inheriting.join(', ')}` : 'of the default image', script: def.setup });
+  for (const p of def.platforms) if (!p.setupInherited && p.setup) out.push({ label: `of platform ${p.name}`, script: p.setup });
+  return out;
 }
 
 function StateNotice({ st }: { st: SandboxStatus }) {
@@ -293,8 +323,38 @@ function DefinitionCard({ def }: { def: SandboxDefinition }) {
       <dl className="sbx-dl-grid">
         <dt>image</dt>
         <dd><code className="sbx-image">{def.image}</code></dd>
+        <dt>user</dt>
+        <dd>
+          {def.user ? (
+            <>
+              commands run as <code>{def.user.name ?? `uid ${def.user.uid}`}</code>
+              {def.user.name && <span className="muted"> (uid {def.user.uid})</span>}; setup runs as root.{' '}
+              <span className="muted small">Files the commands write in the worktree belong to Agern’s service user on the host.</span>
+            </>
+          ) : (
+            <span className="muted">root inside the container (Agern’s service user on the host)</span>
+          )}
+        </dd>
         <dt>setup</dt>
         <dd>{def.setup ? <pre className="sbx-pre sbx-pre--small">{def.setup}</pre> : <span className="muted">none</span>}</dd>
+        <dt>platforms</dt>
+        <dd>
+          {def.platforms.length === 0 ? (
+            <span className="muted">none — commands run in the image above only</span>
+          ) : (
+            <ul className="sbx-services sbx-platforms">
+              {def.platforms.map((p) => (
+                <li key={p.name}>
+                  <strong className="mono">{p.name}</strong> <code>{p.image}</code>
+                  <div className="muted small">
+                    {p.setupInherited ? (def.setup ? 'setup: the top-level script' : 'setup: none (the top level has none)') : p.setup ? 'setup: its own script' : 'setup: none'}
+                  </div>
+                  {!p.setupInherited && p.setup && <pre className="sbx-pre sbx-pre--small">{p.setup}</pre>}
+                </li>
+              ))}
+            </ul>
+          )}
+        </dd>
         <dt>environment</dt>
         <dd><EnvList env={def.env} /></dd>
         <dt>services</dt>
@@ -307,6 +367,15 @@ function DefinitionCard({ def }: { def: SandboxDefinition }) {
                 <li key={s.name}>
                   <strong className="mono">{s.name}</strong> <code>{s.image}</code>
                   {Object.keys(s.env).length > 0 && <EnvList env={s.env} />}
+                  <div className="muted small sbx-ready">
+                    {s.ready ? (
+                      <>
+                        ready when <code>{s.ready.command}</code> succeeds (waits up to {s.ready.timeoutSeconds} s)
+                      </>
+                    ) : (
+                      'no readiness check — commands may start before it accepts connections'
+                    )}
+                  </div>
                 </li>
               ))}
             </ul>
@@ -317,6 +386,12 @@ function DefinitionCard({ def }: { def: SandboxDefinition }) {
         <dt>resources</dt>
         <dd>
           {l.cpus} CPU{l.cpus === 1 ? '' : 's'} · {l.memory} memory <span className="muted">per container</span>
+          {def.platforms.length > 0 && (
+            <span className="muted small">
+              {' '}
+              — each platform in use is another container with these limits
+            </span>
+          )}
           {l.capped && (
             <span className="sbx-capped">
               {' '}

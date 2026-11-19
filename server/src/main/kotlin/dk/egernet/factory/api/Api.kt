@@ -732,6 +732,11 @@ private fun Route.wsRoutes(s: Services) {
         webSocket("/feed") {
             val u = call.requireUser(s)
             s.bus.feed.collect { item ->
+                if (item is FeedItem.Sandboxes) {
+                    // Admins see every sandbox in the overview, also of projects they cannot see; others get nothing.
+                    if (u.isAdmin) send(Frame.Text(AppJson.encodeToString(FeedFrame.serializer(), FeedFrame(type = "sandboxes", runId = item.runId, change = item.change))))
+                    return@collect
+                }
                 val visible = withContext(Dispatchers.IO) { s.access.canSee(u, item.repo) }
                 if (!visible) return@collect
                 val frame = when (item) {
@@ -742,6 +747,7 @@ private fun Route.wsRoutes(s: Services) {
                     is FeedItem.Release -> FeedFrame(type = "release", repo = item.repo, release = item.release)
                     is FeedItem.ReleaseDeleted -> FeedFrame(type = "release_deleted", repo = item.repo, releaseId = item.releaseId)
                     is FeedItem.SandboxApproval -> FeedFrame(type = "sandbox_approval", repo = item.repo, approval = item.approval)
+                    is FeedItem.Sandboxes -> return@collect
                 }
                 send(Frame.Text(AppJson.encodeToString(FeedFrame.serializer(), frame)))
             }

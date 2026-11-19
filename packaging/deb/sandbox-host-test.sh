@@ -217,8 +217,8 @@ EOF
     eq "gradle (as agern in agern.service) exit status" 0 "$status"
     if [ -f "$xml" ]; then
         head -n 2 "$xml" | tail -n 1
-        sed -n '/<system-out>/,/<\/system-out>/p' "$xml" | head -n 20
-        grep -q 'tests="1" skipped="0" failures="0" errors="0"' "$xml" && pass "PodmanIntegrationTest ran and passed" || { fail "PodmanIntegrationTest"; sed -n '/<failure/,/<\/failure>/p' "$xml" | head -n 60; }
+        sed -n '/<system-out>/,/<\/system-out>/p' "$xml" | head -n 40
+        grep -qE 'tests="[1-9][0-9]*" skipped="0" failures="0" errors="0"' "$xml" && pass "PodmanIntegrationTest ran and passed" || { fail "PodmanIntegrationTest"; sed -n '/<failure/,/<\/failure>/p' "$xml" | head -n 60; }
     else
         fail "no test report at $xml"
     fi
