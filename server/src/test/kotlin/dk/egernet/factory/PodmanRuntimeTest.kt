@@ -84,6 +84,24 @@ class PodmanRuntimeTest {
     }
 
     @Test
+    fun `commands raise their oom_score_adj, then run with sh -lc`() {
+        val cmd = SandboxManager.shellCommand("./gradlew test")
+        assertEquals(listOf("sh", "-c", "{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; exec sh -lc \"\$1\"", "sh", "./gradlew test"), cmd)
+        assertEquals("./gradlew test", cmd.last())
+    }
+
+    @Test
+    fun `a cgroup parent when configured`() {
+        val withParent = remote.copy(cgroupParent = "/system.slice/agern-sandbox.service/containers")
+        val args = PodmanRuntime.runArgs(withParent, manager.serviceSpec(runId, "demo-app", def.services[0], def))
+        val i = args.indexOf("--cgroup-parent")
+        assertTrue(i > 0, "no --cgroup-parent in $args")
+        assertEquals("/system.slice/agern-sandbox.service/containers", args[i + 1])
+        assertEquals("--pull=missing", args[i - 1])
+        assertFalse(PodmanRuntime.runArgs(cfg, manager.serviceSpec(runId, "demo-app", def.services[0], def)).contains("--cgroup-parent"))
+    }
+
+    @Test
     fun `nothing that widens the boundary is ever passed`() {
         val all = listOf(
             PodmanRuntime.runArgs(cfg, manager.mainSpec(runId, "r", Paths.get("/w"), def)),
@@ -105,14 +123,22 @@ class PodmanRuntimeTest {
         assertEquals(listOf("podman", "exec", "--workdir", "/workspace", "agern-run-x", "sh", "-lc", "./gradlew test"),
             PodmanRuntime.execArgs(cfg, "agern-run-x", "/workspace", listOf("sh", "-lc", "./gradlew test")))
         assertEquals(listOf("podman", "restart", "--time", "0", "agern-run-x"), PodmanRuntime.restartArgs(cfg, "agern-run-x"))
-        assertEquals(listOf("podman", "rm", "--force", "--ignore", "a", "b"), PodmanRuntime.removeContainersArgs(cfg, listOf("a", "b")))
+        // --volumes: anonymous volumes (e.g. a sidecar image's VOLUME) go with the container; named cache volumes stay.
+        assertEquals(listOf("podman", "rm", "--force", "--ignore", "--volumes", "a", "b"), PodmanRuntime.removeContainersArgs(cfg, listOf("a", "b")))
         assertEquals(listOf("podman", "network", "rm", "--force", "agern-run-x"), PodmanRuntime.removeNetworkArgs(cfg, "agern-run-x"))
         assertEquals(listOf("podman", "volume", "exists", "v"), PodmanRuntime.volumeExistsArgs(cfg, "v"))
         assertEquals(listOf("podman", "volume", "create", "--label", "agern.repo=r", "v"), PodmanRuntime.createVolumeArgs(cfg, "v", mapOf("agern.repo" to "r")))
         assertEquals(listOf("podman", "ps", "--all", "--filter", "label=agern.run", "--format", "{{.Names}}\t{{index .Labels \"agern.run\"}}"),
             PodmanRuntime.listContainersArgs(cfg))
-        assertEquals(listOf("podman", "network", "ls", "--filter", "label=agern.run", "--format", "{{.Name}}\t{{index .Labels \"agern.run\"}}"),
+        assertEquals(listOf("podman", "network", "ls", "--filter", "label=agern.run", "--format", "json"),
             PodmanRuntime.listNetworksArgs(cfg))
+        // As Podman 4.9 prints it (other fields left out); no networks: [] (older versions: null).
+        val json = """[{"name":"agern-run-a","driver":"bridge","labels":{"agern.repo":"r","agern.run":"a"}},
+            {"name":"other","labels":{"x":"y"}},{"name":"agern-run-b","labels":{"agern.run":"b"}}]"""
+        assertEquals(listOf(LabelledResource("agern-run-a", "a"), LabelledResource("agern-run-b", "b")), PodmanRuntime.parseNetworksJson(json))
+        assertEquals(emptyList(), PodmanRuntime.parseNetworksJson("[]\n"))
+        assertEquals(emptyList(), PodmanRuntime.parseNetworksJson("null"))
+        assertFailsWith<SandboxRuntimeException> { PodmanRuntime.parseNetworksJson("Error: something") }
         assertEquals(listOf("/usr/bin/podman", "--url", "unix:///run/agern-podman/podman.sock", "exec", "--workdir", "/workspace", "c", "true"),
             PodmanRuntime.execArgs(remote, "c", "/workspace", listOf("true")))
     }

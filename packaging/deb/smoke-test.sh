@@ -11,6 +11,12 @@
 # 'agern rollback'; dpkg ordering of main builds; remove and purge. Higher versions are made by
 # repacking the given package with another version number.
 #
+# Sandboxes: only what the package scripts do without systemd and Podman — files, 'agern sandbox
+# enable' without Podman (exact install hint, nothing changed), the subordinate id allocation
+# (the real function, against other users' ranges and uids), the settings surviving upgrades,
+# 'agern sandbox disable', purge. Rootless Podman itself needs a real systemd host:
+# packaging/deb/sandbox-host-test.sh (CI runs it on an Ubuntu 24.04 VM).
+#
 # --server also starts the server against a native PostgreSQL (without systemd: 'agern run' as
 # the agern user), checks /api/health and /api/internal/activity, and drives the automatic
 # upgrade: postponed while an agent is busy, given up after the maximum wait, installed when idle.
@@ -112,6 +118,13 @@ eq "/usr/bin/agern" "root:root 755" "$(stat_of /usr/bin/agern)"
 eq "/usr/share/agern/agern.jar" "root:root 644" "$(stat_of /usr/share/agern/agern.jar)"
 check "agern.service at /usr/lib/systemd/system" test -f /usr/lib/systemd/system/agern.service
 check "agern-upgrade.timer at /usr/lib/systemd/system" test -f /usr/lib/systemd/system/agern-upgrade.timer
+for u in agern-sandbox.socket agern-sandbox.service agern-sandbox-prune.service agern-sandbox-prune.timer; do
+    check "$u at /usr/lib/systemd/system" test -f "/usr/lib/systemd/system/$u"
+done
+eq "/usr/lib/agern/sandbox-service" "root:root 755" "$(stat_of /usr/lib/agern/sandbox-service)"
+eq "/usr/share/agern/podman/containers.conf" "root:root 644" "$(stat_of /usr/share/agern/podman/containers.conf)"
+eq "/usr/share/agern/podman/storage.conf" "root:root 644" "$(stat_of /usr/share/agern/podman/storage.conf)"
+check "no sandbox unit enabled by the install" test ! -e /etc/systemd/system/sockets.target.wants/agern-sandbox.socket
 eq "/etc/agern" "root:root 755" "$(stat_of /etc/agern)"
 eq "/etc/agern/agern.env" "root:agern 640" "$(stat_of /etc/agern/agern.env)"
 eq "/var/lib/agern" "agern:agern 750" "$(stat_of /var/lib/agern)"
@@ -146,12 +159,79 @@ printf '%s' "$doc" | grep -q 'ok    agern is in group(s): agern$' && pass "docto
 printf '%s' "$doc" | grep -q 'FAIL  claude not found.*claude.ai/install.sh' && pass "doctor: claude missing, with install hint" || fail "doctor: claude hint"
 printf '%s' "$doc" | grep -q 'FAIL  gh not found.*apt install gh' && pass "doctor: gh missing, with install hint" || fail "doctor: gh hint"
 printf '%s' "$doc" | grep -q 'FAIL  FACTORY_GITHUB_ORG is not set' && pass "doctor: org not set" || fail "doctor: org not set"
+printf '%s' "$doc" | grep -q "ok    sandboxes off ('sudo agern sandbox enable' turns them on)" && pass "doctor: sandboxes off, one line" || fail "doctor: sandboxes off"
 
 sed -i 's/^AGERN_UPGRADE_CHANNEL=stable$/AGERN_UPGRADE_CHANNEL=main/' /etc/agern/agern.env
 agern auto-upgrade status | grep -q '^channel: *main$' && pass "auto-upgrade status (root) reads the channel" || fail "auto-upgrade status as root"
 nobody_out=$(runuser -u nobody -- agern auto-upgrade status 2>&1 || true)
 printf '%s' "$nobody_out" | grep -q '^channel: *unknown (cannot read' && pass "auto-upgrade status without root says it cannot read the channel" || fail "auto-upgrade status without root: $nobody_out"
 sed -i 's/^AGERN_UPGRADE_CHANNEL=main$/AGERN_UPGRADE_CHANNEL=stable/' /etc/agern/agern.env
+
+section "sandboxes: package scripts without systemd and Podman"
+out=$(agern sandbox status 2>&1) || true
+printf '%s\n' "$out"
+printf '%s' "$out" | grep -q '^sandboxes: *off$' && pass "sandbox status (root): off" || fail "sandbox status: $out"
+out=$(runuser -u nobody -- agern sandbox status 2>&1) || true
+printf '%s' "$out" | grep -q '^sandboxes: *unknown (cannot read' && pass "sandbox status without root says it cannot read the setting" || fail "sandbox status as nobody: $out"
+printf '%s' "$out" | grep -q '^containers: *unknown (only root and agern' && pass "sandbox status without root says it cannot query Podman" || fail "sandbox status as nobody (containers): $out"
+command -v podman >/dev/null 2>&1 && fail "podman is installed in the test image (the hint test needs it absent)"
+ENV_SUM=$(sha256sum /etc/agern/agern.env | cut -d' ' -f1)
+SUBID_SUM=$(cat /etc/subuid /etc/subgid 2>/dev/null | sha256sum | cut -d' ' -f1)
+set +e
+out=$(agern sandbox enable 2>&1)
+rc=$?
+set -e
+printf '%s\n' "$out"
+[ "$rc" != 0 ] && pass "sandbox enable without Podman fails" || fail "sandbox enable without Podman (rc $rc)"
+printf '%s' "$out" | grep -qx '  sudo apt install podman uidmap netavark aardvark-dns crun slirp4netns passt' && pass "sandbox enable names the exact packages to install" || fail "sandbox enable install hint"
+printf '%s' "$out" | grep -q 'nothing was changed' && pass "sandbox enable says nothing was changed" || fail "sandbox enable: nothing changed message"
+eq "agern.env unchanged by the failed enable" "$ENV_SUM" "$(sha256sum /etc/agern/agern.env | cut -d' ' -f1)"
+eq "subordinate ids unchanged by the failed enable" "$SUBID_SUM" "$(cat /etc/subuid /etc/subgid 2>/dev/null | sha256sum | cut -d' ' -f1)"
+check "socket not enabled by the failed enable" test ! -e /etc/systemd/system/sockets.target.wants/agern-sandbox.socket
+out=$(runuser -u nobody -- agern sandbox enable 2>&1) || true
+printf '%s' "$out" | grep -q 'needs root' && pass "sandbox enable without root refused" || fail "sandbox enable as nobody: $out"
+
+# The allocation of subordinate ids: the real functions from packaging/agern, against other users'
+# ranges in /etc/subuid and /etc/subgid and a real uid inside a free-looking block.
+eval "$(sed -n -e '/^subid_range() {/,/^}/p' -e '/^subid_free() {/,/^}/p' -e '/^sandbox_ensure_subids() {/,/^}/p' "$SRC_DIR/packaging/agern")"
+# shellcheck disable=SC2034 # used by the functions taken from packaging/agern
+AGERN_USER=agern SANDBOX_SUBID_COUNT=65536 SUBIDS_CHANGED=0
+# shellcheck disable=SC2317,SC2329 # called by those functions (taken in with eval above)
+info() { printf 'agern: %s\n' "$*"; }
+# shellcheck disable=SC2317,SC2329
+die() { printf 'agern: error: %s\n' "$*" >&2; return 1; }
+printf 'alice:100000:65536\nbob:165536:65536\ncarol:300000:1000\n' >/etc/subuid
+printf 'alice:100000:65536\ndave:231072:65536\n' >/etc/subgid
+useradd --uid 362144 --no-create-home bigid
+sandbox_ensure_subids
+eq "subuid range avoids other ranges and uid 362144" "agern:427680:65536" "$(grep '^agern:' /etc/subuid)"
+eq "subgid range is the same block" "agern:427680:65536" "$(grep '^agern:' /etc/subgid)"
+eq "SUBIDS_CHANGED after allocating" 1 "$SUBIDS_CHANGED"
+SUBID_SUM=$(cat /etc/subuid /etc/subgid | sha256sum | cut -d' ' -f1)
+SUBIDS_CHANGED=0
+sandbox_ensure_subids
+eq "allocation again: nothing changes" "$SUBID_SUM" "$(cat /etc/subuid /etc/subgid | sha256sum | cut -d' ' -f1)"
+eq "SUBIDS_CHANGED when kept" 0 "$SUBIDS_CHANGED"
+sed -i '/^agern:/d' /etc/subgid
+sandbox_ensure_subids
+eq "only the missing subgid range is added, clear of all ranges" "agern:493216:65536" "$(grep '^agern:' /etc/subgid)"
+eq "subuid range kept" "agern:427680:65536" "$(grep '^agern:' /etc/subuid)"
+eq "other users' ranges untouched" "alice:100000:65536 bob:165536:65536 carol:300000:1000" "$(grep -v '^agern:' /etc/subuid | tr '\n' ' ' | sed 's/ $//')"
+userdel bigid
+unset -f info die
+
+# An installation with sandboxes on (as 'agern sandbox enable' leaves agern.env): doctor's checks,
+# then the settings must survive the upgrades below.
+printf 'FACTORY_SANDBOX=podman\nFACTORY_SANDBOX_PODMAN_URL=unix:///run/agern-podman/podman.sock\nFACTORY_SANDBOX_CGROUP_PARENT=/system.slice/agern-sandbox.service/containers\n' >>/etc/agern/agern.env
+set +e
+doc=$(agern doctor 2>&1)
+set -e
+printf '%s\n' "$doc" | sed -n '/^sandboxes$/,/^service$/p'
+printf '%s' "$doc" | grep -q 'FAIL  packages for rootless Podman missing: podman uidmap netavark aardvark-dns crun slirp4netns passt (sudo apt install' && pass "doctor (sandboxes on): missing packages with the install command" || fail "doctor: sandbox packages"
+printf '%s' "$doc" | grep -q 'ok    subordinate ids of agern: uids 427680+65536, gids 493216+65536' && pass "doctor: subordinate ids" || fail "doctor: subordinate ids"
+printf '%s' "$doc" | grep -q 'ok    FACTORY_SANDBOX_PODMAN_URL=unix:///run/agern-podman/podman.sock' && pass "doctor: podman url" || fail "doctor: podman url"
+printf '%s' "$doc" | grep -q 'FAIL  systemd is not running: the sandbox service cannot run here' && pass "doctor: no systemd for the sandbox service" || fail "doctor: sandbox without systemd"
+printf '%s' "$doc" | grep -Eq '(ok|warn|FAIL) .*(GB|MB) free for images and caches' && pass "doctor: free disk space" || fail "doctor: free disk space"
 
 section "configuration survives an upgrade (agern upgrade --file)"
 sed -i 's/^FACTORY_GITHUB_ORG=$/FACTORY_GITHUB_ORG=smoke-test-org/' /etc/agern/agern.env
@@ -238,6 +318,25 @@ eq "now $NEXT" "$NEXT" "$(dpkg-query -W -f='${Version}' agern)"
 eq "env file unchanged after all upgrades" "$SUM_BEFORE" "$(sha256sum /etc/agern/agern.env | cut -d' ' -f1)"
 eq "master key unchanged" "$KEY_BEFORE" "$(grep '^FACTORY_MASTER_KEY=' /etc/agern/agern.env)"
 LAST=$NEXT
+
+section "sandboxes: settings kept by the upgrades, then 'agern sandbox disable'"
+check "FACTORY_SANDBOX=podman kept" grep -qx 'FACTORY_SANDBOX=podman' /etc/agern/agern.env
+eq "subuid range kept by the upgrades" "agern:427680:65536" "$(grep '^agern:' /etc/subuid)"
+eq "subgid range kept by the upgrades" "agern:493216:65536" "$(grep '^agern:' /etc/subgid)"
+if out=$(agern sandbox disable 2>&1); then pass "agern sandbox disable"; else fail "agern sandbox disable"; fi
+printf '%s\n' "$out"
+check "FACTORY_SANDBOX=off" grep -qx 'FACTORY_SANDBOX=off' /etc/agern/agern.env
+check "FACTORY_SANDBOX_PODMAN_URL removed" bash -c '! grep -q "^FACTORY_SANDBOX_PODMAN_URL=" /etc/agern/agern.env'
+check "FACTORY_SANDBOX_CGROUP_PARENT removed" bash -c '! grep -q "^FACTORY_SANDBOX_CGROUP_PARENT=" /etc/agern/agern.env'
+check "the commented example lines are kept" grep -q '^# FACTORY_SANDBOX_PODMAN_URL=' /etc/agern/agern.env
+eq "env file permissions after disable" "root:agern 640" "$(stat_of /etc/agern/agern.env)"
+eq "master key unchanged by disable" "$KEY_BEFORE" "$(grep '^FACTORY_MASTER_KEY=' /etc/agern/agern.env)"
+printf '%s' "$out" | grep -q 'systemd is not running here' && pass "disable says there are no units to stop here" || fail "disable without systemd message"
+printf '%s' "$out" | grep -q 'kept: images and' && pass "disable says what it kept" || fail "disable: kept message"
+set +e
+doc=$(agern doctor 2>&1)
+set -e
+printf '%s' "$doc" | grep -q "ok    sandboxes off" && pass "doctor after disable: off" || fail "doctor after disable"
 
 if [ "$SERVER" = 1 ]; then
     section "server against native PostgreSQL (no systemd: agern run as agern)"
@@ -335,8 +434,22 @@ apt-get install -y -q "$WORK/a.deb" >/dev/null 2>&1 && pass "reinstall" || fail 
 eq "master key kept" "$KEY_BEFORE" "$(grep '^FACTORY_MASTER_KEY=' /etc/agern/agern.env)"
 
 section "purge"
+# Sandbox storage as rootless Podman leaves it: owned by agern, with files of its subordinate ids.
+runuser -u agern -- mkdir -p -m 0700 /var/lib/agern/containers/storage/overlay
+runuser -u agern -- touch /var/lib/agern/containers/storage/overlay/layer-file
+chown 427680:427680 /var/lib/agern/containers/storage/overlay/layer-file
+runuser -u agern -- touch /var/lib/agern/keep-me
 apt-get purge -y -q agern >"$WORK/purge.log" 2>&1 && pass "apt-get purge agern" || { fail "apt-get purge agern"; cat "$WORK/purge.log"; }
 grep '^agern:\|^  - ' "$WORK/purge.log" || true
+grep -q 'removing the sandbox container storage /var/lib/agern/containers' "$WORK/purge.log" && pass "purge says it removes the sandbox storage" || fail "purge: sandbox storage message"
+check "sandbox storage removed" test ! -e /var/lib/agern/containers
+check "the rest of the data directory is kept" test -e /var/lib/agern/keep-me
+check "subuid range of agern removed with the user" bash -c '! grep -q "^agern:" /etc/subuid'
+check "subgid range of agern removed with the user" bash -c '! grep -q "^agern:" /etc/subgid'
+check "other users' ranges kept" grep -q '^alice:100000:65536$' /etc/subuid
+for u in agern-sandbox.socket agern-sandbox.service agern-sandbox-prune.timer; do
+    check "$u removed" test ! -e "/usr/lib/systemd/system/$u"
+done
 check "configuration removed" test ! -e /etc/agern/agern.env
 check "/etc/agern removed" test ! -e /etc/agern
 check "package cache removed" test ! -e /var/cache/agern

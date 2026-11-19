@@ -1,0 +1,30 @@
+#!/bin/sh
+# ExecStart of agern-sandbox.service (installed by the agern .deb as /usr/lib/agern/sandbox-service).
+# Runs as the agern user.
+#
+# systemd delegates the unit's cgroup to the agern user (Delegate=yes). Under cgroups v2 a cgroup
+# that holds processes cannot hand controllers to child cgroups, so this script first moves itself
+# into the leaf 'service' and enables cpu, memory and pids for the children; the containers then
+# get cgroups below 'containers' (FACTORY_SANDBOX_CGROUP_PARENT=<unit cgroup>/containers) where
+# their limits apply. Then it becomes the socket-activated Podman API service (same pid, so the
+# socket systemd passes is accepted).
+set -eu
+
+cg=$(sed -n 's/^0::\(.*\)$/\1/p' /proc/self/cgroup)
+dir=/sys/fs/cgroup$cg
+if [ -n "$cg" ] && [ "$cg" != / ] && [ -w "$dir/cgroup.procs" ]; then
+    mkdir -p "$dir/service" "$dir/containers"
+    echo $$ >"$dir/service/cgroup.procs"
+    for c in cpu memory pids io; do
+        if grep -qw "$c" "$dir/cgroup.controllers"; then
+            echo "+$c" >"$dir/cgroup.subtree_control" || echo "agern-sandbox: warning: could not enable the $c controller in $cg" >&2
+            echo "+$c" >"$dir/containers/cgroup.subtree_control" || echo "agern-sandbox: warning: could not enable the $c controller in $cg/containers" >&2
+        elif [ "$c" != io ]; then
+            echo "agern-sandbox: warning: the $c controller is not available in $cg; container limits will not apply" >&2
+        fi
+    done
+else
+    echo "agern-sandbox: warning: the cgroup '$cg' is not delegated to $(id -un) (Delegate=yes); container limits will not apply" >&2
+fi
+
+exec /usr/bin/podman system service --time=0

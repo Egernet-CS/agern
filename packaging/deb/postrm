@@ -4,8 +4,10 @@
 # remove: the program is gone; configuration, data, the 'agern' user and the database stay.
 # purge:  also removes /etc/agern/agern.env (a copy is saved first in /var/backups, because the
 #         master key in it is needed to read the credentials stored in the database),
-#         /var/cache/agern and the 'agern' user and group. The data directory /var/lib/agern
-#         and the PostgreSQL database are never deleted by the package.
+#         /var/cache/agern, the sandbox container storage /var/lib/agern/containers (images and
+#         cache volumes; rm without following symlinks, one file system) and the 'agern' user
+#         and group (userdel also drops its subordinate uid/gid ranges). The rest of the data
+#         directory /var/lib/agern and the PostgreSQL database are never deleted by the package.
 set -e
 
 ENV_FILE=/etc/agern/agern.env
@@ -13,10 +15,13 @@ DATA_DIR=/var/lib/agern
 
 reload() {
     rm -f /etc/systemd/system/multi-user.target.wants/agern.service \
-        /etc/systemd/system/timers.target.wants/agern-upgrade.timer
+        /etc/systemd/system/timers.target.wants/agern-upgrade.timer \
+        /etc/systemd/system/sockets.target.wants/agern-sandbox.socket \
+        /etc/systemd/system/timers.target.wants/agern-sandbox-prune.timer
     if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload >/dev/null 2>&1 || true
-        systemctl reset-failed agern.service agern-upgrade.service >/dev/null 2>&1 || true
+        systemctl reset-failed agern.service agern-upgrade.service agern-sandbox.service agern-sandbox.socket \
+            agern-sandbox-prune.service >/dev/null 2>&1 || true
     fi
 }
 
@@ -41,6 +46,16 @@ case "$1" in
         rm -f /etc/agern/.agern.env.*
         rmdir /etc/agern 2>/dev/null || true
         rm -rf /var/cache/agern
+        # The sandbox storage: images, containers and per-project cache volumes of the agern user's
+        # rootless Podman. Its files belong to the agern user's subordinate ids, which only root can
+        # delete; nothing else in the data directory is touched. A symlink is removed, not followed.
+        storage="$DATA_DIR/containers"
+        if [ -L "$storage" ]; then
+            rm -f "$storage"
+        elif [ -d "$storage" ]; then
+            echo "agern: removing the sandbox container storage $storage (images and cache volumes)"
+            rm -rf --one-file-system "$storage" || echo "agern: warning: could not remove all of $storage"
+        fi
         uid=""
         if getent passwd agern >/dev/null 2>&1; then
             uid=$(id -u agern)

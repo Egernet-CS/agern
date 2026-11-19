@@ -1,0 +1,66 @@
+# Agern sandboxes: rootless Podman's API service, run as the agern user. Installed by the agern
+# .deb as /usr/lib/systemd/system/agern-sandbox.service; started through agern-sandbox.socket,
+# which `agern sandbox enable` enables. Local changes: `systemctl edit agern-sandbox`.
+#
+# Why a unit of its own: agern.service (the server and its agents) has NoNewPrivileges and an
+# empty capability bounding set, and keeps them. Rootless Podman cannot start under those: it
+# sets up the user namespace of the containers with newuidmap/newgidmap, which get the right to
+# write the agern user's subordinate id ranges from file capabilities. This unit runs only Podman,
+# as the same unprivileged user, with what rootless Podman needs and nothing more: no extra
+# capabilities (the bounding set is systemd's default, so newuidmap's file capabilities work),
+# no sudo, no rootful Podman, no Docker group. The server talks to it over a socket only the agern
+# user can open, and the containers belong to that user, so this unit grants the agern user
+# nothing it could not do itself — see docs/ARCHITECTURE.md §9 for the boundary.
+#
+# Delegate=yes hands the unit's cgroup to the agern user, so the containers get cgroups of their
+# own below it with their CPU, memory and pids limits (cgroups v2). The containers' cgroups are
+# children of this unit: stopping it stops every sandbox, and MemoryMax=/CPUQuota= set here
+# (systemctl edit agern-sandbox) cap all sandboxes together.
+[Unit]
+Description=Agern sandboxes - rootless Podman service (agern user)
+Documentation=https://github.com/Egernet-CS/agern/blob/main/docs/INSTALL-LINUX.md#13-sandboxes
+Requires=agern-sandbox.socket
+After=agern-sandbox.socket network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=agern
+Group=agern
+# Podman's runtime state (pause process, container state, network namespaces): a directory of the
+# service's own, in place of the /run/user/<uid> a login session would have.
+RuntimeDirectory=agern-sandbox
+RuntimeDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=/run/agern-sandbox
+Environment=HOME=/var/lib/agern
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+# Root-owned configuration (engine, network backend, storage under /var/lib/agern/containers);
+# the agern user's own ~/.config/containers is not read.
+Environment=CONTAINERS_CONF=/usr/share/agern/podman/containers.conf
+Environment=CONTAINERS_STORAGE_CONF=/usr/share/agern/podman/storage.conf
+WorkingDirectory=/var/lib/agern
+# netavark starts the DNS server of a network (aardvark-dns) through 'systemd-run --user --scope'
+# whenever /run/systemd/system exists; the agern user has no user session bus, so that fails and
+# containers cannot find each other by name. With /run/systemd hidden (an empty read-only tmpfs)
+# netavark starts aardvark-dns directly, as a child of this unit. Bound back in: the journal
+# socket, and systemd-resolved's directory, which /etc/resolv.conf points into where resolved is
+# used (Ubuntu); '-' = only if it exists.
+TemporaryFileSystem=/run/systemd:ro
+BindReadOnlyPaths=/run/systemd/journal -/run/systemd/resolve
+# Moves itself into a leaf cgroup, then becomes `podman system service --time=0` (socket-activated).
+ExecStart=/usr/lib/agern/sandbox-service
+Delegate=yes
+# Stopping the unit stops every sandbox (the server removes what is left at its next start).
+KillMode=control-group
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+UMask=0077
+LimitNOFILE=65536
+# Under memory pressure the kernel kills sandbox processes before the server or PostgreSQL, and
+# the server gets the CPU and I/O first.
+OOMScoreAdjust=500
+CPUWeight=50
+IOWeight=50
+
+# No [Install]: started by agern-sandbox.socket.

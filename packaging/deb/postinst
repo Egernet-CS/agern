@@ -109,6 +109,16 @@ case "$1" in
                 # First install (or reinstall after removal): start at boot from now on.
                 systemctl enable agern.service >/dev/null 2>&1 || say "warning: could not enable agern.service"
             fi
+            # Sandboxes on (agern sandbox enable): keep their socket and clean-up timer enabled, also
+            # after a remove and reinstall. An upgrade never turns them off and leaves the running
+            # sandbox service alone (restarting it would stop the sandboxes of runs in progress).
+            if grep -Eq "^[[:space:]]*FACTORY_SANDBOX=[\"']?podman" "$ENV_FILE" 2>/dev/null; then
+                systemctl enable agern-sandbox.socket agern-sandbox-prune.timer >/dev/null 2>&1 ||
+                    say "warning: could not enable agern-sandbox.socket ('agern sandbox enable')"
+                if systemd_running; then
+                    invoke start agern-sandbox.socket agern-sandbox-prune.timer >/dev/null 2>&1 || true
+                fi
+            fi
         fi
 
         if has_value FACTORY_DB_URL && has_value FACTORY_GITHUB_ORG; then

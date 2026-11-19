@@ -133,7 +133,7 @@ class PodmanRuntime(
 
     override fun listContainers(): List<LabelledResource> = parseLabelled(call(listContainersArgs(cfg), 60_000, "ps").output)
 
-    override fun listNetworks(): List<LabelledResource> = parseLabelled(call(listNetworksArgs(cfg), 60_000, "network ls").output)
+    override fun listNetworks(): List<LabelledResource> = parseNetworksJson(call(listNetworksArgs(cfg), 60_000, "network ls").output)
 
     override fun exposedPorts(image: String): List<String> = try {
         val out = call(exposedPortsArgs(cfg, image), 60_000, "image inspect").output.trim()
@@ -173,6 +173,7 @@ class PodmanRuntime(
                 "--stop-timeout", "5",
                 "--pull=missing",
             )
+            cfg.cgroupParent?.let { a += listOf("--cgroup-parent", it) }
             s.workdir?.let { a += listOf("--workdir", it) }
             s.entrypoint?.let { a += listOf("--entrypoint", it) }
             for ((k, v) in s.env) a += listOf("--env", "$k=$v")
@@ -193,15 +194,36 @@ class PodmanRuntime(
 
         fun restartArgs(cfg: SandboxConfig, name: String) = base(cfg) + listOf("restart", "--time", "0", name)
 
-        fun removeContainersArgs(cfg: SandboxConfig, names: List<String>) = base(cfg) + listOf("rm", "--force", "--ignore") + names
+        fun removeContainersArgs(cfg: SandboxConfig, names: List<String>) = base(cfg) + listOf("rm", "--force", "--ignore", "--volumes") + names
 
         fun removeNetworkArgs(cfg: SandboxConfig, name: String) = base(cfg) + listOf("network", "rm", "--force", name)
 
         fun listContainersArgs(cfg: SandboxConfig) =
             base(cfg) + listOf("ps", "--all", "--filter", "label=$LABEL_RUN", "--format", "{{.Names}}\t{{index .Labels \"$LABEL_RUN\"}}")
 
+        /**
+         * JSON, not a Go template: `network ls` cannot `index .Labels` (Podman 4.9: "cannot index slice/array with type
+         * string"), unlike `ps`. The JSON (`name`, `labels`) is the same from Podman 4.3 on.
+         */
         fun listNetworksArgs(cfg: SandboxConfig) =
-            base(cfg) + listOf("network", "ls", "--filter", "label=$LABEL_RUN", "--format", "{{.Name}}\t{{index .Labels \"$LABEL_RUN\"}}")
+            base(cfg) + listOf("network", "ls", "--filter", "label=$LABEL_RUN", "--format", "json")
+
+        fun parseNetworksJson(out: String): List<LabelledResource> {
+            val text = out.trim()
+            if (text.isEmpty() || text == "null") return emptyList()
+            val arr = try {
+                kotlinx.serialization.json.Json.parseToJsonElement(text) as? kotlinx.serialization.json.JsonArray
+            } catch (e: Exception) {
+                null
+            } ?: throw SandboxRuntimeException("podman network ls: unexpected output: ${text.take(500)}")
+            return arr.mapNotNull { el ->
+                val o = el as? kotlinx.serialization.json.JsonObject ?: return@mapNotNull null
+                val name = (o["name"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: return@mapNotNull null
+                val run = ((o["labels"] as? kotlinx.serialization.json.JsonObject)?.get(LABEL_RUN) as? kotlinx.serialization.json.JsonPrimitive)
+                    ?.content?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+                LabelledResource(name, run)
+            }
+        }
 
         fun exposedPortsArgs(cfg: SandboxConfig, image: String) =
             base(cfg) + listOf("image", "inspect", "--format", "{{json .Config.ExposedPorts}}", image)

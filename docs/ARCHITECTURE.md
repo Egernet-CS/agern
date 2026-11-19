@@ -72,6 +72,7 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_SANDBOX` | `off` | `off` or `podman`: per-run build/test sandboxes in rootless Podman (§5 "Sandboxes"). `off`: runs behave as before and the builder gets no sandbox tools; definitions can still be approved. `fake` (development and end-to-end tests only, accepted only with `FACTORY_DEV_FAKE_GITHUB`): an in-memory runtime that only pretends to run commands |
 | `FACTORY_SANDBOX_PODMAN` | `podman` | The podman binary |
 | `FACTORY_SANDBOX_PODMAN_URL` | unset | When set, every call is `podman --url <url> …` (podman-remote against a `podman system service`, e.g. `unix:///run/…/podman.sock`) |
+| `FACTORY_SANDBOX_CGROUP_PARENT` | unset | When set, every container gets `--cgroup-parent <path>` (an absolute cgroup path, not a `.slice`). Needed by rootless Podman with the `cgroupfs` manager — the packaged `agern-sandbox.service` (§9) — which creates no cgroup, and so applies no limits, for a container without one; `agern sandbox enable` sets it to `<unit cgroup>/containers` |
 | `FACTORY_SANDBOX_REGISTRIES` | `docker.io,ghcr.io,quay.io,mcr.microsoft.com` | Registries sandbox and service images may come from (comma list of hosts, `host:port` allowed); images must name one |
 | `FACTORY_SANDBOX_MAX_CPUS` | `2` | Upper limit, and default, of CPUs per container |
 | `FACTORY_SANDBOX_MAX_MEMORY` | `4g` | Upper limit, and default, of memory per container (`k`/`m`/`g`, binary; at least `64m`); swap is not added on top |
@@ -221,8 +222,8 @@ only used after an admin approved its exact content.
 
 **Runtime.** Rootless Podman driven through its CLI (`FACTORY_SANDBOX=podman`), never rootful,
 never Docker. With `FACTORY_SANDBOX_PODMAN_URL` every call is `podman --url <url> …` so a packaged
-setup can point the server at a per-service `podman system service` socket (the systemd units, the
-unit hardening this needs and `agern doctor` checks are step 2). The runtime is an interface
+setup points the server at the `agern-sandbox` unit's `podman system service` socket (§9 "Sandboxes"). Every
+sub-command and option below exists in Podman 4.3 (Debian 12), the oldest supported version. The runtime is an interface
 (`SandboxRuntime`); tests use an in-memory fake.
 
 **Definition: `.agern/sandbox.yml`** at the repository root, read from the base branch:
@@ -302,18 +303,19 @@ volume exists <volume>  ;  volume create --label agern.repo=<repo> --label agern
 run --detach --name agern-run-<id>-<svc> --label agern.run=<id> --label agern.repo=<repo> --label agern.role=service
     --label agern.service=<svc> --network agern-run-<id> --network-alias <svc> --security-opt no-new-privileges
     --pids-limit 4096 --cpus <cpus> --memory <mem> --memory-swap <mem> --stop-timeout 5 --pull=missing
-    [--env K=V …] <service image>
+    [--cgroup-parent <FACTORY_SANDBOX_CGROUP_PARENT>] [--env K=V …] <service image>
 run --detach --name agern-run-<id> --label agern.run=<id> --label agern.repo=<repo> --label agern.role=sandbox
     --network agern-run-<id> --security-opt no-new-privileges --pids-limit 4096 --cpus <cpus> --memory <mem>
-    --memory-swap <mem> --stop-timeout 5 --pull=missing --workdir /workspace --entrypoint sh [--env K=V …]
+    --memory-swap <mem> --stop-timeout 5 --pull=missing [--cgroup-parent <FACTORY_SANDBOX_CGROUP_PARENT>]
+    --workdir /workspace --entrypoint sh [--env K=V …]
     --mount type=bind,source=<worktree>,target=/workspace [--mount type=volume,source=<volume>,target=<path> …]
     <image> -c "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"
-exec --workdir /workspace agern-run-<id> sh -lc <command>          # setup and every command
+exec --workdir /workspace agern-run-<id> sh -c '{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; exec sh -lc "$1"' sh <command>   # setup and every command
 restart --time 0 agern-run-<id>                                    # after a command timed out
-rm --force --ignore agern-run-<id> [agern-run-<id>-<svc> …]
+rm --force --ignore --volumes agern-run-<id> [agern-run-<id>-<svc> …]   # anonymous volumes (an image's VOLUME) too
 network rm --force agern-run-<id>
 ps --all --filter label=agern.run --format '{{.Names}}	{{index .Labels "agern.run"}}'          # reaper
-network ls --filter label=agern.run --format '{{.Name}}	{{index .Labels "agern.run"}}'         # reaper
+network ls --filter label=agern.run --format json                                               # reaper (name, labels)
 image inspect --format '{{json .Config.ExposedPorts}}' <service image>                          # ports for factory_sandbox_info
 ```
 
@@ -321,7 +323,10 @@ The podman process gets an environment built from an allow-list (`PATH`, `HOME`,
 `XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `DBUS_SESSION_BUS_ADDRESS`, `TMPDIR`), never the
 server's secrets.
 
-**Commands.** `factory_sandbox_exec` runs `sh -lc <command>` in `/workspace`, one command at a time per run
+**Commands.** `factory_sandbox_exec` runs `sh -lc <command>` in `/workspace` (first raising its own
+`oom_score_adj` to 1000, so that a command over the memory limit is what the kernel kills — never the
+sandbox's keep-alive process, which real Podman showed can otherwise happen when the command's memory is
+not freed before a second OOM, ending the whole sandbox), one command at a time per run
 (concurrent calls wait). Its time limit is `timeoutSeconds` if given, never more than
 `FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES` and the stage time limit. A command that runs out of time is
 stopped and the sandbox container restarted (`restart --time 0`: every process in it is killed, files are
@@ -818,11 +823,85 @@ rejected when their `Origin` does not match `FACTORY_PUBLIC_URL`.
 
 **Sandboxes.** Builds and tests can run in per-run rootless Podman containers (§5 "Sandboxes";
 `FACTORY_SANDBOX`, off by default). The containers belong to the service user; Agern and its
-PostgreSQL stay native. In this step a sandbox provides a toolchain, sidecars, limits and a clean
+PostgreSQL stay native. In this release a sandbox provides a toolchain, sidecars, limits and a clean
 environment — it is not a boundary between the agent and the host (see the security boundary below).
-Running Podman under the packaged systemd unit (whose `NoNewPrivileges` and empty
-`CapabilityBoundingSet` stop `newuidmap`/`newgidmap`), the per-service Podman socket, packaging and
-`agern doctor` checks (subuid/subgid ranges, cgroup delegation, lingering) are step 2.
+
+*A second unit, not a weaker first one.* Rootless Podman sets up a container's user namespace with
+`newuidmap`/`newgidmap`, which get the right to map the user's subordinate ids from file capabilities;
+under `agern.service`'s `NoNewPrivileges` and empty `CapabilityBoundingSet` they cannot work. Instead of
+relaxing the unit every agent runs in, the package ships `agern-sandbox.socket` + `agern-sandbox.service`
+(disabled until `agern sandbox enable`): `podman system service --time=0`, socket-activated, `User=agern`,
+with only what rootless Podman needs — no `NoNewPrivileges`, systemd's default bounding set (no
+capability is *added*; the unit runs unprivileged), its own `RuntimeDirectory` (`/run/agern-sandbox` as
+`XDG_RUNTIME_DIR`, since the user has no login session and no lingering), root-owned Podman configuration
+(`CONTAINERS_CONF`, `CONTAINERS_STORAGE_CONF` in `/usr/share/agern/podman`: `cgroupfs` manager, `netavark`,
+`crun`, storage in `/var/lib/agern/containers`) and `Delegate=yes`. The unit hides `/run/systemd` (an
+empty tmpfs; the journal socket and systemd-resolved's directory, where `/etc/resolv.conf` points on
+Ubuntu, are bound back in): netavark starts a network's DNS server, aardvark-dns,
+through `systemd-run --user --scope` whenever `/run/systemd/system` exists, which fails without a user
+session bus — and then containers cannot reach each other by name. Hidden, netavark starts it directly as
+a child of the unit (found on the first real-Podman CI run; netavark 1.4 and 1.14 behave the same). The server keeps every restriction and
+reaches Podman as a podman-remote client: `FACTORY_SANDBOX_PODMAN_URL=unix:///run/agern-podman/podman.sock`,
+a socket `agern:agern 0600`, so no other user can drive it. `agern.service` is ordered after the socket.
+
+*Limits.* Without a systemd user session Podman uses the `cgroupfs` manager in the unit's delegated cgroup.
+`/usr/lib/agern/sandbox-service` (the unit's `ExecStart`) moves itself into the leaf `<unit cgroup>/service`
+and enables `cpu`, `memory`, `pids` (and `io`) for the children, then execs Podman; the server passes
+`--cgroup-parent <unit cgroup>/containers` (`FACTORY_SANDBOX_CGROUP_PARENT`), so each container gets its own
+cgroup with its limits. Without an explicit parent rootless `cgroupfs` creates no cgroup and crun silently
+drops the limits (crun 1.8 on Debian 12 always; newer crun falls back to a sibling of its own cgroup), which
+is why the option exists. All sandboxes live below the unit: stopping it stops them, `systemctl edit
+agern-sandbox` can cap them together (`MemoryMax=`, `CPUQuota=`), and `OOMScoreAdjust=500`, `CPUWeight=50`,
+`IOWeight=50` make the kernel sacrifice and throttle sandboxes before the server and PostgreSQL.
+
+*Enabling* (`agern sandbox enable`, root): checks the packages (`podman` ≥ 4.3, `uidmap`, `netavark`,
+`aardvark-dns`, `crun`, and `slirp4netns` for Podman 4 or `passt` for Podman 5 — never installed by Agern;
+the missing ones are named in one `apt install` line and nothing is changed), cgroups v2 and systemd;
+gives `agern` a subordinate uid and gid range of 65536 with `usermod --add-subuids/--add-subgids` (the first
+`100000 + k·65536` block that overlaps no range in `/etc/subuid`/`/etc/subgid` and no uid/gid the name
+service lists; an existing range is kept); creates the storage directory *as `agern`* (root never writes
+inside the data directory); enables the socket; runs a self-test as `agern` through the socket (pull an
+image from an allowed registry, a private network with a sidecar reached by name, a sandbox with the
+server's options and a bind-mounted directory under the data directory, limits read back from the
+container's cgroup, a 200 MB allocation in a 64 MB container killed, all removed afterwards); only then
+writes `FACTORY_SANDBOX=podman`, `FACTORY_SANDBOX_PODMAN_URL` and `FACTORY_SANDBOX_CGROUP_PARENT` into
+`agern.env` (as data, like `setup-db`), enables `agern-sandbox-prune.timer` and restarts the server if it
+is idle (otherwise it says to restart later). A failed self-test leaves `agern.env` unchanged and the units
+off. `disable` (refuses while busy unless `--force`) writes `FACTORY_SANDBOX=off`, removes the two other
+keys, restarts the server, removes containers and networks labelled `agern.run` (and self-test leftovers),
+and stops and disables the units; images, cache volumes and the subordinate ids are kept. `status` shows
+the setting, units, versions, sandboxes, cache volumes and `podman system df`; a user who is neither root
+nor `agern` is told what cannot be read. `agern doctor` (sandboxes on) checks packages and version,
+subordinate ids, cgroups v2, the URL, socket enabled and listening, that `agern` gets an answer, the unit's
+cgroup owned by `agern` with `cpu memory pids` in `cgroup.subtree_control`, the cgroup parent, the prune
+timer, the storage directory (`agern`, `0700`) and free disk space (warn < 10 GB, fail < 2 GB); with
+sandboxes off it prints one line.
+
+*Disk.* `agern-sandbox-prune.timer` (daily, as `agern`, not root) runs `agern sandbox prune`: images no
+container uses whose build time is older than `AGERN_SANDBOX_PRUNE_HOURS` (default 168; Podman records no
+"last used", so an old base image is removed once idle and pulled again on the next run), dangling images,
+unused volumes of that age that are not per-project caches (label `agern.cache`), and self-test leftovers.
+Cache volumes are removed only by `prune --caches`/`--all`. Containers are removed with `--volumes`, so an
+image's anonymous volumes (e.g. PostgreSQL's data) go with the run.
+
+*Packaging.* The Podman stack is in `Suggests:` (`podman (>= 4.3), uidmap, netavark, aardvark-dns, crun,
+slirp4netns | passt`), not `Recommends:`, so an install without sandboxes gets no container runtime.
+Versions checked with `apt-cache` in the distribution images: Debian 12 Podman 4.3.1 (crun 1.8.1, netavark/
+aardvark-dns 1.4.0, slirp4netns 1.2.0), Ubuntu 24.04 Podman 4.9.3 (crun 1.14.1, netavark 1.4.0), Debian 13
+Podman 5.4.2 (crun 1.21, netavark 1.14.0, passt). An upgrade only reloads systemd: it never disables
+sandboxes, never restarts the sandbox service (that would stop the sandboxes of runs in progress) and never
+touches `/etc/subuid`; `postinst` re-enables the socket and timer when `agern.env` has
+`FACTORY_SANDBOX=podman` (e.g. after `remove` and reinstall). `prerm remove` stops and disables the sandbox
+units; `postrm purge` says so and removes `/var/lib/agern/containers` (`rm -rf --one-file-system`, which
+never follows a symlink; the files belong to subordinate ids only root can delete), and `userdel` drops the
+subordinate ranges.
+
+*Verified* by `packaging/deb/sandbox-host-test.sh`, which CI runs on a GitHub-hosted Ubuntu 24.04 VM (job
+`sandbox`): enable and self-test, doctor, the server under the hardened unit removing a leftover sandbox
+through the socket, the `PodmanIntegrationTest` (real rootless Podman: sidecar DNS, bind mount ownership,
+host paths invisible, not privileged, cache reuse, exec, timeout and restart, memory limit enforced, labels,
+removal) run as `agern` *inside* `agern.service`, upgrade, prune, disable and purge. Debian 12 and 13 run the
+same script on a VM by hand.
 
 **Release artifact.** One self-contained `agern.jar` (server with the built frontend embedded on
 the classpath) — the host needs only Java 17 and PostgreSQL. `FACTORY_WEB_DIR` overrides the
@@ -953,7 +1032,15 @@ a compromised GitHub release; the activity answer is advisory (it decides when, 
 Sandboxes do not move this boundary: their containers are rootless and owned by `agern`, never
 privileged and never given more than Podman's default rootless capabilities, so they grant nothing
 the `agern` user does not already have — and, since agents run on the host as that user, they also
-take nothing away from it (containing the agent is a later step).
+take nothing away from it (containing the agent is a later step). The one thing the sandbox unit
+adds is that a process running as `agern` there may use `newuidmap`/`newgidmap` on the range root
+assigned to `agern`: ids that belong to no account (the allocation checks), so mapping them gives
+access to nothing but the containers' own files. An agent can reach the socket and the Podman API
+(it is the same user), and could run its own rootless containers — exactly what `agern` could do
+with `podman` installed and no sandbox unit; no rootful Podman, no `docker` group, no privileged
+helper and no sudo rule exist. Root never runs anything the agent can write on this path: the
+units, `sandbox-service` and the Podman configuration are root-owned package files, `agern sandbox`
+talks to Podman as `agern` (`runuser`), and `agern.env` is parsed as data.
 
 ## 10. Frontend
 

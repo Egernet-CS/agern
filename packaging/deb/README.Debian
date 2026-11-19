@@ -10,6 +10,10 @@ Files
   /var/cache/agern                 current.deb / previous.deb kept for 'agern rollback' (root)
   agern.service                    the server, runs as the unprivileged 'agern' user
   agern-upgrade.timer/.service     automatic upgrades, off by default ('agern auto-upgrade on')
+  agern-sandbox.socket/.service    rootless Podman for build/test sandboxes, as the 'agern' user;
+                                   off by default ('agern sandbox enable', which names the packages
+                                   to install); storage in /var/lib/agern/containers
+  agern-sandbox-prune.timer        daily removal of unused sandbox images (on with sandboxes)
   logs                             journald: 'agern logs' or 'journalctl -u agern'
 
 First steps
@@ -20,6 +24,7 @@ First steps
 Removing
   apt remove agern   keeps configuration, data, the 'agern' user and the database
   apt purge agern    also removes /etc/agern/agern.env (a copy goes to /var/backups), the
-                     package cache and the 'agern' user; /var/lib/agern and the database stay
+                     package cache, the sandbox storage /var/lib/agern/containers and the
+                     'agern' user; the rest of /var/lib/agern and the database stay
 
 Full guide: https://github.com/Egernet-CS/agern/blob/main/docs/INSTALL-LINUX.md

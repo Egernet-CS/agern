@@ -116,19 +116,23 @@ if [ "$DEB" != no ]; then
     DEB_FILE="agern_${VERSION}_all.deb"
     STAGE="$OUT/deb-root"
     rm -rf "$STAGE"
-    mkdir -p "$STAGE/DEBIAN" "$STAGE/usr/bin" "$STAGE/usr/share/agern" "$STAGE/usr/share/doc/agern" \
-        "$STAGE/usr/lib/systemd/system"
+    mkdir -p "$STAGE/DEBIAN" "$STAGE/usr/bin" "$STAGE/usr/share/agern/podman" "$STAGE/usr/share/doc/agern" \
+        "$STAGE/usr/lib/systemd/system" "$STAGE/usr/lib/agern"
     cp packaging/agern "$STAGE/usr/bin/agern"
     cp "$JAR" "$STAGE/usr/share/agern/agern.jar"
     cp .env.example "$STAGE/usr/share/agern/env.example"
     printf '%s\n' "$VERSION" >"$STAGE/usr/share/agern/VERSION"
     cp packaging/deb/README.Debian "$STAGE/usr/share/doc/agern/README.Debian"
     cp packaging/deb/agern.service packaging/deb/agern-upgrade.service packaging/deb/agern-upgrade.timer \
+        packaging/deb/agern-sandbox.socket packaging/deb/agern-sandbox.service \
+        packaging/deb/agern-sandbox-prune.service packaging/deb/agern-sandbox-prune.timer \
         "$STAGE/usr/lib/systemd/system/"
+    cp packaging/deb/sandbox-service "$STAGE/usr/lib/agern/sandbox-service"
+    cp packaging/deb/podman/containers.conf packaging/deb/podman/storage.conf "$STAGE/usr/share/agern/podman/"
     cp packaging/deb/postinst packaging/deb/prerm packaging/deb/postrm "$STAGE/DEBIAN/"
     find "$STAGE" -type d -exec chmod 0755 {} +
     find "$STAGE" -type f -exec chmod 0644 {} +
-    chmod 0755 "$STAGE/usr/bin/agern" "$STAGE/DEBIAN/postinst" "$STAGE/DEBIAN/prerm" "$STAGE/DEBIAN/postrm"
+    chmod 0755 "$STAGE/usr/bin/agern" "$STAGE/usr/lib/agern/sandbox-service" "$STAGE/DEBIAN/postinst" "$STAGE/DEBIAN/prerm" "$STAGE/DEBIAN/postrm"
     # DEBIAN/md5sums: lets 'dpkg --verify agern' (and 'agern upgrade', before it rebuilds a copy of the
     # installed package for rollback) detect changed files.
     (

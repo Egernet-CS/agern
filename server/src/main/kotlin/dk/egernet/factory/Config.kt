@@ -196,6 +196,12 @@ data class SandboxConfig(
     val podmanBin: String = "podman",
     /** FACTORY_SANDBOX_PODMAN_URL: when set, every call is `podman --url <url> …` (podman-remote against `podman system service`). */
     val podmanUrl: String? = null,
+    /**
+     * FACTORY_SANDBOX_CGROUP_PARENT: when set, every container gets `--cgroup-parent <path>`. Rootless Podman with the
+     * cgroupfs manager (the packaged `agern-sandbox.service`, which has no systemd user session) creates no cgroup for a
+     * container without one, and then CPU/memory/pids limits are not applied (docs/ARCHITECTURE.md §9).
+     */
+    val cgroupParent: String? = null,
     /** FACTORY_SANDBOX_REGISTRIES: registries images may come from (host, or host:port), lower case. */
     val registries: List<String> = DEFAULT_REGISTRIES,
     /** FACTORY_SANDBOX_MAX_CPUS: upper limit (and default) for one container's CPUs. */
@@ -210,7 +216,7 @@ data class SandboxConfig(
     val enabled: Boolean get() = mode != "off"
 
     override fun toString() = if (!enabled) "off" else
-        "SandboxConfig(mode=$mode, podman=$podmanBin, url=${podmanUrl ?: "-"}, registries=$registries, maxCpus=$maxCpus, " +
+        "SandboxConfig(mode=$mode, podman=$podmanBin, url=${podmanUrl ?: "-"}, cgroupParent=${cgroupParent ?: "-"}, registries=$registries, maxCpus=$maxCpus, " +
             "maxMemory=${formatMemory(maxMemoryBytes)}, maxConcurrent=$maxConcurrent, execTimeoutMs=$execTimeoutMs)"
 
     companion object {
@@ -239,10 +245,17 @@ data class SandboxConfig(
                 it.toLongOrNull() ?: throw IllegalArgumentException("FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES must be a whole number of minutes")
             } ?: 30
             require(execMinutes in 1..24 * 60) { "FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES must be between 1 and 1440" }
+            val cgroupParent = get("FACTORY_SANDBOX_CGROUP_PARENT")?.trim()?.takeIf { it.isNotEmpty() }
+            if (cgroupParent != null) {
+                require(CGROUP_PARENT_RE.matches(cgroupParent) && "/../" !in "$cgroupParent/" && !cgroupParent.endsWith(".slice")) {
+                    "FACTORY_SANDBOX_CGROUP_PARENT must be an absolute cgroup path such as /system.slice/agern-sandbox.service/containers"
+                }
+            }
             return SandboxConfig(
                 mode = mode,
                 podmanBin = get("FACTORY_SANDBOX_PODMAN") ?: "podman",
                 podmanUrl = get("FACTORY_SANDBOX_PODMAN_URL"),
+                cgroupParent = cgroupParent,
                 registries = registries,
                 maxCpus = cpus,
                 maxMemoryBytes = memory,
@@ -252,6 +265,7 @@ data class SandboxConfig(
         }
 
         const val MIN_MEMORY = 64L shl 20
+        private val CGROUP_PARENT_RE = Regex("^(/[A-Za-z0-9_.@-]+)+$")
         private val MEMORY_RE = Regex("^([0-9]+)\\s*([kmgt]?)i?b?$", RegexOption.IGNORE_CASE)
 
         /** `4g`, `512m`, `1024k`, `2048` (bytes) → bytes; null when malformed. Units are binary (1k = 1024). */
