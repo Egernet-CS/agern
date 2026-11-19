@@ -13,6 +13,7 @@ import dk.egernet.factory.RunStatus
 import dk.egernet.factory.Services
 import dk.egernet.factory.SettingsDto
 import dk.egernet.factory.SoftwareRequestDto
+import dk.egernet.factory.agent.EventBus
 import dk.egernet.factory.agent.FeedItem
 import dk.egernet.factory.agent.INLINE_IMAGE_TYPES
 import io.ktor.utils.io.readAvailable
@@ -538,6 +539,13 @@ private fun Route.sessionRoutes(s: Services) {
         val rec = visibleSession(s, u, uuidParam("id"))
         call.respond(s.agents.dto(s.agents.stop(u, rec)))
     }
+    // Close a chat: stop its agent and delete it permanently (docs/ARCHITECTURE.md §8).
+    delete("/sessions/{id}") {
+        val u = call.requireUser(s)
+        val rec = visibleSession(s, u, uuidParam("id"))
+        s.agents.closeChat(u, rec)
+        call.respond(HttpStatusCode.NoContent)
+    }
 }
 
 /** Reads a request body, giving up (null) as soon as it exceeds [max] bytes. */
@@ -599,6 +607,9 @@ private fun Route.adminRoutes(s: Services) {
 
 // ------------------------------------------------------------------ websockets
 
+/** WebSocket close code for a session socket whose chat was closed (deleted). */
+private const val SESSION_CLOSED: Short = 4404
+
 private fun Route.wsRoutes(s: Services) {
     route("/ws") {
         // Authenticate before the upgrade so pending/anonymous callers get a plain 401.
@@ -624,6 +635,11 @@ private fun Route.wsRoutes(s: Services) {
             // Subscribe before reading history so nothing falls in between; duplicates are dropped by seq.
             val collector = launch(start = CoroutineStart.UNDISPATCHED) { s.bus.session(rec.id).collect { live.send(it) } }
             try {
+                // Closed between the check above and the subscription: its sentinel was missed.
+                if (withContext(Dispatchers.IO) { s.sessions.get(rec.id) } == null) {
+                    close(CloseReason(SESSION_CLOSED, "session closed"))
+                    return@webSocket
+                }
                 while (true) {
                     val page = withContext(Dispatchers.IO) { s.events.list(rec.id, last, 1000) }
                     for (e in page) {
@@ -633,6 +649,10 @@ private fun Route.wsRoutes(s: Services) {
                     if (page.size < 1000) break
                 }
                 for (e in live) {
+                    if (e.type == EventBus.CLOSED) {
+                        close(CloseReason(SESSION_CLOSED, "session closed"))
+                        break
+                    }
                     if (e.seq != -1L && e.seq <= last) continue
                     send(Frame.Text(AppJson.encodeToString(dk.egernet.factory.EventDto.serializer(), e)))
                     if (e.seq != -1L) last = e.seq
@@ -650,6 +670,7 @@ private fun Route.wsRoutes(s: Services) {
                     is FeedItem.Session -> FeedFrame(type = "session", session = item.session)
                     is FeedItem.Run -> FeedFrame(type = "run", run = item.run)
                     is FeedItem.Issue -> FeedFrame(type = "issue", repo = item.repo, issue = item.issue)
+                    is FeedItem.SessionClosed -> FeedFrame(type = "session_closed", repo = item.repo, sessionId = item.sessionId)
                 }
                 send(Frame.Text(AppJson.encodeToString(FeedFrame.serializer(), frame)))
             }

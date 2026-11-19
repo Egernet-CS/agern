@@ -195,6 +195,8 @@ data class AttachmentDto(
     val run: RunDto? = null,
     val repo: String? = null,
     val issue: IssueDto? = null,
+    /** `session_closed`: the id of the chat session that was closed. */
+    val sessionId: String? = null,
 )
 
 object RunStatus {

@@ -291,6 +291,20 @@ class Attachments(private val cfg: Config, val store: AttachmentStore) {
         return n
     }
 
+    /**
+     * Removes the session's directory with everything in it (the session was closed). Best effort: the files are a
+     * cache of rows that are already gone, so a failure is only logged. Blocking.
+     */
+    fun removeSession(sessionId: UUID) {
+        val d = dir(sessionId)
+        if (!Files.exists(d)) return
+        try {
+            Files.walk(d).use { paths -> paths.sorted(Comparator.reverseOrder()).forEach { Files.deleteIfExists(it) } }
+        } catch (e: Exception) {
+            log.warn("Could not remove attachment files of closed session {}: {}", sessionId, e.toString())
+        }
+    }
+
     // ------------------------------------------------------------ what the agent receives
 
     /**

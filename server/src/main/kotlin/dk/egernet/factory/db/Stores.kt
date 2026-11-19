@@ -214,6 +214,9 @@ class SessionStore(private val db: Db) {
 
     fun get(id: UUID) = db.queryOne("$select WHERE s.id = ?", id, map = ::map)
 
+    /** Deletes a chat session (events and attachments cascade). False when there is no such chat. */
+    fun delete(id: UUID): Boolean = db.update("DELETE FROM agent_sessions WHERE id = ? AND kind = 'chat'", id) == 1
+
     fun list(repo: String?, kind: String?, activeOnly: Boolean): List<SessionRecord> {
         val where = mutableListOf<String>()
         val params = mutableListOf<Any?>()
