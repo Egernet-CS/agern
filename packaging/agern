@@ -1153,7 +1153,8 @@ sandbox_podman_version() { # the installed podman's version, or nothing
     local p
     p=$(command -v podman 2>/dev/null) || return 0
     root_may_exec "$p" || return 0
-    "$p" --version 2>/dev/null | awk '{print $NF; exit}'
+    # (as a user without a home, e.g. nobody, podman may fail even here: then the version is unknown)
+    "$p" --version 2>/dev/null | awk '{print $NF; exit}' || true
 }
 
 # Packages rootless Podman needs here (names as on Debian 12/13 and Ubuntu 24.04). Podman 4 sets up

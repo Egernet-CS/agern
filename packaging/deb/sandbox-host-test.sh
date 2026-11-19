@@ -221,24 +221,19 @@ SPID=$(systemctl show -p MainPID --value agern-sandbox.service)
 ENV_SUM=$(sha256sum /etc/agern/agern.env | cut -d' ' -f1)
 SUBID_SUM=$(cat /etc/subuid /etc/subgid | sha256sum | cut -d' ' -f1)
 A_SEMVER=$(cat /usr/share/agern/VERSION)
-B_SEMVER=${A_SEMVER%%[-+]*}
-B_SEMVER="${B_SEMVER%.*}.$((${B_SEMVER##*.} + 1))"
-rm -rf "$WORK/repack"
-dpkg-deb -R "$WORK/a.deb" "$WORK/repack"
-B_DEB=$B_SEMVER
-sed -i "s/^Version: .*/Version: $B_DEB/" "$WORK/repack/DEBIAN/control"
-printf '%s\n' "$B_SEMVER" >"$WORK/repack/usr/share/agern/VERSION"
-(cd "$WORK/repack" && find usr -type f | LC_ALL=C sort | xargs md5sum) >"$WORK/repack/DEBIAN/md5sums"
-dpkg-deb --build --root-owner-group -Zxz "$WORK/repack" "$WORK/b.deb" >/dev/null
-if agern upgrade --file "$WORK/b.deb" >"$WORK/upgrade.log" 2>&1; then pass "agern upgrade --file (to $B_SEMVER)"; else fail "agern upgrade"; cat "$WORK/upgrade.log"; fi
-eq "now $B_DEB" "$B_DEB" "$(dpkg-query -W -f='${Version}' agern)"
+# The same package again (--force): the upgrade path of postinst, the restart of the server and the
+# health check on its version. (A repacked higher version would carry the same agern.jar, which
+# reports the old version, so the health check after the restart could not pass.)
+SRV_PID=$(systemctl show -p MainPID --value agern.service)
+if agern upgrade --file "$WORK/a.deb" --force >"$WORK/upgrade.log" 2>&1; then pass "agern upgrade --file --force (reinstall $A_SEMVER)"; else fail "agern upgrade"; cat "$WORK/upgrade.log"; fi
+check "the server was restarted by the upgrade" test "$SRV_PID" != "$(systemctl show -p MainPID --value agern.service)"
 eq "agern.env unchanged by the upgrade" "$ENV_SUM" "$(sha256sum /etc/agern/agern.env | cut -d' ' -f1)"
 eq "subordinate ids unchanged by the upgrade" "$SUBID_SUM" "$(cat /etc/subuid /etc/subgid | sha256sum | cut -d' ' -f1)"
 check "socket still enabled" systemctl is-enabled --quiet agern-sandbox.socket
 eq "sandbox service not restarted by the upgrade" "$SPID" "$(systemctl show -p MainPID --value agern-sandbox.service)"
 if agern sandbox selftest >"$WORK/selftest.log" 2>&1; then pass "agern sandbox selftest after the upgrade"; else fail "selftest after upgrade"; fi
 cat "$WORK/selftest.log"
-[ "$(curl -fsS http://127.0.0.1:8080/api/health 2>/dev/null | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')" = "$B_SEMVER" ] && pass "server healthy on $B_SEMVER" || fail "server after upgrade"
+[ "$(curl -fsS http://127.0.0.1:8080/api/health 2>/dev/null | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')" = "$A_SEMVER" ] && pass "server healthy on $A_SEMVER" || fail "server after upgrade"
 
 section "status and prune"
 out=$(agern sandbox status 2>&1) || true
