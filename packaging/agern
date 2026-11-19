@@ -1157,16 +1157,15 @@ sandbox_podman_version() { # the installed podman's version, or nothing
     "$p" --version 2>/dev/null | awk '{print $NF; exit}' || true
 }
 
-# Packages rootless Podman needs here (names as on Debian 12/13 and Ubuntu 24.04). Podman 4 sets up
-# the rootless network namespace with slirp4netns, Podman 5 with pasta (package passt).
+# Packages rootless Podman needs here (names as on Debian 12/13 and Ubuntu 24.04). The rootless
+# network namespace uses slirp4netns on every version (containers.conf: default_rootless_network_cmd,
+# because Debian 13's AppArmor profile confines Podman 5's default, pasta, to /run/user and /tmp).
 sandbox_missing_packages() {
-    local p missing="" pv
+    local p missing=""
     for p in podman uidmap netavark aardvark-dns crun; do
         pkg_installed "$p" || missing="$missing $p"
     done
-    pv=$(sandbox_podman_version)
-    if [ -z "$pv" ] || dpkg --compare-versions "$pv" lt 5; then pkg_installed slirp4netns || missing="$missing slirp4netns"; fi
-    if [ -z "$pv" ] || dpkg --compare-versions "$pv" ge 5; then pkg_installed passt || missing="$missing passt"; fi
+    pkg_installed slirp4netns || missing="$missing slirp4netns"
     printf '%s\n' "${missing# }"
 }
 
@@ -1250,7 +1249,8 @@ sandbox_hints() {
 # reached by name, a sandbox with the server's options and limits and a bind-mounted directory under
 # the data directory, a process over the memory limit is killed; everything is removed afterwards.
 sandbox_selftest() {
-    local cg=$1 image=${AGERN_SANDBOX_TEST_IMAGE:-$SANDBOX_TEST_IMAGE_DEFAULT} regs reg tag dir="" out rc fails=$DOCTOR_FAILS
+    local cg=$1 image=${AGERN_SANDBOX_TEST_IMAGE:-$SANDBOX_TEST_IMAGE_DEFAULT} regs reg tag dir="" out rc fails=$DOCTOR_FAILS started
+    started=$(date +%s)
     regs=$(printf '%s' "${FACTORY_SANDBOX_REGISTRIES:-$SANDBOX_REGISTRIES_DEFAULT}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
     reg=${image%%/*}
     case ",$regs," in
@@ -1328,7 +1328,32 @@ sandbox_selftest() {
     spodman rm --force --ignore --volumes "$tag" "$tag-peer" >/dev/null 2>&1 || true
     spodman network rm --force "$tag" >/dev/null 2>&1 || true
     as_agern rm -rf "$dir" || true
-    [ "$rc" = 0 ] && [ "$DOCTOR_FAILS" = "$fails" ]
+    if [ "$rc" != 0 ] || [ "$DOCTOR_FAILS" != "$fails" ]; then
+        sandbox_apparmor_hint "$started"
+        return 1
+    fi
+    return 0
+}
+
+# AppArmor denials for the agern user's processes since EPOCH (root only: the kernel log), e.g. a
+# profile of pasta, crun or slirp4netns refusing a path under the sandbox service's directories.
+sandbox_apparmor_denials() {
+    is_root || return 0
+    local uid
+    uid=$(id -u "$AGERN_USER" 2>/dev/null) || return 0
+    journalctl -k --since "@$1" --no-pager -o cat 2>/dev/null | grep 'apparmor="DENIED"' | grep -E "(fsuid|ouid)=$uid( |\$)" | tail -n 5 || true
+}
+
+# Prints the denials with what they mean, when there are any.
+sandbox_apparmor_hint() {
+    local denials
+    denials=$(sandbox_apparmor_denials "$1")
+    [ -n "$denials" ] || return 0
+    say "  AppArmor refused something to the agern user's container tools (kernel log):"
+    printf '%s\n' "$denials" | sed -e 's/.*\(apparmor="DENIED".*\)/        \1/' | cut -c1-240
+    say "        A profile of the distribution (see profile=\"…\") does not allow a path the sandbox service uses."
+    say "        Agern's own Podman configuration (/usr/share/agern/podman/containers.conf) avoids the ones known"
+    say "        (pasta on Debian 13); a local edit of that file or an updated profile may have brought it back."
 }
 
 # What a failed name lookup between containers needs looked at (printed by the self-test).
@@ -1674,6 +1699,18 @@ doctor_sandbox() {
                 bad "FACTORY_SANDBOX_CGROUP_PARENT is '${FACTORY_SANDBOX_CGROUP_PARENT:-}', expected $cg/containers ('sudo agern sandbox enable' sets it)"
         else
             meh "$SANDBOX_UNIT is not running (it starts on the first connection; cgroup delegation is checked when it runs)"
+        fi
+        if is_root; then
+            # Since the sandbox service (re)started, or the last 24 h when it is not running.
+            local den since
+            since=$(date -d "$(systemctl show -p ActiveEnterTimestamp --value "$SANDBOX_UNIT" 2>/dev/null)" +%s 2>/dev/null) || since=""
+            [ -n "$since" ] && systemctl is-active --quiet "$SANDBOX_UNIT" || since=$(($(date +%s) - 86400))
+            den=$(sandbox_apparmor_denials "$since")
+            if [ -n "$den" ]; then
+                meh "AppArmor denied the agern user's container tools since $(date -d "@$since" '+%F %T') ('sudo agern sandbox selftest' explains): $(printf '%s\n' "$den" | tail -n 1 | sed -n 's/.*\(profile="[^"]*"\).*\(name="[^"]*"\).*/\1 \2/p')"
+            else
+                ok "no AppArmor denials for $AGERN_USER since $(date -d "@$since" '+%F %T')"
+            fi
         fi
         systemctl is-enabled --quiet "$SANDBOX_PRUNE_TIMER" 2>/dev/null && ok "$SANDBOX_PRUNE_TIMER enabled (daily clean-up)" ||
             meh "$SANDBOX_PRUNE_TIMER is not enabled: unused images are not removed automatically"

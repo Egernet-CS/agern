@@ -74,6 +74,8 @@ if ! command -v podman >/dev/null 2>&1; then
 fi
 
 section "rootless Podman packages"
+# passt too, although Agern does not use it: it is what 'apt install podman' brings on Debian 13, and
+# the sandboxes must work with it present (its AppArmor profile there does not allow our paths).
 PKGS="podman uidmap netavark aardvark-dns crun slirp4netns passt"
 # shellcheck disable=SC2086 # a list of package names
 if apt-get install -y -q $PKGS >"$WORK/podman.log" 2>&1; then pass "apt-get install $PKGS"; else fail "apt-get install $PKGS"; tail -n 40 "$WORK/podman.log"; exit 1; fi
@@ -141,6 +143,7 @@ doc=$(agern doctor 2>&1)
 set -e
 printf '%s\n' "$doc" | sed -n '/^sandboxes$/,/^service$/p'
 sbx=$(printf '%s\n' "$doc" | sed -n '/^sandboxes$/,/^service$/p')
+printf '%s' "$sbx" | grep -q 'ok    no AppArmor denials for agern' && pass "doctor: no AppArmor denials for agern" || fail "doctor: AppArmor denials"
 printf '%s' "$sbx" | grep -q 'FAIL' && fail "doctor: sandbox problems" || pass "doctor: no sandbox problem"
 printf '%s' "$sbx" | grep -q 'ok    controllers cpu, memory, pids enabled' && pass "doctor: limits effective" || fail "doctor: limits"
 printf '%s' "$sbx" | grep -q 'ok    agern reaches the Podman service' && pass "doctor: agern reaches the service" || fail "doctor: reach"
