@@ -4,7 +4,15 @@ import { ApiError, type Api, type Channel } from '../api/api';
 import { isRunActive, isSessionActive, type AgentSession, type Attachment, type ClientConfig, type Issue, type LoginStep, type Preferences, type Run, type StageRole, type User } from '../api/types';
 import {
   announceIssue,
+  assignIssues,
+  createRelease,
+  deleteRelease,
   effective,
+  getRelease,
+  releaseOfIssue,
+  releasesOf,
+  reorderRelease,
+  updateRelease,
   approveRun,
   cancelRun,
   chatInput,
@@ -244,14 +252,14 @@ export const mockApi: Api = {
   issues: (repo, state = 'open') =>
     ok(() => {
       project(repo);
-      return (db.issues[repo] ?? []).filter((i) => state === 'all' || i.state === state).map(({ body: _body, ...i }) => i as Issue);
+      return (db.issues[repo] ?? []).filter((i) => state === 'all' || i.state === state).map(({ body: _body, ...i }) => ({ ...i, release: releaseOfIssue(repo, i.number) }) as Issue);
     }),
   issue: (repo, n) =>
     ok(() => {
       project(repo);
       const i = db.issues[repo]?.find((x) => x.number === n);
       if (!i) throw new MockError(404, 'not_found', 'Issue not found');
-      return i;
+      return { ...i, release: releaseOfIssue(repo, i.number) };
     }),
   createIssue: (repo, body) =>
     ok(() => {
@@ -260,10 +268,38 @@ export const mockApi: Api = {
       const number = Math.max(0, ...list.map((i) => i.number)) + 1;
       const label = body.kind === 'bug' ? { name: 'bug', color: 'd73a4a' } : body.kind === 'feature' ? { name: 'enhancement', color: 'a2eeef' } : { name: 'chore', color: 'c5def5' };
       const now = new Date().toISOString();
-      const i: Issue = { number, title: body.title, state: 'open', kind: body.kind, labels: [label], author: me().githubLogin ?? me().username, assignees: [], comments: 0, createdAt: now, updatedAt: now, htmlUrl: `https://github.com/${ORG}/${repo}/issues/${number}`, body: body.body, activeRunId: null };
+      const i: Issue = { number, title: body.title, state: 'open', kind: body.kind, labels: [label], author: me().githubLogin ?? me().username, assignees: [], comments: 0, createdAt: now, updatedAt: now, htmlUrl: `https://github.com/${ORG}/${repo}/issues/${number}`, body: body.body, activeRunId: null, release: null };
       list.unshift(i);
       announceIssue(repo, i);
       return i;
+    }),
+
+  releases: (repo) => ok(() => (project(repo), releasesOf(repo))),
+  release: (id) =>
+    ok(() => {
+      const r = getRelease(id);
+      project(r.repo);
+      return r;
+    }),
+  createRelease: (repo, body) => ok(() => (project(repo), createRelease(repo, body, me()))),
+  updateRelease: (id, body) =>
+    ok(() => {
+      const r = getRelease(id);
+      project(r.repo);
+      return updateRelease(r, body);
+    }),
+  deleteRelease: (id) =>
+    ok(() => {
+      const r = getRelease(id);
+      project(r.repo);
+      deleteRelease(r);
+    }),
+  assignIssues: (repo, numbers, releaseId) => ok(() => (project(repo), assignIssues(repo, numbers, releaseId))),
+  reorderRelease: (id, numbers) =>
+    ok(() => {
+      const r = getRelease(id);
+      project(r.repo);
+      return reorderRelease(r, numbers);
     }),
 
   projectRuns: (repo) => ok(() => (project(repo), [...db.runs.values()].filter((r) => r.repo === repo).sort(byNewest))),

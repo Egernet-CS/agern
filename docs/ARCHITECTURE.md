@@ -279,6 +279,40 @@ Stage `role`: `spec-writer`, `builder`, `security`, `ux`, `ui-design`, `code`, `
 Stage `status`: `pending`, `running`, `done`, `failed`, `skipped`.
 Stage `verdict`: `PASS`, `CHANGES`, `APPROVE`, `ESCALATE` or null.
 
+### Releases
+
+A **release** is a named plan of issues for one project, in the order they will be built. Building a release
+unattended on a release branch is delivered in steps (issue #13): this step only **plans**. Starting a release,
+its branch `release/<name>`, runs that branch from and merge into it, the release pull request, approval and
+scheduling come later; single runs are unaffected and still merge into the default branch.
+
+- **Model.** Tables `releases` (`id`, `repo`, `name`, `description`, `status`, `created_by`, timestamps) and
+  `release_issues` (`release_id`, `repo`, `issue_number`, `position`, `issue_title`, `issue_kind`, `added_by`,
+  `added_at`). Several releases may exist per project. Creating one creates no branch, no run and makes no
+  GitHub write.
+- **States.** `status` is free text; the only value so far is `planning` (shown as "in preparation"). Later steps
+  add `scheduled`, `building`, `paused`, `ready`, `released` and `cancelled`.
+- **Names** are trimmed, match `^[A-Za-z0-9][A-Za-z0-9._-]{0,49}$`, contain no `..` and do not end with `.` or
+  `.lock`, so they are safe as the git branch `release/<name>` and in URLs (400 otherwise). They are unique per
+  project, case-insensitively, across all releases including future history (409 `release_name_taken`); renaming
+  to another casing of the release's own name is allowed. Descriptions are optional, at most 2000 characters.
+- **Issues.** Only open issues can be assigned (checked with the caller's GitHub token; pull requests are not
+  issues). An issue is in **at most one** release per project, enforced by the primary key `(repo, issue_number)`;
+  assigning an issue that is in another release moves it. New and moved issues go last, in the order given;
+  assigning an issue already in the target release changes nothing. The title and kind are stored at assignment
+  time (like `runs.issue_title`) and not refreshed. An issue closed on GitHub afterwards stays until removed.
+  Assignments and reorders run in one transaction under a per-repo advisory lock (`releases:<repo>`); an
+  assignment is all-or-nothing.
+- **Order.** Positions are explicit; a reorder must name exactly the release's current issues (else 409
+  `release_issues_changed`) and rewrites them densely.
+- **Access.** Everyone who can see the project sees its releases; any logged-in user who can see it may create,
+  edit, delete, assign and reorder — the rule that also gates creating issues and starting runs. A release of a
+  repository the caller cannot see answers 404, never 403. (Once a release can be started, changes after the
+  start are limited to the user who started it and admins.)
+- **Deleting** a release removes the plan and its assignments only; the issues stay open on GitHub.
+- **Live.** Every change emits a `release` feed frame per affected release (a move: source and target), deletion
+  `release_deleted` (§8). `updatedAt` strictly increases on every change at millisecond resolution.
+
 ## 7. Chat agent ↔ factory (MCP)
 
 The server exposes an MCP endpoint (`POST /mcp`, streamable HTTP, JSON responses). Every agent
@@ -287,8 +321,15 @@ to the owner and the repo, and dies with the process.
 
 Tools: `factory_list_issues`, `factory_get_issue`, `factory_create_issue`, `factory_start_run`,
 `factory_list_runs`, `factory_get_run`, `factory_approve_run`, `factory_cancel_run`,
-`factory_send_to_agent`, `factory_request_software`. Pipeline-stage agents get only `factory_get_issue`
+`factory_send_to_agent`, `factory_request_software`, `factory_list_releases`, `factory_create_release`,
+`factory_assign_issues`, `factory_unassign_issues`. Pipeline-stage agents get only `factory_get_issue`
 and `factory_request_software`.
+
+Release tools (§6 "Releases"), chat agents only; the three mutating ones also refuse run-bound tokens:
+`factory_list_releases {}` (the `/factory releases` text, with release ids), `factory_create_release
+{ name, description? }`, `factory_assign_issues { release, issueNumbers }` (`release`: a name — case-insensitive —
+or id of a release of this project; `issueNumbers`: an array of integers, `"#5"` accepted; assigns or moves) and
+`factory_unassign_issues { issueNumbers }`. `factory_list_issues` appends ` [release <name>]` to assigned issues.
 
 `factory_send_to_agent` `{ runId?, role?, sessionId?, message }` passes the person's message to a running
 spec-writer or builder of a run in this project (§6 "Messages to running agents"): by `runId` + `role`
@@ -300,7 +341,13 @@ message is queued for the agent's next step, never that it was already applied.
 Chat input starting with `/factory` is handled by the server and not sent to Claude (with attachments it
 is rejected with 422 `attachments_not_allowed`; they stay unsent so the owner can send them in a normal message):
 `/factory run <issue>`, `/factory status`, `/factory approve [runId]`, `/factory cancel <runId>`,
-`/factory help`. The reply is appended to the transcript as a `system` event.
+`/factory releases`, `/factory release create <name> [description…]`, `/factory release add <name> <issue>…`,
+`/factory release remove <issue>…`, `/factory help`. The reply is appended to the transcript as a `system` event.
+Release commands act in the chat's project as its owner: `releases` lists name, "in preparation", the issue count
+and the issues in order (`#n title`); `add` assigns or moves and says what happened (e.g. `Release "1.4": added
+#5, #6 (now 4 issues).`, plus issues moved from another release); `remove` takes issues out of whatever release
+they are in. Issue tokens accept `5`, `#5` and `#5,`; an unknown release name gets a reply naming the existing
+ones; a missing or invalid argument gets a one-line usage reply. Renaming, deleting and reordering are web-only.
 
 ## 8. HTTP API
 
@@ -331,7 +378,15 @@ type Project = { name: string; fullName: string; description: string | null; pri
 type IssueKind = 'feature' | 'bug' | 'task';      // from labels: bug → bug; enhancement/feature → feature; else task
 type Issue = { number: number; title: string; state: 'open' | 'closed'; kind: IssueKind;
   labels: { name: string; color: string }[]; author: string; assignees: string[]; comments: number;
-  createdAt: string; updatedAt: string; htmlUrl: string; body?: string; activeRunId: string | null };
+  createdAt: string; updatedAt: string; htmlUrl: string; body?: string; activeRunId: string | null;
+  release: { id: string; name: string } | null };  // the release it is planned in (§6 "Releases"); always present
+
+type ReleaseIssue = { number: number; title: string; kind: IssueKind };   // title/kind as when it was assigned
+type Release = { id: string; repo: string; name: string; description: string;
+  status: 'planning';                       // shown as "in preparation"; later steps add more states
+  createdBy: { username: string; displayName: string };
+  createdAt: string; updatedAt: string;     // updatedAt strictly increases on every change
+  issues: ReleaseIssue[] };                 // in build order
 
 type SessionKind = 'chat' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
 type SessionStatus = 'starting' | 'running' | 'idle' | 'done' | 'failed' | 'stopped';
@@ -429,6 +484,13 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `GET /api/projects/{repo}/issues?state=open\|closed\|all` | → `Issue[]` | pull requests excluded |
 | `GET /api/projects/{repo}/issues/{number}` | → `Issue` (with `body`) | |
 | `POST /api/projects/{repo}/issues` | `{ title, body, kind }` → `Issue` | |
+| `GET /api/projects/{repo}/releases` | → `Release[]` | newest first (`createdAt` desc), each with its issues in order |
+| `POST /api/projects/{repo}/releases` | `{ name, description? }` → 201 `Release` | 400 invalid name or description; 409 `release_name_taken`. Starts nothing |
+| `GET /api/releases/{id}` | → `Release` | 404 unknown or invisible |
+| `PUT /api/releases/{id}` | `{ name, description }` → `Release` | rename or edit; same validation as create |
+| `DELETE /api/releases/{id}` | → 204 | removes the plan and its assignments; the issues are untouched on GitHub |
+| `POST /api/projects/{repo}/releases/assign` | `{ issueNumbers: number[], releaseId: string \| null }` → `Release[]` | assigns or moves the issues to that release of `{repo}` (404 otherwise), or takes them out with `releaseId: null` (numbers in no release are ignored, no GitHub calls). 1–100 positive numbers, duplicates collapsed (400 otherwise; an invalid `releaseId` is 400). Every issue is fetched with the caller's token: unknown → 404 "Issue #n not found", closed → 409 `issue_closed`; all-or-nothing. Answers all releases of the project after the change |
+| `PUT /api/releases/{id}/issues/order` | `{ issueNumbers: number[] }` → `Release` | the new complete order; anything but exactly the current issues → 409 `release_issues_changed`, nothing changes |
 | `GET /api/projects/{repo}/runs` | → `Run[]` | newest first |
 | `POST /api/projects/{repo}/runs` | `{ issueNumber }` → `Run` | needs Claude credential; 409 if the issue has an active run |
 | `GET /api/runs?active=true&status=<s>` | → `Run[]` | across visible repos, newest first (max 200). `active=true`: not finished, i.e. `queued`, `spec`, `building`, `reviewing`, `approving` or `needs_human`. `status`: only these statuses, repeatable and/or comma list (`?status=needs_human`); unknown status → 400. Both given: both apply |
@@ -471,6 +533,9 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 - Messages to pipeline agents: reviewer/approver → 409 `agent_does_not_accept_messages`; agent not running
   (pending, finished, failed, stopped) → 409 `agent_not_running`; with attachments → 422
   `attachments_not_allowed`; not the run's owner → 403 `forbidden`.
+- Releases: duplicate name → 409 `release_name_taken`; assigning a closed issue → 409 `issue_closed`; a stale
+  order → 409 `release_issues_changed`. Every release route answers 404 when the caller cannot see the project,
+  also when addressed by release id.
 - "Needs Claude credential" → 422 `claude_credential_required`; too many agents → 409
   `too_many_agents`; issue already has an active run → 409 `active_run_exists`; missing CSRF header
   → 403 `csrf`; foreign `Origin` → 403 `bad_origin`.
@@ -519,6 +584,11 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   after a reconnect. Issues created, edited or closed directly on GitHub are not announced.
   `{ type: 'session_closed', repo: string, sessionId: string }` announces a closed (deleted) chat, with
   the same visibility filter; clients drop it from their lists and never show it again.
+  `{ type: 'release', repo: string, release: Release }` is sent after every change to a release (created, edited,
+  issues added, removed, moved in or out, reordered), once per affected release — a move sends one for the source
+  and one for the target. `{ type: 'release_deleted', repo: string, releaseId: string }` announces a deleted
+  release. Both pass the same visibility filter; clients order versions by `updatedAt` and reload their release
+  lists after a reconnect.
 
 ## 9. Deployment and release
 
@@ -664,6 +734,7 @@ a compromised GitHub release; the activity answer is advisory (it decides when, 
 
 Routes: `/login`, `/` (projects), `/p/:repo` (issues · CLI chat · agents), `/p/:repo/runs/:runId`
 (pipeline diagram with live stages; selecting a stage shows that agent's transcript),
+`/p/:repo/releases/:releaseId` (a release's plan, below),
 `/agents` (everything running), `/settings` (own credentials, and "Models & cost": the user's own model per
 role and fix rounds, with presets — *Default* clears every choice, *Economy* picks Sonnet for chat and spec,
 Haiku for the four reviewers and one fix round), `/admin` ("Factory settings": the default models and the
@@ -703,5 +774,22 @@ both ask for confirmation (the chat, its transcript and attachments are deleted 
 it keep running). The closed chat disappears from the picker and all lists at once; if it was open, `?session=`
 is cleared and the page falls back to another chat or the empty state. Others watching it via `?session=` see
 "This chat was closed" with a Dismiss button instead of an error.
+
+**Releases.** The activity pane has a "Releases" section above "Runs": one row per release (name, the pill
+"in preparation", "N issues") linking to its page, and "+ New" (accessible name "New release") opening the dialog
+"New release in <repo>" (Name with the naming rule, optional Description). Once the project has at least one
+release, the issues panel adds: a "Release" filter (All issues · No release · each release) combined with the kind
+and state filters; the release name as a tag on assigned issues, linking to the release page; on open issues a
+compact "Release for #n" select (assigns, moves or removes at once; disabled while the request runs; errors show
+in the panel's alert line) and a "Select #n" checkbox — with a selection, a bar shows "N selected", "Assign
+selected to", "Assign" and "Clear" (changing the state filter clears the selection). Badges and filter come from
+the live release list (fetched once per project page and overlaid with feed frames and the client's own answers),
+so assignments made by others, `/factory` or the chat agent appear without a reload; a deleted release drops out
+of the filter. The release page (a normal scrolling page) shows the name, pill, description (plain text, line
+breaks kept), creator, the note that nothing is built until the release is started, "Edit" (name, description)
+and "Delete" (confirmation; the issues stay open and unassigned; then back to the project). Its issues are an
+ordered list with "Move #n up", "Move #n down" and "Remove #n from release" buttons (no drag and drop), and an
+"Add an open issue" select listing open issues not in this release (those in another release are marked
+"(in <name>)" and moved). It updates live; if someone else deletes the release, the page says so.
 
 Artwork is served from `web/public/art/` (see `art/README.md`).

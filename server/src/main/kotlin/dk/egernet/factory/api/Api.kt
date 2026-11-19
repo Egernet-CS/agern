@@ -92,6 +92,10 @@ private val log = LoggerFactory.getLogger("dk.egernet.factory.api")
 @Serializable data class GithubTokenReq(val token: String)
 @Serializable data class CreateIssueReq(val title: String, val body: String = "", val kind: String = "task")
 @Serializable data class CreateRunReq(val issueNumber: Int)
+@Serializable data class CreateReleaseReq(val name: String, val description: String = "")
+@Serializable data class UpdateReleaseReq(val name: String, val description: String = "")
+@Serializable data class AssignReq(val issueNumbers: List<Int>, val releaseId: String? = null)
+@Serializable data class OrderReq(val issueNumbers: List<Int>)
 @Serializable data class CreateSessionReq(val model: String? = null)
 @Serializable data class InputReq(val text: String = "", val attachmentIds: List<String> = emptyList())
 @Serializable data class ResolveReq(val status: String, val note: String? = null)
@@ -236,6 +240,7 @@ fun Application.installApi(s: Services) {
             meRoutes(s)
             projectRoutes(s)
             runRoutes(s)
+            releaseRoutes(s)
             sessionRoutes(s)
             adminRoutes(s)
             wsRoutes(s)
@@ -419,6 +424,49 @@ private fun Route.runRoutes(s: Services) {
     }
     post("/runs/{id}/approve") { call.respond(s.factory.approveRun(call.requireUser(s), uuidParam("id"))) }
     post("/runs/{id}/cancel") { call.respond(s.factory.cancelRun(call.requireUser(s), uuidParam("id"))) }
+}
+
+// ------------------------------------------------------------------ releases (docs/ARCHITECTURE.md §6 "Releases")
+
+private fun Route.releaseRoutes(s: Services) {
+    get("/projects/{repo}/releases") {
+        val u = call.requireUser(s)
+        call.respond(s.releases.list(u, repoParam()).map { it.toDto() })
+    }
+    post("/projects/{repo}/releases") {
+        val u = call.requireUser(s)
+        val req = call.receive<CreateReleaseReq>()
+        call.respond(HttpStatusCode.Created, s.releases.create(u, repoParam(), req.name, req.description).toDto())
+    }
+    post("/projects/{repo}/releases/assign") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        val req = call.receive<AssignReq>()
+        val releaseId = req.releaseId?.let { runCatching { UUID.fromString(it) }.getOrNull() ?: throw badRequest("releaseId is not a valid id") }
+        s.releases.assign(u, repo, req.issueNumbers, releaseId)
+        call.respond(s.releases.list(u, repo).map { it.toDto() })
+    }
+    get("/releases/{id}") {
+        val u = call.requireUser(s)
+        call.respond(s.releases.visible(u, uuidParam("id")).toDto())
+    }
+    put("/releases/{id}") {
+        val u = call.requireUser(s)
+        val id = uuidParam("id")
+        val req = call.receive<UpdateReleaseReq>()
+        call.respond(s.releases.update(u, id, req.name, req.description).toDto())
+    }
+    delete("/releases/{id}") {
+        val u = call.requireUser(s)
+        s.releases.delete(u, uuidParam("id"))
+        call.respond(HttpStatusCode.NoContent)
+    }
+    put("/releases/{id}/issues/order") {
+        val u = call.requireUser(s)
+        val id = uuidParam("id")
+        val req = call.receive<OrderReq>()
+        call.respond(s.releases.reorder(u, id, req.issueNumbers).toDto())
+    }
 }
 
 // ------------------------------------------------------------------ agent sessions
@@ -671,6 +719,8 @@ private fun Route.wsRoutes(s: Services) {
                     is FeedItem.Run -> FeedFrame(type = "run", run = item.run)
                     is FeedItem.Issue -> FeedFrame(type = "issue", repo = item.repo, issue = item.issue)
                     is FeedItem.SessionClosed -> FeedFrame(type = "session_closed", repo = item.repo, sessionId = item.sessionId)
+                    is FeedItem.Release -> FeedFrame(type = "release", repo = item.repo, release = item.release)
+                    is FeedItem.ReleaseDeleted -> FeedFrame(type = "release_deleted", repo = item.repo, releaseId = item.releaseId)
                 }
                 send(Frame.Text(AppJson.encodeToString(FeedFrame.serializer(), frame)))
             }

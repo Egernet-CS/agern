@@ -31,6 +31,7 @@ class FactoryService(
     private val softwareRequests: SoftwareRequestStore,
     private val sessions: SessionStore,
     private val bus: EventBus,
+    private val releases: ReleaseService,
 ) {
     private val org get() = cfg.githubOrg
 
@@ -47,11 +48,11 @@ class FactoryService(
         }
     }
 
-    fun issueDto(repo: String, i: GhIssue, withBody: Boolean, activeRunId: UUID?) = IssueDto(
+    fun issueDto(repo: String, i: GhIssue, withBody: Boolean, activeRunId: UUID?, release: IssueReleaseDto? = null) = IssueDto(
         number = i.number, title = i.title, state = i.state, kind = issueKindFromLabels(i.labels.map { it.name }),
         labels = i.labels.map { LabelDto(it.name, it.color) }, author = i.user?.login ?: "", assignees = i.assignees.map { it.login },
         comments = i.comments, createdAt = i.createdAt, updatedAt = i.updatedAt, htmlUrl = i.htmlUrl,
-        body = if (withBody) (i.body ?: "") else null, activeRunId = activeRunId?.toString(),
+        body = if (withBody) (i.body ?: "") else null, activeRunId = activeRunId?.toString(), release = release,
     )
 
     fun projectDto(r: GhRepo, agentCounts: Map<String, Int>, runCounts: Map<String, Int>) = ProjectDto(
@@ -79,14 +80,16 @@ class FactoryService(
         withContext(Dispatchers.IO) { access.requireVisible(user, repo) }
         val client = access.requireClient(user)
         val active = runs.activeRunsByIssue(repo)
-        return gh { client.listIssues(org, repo, state) }.map { issueDto(repo, it, false, active[it.number]) }
+        val planned = withContext(Dispatchers.IO) { releases.releaseByIssue(repo) }
+        return gh { client.listIssues(org, repo, state) }.map { issueDto(repo, it, false, active[it.number], planned[it.number]) }
     }
 
     suspend fun getIssue(user: UserRecord, repo: String, number: Int): IssueDto {
         withContext(Dispatchers.IO) { access.requireVisible(user, repo) }
         val client = access.requireClient(user)
         val i = gh { client.getIssue(org, repo, number) } ?: throw notFound("Issue #$number not found")
-        return issueDto(repo, i, true, runs.activeRunFor(repo, number))
+        val planned = withContext(Dispatchers.IO) { releases.releaseByIssue(repo) }
+        return issueDto(repo, i, true, runs.activeRunFor(repo, number), planned[number])
     }
 
     /** Issue with its comments, as plain text for agents. */
@@ -240,7 +243,35 @@ class FactoryService(
                 val r = cancelRun(owner, id)
                 "Run ${r.id}: ${r.status}"
             }
+            "releases" -> releases.describe(owner, repo, withIds = false)
+            "release" -> releaseCommand(owner, repo, parts.drop(1))
             else -> "Unknown command '$cmd'.\n$HELP"
+        }
+    }
+
+    /** `/factory release create|add|remove …` (docs/ARCHITECTURE.md §7). */
+    private suspend fun releaseCommand(owner: UserRecord, repo: String, args: List<String>): String {
+        val usage = "Usage: /factory release create <name> [description] | add <name> <issue>… | remove <issue>…"
+        return when (args.firstOrNull()?.lowercase()) {
+            "create" -> {
+                val name = args.getOrNull(1) ?: return "Usage: /factory release create <name> [description]"
+                val r = releases.create(owner, repo, name, args.drop(2).joinToString(" "))
+                "Created release \"${r.name}\"."
+            }
+            "add" -> {
+                val name = args.getOrNull(1) ?: return "Usage: /factory release add <name> <issue> [<issue>…]"
+                val numbers = parseIssueTokens(args.drop(2)) ?: return "Usage: /factory release add <name> <issue> [<issue>…]"
+                val target = releases.find(owner, repo, name)
+                val out = releases.assign(owner, repo, numbers, target.id)
+                assignReply(target.name, out)
+            }
+            "remove" -> {
+                val numbers = parseIssueTokens(args.drop(1)) ?: return "Usage: /factory release remove <issue> [<issue>…]"
+                val out = releases.assign(owner, repo, numbers, null)
+                if (out.removed.isEmpty()) "None of ${numbers.joinToString(", ") { "#$it" }} is in a release."
+                else "Removed ${out.removed.joinToString(", ") { "#$it" }} from ${if (out.removed.size == 1) "its release" else "their releases"}."
+            }
+            else -> usage
         }
     }
 
@@ -251,12 +282,34 @@ class FactoryService(
     }
 
     companion object {
+        /** `5`, `#5` and `#5,`; null when there is none or one is not an issue number. */
+        fun parseIssueTokens(tokens: List<String>): List<Int>? {
+            val nums = tokens.flatMap { it.split(',') }.map { it.trim() }.filter { it.isNotEmpty() }
+                .map { t -> t.removePrefix("#").toIntOrNull()?.takeIf { it > 0 } ?: return null }
+            return nums.ifEmpty { null }
+        }
+
+        /** E.g. `Release "1.4": added #5, #6 (now 4 issues).` plus moves from other releases. */
+        fun assignReply(name: String, out: ReleaseService.AssignOutcome): String {
+            val total = out.release?.issues?.size ?: 0
+            val now = "now $total issue${if (total == 1) "" else "s"}"
+            if (out.added.isEmpty()) return "Release \"$name\": nothing changed, the issues are already in it ($now)."
+            return buildString {
+                append("Release \"$name\": added ${out.added.joinToString(", ") { "#$it" }} ($now).")
+                out.movedFrom.forEach { (from, nums) -> append(" Moved ${nums.joinToString(", ") { "#$it" }} from release \"$from\".") }
+            }
+        }
+
         val HELP = """
             |Factory commands (handled by Agern, not sent to Claude):
             |  /factory run <issue>       start a pipeline run for an issue in this project
             |  /factory status            list recent runs in this project
             |  /factory approve [runId]   merge a run that waits for a human (owner only)
             |  /factory cancel <runId>    cancel a run (owner or admin)
+            |  /factory releases          list the releases planned in this project
+            |  /factory release create <name> [description]   plan a new release
+            |  /factory release add <name> <issue>…            put issues into a release (moves them from another)
+            |  /factory release remove <issue>…                take issues out of their release
             |  /factory help              this help
             |To steer a running spec-writer or builder, select it on the run page and type below its transcript,
             |or ask the chat agent to pass a message on (it uses the factory_send_to_agent tool).

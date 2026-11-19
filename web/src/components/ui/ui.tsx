@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import type { IssueKind, RunStatus, SessionKind, SessionStatus } from '../../api/types';
+import type { IssueKind, ReleaseStatus, RunStatus, SessionKind, SessionStatus } from '../../api/types';
 
 /** Decorative artwork from /art that degrades to a gradient (never a broken-image icon). */
 export function Art({ src, className = '', children }: { src: string; className?: string; children?: ReactNode }) {
@@ -74,6 +74,17 @@ export function SessionStatusPill({ status }: { status: SessionStatus }) {
     <span className={`pill pill--${SESSION_TONE[status]}`}>
       <span className="pill-dot" aria-hidden />
       {status}
+    </span>
+  );
+}
+
+const RELEASE_LABEL: Record<ReleaseStatus, string> = { planning: 'in preparation' };
+const RELEASE_TONE: Record<ReleaseStatus, string> = { planning: 'idle' };
+export function ReleaseStatusPill({ status }: { status: ReleaseStatus }) {
+  return (
+    <span className={`pill pill--${RELEASE_TONE[status]}`}>
+      <span className="pill-dot" aria-hidden />
+      {RELEASE_LABEL[status]}
     </span>
   );
 }
