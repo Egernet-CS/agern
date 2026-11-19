@@ -154,8 +154,13 @@ class PodmanIntegrationTest {
         assertEquals("50000 100000", ok(a, "cat /sys/fs/cgroup/cpu.max"), "cpu.max for 0.5 CPUs")
         assertEquals("4096", ok(a, "cat /sys/fs/cgroup/pids.max"), "pids.max")
         // ... and enforced: a process that allocates more than the limit is killed, the sandbox survives.
+        val before = ok(a, "echo pid1 \$(cat /proc/1/oom_score_adj) self \$(cat /proc/self/oom_score_adj) group \$(cat /sys/fs/cgroup/memory.oom.group 2>/dev/null)")
+        println("before the memory hog: $before")
         val hog = sh(a, "x=\$(head -c 400000000 /dev/zero | tr '\\0' a); echo survived \${#x}", timeoutMs = 120_000)
+        val state = podman("inspect", "--format", "{{.State.Status}} exit={{.State.ExitCode}} oomkilled={{.State.OOMKilled}}", a).output.trim()
+        println("after the memory hog: exit ${hog.exitCode}, container $state")
         assertTrue(hog.exitCode != 0 && !hog.output.contains("survived"), "a 400 MB allocation was not stopped by a 128 MB limit: ${hog.exitCode} ${hog.output}")
+        assertTrue(state.startsWith("running"), "the sandbox itself did not survive the memory hog ($state; before: $before)")
         assertTrue(Regex("oom_kill [1-9]").containsMatchIn(ok(a, "cat /sys/fs/cgroup/memory.events")), "no oom_kill in memory.events")
         assertEquals("alive", ok(a, "echo alive"))
 

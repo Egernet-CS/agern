@@ -206,10 +206,13 @@ EOF
     eq "gradle (as agern in agern.service) exit status" 0 "$status"
     if [ -f "$xml" ]; then
         head -n 2 "$xml" | tail -n 1
+        sed -n '/<system-out>/,/<\/system-out>/p' "$xml" | head -n 20
         grep -q 'tests="1" skipped="0" failures="0" errors="0"' "$xml" && pass "PodmanIntegrationTest ran and passed" || { fail "PodmanIntegrationTest"; sed -n '/<failure/,/<\/failure>/p' "$xml" | head -n 60; }
     else
         fail "no test report at $xml"
     fi
+    echo "--- kernel OOM messages during the test:"
+    journalctl -k --since "@$T0" --no-pager -o cat 2>/dev/null | grep -iE 'oom|killed process' | tail -n 20 || true
     rm -f /run/systemd/system/agern.service.d/zz-sandbox-it.conf
     systemctl daemon-reload
     systemctl reset-failed agern.service >/dev/null 2>&1 || true
@@ -221,13 +224,33 @@ SPID=$(systemctl show -p MainPID --value agern-sandbox.service)
 ENV_SUM=$(sha256sum /etc/agern/agern.env | cut -d' ' -f1)
 SUBID_SUM=$(cat /etc/subuid /etc/subgid | sha256sum | cut -d' ' -f1)
 A_SEMVER=$(cat /usr/share/agern/VERSION)
-# The same package again (--force): the upgrade path of postinst, the restart of the server and the
-# health check on its version. (A repacked higher version would carry the same agern.jar, which
-# reports the old version, so the health check after the restart could not pass.)
+# A real upgrade: the package under test as a higher version, with the version inside agern.jar
+# changed too (the health check after the restart compares it).
+B_SEMVER=${A_SEMVER%%[-+]*}
+B_SEMVER="${B_SEMVER%.*}.$((${B_SEMVER##*.} + 1))"
+rm -rf "$WORK/repack"
+dpkg-deb -R "$WORK/a.deb" "$WORK/repack"
+sed -i "s/^Version: .*/Version: $B_SEMVER/" "$WORK/repack/DEBIAN/control"
+printf '%s\n' "$B_SEMVER" >"$WORK/repack/usr/share/agern/VERSION"
+command -v python3 >/dev/null 2>&1 || apt-get install -y -q python3 >/dev/null
+python3 -I - "$WORK/repack/usr/share/agern/agern.jar" "$B_SEMVER" <<'PY'
+import sys, zipfile, shutil
+jar, version = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(jar) as src, zipfile.ZipFile(jar + ".new", "w", zipfile.ZIP_DEFLATED) as dst:
+    for item in src.infolist():
+        data = src.read(item.filename)
+        if item.filename == "agern-version.txt":
+            data = (version + "\n").encode()
+        dst.writestr(item, data)
+shutil.move(jar + ".new", jar)
+PY
+(cd "$WORK/repack" && find usr -type f | LC_ALL=C sort | xargs md5sum) >"$WORK/repack/DEBIAN/md5sums"
+dpkg-deb --build --root-owner-group -Zxz "$WORK/repack" "$WORK/b.deb" >/dev/null
 SRV_PID=$(systemctl show -p MainPID --value agern.service)
 T0=$(date +%s)
-if agern upgrade --file "$WORK/a.deb" --force >"$WORK/upgrade.log" 2>&1; then pass "agern upgrade --file --force (reinstall $A_SEMVER)"; else fail "agern upgrade"; fi
+if agern upgrade --file "$WORK/b.deb" >"$WORK/upgrade.log" 2>&1; then pass "agern upgrade --file (to $B_SEMVER)"; else fail "agern upgrade"; fi
 grep -v -E '^\(Reading database|^$' "$WORK/upgrade.log" || true
+eq "now $B_SEMVER" "$B_SEMVER" "$(dpkg-query -W -f='${Version}' agern)"
 echo "--- agern.service around the upgrade:"
 journal_since agern.service "$T0" | grep -E 'Stopp|Start|Deactivated|exited' || true
 echo "--- agern.service: MainPID $SRV_PID before, $(systemctl show -p MainPID --value agern.service) after; is-enabled $(systemctl is-enabled agern.service 2>&1)"
@@ -238,7 +261,7 @@ check "socket still enabled" systemctl is-enabled --quiet agern-sandbox.socket
 eq "sandbox service not restarted by the upgrade" "$SPID" "$(systemctl show -p MainPID --value agern-sandbox.service)"
 if agern sandbox selftest >"$WORK/selftest.log" 2>&1; then pass "agern sandbox selftest after the upgrade"; else fail "selftest after upgrade"; fi
 cat "$WORK/selftest.log"
-[ "$(curl -fsS http://127.0.0.1:8080/api/health 2>/dev/null | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')" = "$A_SEMVER" ] && pass "server healthy on $A_SEMVER" || fail "server after upgrade"
+[ "$(curl -fsS http://127.0.0.1:8080/api/health 2>/dev/null | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')" = "$B_SEMVER" ] && pass "server healthy on $B_SEMVER" || fail "server after upgrade"
 
 section "status and prune"
 out=$(agern sandbox status 2>&1) || true
