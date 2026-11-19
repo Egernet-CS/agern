@@ -56,6 +56,11 @@ Models per role are a setting. The details are in [`docs/ARCHITECTURE.md`](docs/
   can watch; sessions owned by someone else are read-only.
 - **Agents can use the factory.** The chat agent gets factory tools over MCP (list and create issues,
   start, approve and cancel runs), and `/factory run|status|approve|cancel` works in the chat.
+- **Build and test sandboxes (optional).** A project describes a container for its builds and tests
+  in `.agern/sandbox.yml` — toolchain image, setup script, sidecar services such as PostgreSQL with a
+  readiness check, caches, a non-root user, and extra *platform* images to test on. After an admin
+  approves the file, each run's builder builds and tests in its own rootless Podman container. Off by
+  default; see [`docs/SANDBOXES.md`](docs/SANDBOXES.md) (this repository has its own, `.agern/sandbox.yml`).
 - **Native and small.** One self-contained `agern.jar` (server with the frontend embedded), Java 17
   and a natively installed PostgreSQL. No Docker needed for Agern itself.
 
@@ -256,7 +261,7 @@ can also run locally; `--deb` needs `dpkg-deb`) and publishes a GitHub Release w
 server/      Kotlin + Ktor backend          web/        React + TypeScript frontend
 packaging/   installer, agern CLI, service units, deb/ (Debian package)
 scripts/     release.sh, package.sh, main-version.sh
-docs/        architecture and API contract, INSTALL-LINUX.md
+docs/        architecture and API contract, INSTALL-LINUX.md, SANDBOXES.md (for project authors)
 art/         Blender sources of the artwork
 ```
 
