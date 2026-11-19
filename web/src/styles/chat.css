@@ -659,6 +659,10 @@
 .chat-start h3 {
   font-size: 1.2rem;
 }
+/* a watched chat that its owner or an admin closed */
+.chat-closed h3 {
+  color: var(--text-2);
+}
 .ascii {
   color: var(--amber);
   font-size: 13px;

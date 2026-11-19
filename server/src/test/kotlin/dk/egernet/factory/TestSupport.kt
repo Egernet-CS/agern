@@ -49,6 +49,8 @@ class FakeProcess(val spec: LaunchSpec, private val onInput: (FakeProcess, Strin
     private val ch = Channel<String>(Channel.UNLIMITED)
     private val exit = CompletableDeferred<Int>()
     @Volatile var killed = false
+    /** Simulates a process that will not die: closing stdin and killing it do not end it (call [exit] to end it). */
+    @Volatile var unkillable = false
     /** Every line written to stdin, in order. */
     val written = CopyOnWriteArrayList<String>()
     /** Lines written to stdin and not yet picked up (see [pickUp]). */
@@ -112,11 +114,11 @@ class FakeProcess(val spec: LaunchSpec, private val onInput: (FakeProcess, Strin
     }
     override fun closeInput() {
         inputClosed = true
-        if (spec.interactive) exit(0)
+        if (spec.interactive && !unkillable) exit(0)
     }
     override fun kill() {
         killed = true
-        if (!exit.isCompleted) exit(143)
+        if (!unkillable && !exit.isCompleted) exit(143)
     }
     override suspend fun awaitExit(): Int = exit.await()
     override fun stderrTail(): String = "fake stderr"

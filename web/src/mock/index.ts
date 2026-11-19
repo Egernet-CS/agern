@@ -8,6 +8,7 @@ import {
   approveRun,
   cancelRun,
   chatInput,
+  closeChat,
   createChat,
   db,
   interrupt,
@@ -383,6 +384,18 @@ export const mockApi: Api = {
       stopSession(s);
       return s;
     }),
+  closeChat: (id) =>
+    ok(() => {
+      const s = session(id);
+      if (s.owner.username !== me().username && !me().isAdmin) throw new MockError(403, 'forbidden', 'Only the owner or an admin can close this chat');
+      if (s.kind !== 'chat') throw new MockError(409, 'not_a_chat', 'Only chat sessions can be closed; cancel the run to stop a pipeline agent');
+      for (const [aid, a] of attachments) {
+        if (a.sessionId !== id) continue;
+        URL.revokeObjectURL(a.url);
+        attachments.delete(aid);
+      }
+      closeChat(s);
+    }),
 
   settings: () => ok(() => (needAdmin(), db.settings)),
   putSettings: (s) =>
@@ -405,19 +418,30 @@ export const mockApi: Api = {
   openSessionSocket(id, after, handlers): Channel {
     let closed = false;
     const sub = (e: Parameters<typeof handlers.onFrame>[0]) => !closed && handlers.onFrame(e);
+    const onClose = (info: { code: number; reason: string }) => {
+      if (closed) return;
+      closed = true;
+      handlers.onClose?.(info);
+    };
     const t = setTimeout(() => {
       if (closed) return;
+      // Like the server: an unknown (or closed) session is refused.
+      if (!db.sessions.has(id)) return onClose({ code: 1008, reason: 'not found' });
       handlers.onOpen?.();
       for (const e of db.events.get(id) ?? []) if (e.seq > after) handlers.onFrame(clone(e));
       let set = db.sessionSubs.get(id);
       if (!set) db.sessionSubs.set(id, (set = new Set()));
       set.add(sub);
+      let closers = db.sessionClosers.get(id);
+      if (!closers) db.sessionClosers.set(id, (closers = new Set()));
+      closers.add(onClose);
     }, 60);
     return {
       close() {
         closed = true;
         clearTimeout(t);
         db.sessionSubs.get(id)?.delete(sub);
+        db.sessionClosers.get(id)?.delete(onClose);
       },
     };
   },

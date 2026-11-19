@@ -447,6 +447,7 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `DELETE /api/sessions/{id}/attachments/{aid}` | → 204 | owner only; unsent only (409 `attachment_sent`) |
 | `POST /api/sessions/{id}/interrupt` | → 202 | owner only; stops the current turn (chat only; 409 for pipeline agents — cancel the run instead) |
 | `POST /api/sessions/{id}/stop` | → `AgentSession` | owner or admin |
+| `DELETE /api/sessions/{id}` | → 204 | **Close a chat**: owner or admin (403 otherwise, 404 if the repo is not visible); chat only (409 `not_a_chat` for pipeline sessions — cancel the run instead). A live process is stopped first (as `stop`, up to 10 s; if it has not exited, 409 `agent_not_stopped` and nothing is deleted). Then the session is deleted permanently with its events, attachment rows and the files under `<dataDir>/attachments/<id>/`; its session sockets are closed with `4404` and the feed announces `session_closed`. Runs started from it keep running (their `startedBySessionId` becomes `null`). Afterwards every route for the id answers 404 |
 | `GET /api/admin/settings` · `PUT /api/admin/settings` | `Settings` | admin |
 | `GET /api/admin/users` | → `User[]` | admin |
 | `GET /api/admin/software-requests` | → `SoftwareRequest[]` | admin |
@@ -505,7 +506,10 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 
 - `GET /api/ws/sessions/{id}?after=<seq>` — replays persisted events with `seq > after`, then
   streams live. Frames are `Event` JSON. Live-only partial deltas are sent as
-  `{ seq: -1, type: 'claude', payload: { type: 'stream_event', … } }`.
+  `{ seq: -1, type: 'claude', payload: { type: 'stream_event', … } }`. An unknown or invisible session
+  is refused with close code `1008 "not found"`. When the chat is closed (`DELETE /api/sessions/{id}`),
+  the server closes every open socket of it with code `4404 "session closed"` (no frame is sent first);
+  clients must not reconnect after `4404` or `1008`.
 - `GET /api/ws/feed` — frames `{ type: 'session', session: AgentSession }` and
   `{ type: 'run', run: Run }` whenever one the user may see changes, and
   `{ type: 'issue', repo: string, issue: Issue }` when an issue is created through Agern (the REST
@@ -513,6 +517,8 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   list shape (no `body`), and the frame passes the same per-user visibility filter as the others. The
   feed is live only (no replay), so clients reload their issue lists and the project's open-issue count
   after a reconnect. Issues created, edited or closed directly on GitHub are not announced.
+  `{ type: 'session_closed', repo: string, sessionId: string }` announces a closed (deleted) chat, with
+  the same visibility filter; clients drop it from their lists and never show it again.
 
 ## 9. Deployment and release
 
@@ -690,5 +696,12 @@ The transcript sticks to the bottom while the agent streams unless the reader ha
 so the transcript shrinks rather than the prompt being pushed off screen. Other pages (projects, run,
 agents, settings, admin) scroll normally under a sticky top bar; the run page's transcript is its own
 scrolling pane with the same stick-to-bottom behaviour.
+
+**Closing chats.** The activity pane lists every chat of the project under "Chats" (newest first). The owner
+of a chat, and admins, get a "Close" button on its row and a "Close chat" button in the open chat's header;
+both ask for confirmation (the chat, its transcript and attachments are deleted permanently; runs started from
+it keep running). The closed chat disappears from the picker and all lists at once; if it was open, `?session=`
+is cleared and the page falls back to another chat or the empty state. Others watching it via `?session=` see
+"This chat was closed" with a Dismiss button instead of an error.
 
 Artwork is served from `web/public/art/` (see `art/README.md`).

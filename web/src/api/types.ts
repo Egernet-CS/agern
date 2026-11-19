@@ -232,7 +232,9 @@ export type FeedFrame =
   | { type: 'session'; session: AgentSession }
   | { type: 'run'; run: Run }
   /** An issue created through Agern, in list shape (no body). Event only: not replayed, not sent for changes made on GitHub. */
-  | { type: 'issue'; repo: string; issue: Issue };
+  | { type: 'issue'; repo: string; issue: Issue }
+  /** A chat was closed (deleted) by its owner or an admin. */
+  | { type: 'session_closed'; repo: string; sessionId: string };
 
 /** Agents are working on these runs. */
 export const WORKING_RUN_STATUSES: RunStatus[] = ['queued', 'spec', 'building', 'reviewing', 'approving'];

@@ -150,6 +150,7 @@ export const httpApi: Api = {
   config: () => get('/api/config'),
   interrupt: (id) => post(`/api/sessions/${enc(id)}/interrupt`),
   stopSession: (id) => post(`/api/sessions/${enc(id)}/stop`),
+  closeChat: (id) => del(`/api/sessions/${enc(id)}`),
 
   settings: () => get('/api/admin/settings'),
   putSettings: (s) => put('/api/admin/settings', s),

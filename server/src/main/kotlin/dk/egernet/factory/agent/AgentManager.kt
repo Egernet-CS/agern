@@ -144,6 +144,8 @@ class AgentManager(
     private val chatLocks = ConcurrentHashMap<UUID, Mutex>()
     private val eventLocks = ConcurrentHashMap<UUID, Any>()
     private val slots = ConcurrentHashMap<UUID, Semaphore>()
+    /** Chats that were closed (deleted): late background work for them is dropped. */
+    private val closed = ConcurrentHashMap.newKeySet<UUID>()
 
     private fun slot(userId: UUID) = slots.computeIfAbsent(userId) { Semaphore(cfg.maxAgentsPerUser) }
 
@@ -161,8 +163,10 @@ class AgentManager(
 
     // ------------------------------------------------------------ events & status
 
+    /** Appends and broadcasts an event. For a closed chat nothing is stored or sent (a transient `seq = -1` event is returned). */
     fun publish(sessionId: UUID, type: String, payload: JsonElement): EventDto =
         synchronized(eventLocks.computeIfAbsent(sessionId) { Any() }) {
+            if (sessionId in closed) return@synchronized EventDto(-1, sessionId.toString(), Instant.now().iso(), type, payload)
             val e = events.append(sessionId, type, payload)
             bus.emit(sessionId, e)
             e
@@ -244,6 +248,8 @@ class AgentManager(
             val mutex = chatLocks.computeIfAbsent(s.id) { Mutex() }
             try {
                 mutex.withLock {
+                    // Closed while this input waited for the lock: drop it (no process, no files).
+                    if (s.id in closed) return@withLock
                     val content = withContext(Dispatchers.IO) { attachments.content(text, attached) }
                     val l = live[s.id] ?: startChat(s.id, user)
                     try {
@@ -372,6 +378,7 @@ class AgentManager(
     private suspend fun relaunchFresh(dead: Live) {
         val id = dead.sessionId
         chatLocks.computeIfAbsent(id) { Mutex() }.withLock {
+            if (id in closed) return
             val texts = synchronized(dead.pending) { dead.pending.toList() }
             if (texts.isEmpty()) {
                 setStatus(id, SessionStatus.IDLE)
@@ -498,13 +505,52 @@ class AgentManager(
         if (l != null) {
             l.stopReason = "stopped"
             systemEvent(s.id, "warn", "Stopped by ${user.username}")
-            l.proc.closeInput()
-            l.proc.kill()
-            withContext(Dispatchers.IO) { kotlinx.coroutines.withTimeoutOrNull(10_000) { l.exited.await() } }
+            killAndWait(l)
         } else if (s.status !in setOf(SessionStatus.DONE, SessionStatus.FAILED, SessionStatus.STOPPED)) {
             setStatus(s.id, SessionStatus.STOPPED, ended = true)
         }
         return sessions.get(s.id)!!
+    }
+
+    /** Kills [l]'s process as a user stop does and waits up to 10 s for it to exit; false if it has not exited by then. */
+    private suspend fun killAndWait(l: Live): Boolean {
+        l.stopReason = "stopped"
+        l.proc.closeInput()
+        l.proc.kill()
+        return withContext(Dispatchers.IO) { withTimeoutOrNull(10_000) { l.exited.await() } } != null
+    }
+
+    /**
+     * Owner or admin, chats only. Stops the agent process (if any), then permanently deletes the session with its
+     * events, attachment rows and attachment files, disconnects its WebSocket watchers and announces it on the feed.
+     * Runs started from the chat are not touched (`runs.started_by_session_id` becomes null).
+     */
+    suspend fun closeChat(user: UserRecord, s: SessionRecord) {
+        if (s.ownerId != user.id && !user.isAdmin) throw forbidden("Only the owner or an admin can close this chat")
+        if (s.kind != "chat") throw conflict("Only chat sessions can be closed; cancel the run to stop a pipeline agent", "not_a_chat")
+        // Under the chat lock no input coroutine is starting or feeding a process meanwhile.
+        chatLocks.computeIfAbsent(s.id) { Mutex() }.withLock {
+            sessions.get(s.id) ?: throw notFound("Session not found")
+            live[s.id]?.let { l ->
+                if (!killAndWait(l)) throw conflict("The agent process did not stop; try again", "agent_not_stopped")
+            }
+            // The same lock as publish(): once the row is gone, no event can be appended for it any more.
+            synchronized(eventLocks.computeIfAbsent(s.id) { Any() }) {
+                closed += s.id
+                val deleted = try {
+                    sessions.delete(s.id)
+                } catch (e: Exception) {
+                    closed -= s.id
+                    throw e
+                }
+                // Gone some other way: it stays marked closed, which is right for a missing row.
+                if (!deleted) throw notFound("Session not found")
+            }
+        }
+        withContext(Dispatchers.IO) { attachments.removeSession(s.id) }
+        bus.closeSession(s.id)
+        bus.emitFeed(FeedItem.SessionClosed(s.repo, s.id.toString()))
+        log.info("Chat {} in {} closed by {}", s.id, s.repo, user.username)
     }
 
     /** Stops chat processes that have been idle for FACTORY_CHAT_IDLE_MINUTES. */

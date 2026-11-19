@@ -1514,6 +1514,51 @@ html.app-locked #root {
   color: var(--text-3);
 }
 
+/* the project's chats (activity panel): select button + a separate close button */
+.chat-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 8px 12px;
+}
+.chat-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.chat-item-btn {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.chat-item-btn:hover {
+  border-color: var(--line-3);
+}
+.chat-item.is-current .chat-item-btn {
+  border-color: rgba(255, 177, 74, 0.5);
+}
+.ci-title {
+  font-size: 0.86rem;
+  font-weight: 550;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-item-close {
+  flex: none;
+}
+
 /* ------------------------------------------------------------------ run page */
 .runpage {
   padding-top: 20px;
