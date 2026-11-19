@@ -266,4 +266,16 @@ class SandboxDefinitionTest {
         assertFailsWith<IllegalArgumentException> { SandboxConfig.fromEnv(mapOf("FACTORY_SANDBOX_MAX_PLATFORMS" to "21")::get) }
         assertFailsWith<IllegalArgumentException> { SandboxConfig.fromEnv(mapOf("FACTORY_SANDBOX_MAX_PLATFORMS" to "many")::get) }
     }
+
+    @Test
+    fun `Agern's own definition is valid`() {
+        // Gradle runs the tests in server/; the file is at the repository root.
+        val file = listOf(java.nio.file.Paths.get("../.agern/sandbox.yml"), java.nio.file.Paths.get(".agern/sandbox.yml")).first { java.nio.file.Files.exists(it) }
+        val d = valid(java.nio.file.Files.readString(file))
+        assertEquals("docker.io/library/eclipse-temurin:17-jdk", d.image, "the server's Gradle toolchain is JDK 17")
+        assertEquals("ubuntu", d.user!!.name)
+        assertEquals(listOf("postgres"), d.services.map { it.name })
+        assertTrue(d.services[0].ready != null)
+        assertTrue(d.caches.all { it.startsWith("/home/ubuntu/") }, d.caches.toString())
+    }
 }

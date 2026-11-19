@@ -56,7 +56,8 @@ jobs:
         run: |
           shellcheck packaging/agern packaging/install.sh scripts/*.sh \
             packaging/deb/postinst packaging/deb/prerm packaging/deb/postrm packaging/deb/smoke-test.sh \
-            packaging/deb/sandbox-host-test.sh packaging/deb/sandbox-service
+            packaging/deb/sandbox-host-test.sh packaging/deb/sandbox-service \
+            server/src/main/resources/sandbox/prepare-user.sh
 
   deb:
     name: Debian package (build)

@@ -1,3 +1,4 @@
+# shellcheck shell=sh
 # Prepares the account sandbox commands run as (`user:` in .agern/sandbox.yml; docs/ARCHITECTURE.md §5
 # "Sandboxes"). Run by the server as root inside a new sandbox container, before the setup script, with
 # plain POSIX sh tools only (busybox is enough):
