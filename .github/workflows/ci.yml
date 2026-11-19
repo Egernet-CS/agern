@@ -157,5 +157,5 @@ jobs:
           gh release upload main-latest "dist/$deb" --clobber
           gh release upload main-latest dist/SHA256SUMS --clobber
           gh release view main-latest --json assets --jq '.assets[].name' |
-            grep -E '^agern_.*_all\.deb$' | grep -vxF "$deb" |
+            { grep -E '^agern_.*_all\.deb$' || true; } | { grep -vxF "$deb" || true; } |
             while read -r old; do gh release delete-asset main-latest "$old" --yes; done
