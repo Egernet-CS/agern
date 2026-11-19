@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { api, ApiError, isRunActive, isRunWorking, type AgentSession, type Run, type StageRole } from '../api';
 import { ChatView } from '../components/chat/ChatView';
+import { RunSandboxLine } from '../components/sandbox/SandboxBits';
 import { Markdown } from '../components/chat/Markdown';
 import { buildNodes, latestStage, REVIEWERS, ROLE_BLURB, roundName, rounds, stagesFor, type NodeId } from '../components/pipeline/model';
 import { PipelineDiagram } from '../components/pipeline/PipelineDiagram';
@@ -101,6 +102,7 @@ export function RunPage() {
           <div><dt>{run.endedAt ? 'took' : 'running for'}</dt><dd>{between(run.createdAt, run.endedAt, now)}</dd></div>
           <div><dt>started</dt><dd>{timeAgo(run.createdAt, now)}</dd></div>
         </dl>
+        <RunSandboxLine run={run} />
         <div className="rh-actions">
           {run.status === 'needs_human' && isOwner && (
             <button className="btn btn--approve" onClick={() => void act('approve')} disabled={busy !== null}>
