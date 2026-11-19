@@ -262,4 +262,17 @@ art/         Blender sources of the artwork
 
 ## License
 
-No license has been chosen yet; until one is, all rights are reserved.
+Copyright 2026 Egernet.
+
+Agern is licensed under either of
+
+- the Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)), or
+- the MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Unless you explicitly state otherwise, any contribution you intentionally submit
+for inclusion in Agern shall be dual licensed as above, without any additional terms or conditions.
+
+Not covered by these licenses: third-party libraries and the bundled fonts (JetBrains Mono and
+Hanken Grotesk, SIL Open Font License 1.1) keep their own licenses, and the music in
+`docs/media/agern-concept.mp4` ("Technology" by Eliveta) is used under the Pixabay Content License
+and may not be extracted or redistributed on its own.
