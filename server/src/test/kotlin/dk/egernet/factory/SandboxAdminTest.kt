@@ -136,6 +136,53 @@ class SandboxAdminTest {
     }
 
     @Test
+    fun `the overview shows platform containers, their slots and memory, and admins get live frames`() {
+        val withPlatform = definition + "platforms:\n  node20:\n    image: docker.io/library/node:20\n"
+        world.sandboxFile(withPlatform)
+        approve(withPlatform)
+        val root = world.user("root", admin = true)
+        val rt = world.sandboxRuntime
+        val frames = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val collector = s.scope.async(start = CoroutineStart.UNDISPATCHED) {
+            s.bus.feed.filterIsInstance<FeedItem.Sandboxes>().collect { frames += it.change }
+        }
+        val both = CountDownLatch(1)
+        val stopped = CountDownLatch(1)
+        script { p ->
+            exec(p, "npm test")
+            val body = buildJsonObject {
+                put("jsonrpc", "2.0"); put("id", 1); put("method", "tools/call")
+                putJsonObject("params") { put("name", "factory_sandbox_exec"); putJsonObject("arguments") { put("command", "npm test"); put("platform", "node20") } }
+            }
+            runBlocking { s.mcp.handle(token(p), body.toString()) }
+            both.countDown()
+            stopped.await(10, TimeUnit.SECONDS)
+            "built"
+        }
+        val run = runBlocking { s.orchestrator.start(world.user("alice"), "demo-app", 1, null) }
+        assertTrue(both.await(10, TimeUnit.SECONDS))
+        val sb = runBlocking { s.sandboxes.overview(root) }.sandboxes.single()
+        assertEquals(listOf("default", "node20"), sb.containers.map { it.platform })
+        assertEquals(listOf("docker.io/library/node:22", "docker.io/library/node:20"), sb.containers.map { it.image })
+        assertEquals(listOf("node20"), sb.platforms)
+        assertEquals(2, sb.slots)
+        assertEquals("3g", sb.memoryTotal, "1g each: two command containers and one service")
+        assertEquals(2, runBlocking { s.sandboxes.overview(root) }.inUse)
+        assertEquals(4, runBlocking { s.sandboxes.overview(root) }.limits.maxPlatforms)
+
+        // Stop removes the platform container too and frees both slots.
+        runBlocking { s.sandboxes.stop(root, run.id) }
+        assertTrue(rt.containers.isEmpty(), rt.calls.toString())
+        assertTrue(rt.calls.contains("rm agern-run-${run.id} agern-run-${run.id}--node20 agern-run-${run.id}-db"), rt.calls.toString())
+        assertEquals(0, s.sandboxes.inUse())
+        stopped.countDown()
+        world.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
+        runBlocking { withTimeout(5_000) { while (frames.size < 3) kotlinx.coroutines.delay(20) } }
+        collector.cancel()
+        assertEquals(listOf("created", "created", "stopped"), frames.take(3))
+    }
+
+    @Test
     fun `a command running while an admin stops the sandbox ends with an error saying so`() {
         world.sandboxFile(definition)
         approve()

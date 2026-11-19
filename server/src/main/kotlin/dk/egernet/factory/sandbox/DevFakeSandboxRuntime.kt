@@ -28,8 +28,13 @@ class DevFakeSandboxRuntime : SandboxRuntime {
         containers[spec.name] = spec
     }
 
-    override fun exec(container: String, command: List<String>, workdir: String, timeoutMs: Long): ExecResult {
+    override fun exec(container: String, command: List<String>, workdir: String, timeoutMs: Long, user: ExecUser?): ExecResult {
         val spec = containers[container] ?: throw SandboxRuntimeException("no such container: $container")
+        // The server's own steps (SandboxManager.PREPARE_USER_SCRIPT, HAND_OVER_SCRIPT).
+        when (command.getOrNull(3)) {
+            "agern-user" -> command[5].ifEmpty { "sandbox" }.let { return ExecResult(0, "AGERN_USER $it /home/$it\n", false, false, 1) }
+            "agern-hand-over" -> return ExecResult(0, "", false, false, 1)
+        }
         val script = command.last()
         val started = System.currentTimeMillis()
         val out = StringBuilder()
@@ -65,6 +70,8 @@ class DevFakeSandboxRuntime : SandboxRuntime {
     }
 
     override fun restartContainer(name: String) {}
+
+    override fun logs(name: String, lines: Int) = ""
 
     override fun removeContainers(names: List<String>) {
         names.forEach { containers.remove(it) }

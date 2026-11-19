@@ -21,7 +21,24 @@ data class ContainerSpec(
     val entrypoint: String? = null,
     /** Command (arguments of the entrypoint); empty = the image's own (sidecars). */
     val command: List<String> = emptyList(),
+    /**
+     * The uid that the service user on the host becomes inside the container (`--userns keep-id:uid=<n>,gid=<n>`),
+     * when the definition has `user:`; null keeps rootless Podman's default (container root = the service user).
+     */
+    val keepIdUid: Int? = null,
+    /** `--user` for the container's main process; null = the image's. */
+    val user: String? = null,
 )
+
+/** Who a command runs as inside the container: `--user <uid>:<gid>` plus HOME, USER and LOGNAME. */
+data class ExecUser(val uid: Int, val gid: Int, val name: String, val home: String) {
+    val env: Map<String, String> get() = linkedMapOf("HOME" to home, "USER" to name, "LOGNAME" to name)
+
+    companion object {
+        /** Container root, for setup and the server's own preparation steps. */
+        val ROOT = ExecUser(0, 0, "root", "/root")
+    }
+}
 
 data class ExecResult(
     /** -1 when the command was stopped by the time limit. */
@@ -52,8 +69,11 @@ interface SandboxRuntime {
     fun ensureVolume(name: String, labels: Map<String, String>)
     /** Pulls the image if needed and starts the container detached. */
     fun startContainer(spec: ContainerSpec)
-    /** Runs [command] in [container] and waits up to [timeoutMs]; on timeout the client is stopped and [ExecResult.timedOut] is set. */
-    fun exec(container: String, command: List<String>, workdir: String, timeoutMs: Long): ExecResult
+    /**
+     * Runs [command] in [container] and waits up to [timeoutMs]; on timeout the client is stopped and [ExecResult.timedOut]
+     * is set. [user] null: the container's default user (root in a sandbox).
+     */
+    fun exec(container: String, command: List<String>, workdir: String, timeoutMs: Long, user: ExecUser? = null): ExecResult
     /** Kills every process in the container and starts it again (files are kept). Used after a command timed out. */
     fun restartContainer(name: String)
     /** Force-removes the containers; missing ones are ignored. */
@@ -62,6 +82,8 @@ interface SandboxRuntime {
     fun removeNetwork(name: String)
     fun listContainers(): List<LabelledResource>
     fun listNetworks(): List<LabelledResource>
+    /** The last [lines] lines of the container's output (a service that did not become ready); empty when unknown. */
+    fun logs(name: String, lines: Int): String
     /** Ports the image declares (`EXPOSE`), e.g. `5432/tcp`; empty when unknown. */
     fun exposedPorts(image: String): List<String>
 }

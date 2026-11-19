@@ -106,8 +106,8 @@ class McpServer(
         Tool("factory_unassign_issues", "Take issues out of whatever release of this project they are in.",
             schema(Triple("issueNumbers", "integers", "Issue numbers"), required = listOf("issueNumbers"))),
         Tool("factory_sandbox_info", "Whether this run has a sandbox (a container with the project's toolchain and services, " +
-            "defined in .agern/sandbox.yml and approved by an admin) and, if not, why. When it has one: image, services with their " +
-            "host names and ports, caches and limits.",
+            "defined in .agern/sandbox.yml and approved by an admin) and, if not, why. When it has one: image, platforms (other " +
+            "images to test on), the user commands run as, services with their host names, ports and readiness, caches and limits.",
             schema()),
         Tool("factory_sandbox_exec", "Run a shell command in this run's sandbox, e.g. a build or the tests. It runs as `sh -lc <command>` " +
             "in /workspace, which is your working directory (the same files, so edits on the host are visible at once). The " +
@@ -115,6 +115,7 @@ class McpServer(
             "durationMs, timedOut }. Use git on the host, not here.",
             schema(Triple("command", "string", "Shell command, e.g. './gradlew test' or 'npm ci && npm test'"),
                 Triple("timeoutSeconds", "integer", "Optional time limit in seconds (default and maximum: the server's limit)"),
+                Triple("platform", "string", "Optional: a platform from factory_sandbox_info (another image, e.g. 'jdk17'); default: the main image"),
                 required = listOf("command"))),
         Tool("factory_request_software", "Ask an administrator to install software on the factory host. " +
             "Use this instead of installing system-wide software yourself.",
@@ -257,7 +258,8 @@ class McpServer(
                     val timeout = args["timeoutSeconds"]?.let { el ->
                         (el as? JsonPrimitive)?.let { p -> p.contentOrNull?.toLongOrNull() } ?: return toolError("timeoutSeconds must be a whole number")
                     }
-                    sandboxes.exec(runId, grant.sessionId, str("command") ?: return toolError("command is required"), timeout)
+                    val platform = args["platform"]?.let { el -> (el as? JsonPrimitive)?.takeIf { it.isString }?.content ?: return toolError("platform must be a string") }
+                    sandboxes.exec(runId, grant.sessionId, str("command") ?: return toolError("command is required"), timeout, platform)
                         .let { if (it.isError) return toolError(it.text) else it.text }
                 }
                 "factory_request_software" -> {

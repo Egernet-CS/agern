@@ -486,4 +486,196 @@ class SandboxTest {
         assertEquals(setOf("agern-run-${active.id}"), rt.networks.keys)
         assertEquals(RunStatus.FAILED, w.services.runs.get(inProgress.id)!!.status)
     }
+
+    // ---------------------------------------------------------------- platforms, readiness, user (step 4)
+
+    private val platformDefinition = """
+        image: docker.io/library/eclipse-temurin:21-jdk
+        setup: echo main setup
+        user: builder
+        services:
+          postgres:
+            image: docker.io/library/postgres:17
+            ready: { command: "pg_isready -h 127.0.0.1", timeoutSeconds: 30 }
+        caches: [ /home/builder/.gradle ]
+        platforms:
+          jdk17:
+            image: docker.io/library/eclipse-temurin:17-jdk
+          debian12:
+            image: docker.io/library/debian:12
+            setup: echo debian setup
+    """.trimIndent() + "\n"
+
+    @Test
+    fun `platforms get their own containers on first use, share network and services, and are removed with the run`() {
+        val w = world { it.copy(sandbox = it.sandbox.copy(maxConcurrent = 3)) }
+        w.sandboxFile(platformDefinition)
+        approve(w, platformDefinition)
+        val rt = w.sandboxRuntime
+        val answers = mutableListOf<ToolAnswer>()
+        var info: JsonObject? = null
+        script(w) { p ->
+            info = call(w, token(p), "factory_sandbox_info").json
+            answers += exec(w, p, "./gradlew test")
+            answers += call(w, token(p), "factory_sandbox_exec", buildJsonObject { put("command", "./gradlew test"); put("platform", "jdk17") })
+            answers += call(w, token(p), "factory_sandbox_exec", buildJsonObject { put("command", "make check"); put("platform", "debian12") })
+            answers += call(w, token(p), "factory_sandbox_exec", buildJsonObject { put("command", "x"); put("platform", "windows") })
+            answers += call(w, token(p), "factory_sandbox_exec", buildJsonObject { put("command", "uname"); put("platform", "default") })
+            "Tested on every platform."
+        }
+        val run = start(w)
+        val done = w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
+        assertEquals(RunStatus.MERGED, done.status, done.error)
+        val id = run.id
+
+        val platforms = info!!["platforms"]!!.jsonArray.map { it.jsonObject["name"]!!.jsonPrimitive.content }
+        assertEquals(listOf("jdk17", "debian12"), platforms)
+        assertEquals("builder", info!!["user"]!!.jsonObject["name"]!!.jsonPrimitive.content)
+        assertEquals("checked on creation", info!!["services"]!!.jsonArray[0].jsonObject["readiness"]!!.jsonPrimitive.content)
+        assertTrue(answers.take(3).all { !it.isError }, answers.toString())
+        assertEquals(listOf("default", "jdk17", "debian12"), answers.take(3).map { it.json["platform"]!!.jsonPrimitive.content })
+        assertTrue(answers[3].isError && answers[3].text.contains("Unknown platform 'windows'") && answers[3].text.contains("jdk17"), answers[3].text)
+        assertFalse(answers[4].isError, answers[4].text)
+
+        // One network and one sidecar; one container per image, created in the order they were used.
+        assertEquals(1, rt.calls.count { it.startsWith("network create") })
+        assertEquals(listOf("agern-run-$id-postgres", "agern-run-$id", "agern-run-$id--jdk17", "agern-run-$id--debian12"), rt.started.map { it.name })
+        val (main, jdk17, debian) = rt.started.drop(1)
+        assertEquals("docker.io/library/eclipse-temurin:17-jdk", jdk17.image)
+        assertEquals(mapOf("agern.run" to "$id", "agern.repo" to "demo-app", "agern.role" to "platform", "agern.platform" to "jdk17"), jdk17.labels)
+        assertTrue(listOf(main, jdk17, debian).all { it.network == "agern-run-$id" && it.mounts[0].target == "/workspace" && it.keepIdUid == 1000 && it.user == "0:0" })
+        // Caches per platform: same path, another volume.
+        val volumes = listOf(main, jdk17, debian).map { c -> c.mounts.single { it.volume }.source }
+        assertEquals(3, volumes.toSet().size, volumes.toString())
+        assertTrue(listOf(main, jdk17, debian).all { c -> c.mounts.single { it.volume }.target == "/home/builder/.gradle" })
+
+        // Setup per container: the platform without `setup:` inherits the top-level one; commands run as the user.
+        assertEquals(
+            listOf("agern-run-$id" to "echo main setup", "agern-run-$id" to "./gradlew test", "agern-run-$id--jdk17" to "echo main setup",
+                "agern-run-$id--jdk17" to "./gradlew test", "agern-run-$id--debian12" to "echo debian setup", "agern-run-$id--debian12" to "make check",
+                "agern-run-$id" to "uname"),
+            rt.execs.map { it.first to it.second },
+        )
+        val setups = rt.execs.indices.filter { rt.execs[it].second.endsWith("setup") }
+        assertTrue(setups.all { rt.execUsers[it] == null }, "setup runs as root")
+        assertTrue(rt.execs.indices.filter { it !in setups }.all { rt.execUsers[it]?.let { u -> u.uid == 1000 && u.name == "builder" && u.home == "/home/builder" } == true })
+        assertEquals(3, rt.internal.count { it.startsWith("prepare-user") })
+        assertTrue(rt.internal.contains("prepare-user agern-run-$id 1000 builder /home/builder/.gradle"), rt.internal.toString())
+        assertEquals(3, rt.internal.count { it.startsWith("hand-over") })
+        // The readiness check ran once, before the first container was used (platforms reuse the service).
+        assertEquals(listOf("ready agern-run-$id-postgres pg_isready -h 127.0.0.1"), rt.internal.filter { it.startsWith("ready") })
+
+        // Everything is removed at the end, platform containers included; nothing is held.
+        assertTrue(rt.containers.isEmpty() && rt.networks.isEmpty(), rt.calls.toString())
+        assertTrue(rt.calls.contains("rm agern-run-$id agern-run-$id--jdk17 agern-run-$id--debian12 agern-run-$id-postgres"), rt.calls.toString())
+        assertEquals(0, w.services.sandboxes.inUse())
+
+        // The run records where commands ran; the transcript logs name the platform; the prompt asks for every platform.
+        val dto = w.services.runs.toDto(done).sandbox!!
+        assertEquals(listOf("jdk17", "debian12"), dto.platforms)
+        assertEquals(listOf("default", "jdk17", "debian12"), dto.platformsUsed)
+        val logs = builderEvents(w, id).mapNotNull { it.payload.jsonObject["sandbox"]?.jsonObject }
+        assertEquals(listOf("default", "default", "jdk17", "jdk17", "debian12", "debian12", "default"), logs.map { it["platform"]!!.jsonPrimitive.content })
+        val prompt = w.launcher.byRole("builder").single().written.first()
+        assertTrue(prompt.contains("Platforms: `jdk17`, `debian12`") && prompt.contains("report the result per platform"), prompt)
+    }
+
+    @Test
+    fun `every command container takes a slot, and a run makes room by removing its own idle ones`() {
+        val w = world { it.copy(sandbox = it.sandbox.copy(maxConcurrent = 2)) }
+        w.sandboxFile(platformDefinition)
+        approve(w, platformDefinition)
+        val rt = w.sandboxRuntime
+        val aDone = CountDownLatch(1)
+        val bAsked = CountDownLatch(1)
+        val answersA = CopyOnWriteArrayList<ToolAnswer>()
+        val answersB = CopyOnWriteArrayList<ToolAnswer>()
+        var inUseWithTwo = -1
+        script(w) { p ->
+            if (p.spec.prompt!!.contains("Implement issue #1 ")) {
+                answersA += exec(w, p, "a default")
+                answersA += call(w, token(p), "factory_sandbox_exec", buildJsonObject { put("command", "a jdk17"); put("platform", "jdk17") })
+                inUseWithTwo = w.services.sandboxes.inUse()
+                // Both slots are this run's: the third container replaces the least recently used one (default).
+                answersA += call(w, token(p), "factory_sandbox_exec", buildJsonObject { put("command", "a debian"); put("platform", "debian12") })
+                aDone.countDown()
+                bAsked.await(10, TimeUnit.SECONDS)
+            } else {
+                aDone.await(10, TimeUnit.SECONDS)
+                answersB += exec(w, p, "b default")
+                bAsked.countDown()
+            }
+            "ok"
+        }
+        val a = start(w, 1)
+        assertTrue(aDone.await(10, TimeUnit.SECONDS))
+        val b = start(w, 2)
+        for (r in listOf(a, b)) assertEquals(RunStatus.MERGED, w.awaitRun(r.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
+        assertEquals(2, inUseWithTwo)
+        assertTrue(answersA.none { it.isError }, answersA.toString())
+        assertTrue(rt.calls.contains("rm agern-run-${a.id}"), rt.calls.toString())
+        assertTrue(systemTexts(w, a.id).any { it.startsWith("Removed this run's idle `default` container to make room for `debian12`") })
+        // Run B found no free slot and holds no container it could give up: busy.
+        assertTrue(answersB.single().isError && answersB.single().text.contains("all in use"), answersB.toString())
+        assertEquals(0, w.services.sandboxes.inUse())
+    }
+
+    @Test
+    fun `creation waits for a service's readiness check and fails clearly when it never passes`() {
+        val w = world()
+        w.sandboxFile(platformDefinition)
+        approve(w, platformDefinition)
+        val rt = w.sandboxRuntime
+        rt.onReady = { _, _, attempt -> if (attempt < 3) 2 else 0 }
+        val answers = CopyOnWriteArrayList<ToolAnswer>()
+        script(w) { p -> answers += exec(w, p, "make"); "ok" }
+        val first = start(w, 1)
+        assertEquals(RunStatus.MERGED, w.awaitRun(first.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
+        assertFalse(answers[0].isError, answers[0].text)
+        assertEquals(3, rt.internal.count { it == "ready agern-run-${first.id}-postgres pg_isready -h 127.0.0.1" })
+        assertEquals(listOf("echo main setup", "make"), rt.execs.map { it.second })
+
+        // A check that never passes: the creation fails after its time limit, naming the service and showing its log.
+        val quick = platformDefinition.replace("timeoutSeconds: 30", "timeoutSeconds: 1")
+        w.sandboxFile(quick)
+        approve(w, quick)
+        rt.onReady = { _, _, _ -> 2 }
+        val second = start(w, 2)
+        assertEquals(RunStatus.MERGED, w.awaitRun(second.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
+        val failed = answers[1]
+        assertTrue(failed.isError, failed.text)
+        assertTrue(failed.text.contains("Service 'postgres' did not become ready within 1 s") && failed.text.contains("pg_isready -h 127.0.0.1"), failed.text)
+        assertTrue(failed.text.contains("LOG: database system is starting up (agern-run-${second.id}-postgres)"), failed.text)
+        assertTrue(systemTexts(w, second.id).any { it.startsWith("Service 'postgres' did not become ready") })
+        assertTrue(rt.execs.none { it.first.startsWith("agern-run-${second.id}") }, "nothing ran in a sandbox whose service was not ready")
+        assertTrue(rt.calls.contains("network rm agern-run-${second.id}"))
+        assertEquals(0, w.services.sandboxes.inUse())
+    }
+
+    @Test
+    fun `without a readiness check the agent is told that services may still be starting`() {
+        val w = world()
+        w.sandboxFile(definition)
+        approve(w)
+        var info: JsonObject? = null
+        script(w) { p -> info = call(w, token(p), "factory_sandbox_info").json; "ok" }
+        assertEquals(RunStatus.MERGED, w.awaitRun(start(w).id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
+        assertEquals("unchecked", info!!["services"]!!.jsonArray[0].jsonObject["readiness"]!!.jsonPrimitive.content)
+        assertTrue(info!!["servicesNote"]!!.jsonPrimitive.content.contains("may still be starting"))
+        assertEquals(null, info!!["user"])
+        assertTrue(w.sandboxRuntime.internal.isEmpty())
+    }
+
+    @Test
+    fun `at start leftover platform containers are removed too`() {
+        val w = world()
+        val orphan = UUID.randomUUID()
+        val rt = w.sandboxRuntime
+        for (n in listOf("agern-run-$orphan", "agern-run-$orphan--jdk17", "agern-run-$orphan-postgres")) rt.containers[n] = orphan.toString()
+        rt.networks["agern-run-$orphan"] = orphan.toString()
+        w.services.start()
+        runBlocking { withTimeout(10_000) { w.services.sandboxReaper!!.join() } }
+        assertTrue(rt.containers.isEmpty() && rt.networks.isEmpty(), rt.calls.toString())
+        assertTrue(rt.calls.any { it.startsWith("rm ") && it.contains("agern-run-$orphan--jdk17") }, rt.calls.toString())
+    }
 }

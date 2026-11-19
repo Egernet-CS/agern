@@ -106,9 +106,9 @@ class PodmanRuntime(
         call(runArgs(cfg, spec), timeoutMs = 20 * 60_000L, what = "run ${spec.name}")
     }
 
-    override fun exec(container: String, command: List<String>, workdir: String, timeoutMs: Long): ExecResult {
+    override fun exec(container: String, command: List<String>, workdir: String, timeoutMs: Long, user: ExecUser?): ExecResult {
         val started = System.nanoTime()
-        val r = runner.run(execArgs(cfg, container, workdir, command), timeoutMs, ExecLimits.LOG_CHARS)
+        val r = runner.run(execArgs(cfg, container, workdir, command, user), timeoutMs, ExecLimits.LOG_CHARS)
         return ExecResult(
             exitCode = if (r.timedOut) -1 else r.exitCode, output = r.output, outputTruncated = r.truncated, timedOut = r.timedOut,
             durationMs = (System.nanoTime() - started) / 1_000_000,
@@ -129,6 +129,12 @@ class PodmanRuntime(
         if (r.exitCode != 0 && !r.output.contains("no such network", ignoreCase = true) && !r.output.contains("network not found", ignoreCase = true)) {
             throw SandboxRuntimeException("podman network rm failed (exit ${r.exitCode}): ${r.output.trim().takeLast(1000)}")
         }
+    }
+
+    override fun logs(name: String, lines: Int): String = try {
+        runner.run(logsArgs(cfg, name, lines), 60_000, 64 * 1024).output
+    } catch (e: SandboxRuntimeException) {
+        ""
     }
 
     override fun listContainers(): List<LabelledResource> = parseLabelled(call(listContainersArgs(cfg), 60_000, "ps").output)
@@ -164,6 +170,9 @@ class PodmanRuntime(
             a += labelArgs(s.labels)
             a += listOf("--network", s.network)
             s.networkAlias?.let { a += listOf("--network-alias", it) }
+            // Never `host`: a private user namespace in which the service user is uid n (not root), Podman 4.3+.
+            s.keepIdUid?.let { a += listOf("--userns", "keep-id:uid=$it,gid=$it") }
+            s.user?.let { a += listOf("--user", it) }
             a += listOf(
                 "--security-opt", "no-new-privileges",
                 "--pids-limit", s.pidsLimit.toString(),
@@ -189,8 +198,12 @@ class PodmanRuntime(
             return a
         }
 
-        fun execArgs(cfg: SandboxConfig, container: String, workdir: String, command: List<String>) =
-            base(cfg) + listOf("exec", "--workdir", workdir, container) + command
+        fun execArgs(cfg: SandboxConfig, container: String, workdir: String, command: List<String>, user: ExecUser? = null): List<String> {
+            val who = user?.let { u -> listOf("--user", "${u.uid}:${u.gid}") + u.env.flatMap { (k, v) -> listOf("--env", "$k=$v") } } ?: emptyList()
+            return base(cfg) + listOf("exec") + who + listOf("--workdir", workdir, container) + command
+        }
+
+        fun logsArgs(cfg: SandboxConfig, name: String, lines: Int) = base(cfg) + listOf("logs", "--tail", lines.toString(), name)
 
         fun restartArgs(cfg: SandboxConfig, name: String) = base(cfg) + listOf("restart", "--time", "0", name)
 

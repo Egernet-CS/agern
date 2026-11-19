@@ -89,6 +89,7 @@ class Services(
         cfg, sandboxRuntime, SandboxApprovalStore(db), runs, access, git,
         publishSystem = { sessionId, payload -> agents.publish(sessionId, "system", payload) },
         emitFeed = { bus.emitFeed(it) },
+        emitRun = { id -> runs.get(id)?.let { bus.emitFeed(dk.egernet.factory.agent.FeedItem.Run(runs.toDto(it))) } },
         approvers = {
             val known = users.all().filter { it.isAdmin }
             (known.map { OwnerDto(it.username, it.displayName) } + (cfg.admins - known.map { it.username }.toSet()).map { OwnerDto(it, it) })

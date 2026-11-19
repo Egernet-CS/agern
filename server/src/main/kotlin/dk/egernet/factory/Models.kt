@@ -134,9 +134,24 @@ data class RunDto(
  * Only `approved` gives the builder a sandbox; [reason] says why (not) in words.
  */
 @Serializable
-data class RunSandboxDto(val state: String, val reason: String, val sha256: String?, val image: String?)
+data class RunSandboxDto(
+    val state: String, val reason: String, val sha256: String?, val image: String?,
+    /** The definition's platforms besides the default image (`approved` only; empty for older runs). */
+    val platforms: List<String> = emptyList(),
+    /** Where the builder ran commands: `default` and platform names, in first-use order (only when there are platforms). */
+    val platformsUsed: List<String> = emptyList(),
+)
 
-@Serializable data class SandboxServiceDto(val name: String, val image: String, val env: Map<String, String>)
+/** A sidecar's readiness check (`ready:`). */
+@Serializable data class SandboxReadyDto(val command: String, val timeoutSeconds: Int)
+
+@Serializable data class SandboxServiceDto(val name: String, val image: String, val env: Map<String, String>, val ready: SandboxReadyDto? = null)
+
+/** A platform: another image the builder can run commands in. [setupInherited]: it uses the top-level `setup`. */
+@Serializable data class SandboxPlatformDto(val name: String, val image: String, val setup: String?, val setupInherited: Boolean)
+
+/** `user:` as written ([name] or [uid]) and the uid commands run as inside the container. */
+@Serializable data class SandboxUserDto(val name: String?, val uid: Int)
 
 @Serializable
 data class SandboxLimitsDto(
@@ -151,6 +166,9 @@ data class SandboxLimitsDto(
 data class SandboxDefinitionDto(
     val image: String, val setup: String?, val env: Map<String, String>, val services: List<SandboxServiceDto>,
     val caches: List<String>, val limits: SandboxLimitsDto,
+    val platforms: List<SandboxPlatformDto> = emptyList(),
+    /** Null: commands run as root inside the container. */
+    val user: SandboxUserDto? = null,
 )
 
 @Serializable data class SandboxApprovalDto(val sha256: String, val content: String, val approvedBy: OwnerDto, val approvedAt: String)
@@ -189,11 +207,23 @@ data class RunningSandboxDto(
     val createdAt: String,
     /** Per-container limits it runs with. */
     val cpus: Double, val memory: String,
+    /** The containers that run commands right now (the default image and/or platforms), each taking one slot. */
+    val containers: List<SandboxContainerDto> = emptyList(),
+    /** The definition's platforms (whether or not they exist right now). */
+    val platforms: List<String> = emptyList(),
+    /** Slots of FACTORY_SANDBOX_MAX_CONCURRENT this run holds: one per entry of [containers]. */
+    val slots: Int = 0,
+    /** The memory all of the run's containers may use together: [memory] × (command containers + services). */
+    val memoryTotal: String = memory,
 )
+
+/** One container of a run's sandbox that runs commands: `default` (the top-level image) or a platform. */
+@Serializable data class SandboxContainerDto(val platform: String, val image: String, val createdAt: String)
 
 @Serializable
 data class SandboxServerLimitsDto(
     val maxCpus: Double, val maxMemory: String, val maxConcurrent: Int, val execTimeoutMinutes: Long, val registries: List<String>,
+    val maxPlatforms: Int = 4,
 )
 
 /** `GET /api/admin/sandboxes`: the runtime, its limits and the sandboxes that exist. */
@@ -308,6 +338,10 @@ data class AttachmentDto(
     val releaseId: String? = null,
     /** `sandbox_approval`: the project's approval after the change; null when it was revoked. */
     val approval: SandboxApprovalDto? = null,
+    /** `sandboxes` (admins only): the run whose sandbox changed. */
+    val runId: String? = null,
+    /** `sandboxes`: `created`, `removed` or `stopped`. */
+    val change: String? = null,
 )
 
 object RunStatus {

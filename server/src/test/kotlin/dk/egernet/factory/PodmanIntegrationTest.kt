@@ -2,6 +2,9 @@ package dk.egernet.factory
 
 import dk.egernet.factory.sandbox.ContainerSpec
 import dk.egernet.factory.sandbox.ExecResult
+import dk.egernet.factory.sandbox.ExecUser
+import dk.egernet.factory.sandbox.SandboxPlatform
+import dk.egernet.factory.sandbox.SandboxUser
 import dk.egernet.factory.sandbox.PodmanRuntime
 import dk.egernet.factory.sandbox.ProcessCommandRunner
 import dk.egernet.factory.sandbox.SandboxDefinition
@@ -32,6 +35,7 @@ import kotlin.test.fail
  *                                           else java.io.tmpdir). It must be visible to the Podman service, so not a
  *                                           private /tmp of the calling unit.
  *   AGERN_PODMAN_IT_IMAGE                   a small image with busybox tools (default docker.io/library/busybox:1.36.1)
+ *   AGERN_PODMAN_IT_PLATFORM_IMAGE          another small image for the platform container (default docker.io/library/alpine:3.20)
  *
  * Containers are built with the same [SandboxManager] spec functions the server uses, so the command lines are exactly
  * those of a run (docs/ARCHITECTURE.md §5 "Sandboxes").
@@ -40,6 +44,7 @@ class PodmanIntegrationTest {
     private val env = System.getenv()
     private val enabled = env["AGERN_PODMAN_IT"] == "1"
     private val image = env["AGERN_PODMAN_IT_IMAGE"] ?: "docker.io/library/busybox:1.36.1"
+    private val platformImage = env["AGERN_PODMAN_IT_PLATFORM_IMAGE"] ?: "docker.io/library/alpine:3.20"
     private val cfg by lazy {
         SandboxConfig(
             mode = "podman",
@@ -53,6 +58,7 @@ class PodmanIntegrationTest {
     private val repo = "agern-it-" + UUID.randomUUID().toString().take(8)
     private val runA = UUID.randomUUID()
     private val runB = UUID.randomUUID()
+    private val runC = UUID.randomUUID()
     private lateinit var base: Path
 
     private val memory = 128L shl 20
@@ -74,12 +80,15 @@ class PodmanIntegrationTest {
     @AfterTest
     fun tearDown() {
         if (!enabled) return
-        val names = listOf(runA, runB).flatMap { listOf(SandboxManager.containerName(it), SandboxManager.serviceContainerName(it, "web")) } +
-            "agern-it-anon-$runA"
+        val names = listOf(runA, runB, runC).flatMap { listOf(SandboxManager.containerName(it), SandboxManager.serviceContainerName(it, "web")) } +
+            "agern-it-anon-$runA" + SandboxManager.platformContainerName(runC, "alt")
         runCatching { rt.removeContainers(names) }
-        for (r in listOf(runA, runB)) runCatching { rt.removeNetwork(SandboxManager.networkName(r)) }
-        runCatching { podman("volume", "rm", "--force", SandboxManager.cacheVolumeName(repo, "/cache")) }
-        // Files written in the containers belong to the service user (container root), so this works without podman unshare.
+        for (r in listOf(runA, runB, runC)) runCatching { rt.removeNetwork(SandboxManager.networkName(r)) }
+        for (v in listOf(SandboxManager.cacheVolumeName(repo, "/cache"), SandboxManager.cacheVolumeName(repo, "/cache", "alt"))) {
+            runCatching { podman("volume", "rm", "--force", v) }
+        }
+        // Files written in the containers belong to the service user (container root, or the `user:` handed them over),
+        // so this works without podman unshare.
         if (::base.isInitialized) base.toFile().deleteRecursively()
     }
 
@@ -210,5 +219,78 @@ class PodmanIntegrationTest {
         assertTrue(podman("volume", "exists", anonVolume).exitCode != 0, "the anonymous volume $anonVolume was not removed with its container")
         assertEquals(0, podman("volume", "exists", SandboxManager.cacheVolumeName(repo, "/cache")).exitCode, "the cache volume was removed")
         assertEquals("built\n", Files.readString(written), "the worktree must survive the sandbox")
+    }
+
+    /**
+     * `user:` (`--userns keep-id:uid=1000,gid=1000`, keep-alive and setup as container root) and a platform container in
+     * another image, exactly as [SandboxManager] creates them: commands run as uid 1000, which is the service user on
+     * the host, so the worktree stays the service user's; what setup (root) writes is handed over afterwards.
+     */
+    @Test
+    fun `a platform container and a non-root user on real rootless podman`() {
+        val worktree = Files.createDirectories(base.resolve("runs/c"))
+        val hostUid = Files.getAttribute(worktree, "unix:uid")
+        val withUser = def.copy(
+            services = emptyList(),
+            platforms = listOf(SandboxPlatform("alt", platformImage, null, false)),
+            user = SandboxUser("builder", 1000),
+        )
+        val main = SandboxManager.containerName(runC)
+        val alt = SandboxManager.platformContainerName(runC, "alt")
+        rt.createNetwork(SandboxManager.networkName(runC), SandboxManager.labels(runC, repo, "network"))
+        for (p in listOf(null, withUser.platforms[0])) {
+            for (c in withUser.caches) rt.ensureVolume(SandboxManager.cacheVolumeName(repo, c, p?.name), linkedMapOf("agern.repo" to repo, "agern.cache" to c))
+            val started = System.nanoTime()
+            rt.startContainer(SandboxManager.commandSpec(runC, repo, worktree, withUser, p))
+            println("started ${p?.name ?: "default"} with keep-id in ${(System.nanoTime() - started) / 1_000_000} ms")
+        }
+        for (c in listOf(main, alt)) {
+            val prep = rt.exec(c, listOf("sh", "-c", SandboxManager.PREPARE_USER_SCRIPT, "agern-user", "1000", "builder") + withUser.caches,
+                SandboxManager.WORKDIR, 60_000) // as the containers' default user: root (--user 0:0)
+            assertEquals(0, prep.exitCode, "prepare-user in $c: ${prep.output}")
+            assertEquals("AGERN_USER builder /home/builder", prep.output.trim().lines().last(), prep.output)
+        }
+        val builder = ExecUser(1000, 1000, "builder", "/home/builder")
+        fun asUser(c: String, cmd: String): String {
+            val r = rt.exec(c, SandboxManager.shellCommand(cmd), SandboxManager.WORKDIR, 120_000, builder)
+            if (r.exitCode != 0) fail("`$cmd` as builder in $c exited ${r.exitCode}: ${r.output}")
+            return r.output.trim()
+        }
+
+        // Setup runs as container root, which is a subordinate id on the host: hand-over gives its files to the user.
+        assertEquals("0", ok(main, "id -u"))
+        ok(main, "echo by-setup > by-setup.txt && mkdir -p /home/builder/tool && echo t > /home/builder/tool/x")
+        val bySetup = worktree.resolve("by-setup.txt")
+        assertTrue(Files.getAttribute(bySetup, "unix:uid") != hostUid, "container root is not the service user under keep-id")
+        val handOver = rt.exec(main, listOf("sh", "-c", SandboxManager.HAND_OVER_SCRIPT, "agern-hand-over", "1000", "/home/builder", SandboxManager.WORKDIR),
+            SandboxManager.WORKDIR, 60_000)
+        assertEquals(0, handOver.exitCode, handOver.output)
+        assertEquals(hostUid, Files.getAttribute(bySetup, "unix:uid"), "setup's file was handed over to the service user")
+
+        // Commands run as the user: uid 1000, its name and home, and what they write belongs to the service user on the host.
+        assertEquals("1000 1000 builder /home/builder", asUser(main, "echo \$(id -u) \$(id -g) \$(whoami) \$HOME"))
+        asUser(main, "echo by-user > by-user.txt && echo t >> /home/builder/tool/x && echo cached > /cache/marker")
+        val byUser = worktree.resolve("by-user.txt")
+        assertEquals(hostUid, Files.getAttribute(byUser, "unix:uid"), "owner of a file written by the user")
+        assertEquals(Files.getAttribute(worktree, "unix:gid"), Files.getAttribute(byUser, "unix:gid"), "group of a file written by the user")
+        val denied = rt.exec(main, SandboxManager.shellCommand("touch /etc/agern-user-test"), SandboxManager.WORKDIR, 30_000, builder)
+        assertTrue(denied.exitCode != 0, "the user is not root: ${denied.output}")
+
+        // The platform container: another image, the same worktree and network, its own cache volume.
+        assertTrue(asUser(alt, "cat /etc/os-release").contains("Alpine", ignoreCase = true))
+        assertEquals("by-user", asUser(alt, "cat by-user.txt"))
+        assertEquals("absent", asUser(alt, "test -e /cache/marker && echo present || echo absent"), "platforms have their own caches")
+        asUser(alt, "echo from-alt > from-alt.txt")
+        assertEquals(hostUid, Files.getAttribute(worktree.resolve("from-alt.txt"), "unix:uid"))
+        assertEquals("platform", podman("inspect", "--format", "{{index .Config.Labels \"agern.role\"}}", alt).output.trim())
+        assertEquals("alt", podman("inspect", "--format", "{{index .Config.Labels \"agern.platform\"}}", alt).output.trim())
+        assertEquals((memory).toString(), asUser(alt, "cat /sys/fs/cgroup/memory.max"), "platform containers get the same limits")
+
+        // Reaper and removal see both containers of the run.
+        assertEquals(setOf(main, alt), rt.listContainers().filter { it.runId == runC.toString() }.map { it.name }.toSet())
+        rt.removeContainers(listOf(main, alt))
+        rt.removeNetwork(SandboxManager.networkName(runC))
+        assertTrue(rt.listContainers().none { it.runId == runC.toString() }, "containers of run C left")
+        assertEquals("by-user\n", Files.readString(byUser), "the worktree survives")
     }
 }

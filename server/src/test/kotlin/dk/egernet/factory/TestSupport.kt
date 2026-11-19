@@ -249,8 +249,15 @@ class FakeSandboxRuntime : dk.egernet.factory.sandbox.SandboxRuntime {
     /** Every call, e.g. `network create agern-run-…`, `start agern-run-…`, `exec agern-run-… ./gradlew test`. */
     val calls = CopyOnWriteArrayList<String>()
     val started = CopyOnWriteArrayList<dk.egernet.factory.sandbox.ContainerSpec>()
-    /** Commands run with exec: (container, command line after `sh -lc`, timeout ms). */
+    /** Commands run with exec: (container, command line after `sh -lc`, timeout ms). The server's own steps are not here. */
     val execs = CopyOnWriteArrayList<Triple<String, String, Long>>()
+    /** Who each of [execs] ran as (null: the container's default user). */
+    val execUsers = CopyOnWriteArrayList<dk.egernet.factory.sandbox.ExecUser?>()
+    /** The server's own steps: `prepare-user <uid> <name> <caches…>`, `hand-over …`, `ready <container> <command>`. */
+    val internal = CopyOnWriteArrayList<String>()
+    /** Answers readiness checks: (service container, check command, attempt starting at 1). Default: ready at once. */
+    @Volatile var onReady: (container: String, command: String, attempt: Int) -> Int = { _, _, _ -> 0 }
+    private val readyAttempts = java.util.concurrent.ConcurrentHashMap<String, Int>()
     /** Existing containers and networks: name → run id. */
     val containers = java.util.concurrent.ConcurrentHashMap<String, String>()
     val networks = java.util.concurrent.ConcurrentHashMap<String, String>()
@@ -274,13 +281,33 @@ class FakeSandboxRuntime : dk.egernet.factory.sandbox.SandboxRuntime {
         started += spec
         containers[spec.name] = spec.labels.getValue("agern.run")
     }
-    override fun exec(container: String, command: List<String>, workdir: String, timeoutMs: Long): dk.egernet.factory.sandbox.ExecResult {
+    override fun exec(
+        container: String, command: List<String>, workdir: String, timeoutMs: Long, user: dk.egernet.factory.sandbox.ExecUser?,
+    ): dk.egernet.factory.sandbox.ExecResult {
+        if (!containers.containsKey(container)) throw dk.egernet.factory.sandbox.SandboxRuntimeException("no such container $container")
+        when (command.getOrNull(3)) {
+            "agern-user" -> {
+                internal += "prepare-user $container " + command.drop(4).joinToString(" ")
+                val name = command[5].ifEmpty { "sandbox" }
+                return dk.egernet.factory.sandbox.ExecResult(0, "AGERN_USER $name /home/$name\n", false, false, 1)
+            }
+            "agern-hand-over" -> {
+                internal += "hand-over $container " + command.drop(4).joinToString(" ")
+                return dk.egernet.factory.sandbox.ExecResult(0, "", false, false, 1)
+            }
+        }
+        if (command.size == 3 && command[1] == "-c" && workdir == "/") {
+            val attempt = readyAttempts.merge("$container ${command[2]}", 1, Int::plus)!!
+            internal += "ready $container ${command[2]}"
+            return dk.egernet.factory.sandbox.ExecResult(onReady(container, command[2], attempt), "not yet", false, false, 1)
+        }
         val line = command.last() // SandboxManager.shellCommand: the command is the last argument
         calls += "exec $container $line"
-        if (!containers.containsKey(container)) throw dk.egernet.factory.sandbox.SandboxRuntimeException("no such container $container")
         execs += Triple(container, line, timeoutMs)
+        execUsers += user
         return onExec(container, line, timeoutMs)
     }
+    override fun logs(name: String, lines: Int) = "LOG: database system is starting up ($name)"
     override fun restartContainer(name: String) { calls += "restart $name" }
     override fun removeContainers(names: List<String>) {
         calls += "rm ${names.joinToString(" ")}"

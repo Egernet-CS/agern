@@ -212,12 +212,14 @@ data class SandboxConfig(
     val maxConcurrent: Int = 2,
     /** FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES: default and maximum for one command (also capped by the stage time limit). */
     val execTimeoutMs: Long = 30 * 60_000L,
+    /** FACTORY_SANDBOX_MAX_PLATFORMS: platforms a definition may name besides its default image (0 forbids them). */
+    val maxPlatforms: Int = 4,
 ) {
     val enabled: Boolean get() = mode != "off"
 
     override fun toString() = if (!enabled) "off" else
         "SandboxConfig(mode=$mode, podman=$podmanBin, url=${podmanUrl ?: "-"}, cgroupParent=${cgroupParent ?: "-"}, registries=$registries, maxCpus=$maxCpus, " +
-            "maxMemory=${formatMemory(maxMemoryBytes)}, maxConcurrent=$maxConcurrent, execTimeoutMs=$execTimeoutMs)"
+            "maxMemory=${formatMemory(maxMemoryBytes)}, maxConcurrent=$maxConcurrent, execTimeoutMs=$execTimeoutMs, maxPlatforms=$maxPlatforms)"
 
     companion object {
         val DEFAULT_REGISTRIES = listOf("docker.io", "ghcr.io", "quay.io", "mcr.microsoft.com")
@@ -245,6 +247,10 @@ data class SandboxConfig(
                 it.toLongOrNull() ?: throw IllegalArgumentException("FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES must be a whole number of minutes")
             } ?: 30
             require(execMinutes in 1..24 * 60) { "FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES must be between 1 and 1440" }
+            val platforms = get("FACTORY_SANDBOX_MAX_PLATFORMS")?.let {
+                it.toIntOrNull() ?: throw IllegalArgumentException("FACTORY_SANDBOX_MAX_PLATFORMS must be a whole number")
+            } ?: 4
+            require(platforms in 0..20) { "FACTORY_SANDBOX_MAX_PLATFORMS must be between 0 and 20" }
             val cgroupParent = get("FACTORY_SANDBOX_CGROUP_PARENT")?.trim()?.takeIf { it.isNotEmpty() }
             if (cgroupParent != null) {
                 require(CGROUP_PARENT_RE.matches(cgroupParent) && "/../" !in "$cgroupParent/" && !cgroupParent.endsWith(".slice")) {
@@ -261,6 +267,7 @@ data class SandboxConfig(
                 maxMemoryBytes = memory,
                 maxConcurrent = concurrent,
                 execTimeoutMs = execMinutes * 60_000L,
+                maxPlatforms = platforms,
             )
         }
 
