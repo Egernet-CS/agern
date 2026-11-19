@@ -130,6 +130,14 @@ jobs:
         with:
           name: deb
           path: dist
+      # The integration test runs Gradle as the agern user: download its dependencies here first (cached
+      # by setup-gradle) and hand them over, so it does not hit Maven Central again.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - run: ./gradlew --no-daemon :server:testClasses
       # Installs the package, PostgreSQL and Podman with apt; 'agern sandbox enable' and its
       # self-test; doctor; the server under the hardened unit reaping a leftover sandbox through the
       # socket; PodmanIntegrationTest as the agern user inside agern.service; upgrade, prune,
@@ -137,7 +145,7 @@ jobs:
       - name: Sandbox host test
         env:
           VERSION: ${{ needs.deb.outputs.version }}
-        run: sudo bash packaging/deb/sandbox-host-test.sh "dist/agern_${VERSION}_all.deb" --it .
+        run: sudo AGERN_IT_GRADLE_CACHE="$HOME/.gradle" bash packaging/deb/sandbox-host-test.sh "dist/agern_${VERSION}_all.deb" --it .
 
   publish-main:
     name: Publish the rolling main pre-release

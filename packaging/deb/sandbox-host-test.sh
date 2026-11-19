@@ -16,7 +16,8 @@
 # (ExecStart replaced by a runtime drop-in), against the unit's socket; an upgrade keeps sandboxes
 # on without restarting the sandbox service; status and prune; 'agern sandbox disable'; purge.
 #
-# Environment: AGERN_SANDBOX_TEST_IMAGE / AGERN_PODMAN_IT_IMAGE (default docker.io/library/busybox:1.36.1).
+# Environment: AGERN_SANDBOX_TEST_IMAGE / AGERN_PODMAN_IT_IMAGE (default docker.io/library/busybox:1.36.1);
+# AGERN_IT_GRADLE_CACHE = a Gradle home whose downloaded dependencies seed the agern user's.
 
 # shellcheck disable=SC2015 # 'test && pass || fail': pass always succeeds
 set -euo pipefail
@@ -179,6 +180,13 @@ if [ -n "$IT_SRC" ]; then
     IT=/var/lib/agern/sandbox-it
     rm -rf "$IT"
     as_agern mkdir -p "$IT"
+    # Optional: a Gradle home with the dependencies already downloaded (CI passes the runner's, which
+    # gradle/actions/setup-gradle caches), so the agern user does not fetch them again.
+    if [ -n "${AGERN_IT_GRADLE_CACHE:-}" ] && [ -d "$AGERN_IT_GRADLE_CACHE/caches/modules-2" ]; then
+        as_agern mkdir -p /var/lib/agern/.gradle/caches
+        tar -C "$AGERN_IT_GRADLE_CACHE" -cf - caches/modules-2 wrapper 2>/dev/null | as_agern tar -C /var/lib/agern/.gradle -xf - || true
+        echo "seeded the agern user's Gradle home from $AGERN_IT_GRADLE_CACHE"
+    fi
     tar -C "$IT_SRC" --exclude=./.git --exclude=./web --exclude=./build --exclude=./server/build --exclude=./.gradle --exclude=./node_modules -cf - . |
         as_agern tar -C "$IT" -xf -
     mkdir -p /run/systemd/system/agern.service.d
