@@ -91,7 +91,7 @@ if [ ! -f "$SRC_DIR/agern.jar" ] || [ ! -f "$SRC_DIR/VERSION" ]; then
     curl -fsSL --retry 3 -o "$tmp/$tarball" "$dl/$tarball" || die "download failed: $dl/$tarball"
     expected=$(awk -v f="$tarball" '{n=$2; sub(/^\*/, "", n); if (n == f) {print $1; exit}}' "$tmp/SHA256SUMS")
     actual=$(sha256_of "$tmp/$tarball")
-    [ -n "$expected" ] && [ "$expected" = "$actual" ] || die "checksum mismatch for $tarball (expected ${expected:-none}, got $actual)"
+    if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then die "checksum mismatch for $tarball (expected ${expected:-none}, got $actual)"; fi
     info "checksum OK"
     mkdir "$tmp/x"
     tar -xzf "$tmp/$tarball" -C "$tmp/x"

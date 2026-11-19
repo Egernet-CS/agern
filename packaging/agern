@@ -4,22 +4,33 @@
 #   agern start|stop|restart|status     control the service
 #   agern logs [-f] [-n LINES]          show the server log
 #   agern version                       installed, previous and running version
-#   agern upgrade [VERSION] [--force]   download a release, verify, swap, restart, health check
-#   agern rollback                      switch back to the previous version
+#   agern upgrade [options]             download a release, verify, install, restart, health check
+#   agern rollback [--force]            switch back to the previous version
 #   agern doctor                        check the host
+#   agern setup-db [--db N] [--user N]  create the PostgreSQL role and database (local, root)
+#   agern auto-upgrade on|off|status    automatic upgrades when idle (.deb installs, root)
 #   agern run                           run the server in the foreground (used by the service)
 #
-# Layout (prefix /opt/agern unless AGERN_PREFIX is set):
-#   <prefix>/agern.conf                 written by install.sh (paths, service user, service manager)
-#   <prefix>/versions/<version>/        one unpacked release each (agern.jar, this script, ...)
-#   <prefix>/current, <prefix>/previous symlinks into versions/
-#   <prefix>/bin/agern                  -> ../current/agern
+# upgrade options: [VERSION | --version VERSION] [--force]; on .deb installs also
+#   [--channel stable|main] [--file PATH.deb]. --force reinstalls the installed version, allows
+#   a downgrade and upgrades even while agents are working.
+#
+# Two layouts, detected from where this script lives:
+#   tarball (install.sh)   <prefix>/versions/<version>/agern, <prefix>/{current,previous,agern.conf}
+#                          (prefix /opt/agern unless AGERN_PREFIX is set)
+#   deb (agern_*.deb)      /usr/bin/agern, /usr/share/agern/agern.jar, /etc/agern/agern.env,
+#                          /var/lib/agern (data), /var/cache/agern (kept packages, root only)
 #
 # Environment overrides (mostly for testing):
-#   AGERN_PREFIX              install prefix
+#   AGERN_PREFIX              tarball install prefix (forces the tarball layout)
 #   AGERN_RELEASE_BASE_URL    where releases are downloaded from
 #                             (default https://github.com/Egernet-CS/agern/releases; file:// works)
 #   AGERN_HEALTH_TIMEOUT      seconds to wait for /api/health after a (re)start (default 120)
+#
+# Security: when run as root this script never sources or evaluates a file the service user can
+# write. /etc/agern/agern.env is parsed as KEY=value data (only known keys are read), and only
+# when it is root-owned and not writable by group or others. Packages are installed only from a
+# GitHub release whose SHA-256 matches the release's SHA256SUMS, or from a file the admin names.
 #
 # Bash 3.2 compatible (macOS /bin/bash).
 # shellcheck disable=SC2015 # 'test && ok || bad': ok/meh always succeed
@@ -29,14 +40,17 @@ set -euo pipefail
 AGERN_REPO_DEFAULT_BASE="https://github.com/Egernet-CS/agern/releases"
 LAUNCHD_LABEL="dk.egernet.agern"
 SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+DEB_FILE_RE='^agern_[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?_all\.deb$'
 
 # ---------------------------------------------------------------------------------------------
 # helpers
 
 say()  { printf '%s\n' "$*"; }
+# Under systemd (journal on stdout) '<N>' prefixes set the journal priority.
+if [ -n "${JOURNAL_STREAM:-}" ]; then J_WARN='<4>'; J_ERR='<3>'; else J_WARN=''; J_ERR=''; fi
 info() { printf 'agern: %s\n' "$*"; }
-warn() { printf 'agern: warning: %s\n' "$*" >&2; }
-die()  { printf 'agern: error: %s\n' "$*" >&2; exit 1; }
+warn() { printf '%sagern: warning: %s\n' "$J_WARN" "$*" >&2; }
+die()  { printf '%sagern: error: %s\n' "$J_ERR" "$*" >&2; exit 1; }
 
 is_root() { [ "$(id -u)" -eq 0 ]; }
 
@@ -53,43 +67,80 @@ script_dir() {
     (cd -P "$(dirname "$self")" && pwd -P)
 }
 
-detect_prefix() {
+SELF_DIR=$(script_dir)
+
+# deb layout: this script is <usr>/bin/agern next to <usr>/share/agern/agern.jar.
+if [ -z "${AGERN_PREFIX:-}" ] && [ -f "$SELF_DIR/../share/agern/agern.jar" ]; then
+    LAYOUT=deb
+    SHARE_DIR=$(cd -P "$SELF_DIR/../share/agern" && pwd -P)
+    PREFIX=$SHARE_DIR
+    AGERN_ENV_FILE=/etc/agern/agern.env
+    AGERN_DATA_DIR=/var/lib/agern
+    AGERN_LOG_DIR=""
+    AGERN_USER=agern
+    CACHE_DIR=/var/cache/agern
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then AGERN_SERVICE=systemd; else AGERN_SERVICE=none; fi
+    JAR="$SHARE_DIR/agern.jar"
+    PID_FILE=/run/agern/agern.pid
+else
+    LAYOUT=tarball
     if [ -n "${AGERN_PREFIX:-}" ]; then
-        printf '%s\n' "$AGERN_PREFIX"
-        return
-    fi
-    local dir
-    dir=$(script_dir)
-    if [ "$(basename "$(dirname "$dir")")" = "versions" ]; then
-        dirname "$(dirname "$dir")"
+        PREFIX=$AGERN_PREFIX
+    elif [ "$(basename "$(dirname "$SELF_DIR")")" = "versions" ]; then
+        PREFIX=$(dirname "$(dirname "$SELF_DIR")")
     else
-        printf '%s\n' /opt/agern
+        PREFIX=/opt/agern
     fi
-}
-
-PREFIX=$(detect_prefix)
-CONF_FILE="$PREFIX/agern.conf"
-
-# Defaults; agern.conf (written by install.sh) overrides them.
-AGERN_ENV_FILE=/etc/agern/agern.env
-AGERN_DATA_DIR=/var/lib/agern
-AGERN_LOG_DIR=/var/log/agern
-AGERN_USER=agern
-AGERN_SERVICE=none
-if [ -r "$CONF_FILE" ]; then
-    # shellcheck source=/dev/null
-    . "$CONF_FILE"
+    # Defaults; agern.conf (written by install.sh, root-owned like the rest of the prefix) overrides them.
+    AGERN_ENV_FILE=/etc/agern/agern.env
+    AGERN_DATA_DIR=/var/lib/agern
+    AGERN_LOG_DIR=/var/log/agern
+    AGERN_USER=agern
+    AGERN_SERVICE=none
+    if [ -r "$PREFIX/agern.conf" ]; then
+        # shellcheck source=/dev/null
+        . "$PREFIX/agern.conf"
+    fi
+    JAR="$PREFIX/current/agern.jar"
+    PID_FILE="$PREFIX/run/agern.pid"
 fi
-LOG_FILE="$AGERN_LOG_DIR/agern.log"
-PID_FILE="$PREFIX/run/agern.pid"
+LOG_FILE="${AGERN_LOG_DIR:-/var/log/agern}/agern.log"
 SYSTEMD_UNIT=agern.service
+UPGRADE_TIMER=agern-upgrade.timer
 LAUNCHD_PLIST="/Library/LaunchDaemons/$LAUNCHD_LABEL.plist"
 
-# Read KEY=VALUE lines (systemd EnvironmentFile style: no shell expansion, optional surrounding
-# quotes, '#' comments on their own line) and export them. Never evaluates the file as shell.
+# Keys read from the env file by everything except 'agern run'. They are set as plain shell
+# variables (not exported), so nothing in the file can change PATH, LD_PRELOAD and the like for
+# the commands this script runs.
+KNOWN_KEYS=" FACTORY_HOST FACTORY_PORT FACTORY_DB_URL FACTORY_DB_USER FACTORY_DB_PASSWORD FACTORY_MASTER_KEY"
+KNOWN_KEYS="$KNOWN_KEYS FACTORY_GITHUB_ORG FACTORY_AUTH FACTORY_2FA FACTORY_ADMINS FACTORY_DEV_FAKE_GITHUB"
+KNOWN_KEYS="$KNOWN_KEYS FACTORY_DATA_DIR FACTORY_CLAUDE_BIN FACTORY_AGENT_PATH FACTORY_PUBLIC_URL"
+KNOWN_KEYS="$KNOWN_KEYS AGERN_JAVA AGERN_JAVA_OPTS JAVA_HOME AGERN_UPGRADE_CHANNEL AGERN_UPGRADE_MAX_WAIT_HOURS "
+
+# Is FILE safe for root to parse: owned by root and not writable by group or others?
+root_owned_file() {
+    local f=$1 o m
+    [ -f "$f" ] && [ ! -L "$f" ] || return 1
+    o=$(stat -c %u "$f" 2>/dev/null || stat -f %u "$f")
+    m=$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f")
+    [ "$o" = 0 ] || return 1
+    case $m in *[2367]? | *[2367]) return 1 ;; esac
+    return 0
+}
+
+# load_env_file FILE [all]
+# Reads KEY=VALUE lines (systemd EnvironmentFile style: no shell expansion, optional surrounding
+# quotes, '#' comments on their own line). Never evaluates the file as shell. With 'all' (only
+# 'agern run', never as root) every key is exported; otherwise only KNOWN_KEYS are set.
 load_env_file() {
-    local file=$1 line key val
+    local file=$1 mode=${2:-known} line key val
     [ -r "$file" ] || return 1
+    # On .deb installs root also takes upgrade settings from this file: it must be root's alone.
+    # (Tarball installs on macOS keep it owned by the service user; it is only ever read as data.)
+    if is_root && [ "$LAYOUT" = deb ] && ! root_owned_file "$file"; then
+        warn "not reading $file: it must be owned by root and not writable by group or others"
+        return 1
+    fi
     while IFS= read -r line || [ -n "$line" ]; do
         line=${line#"${line%%[![:space:]]*}"}
         case $line in '' | '#'*) continue ;; esac
@@ -104,7 +155,11 @@ load_env_file() {
                 \'*\') val=${val:1:${#val}-2} ;;
             esac
         fi
-        export "$key=$val"
+        if [ "$mode" = all ]; then
+            export "$key=$val"
+        else
+            case $KNOWN_KEYS in *" $key "*) printf -v "$key" '%s' "$val" ;; esac
+        fi
     done <"$file"
     return 0
 }
@@ -117,12 +172,23 @@ ensure_env() {
     return 0
 }
 
-health_url() {
+server_host() { # the address this host reaches the server on
     ensure_env
-    local host=${FACTORY_HOST:-0.0.0.0} port=${FACTORY_PORT:-8080}
+    local host=${FACTORY_HOST:-0.0.0.0}
     case $host in '' | 0.0.0.0 | '::' | '[::]') host=127.0.0.1 ;; esac
     case $host in *:*) case $host in \[*) ;; *) host="[$host]" ;; esac ;; esac
-    printf 'http://%s:%s/api/health\n' "$host" "$port"
+    printf '%s\n' "$host"
+}
+
+health_url() { printf 'http://%s:%s/api/health\n' "$(server_host)" "${FACTORY_PORT:-8080}"; }
+
+# The activity endpoint answers loopback callers only. The server always listens on 127.0.0.1
+# (an extra listener when FACTORY_HOST is a LAN address), unless it is bound to ::1 alone.
+activity_url() {
+    ensure_env
+    local host=127.0.0.1
+    case ${FACTORY_HOST:-} in ::1 | '[::1]') host='[::1]' ;; esac
+    printf 'http://%s:%s/api/internal/activity\n' "$host" "${FACTORY_PORT:-8080}"
 }
 
 # Prints the version the running server reports, or nothing.
@@ -132,8 +198,36 @@ running_version() {
         sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' || true
 }
 
+# semver -> dpkg version: the '-' that starts a pre-release becomes '~' so it sorts before the
+# release (1.2.0~rc.1 < 1.2.0); build metadata (+...) is kept. deb -> semver is the reverse.
+semver_to_deb() {
+    local core=${1%%+*} build=""
+    [ "$core" != "$1" ] && build="+${1#*+}"
+    case $core in *-*) core="${core%%-*}~${core#*-}" ;; esac
+    printf '%s%s\n' "$core" "$build"
+}
+deb_to_semver() {
+    local v=$1
+    case $v in *~*) v="${v%%~*}-${v#*~}" ;; esac
+    printf '%s\n' "$v"
+}
+
+deb_installed_version() { # dpkg version of the installed package, or nothing
+    local s
+    s=$(dpkg-query -W -f='${db:Status-Abbrev}|${Version}' agern 2>/dev/null || true)
+    case $s in 'ii '*) printf '%s\n' "${s#*|}" ;; esac
+}
+
 installed_version() {
     local which=${1:-current}
+    if [ "$LAYOUT" = deb ]; then
+        if [ "$which" = current ]; then
+            [ -r "$SHARE_DIR/VERSION" ] && tr -d '[:space:]' <"$SHARE_DIR/VERSION"
+        elif [ -f "$CACHE_DIR/previous.deb" ]; then
+            deb_to_semver "$(dpkg-deb -f "$CACHE_DIR/previous.deb" Version 2>/dev/null || true)"
+        fi
+        return 0
+    fi
     if [ -r "$PREFIX/$which/VERSION" ]; then tr -d '[:space:]' <"$PREFIX/$which/VERSION"; fi
 }
 
@@ -149,9 +243,12 @@ sha256_of() {
 
 need_root_for_service() {
     if [ "$AGERN_SERVICE" != none ] && ! is_root; then
-        die "this needs root (the service is managed by $AGERN_SERVICE); try: sudo $0 $*"
+        die "this needs root (the service is managed by $AGERN_SERVICE); try: sudo agern $*"
     fi
 }
+
+need_root() { is_root || die "this needs root; try: sudo agern $*"; }
+need_deb() { [ "$LAYOUT" = deb ] || die "'$*' is only available on .deb installs (this is a tarball install under $PREFIX)"; }
 
 # ---------------------------------------------------------------------------------------------
 # service control
@@ -169,6 +266,11 @@ svc_is_running() {
     esac
 }
 
+no_service_manager_deb() {
+    die "systemd is not running here; start the server yourself, as the service user:
+  runuser -u $AGERN_USER -- agern run"
+}
+
 svc_start() {
     case $AGERN_SERVICE in
         systemd) systemctl start "$SYSTEMD_UNIT" ;;
@@ -180,6 +282,7 @@ svc_start() {
             fi
             ;;
         *)
+            [ "$LAYOUT" = deb ] && no_service_manager_deb
             if svc_is_running; then
                 info "already running (pid $(cat "$PID_FILE"))"
                 return 0
@@ -200,6 +303,7 @@ svc_stop() {
             fi
             ;;
         *)
+            [ "$LAYOUT" = deb ] && no_service_manager_deb
             svc_is_running || { rm -f "$PID_FILE"; return 0; }
             local pid i=0
             pid=$(cat "$PID_FILE")
@@ -234,7 +338,7 @@ svc_restart() {
 
 # wait_healthy [expected-version] — waits until /api/health answers (with that version).
 wait_healthy() {
-    local want=${1:-} timeout=${AGERN_HEALTH_TIMEOUT:-120} waited=0 got
+    local want=${1:-} timeout=${AGERN_HEALTH_TIMEOUT:-120} waited=0 got=""
     while [ "$waited" -lt "$timeout" ]; do
         got=$(running_version)
         if [ -n "$got" ] && { [ -z "$want" ] || [ "$got" = "$want" ]; }; then
@@ -242,7 +346,7 @@ wait_healthy() {
             return 0
         fi
         if [ "$AGERN_SERVICE" = none ] && ! svc_is_running; then
-            warn "the server process exited (see $LOG_FILE)"
+            warn "the server process exited${AGERN_LOG_DIR:+ (see $LOG_FILE)}"
             return 1
         fi
         sleep 2
@@ -252,8 +356,32 @@ wait_healthy() {
     return 1
 }
 
+# Is anybody's work in progress? Sets ACT_STATE (idle | busy | stopped | unknown), ACT_RUNS,
+# ACT_AGENTS. The answer is advisory: it decides *when* to restart, never *what* is installed.
+server_activity() {
+    ACT_STATE=unknown ACT_RUNS="?" ACT_AGENTS="?"
+    if ! svc_is_running; then ACT_STATE=stopped; return 0; fi
+    local body
+    body=$(curl -fsS --max-time 5 "$(activity_url)" 2>/dev/null) || return 0
+    ACT_RUNS=$(printf '%s' "$body" | sed -n 's/.*"activeRuns":\([0-9]*\).*/\1/p')
+    ACT_AGENTS=$(printf '%s' "$body" | sed -n 's/.*"busyAgents":\([0-9]*\).*/\1/p')
+    case $body in
+        *'"idle":true'*) ACT_STATE=idle ;;
+        *'"idle":false'*) ACT_STATE=busy ;;
+    esac
+}
+
+describe_activity() {
+    case $ACT_STATE in
+        idle) say "idle" ;;
+        stopped) say "server not running" ;;
+        busy) say "busy: ${ACT_RUNS:-?} run(s) in progress, ${ACT_AGENTS:-?} agent(s) working" ;;
+        *) say "unknown (the server is running but $(activity_url) does not answer)" ;;
+    esac
+}
+
 # ---------------------------------------------------------------------------------------------
-# version switching
+# tarball layout: version switching
 
 link_target() { # prints "versions/X" for a link, or nothing
     [ -L "$PREFIX/$1" ] && readlink "$PREFIX/$1" || true
@@ -288,6 +416,7 @@ acquire_lock() {
 # Makes it current (old current becomes previous), restarts, and switches back automatically
 # when the new version does not report itself healthy.
 cmd_activate() {
+    [ "$LAYOUT" = tarball ] || die "activate is for tarball installs"
     local v=${1:-} start=1
     [ -n "$v" ] || die "usage: agern activate VERSION [--no-start]"
     [ "${2:-}" = "--no-start" ] && start=0
@@ -327,7 +456,7 @@ cmd_activate() {
     die "upgrade to $v failed and the rollback to ${old_cur#versions/} did not come up either (see 'agern logs')"
 }
 
-cmd_rollback() {
+cmd_rollback_tarball() {
     need_root_for_service rollback
     acquire_lock
     local cur prev
@@ -342,31 +471,25 @@ cmd_rollback() {
     info "now running ${prev#versions/} (rollback again to return to ${cur#versions/})"
 }
 
-# ---------------------------------------------------------------------------------------------
-# upgrade
-
 download() { # download URL FILE
     curl -fsSL --retry 3 --connect-timeout 15 -o "$2" "$1" || die "download failed: $1"
 }
 
-cmd_upgrade() {
-    local want="" force=0 arg
-    for arg in "$@"; do
-        case $arg in
-            --force) force=1 ;;
-            -*) die "unknown option $arg" ;;
-            *) want=${arg#v} ;;
-        esac
-    done
-    if [ -n "$want" ] && ! [[ $want =~ $SEMVER_RE ]]; then die "not a version: $want"; fi
+release_base() {
+    local base=${AGERN_RELEASE_BASE_URL:-$AGERN_REPO_DEFAULT_BASE}
+    printf '%s\n' "${base%/}"
+}
+
+cmd_upgrade_tarball() { # want force
+    local want=$1 force=$2
     need_root_for_service upgrade
     command -v curl >/dev/null 2>&1 || die "curl is required"
     command -v tar >/dev/null 2>&1 || die "tar is required"
     acquire_lock
     TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/agern-upgrade.XXXXXX")
 
-    local base=${AGERN_RELEASE_BASE_URL:-$AGERN_REPO_DEFAULT_BASE} sums_url
-    base=${base%/}
+    local base sums_url
+    base=$(release_base)
     if [ -n "$want" ]; then
         sums_url="$base/download/v$want/SHA256SUMS"
     else
@@ -413,6 +536,497 @@ cmd_upgrade() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# deb layout: upgrade, rollback, automatic upgrades
+#
+# /var/cache/agern (root, 0755) keeps current.deb (the installed package) and previous.deb (the
+# one before it, for 'agern rollback'); downloads land in partial/ (root, 0700) until verified.
+
+deb_lock() { # deb_lock [quiet] — one upgrade/rollback at a time
+    mkdir -p "$CACHE_DIR"
+    exec 9>"$CACHE_DIR/lock"
+    if ! flock -n 9; then
+        [ "${1:-}" = quiet ] && { info "another upgrade or rollback is running; skipping"; exit 0; }
+        die "another upgrade or rollback is running"
+    fi
+}
+
+deb_partial() {
+    mkdir -p "$CACHE_DIR/partial"
+    chmod 0755 "$CACHE_DIR"
+    chmod 0700 "$CACHE_DIR/partial"
+    printf '%s\n' "$CACHE_DIR/partial"
+}
+
+# Checks that FILE is an Agern package; prints its dpkg version.
+deb_check_file() {
+    local f=$1 pkg arch ver
+    [ -f "$f" ] || die "$f does not exist"
+    pkg=$(dpkg-deb -f "$f" Package 2>/dev/null || true)
+    arch=$(dpkg-deb -f "$f" Architecture 2>/dev/null || true)
+    ver=$(dpkg-deb -f "$f" Version 2>/dev/null || true)
+    [ "$pkg" = agern ] && [ "$arch" = all ] && [ -n "$ver" ] || die "$f is not an Agern package (Package '$pkg', Architecture '$arch')"
+    printf '%s\n' "$ver"
+}
+
+# resolve_release CHANNEL WANT — reads the release's SHA256SUMS. Sets REL_DIR_URL, REL_FILE,
+# REL_SHA, REL_SEMVER, REL_DEB (dpkg version). Downloads nothing else.
+resolve_release() {
+    local channel=$1 want=$2 base dir sums
+    base=$(release_base)
+    if [ -n "$want" ]; then dir="$base/download/v$want"
+    elif [ "$channel" = main ]; then dir="$base/download/main-latest"
+    else dir="$base/latest/download"; fi
+    sums="$(deb_partial)/SHA256SUMS"
+    download "$dir/SHA256SUMS" "$sums"
+    REL_FILE=$(awk '{sub(/^\*/, "", $2); print $2}' "$sums" | grep -E "$DEB_FILE_RE" | head -n 1 || true)
+    [ -n "$REL_FILE" ] || die "$dir/SHA256SUMS lists no agern_<version>_all.deb"
+    REL_SHA=$(awk -v f="$REL_FILE" '{n=$2; sub(/^\*/, "", n); if (n == f) {print $1; exit}}' "$sums")
+    [[ $REL_SHA =~ ^[0-9a-f]{64}$ ]] || die "no valid checksum for $REL_FILE in $dir/SHA256SUMS"
+    REL_SEMVER=${REL_FILE#agern_}
+    REL_SEMVER=${REL_SEMVER%_all.deb}
+    if [ -n "$want" ] && [ "$REL_SEMVER" != "$want" ]; then die "release v$want contains $REL_FILE"; fi
+    REL_DEB=$(semver_to_deb "$REL_SEMVER")
+    REL_DIR_URL=$dir
+    rm -f "$sums"
+}
+
+# Downloads the resolved release and verifies it; prints the path of the verified package.
+fetch_release() {
+    local part out actual ver
+    part=$(deb_partial)
+    rm -f "$part/$REL_FILE"
+    info "downloading $REL_DIR_URL/$REL_FILE" >&2
+    download "$REL_DIR_URL/$REL_FILE" "$part/$REL_FILE"
+    actual=$(sha256_of "$part/$REL_FILE")
+    if [ "$actual" != "$REL_SHA" ]; then
+        rm -f "$part/$REL_FILE"
+        die "checksum mismatch for $REL_FILE (expected $REL_SHA, got $actual); nothing was changed"
+    fi
+    ver=$(deb_check_file "$part/$REL_FILE")
+    [ "$ver" = "$REL_DEB" ] || die "$REL_FILE contains version $ver, expected $REL_DEB"
+    info "checksum OK ($actual)" >&2
+    out="$CACHE_DIR/$REL_FILE"
+    chmod 0644 "$part/$REL_FILE"
+    mv -f "$part/$REL_FILE" "$out"
+    printf '%s\n' "$out"
+}
+
+# Makes sure current.deb holds the installed version (for a later rollback), best effort.
+deb_keep_installed() {
+    local inst=$1 cand sv part sha
+    [ -n "$inst" ] || return 0
+    if [ -f "$CACHE_DIR/current.deb" ] && [ "$(dpkg-deb -f "$CACHE_DIR/current.deb" Version 2>/dev/null || true)" = "$inst" ]; then
+        return 0
+    fi
+    sv=$(deb_to_semver "$inst")
+    cand="$CACHE_DIR/agern_${sv}_all.deb"
+    if [ -f "$cand" ] && [ "$(dpkg-deb -f "$cand" Version 2>/dev/null || true)" = "$inst" ]; then
+        cp -f "$cand" "$CACHE_DIR/current.deb"
+        return 0
+    fi
+    case $inst in
+        *~main*) ;;
+        *)
+            # A tagged release can be fetched again (verified like any download).
+            part=$(deb_partial)
+            if curl -fsSL --retry 2 --connect-timeout 15 -o "$part/SHA256SUMS.keep" "$(release_base)/download/v$sv/SHA256SUMS" 2>/dev/null &&
+                sha=$(awk -v f="agern_${sv}_all.deb" '{n=$2; sub(/^\*/, "", n); if (n == f) {print $1; exit}}' "$part/SHA256SUMS.keep") &&
+                [ -n "$sha" ] &&
+                curl -fsSL --retry 2 --connect-timeout 15 -o "$part/keep.deb" "$(release_base)/download/v$sv/agern_${sv}_all.deb" 2>/dev/null &&
+                [ "$(sha256_of "$part/keep.deb")" = "$sha" ] &&
+                [ "$(dpkg-deb -f "$part/keep.deb" Version 2>/dev/null || true)" = "$inst" ]; then
+                chmod 0644 "$part/keep.deb"
+                mv -f "$part/keep.deb" "$CACHE_DIR/current.deb"
+                rm -f "$part/SHA256SUMS.keep"
+                info "kept a copy of the installed version $inst for 'agern rollback'"
+                return 0
+            fi
+            rm -f "$part/SHA256SUMS.keep" "$part/keep.deb"
+            ;;
+    esac
+    warn "no copy of the installed version $inst is available; 'agern rollback' will not be able to return to it"
+    rm -f "$CACHE_DIR/current.deb"
+}
+
+config_complete() { # the service is started by the package only when this holds
+    ensure_env
+    [ -n "${FACTORY_DB_URL:-}" ] && [ -n "${FACTORY_GITHUB_ORG:-}" ]
+}
+
+apt_install() {
+    local f=$1
+    local opts=(-y -q --allow-downgrades -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confold)
+    if DEBIAN_FRONTEND=noninteractive apt-get install "${opts[@]}" "$f"; then return 0; fi
+    warn "apt-get install failed; refreshing the package lists and trying once more"
+    apt-get update -q || true
+    DEBIAN_FRONTEND=noninteractive apt-get install "${opts[@]}" "$f"
+}
+
+# deb_install FILE [rollback] — installs FILE with apt (dependencies resolve, downgrades allowed),
+# rotates current.deb/previous.deb, waits for the restarted service and, when the new version does
+# not come up, reinstalls the one before it.
+deb_install() {
+    local f=$1 mode=${2:-upgrade} new inst sv
+    new=$(deb_check_file "$f")
+    inst=$(deb_installed_version)
+    [ "$mode" = rollback ] || deb_keep_installed "$inst"
+
+    info "installing agern $new (installed: ${inst:-none})"
+    apt_install "$f" || die "installing $f failed; ${inst:-nothing} is still installed"
+
+    # Rotate the kept packages: what was installed becomes previous.deb, FILE becomes current.deb.
+    local tmp="$CACHE_DIR/.rotate.$$"
+    if [ "$mode" = rollback ]; then
+        mv -f "$CACHE_DIR/current.deb" "$tmp" 2>/dev/null || true
+        mv -f "$CACHE_DIR/previous.deb" "$CACHE_DIR/current.deb"
+        if [ -f "$tmp" ]; then mv -f "$tmp" "$CACHE_DIR/previous.deb"; else rm -f "$CACHE_DIR/previous.deb"; fi
+    else
+        if [ -f "$CACHE_DIR/current.deb" ] && [ "$inst" != "$new" ]; then
+            mv -f "$CACHE_DIR/current.deb" "$CACHE_DIR/previous.deb"
+        elif [ "$inst" != "$new" ]; then
+            rm -f "$CACHE_DIR/previous.deb"   # older than what was installed: not a rollback target
+        fi
+        cp -f "$f" "$tmp" && chmod 0644 "$tmp" && mv -f "$tmp" "$CACHE_DIR/current.deb"
+    fi
+    # Only current.deb and previous.deb are kept.
+    find "$CACHE_DIR" -maxdepth 1 -name 'agern_*_all.deb' -type f -delete 2>/dev/null || true
+
+    sv=$(deb_to_semver "$new")
+    if ! config_complete; then
+        info "agern $new is installed; the configuration is incomplete, so the service was not started"
+        return 0
+    fi
+    if [ "$AGERN_SERVICE" != systemd ]; then
+        info "agern $new is installed (no systemd here: restart the server yourself)"
+        return 0
+    fi
+    if ! systemctl is-enabled --quiet "$SYSTEMD_UNIT" 2>/dev/null; then
+        info "agern $new is installed ($SYSTEMD_UNIT is disabled, not started)"
+        return 0
+    fi
+    if wait_healthy "$sv"; then
+        info "now running $sv${inst:+ (previous: $(deb_to_semver "$inst"); 'agern rollback' switches back)}"
+        return 0
+    fi
+    if [ "$mode" != rollback ] && [ -n "$inst" ] && [ "$inst" != "$new" ] && [ -f "$CACHE_DIR/previous.deb" ]; then
+        warn "version $sv did not come up; reinstalling $(deb_to_semver "$inst")"
+        deb_install "$CACHE_DIR/previous.deb" rollback || true
+        die "upgrade to $sv failed and was rolled back (see 'agern logs')"
+    fi
+    die "version $sv did not come up (see 'agern logs')"
+}
+
+# Refuses (or, with --force, warns) when a restart would interrupt work.
+deb_check_idle() {
+    local force=$1
+    server_activity
+    case $ACT_STATE in
+        idle | stopped) return 0 ;;
+    esac
+    if [ "$force" = 1 ]; then
+        warn "proceeding although the server is $(describe_activity) (--force)"
+        return 0
+    fi
+    die "not restarting now, the server is $(describe_activity). Try again later, or use --force (interrupted runs fail)"
+}
+
+valid_channel() {
+    case $1 in stable | main) return 0 ;; esac
+    die "unknown channel '$1' (stable or main)"
+}
+
+cmd_upgrade_deb() { # channel want file force
+    local channel=$1 want=$2 file=$3 force=$4 inst f
+    need_root upgrade
+    command -v curl >/dev/null 2>&1 || die "curl is required"
+    deb_lock
+    inst=$(deb_installed_version)
+    if [ -n "$file" ]; then
+        case $file in /*) ;; *) file="$(pwd -P)/$file" ;; esac
+        local fv
+        fv=$(deb_check_file "$file")
+        if [ "$fv" = "$inst" ] && [ "$force" = 0 ]; then info "version $fv is already installed (use --force to reinstall it)"; return 0; fi
+        if [ -n "$inst" ] && dpkg --compare-versions "$fv" lt "$inst" && [ "$force" = 0 ]; then
+            die "$file is version $fv, older than the installed $inst (use --force to downgrade)"
+        fi
+        deb_check_idle "$force"
+        # Install from a root-owned copy, so the file cannot change between check and install.
+        local part
+        part=$(deb_partial)
+        cp -f "$file" "$part/local.deb"
+        fv=$(deb_check_file "$part/local.deb")
+        f="$CACHE_DIR/agern_$(deb_to_semver "$fv")_all.deb"
+        chmod 0644 "$part/local.deb"
+        mv -f "$part/local.deb" "$f"
+        info "installing $file (no checksum: a file you named)"
+        deb_install "$f"
+        return
+    fi
+    ensure_env
+    [ -n "$channel" ] || channel=${AGERN_UPGRADE_CHANNEL:-stable}
+    valid_channel "$channel"
+    if [ -n "$want" ]; then info "looking for release v$want"; else info "looking for the latest release on the $channel channel"; fi
+    resolve_release "$channel" "$want"
+    if [ "$REL_DEB" = "$inst" ] && [ "$force" = 0 ]; then
+        info "version $REL_SEMVER is already installed (use --force to reinstall it)"
+        return 0
+    fi
+    if [ -n "$inst" ] && dpkg --compare-versions "$REL_DEB" lt "$inst" && [ "$force" = 0 ]; then
+        die "the $channel release is $REL_SEMVER, older than the installed $(deb_to_semver "$inst") (use --force to downgrade)"
+    fi
+    deb_check_idle "$force"
+    f=$(fetch_release)
+    deb_install "$f"
+}
+
+cmd_rollback_deb() {
+    local force=0
+    [ "${1:-}" = --force ] && force=1
+    need_root rollback
+    deb_lock
+    [ -f "$CACHE_DIR/previous.deb" ] || die "no previous package is kept in $CACHE_DIR: 'agern upgrade' keeps one, when it has (or can download) a copy of the version it replaces"
+    local prev inst
+    prev=$(deb_check_file "$CACHE_DIR/previous.deb")
+    inst=$(deb_installed_version)
+    deb_check_idle "$force"
+    info "rolling back from ${inst:-none} to $prev"
+    deb_install "$CACHE_DIR/previous.deb" rollback
+}
+
+# --- automatic upgrades ----------------------------------------------------------------------
+# agern-upgrade.timer runs 'agern auto-upgrade run' (as root) every 15 minutes when enabled.
+# State in /var/cache/agern/auto-upgrade.state (root-owned, written only here):
+#   pending_target=<dpkg version> pending_since=<epoch>  waiting for the server to become idle
+#   gave_up=<dpkg version>                                waited too long; not retried
+
+STATE_FILE_NAME=auto-upgrade.state
+st_pending_target="" st_pending_since="" st_gave_up=""
+
+state_read() {
+    local f="$CACHE_DIR/$STATE_FILE_NAME" line k v
+    st_pending_target="" st_pending_since="" st_gave_up=""
+    root_owned_file "$f" || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        k=${line%%=*}
+        v=${line#*=}
+        [[ $v =~ ^[0-9A-Za-z.+~-]*$ ]] || continue
+        case $k in
+            pending_target) st_pending_target=$v ;;
+            pending_since) [[ $v =~ ^[0-9]+$ ]] && st_pending_since=$v ;;
+            gave_up) st_gave_up=$v ;;
+        esac
+    done <"$f"
+}
+
+state_write() {
+    local f="$CACHE_DIR/$STATE_FILE_NAME"
+    mkdir -p "$CACHE_DIR"
+    printf 'pending_target=%s\npending_since=%s\ngave_up=%s\n' "$st_pending_target" "$st_pending_since" "$st_gave_up" >"$f.tmp"
+    chmod 0644 "$f.tmp"
+    mv -f "$f.tmp" "$f"
+}
+
+auto_upgrade_run() {
+    need_root auto-upgrade run
+    need_deb auto-upgrade
+    command -v curl >/dev/null 2>&1 || die "curl is required"
+    deb_lock quiet
+    ensure_env
+    local channel=${AGERN_UPGRADE_CHANNEL:-stable} max=${AGERN_UPGRADE_MAX_WAIT_HOURS:-24} inst now
+    valid_channel "$channel"
+    [[ $max =~ ^[0-9]+$ ]] || die "AGERN_UPGRADE_MAX_WAIT_HOURS must be a whole number of hours"
+    inst=$(deb_installed_version)
+    resolve_release "$channel" ""
+    state_read
+    if [ -n "$inst" ] && ! dpkg --compare-versions "$REL_DEB" gt "$inst"; then
+        info "up to date: $(deb_to_semver "$inst") installed, latest on the $channel channel is $REL_SEMVER"
+        st_pending_target="" st_pending_since=""
+        state_write
+        return 0
+    fi
+    if [ "$st_gave_up" = "$REL_DEB" ]; then
+        info "not upgrading to $REL_SEMVER: gave up waiting for an idle moment earlier; run 'agern upgrade' when it suits you"
+        return 0
+    fi
+    now=$(date +%s)
+    if [ "$st_pending_target" != "$REL_DEB" ] || [ -z "$st_pending_since" ]; then
+        st_pending_target=$REL_DEB st_pending_since=$now
+    fi
+    server_activity
+    case $ACT_STATE in
+        idle | stopped) ;;
+        *)
+            local waited=$(((now - st_pending_since) / 3600))
+            if [ "$((now - st_pending_since))" -ge "$((max * 3600))" ]; then
+                warn "giving up on the automatic upgrade to $REL_SEMVER: the server has not been idle for ${waited}h (AGERN_UPGRADE_MAX_WAIT_HOURS=$max); it is $(describe_activity). Run 'agern upgrade' when it suits you; a newer release is tried again automatically."
+                st_gave_up=$REL_DEB st_pending_target="" st_pending_since=""
+                state_write
+                return 0
+            fi
+            info "postponing the upgrade to $REL_SEMVER: the server is $(describe_activity); next try on the next timer tick (waiting ${waited}h of at most ${max}h)"
+            state_write
+            return 0
+            ;;
+    esac
+    local f
+    f=$(fetch_release)
+    # The download took a while: look again right before the restart.
+    server_activity
+    case $ACT_STATE in
+        idle | stopped) ;;
+        *)
+            info "postponing the upgrade to $REL_SEMVER: work started during the download ($(describe_activity))"
+            state_write
+            return 0
+            ;;
+    esac
+    st_pending_target="" st_pending_since=""
+    state_write
+    info "upgrading automatically from ${inst:-none} to $REL_DEB ($channel channel)"
+    deb_install "$f"
+}
+
+# set_env_key KEY VALUE — rewrites /etc/agern/agern.env with KEY=VALUE (replacing the first
+# uncommented KEY= line, else appending), keeping owner and mode. Root only.
+set_env_key() {
+    local key=$1 val=$2 f=$AGERN_ENV_FILE tmp
+    [[ $key =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "bad key $key"
+    case $val in *$'\n'*) die "value for $key contains a newline" ;; esac
+    root_owned_file "$f" || die "$f must exist, be owned by root and not be writable by group or others"
+    tmp=$(mktemp "$f.XXXXXX")
+    chmod --reference="$f" "$tmp"
+    chown --reference="$f" "$tmp"
+    AGERN_SET_KEY=$key AGERN_SET_VAL=$val awk '
+        BEGIN { k = ENVIRON["AGERN_SET_KEY"]; v = ENVIRON["AGERN_SET_VAL"]; done = 0 }
+        !done && index($0, k "=") == 1 { print k "=" v; done = 1; next }
+        { print }
+        END { if (!done) print k "=" v }
+    ' "$f" >"$tmp"
+    mv -f "$tmp" "$f"
+    printf -v "$key" '%s' "$val"
+}
+
+cmd_auto_upgrade() {
+    local sub=${1:-status}
+    [ $# -gt 0 ] && shift
+    need_deb auto-upgrade
+    case $sub in
+        on)
+            need_root auto-upgrade on
+            [ "$AGERN_SERVICE" = systemd ] || die "automatic upgrades need systemd"
+            local channel=""
+            while [ $# -gt 0 ]; do
+                case $1 in
+                    --channel) shift; channel=${1:?--channel needs stable or main} ;;
+                    --channel=*) channel=${1#--channel=} ;;
+                    *) die "usage: agern auto-upgrade on [--channel stable|main]" ;;
+                esac
+                shift
+            done
+            if [ -n "$channel" ]; then
+                valid_channel "$channel"
+                set_env_key AGERN_UPGRADE_CHANNEL "$channel"
+            fi
+            systemctl enable --now "$UPGRADE_TIMER"
+            ensure_env
+            info "automatic upgrades on (channel ${AGERN_UPGRADE_CHANNEL:-stable}; checked every 15 minutes, installed when no agent is working)"
+            ;;
+        off)
+            need_root auto-upgrade off
+            [ "$AGERN_SERVICE" = systemd ] || die "automatic upgrades need systemd"
+            systemctl disable --now "$UPGRADE_TIMER"
+            info "automatic upgrades off"
+            ;;
+        status)
+            ensure_env
+            local enabled=no
+            if [ "$AGERN_SERVICE" = systemd ] && systemctl is-enabled --quiet "$UPGRADE_TIMER" 2>/dev/null; then enabled=yes; fi
+            say "automatic upgrades: $([ "$enabled" = yes ] && echo on || echo off)"
+            say "channel:            ${AGERN_UPGRADE_CHANNEL:-stable}"
+            say "max wait for idle:  ${AGERN_UPGRADE_MAX_WAIT_HOURS:-24}h"
+            if [ "$enabled" = yes ]; then
+                say "timer:"
+                systemctl list-timers --all "$UPGRADE_TIMER" --no-pager 2>/dev/null | sed -n '1,2s/^/  /p' || true
+            fi
+            if is_root; then
+                state_read
+                [ -n "$st_pending_target" ] && say "waiting to install: $(deb_to_semver "$st_pending_target") since $(date -d "@$st_pending_since" 2>/dev/null || echo "$st_pending_since")"
+                [ -n "$st_gave_up" ] && say "gave up on:         $(deb_to_semver "$st_gave_up") (install it with 'agern upgrade')"
+            fi
+            if [ "$AGERN_SERVICE" = systemd ]; then
+                say "recent runs (journalctl -u agern-upgrade.service):"
+                journalctl -u agern-upgrade.service -n 8 --no-pager -o short-iso 2>/dev/null | sed 's/^/  /' || true
+            fi
+            ;;
+        run) auto_upgrade_run ;;
+        *) die "usage: agern auto-upgrade on [--channel stable|main] | off | status" ;;
+    esac
+}
+
+# --- PostgreSQL setup ------------------------------------------------------------------------
+
+as_postgres() {
+    if command -v runuser >/dev/null 2>&1; then runuser -u postgres -- "$@"; else sudo -u postgres "$@"; fi
+}
+
+cmd_setup_db() {
+    local db=factory user=factory
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --db) shift; db=${1:?--db needs a name} ;;
+            --user) shift; user=${1:?--user needs a name} ;;
+            *) die "usage: agern setup-db [--db NAME] [--user NAME]" ;;
+        esac
+        shift
+    done
+    need_root setup-db
+    [ "$(uname -s)" = Linux ] || die "setup-db supports a local PostgreSQL on Linux"
+    [[ $db =~ ^[a-z_][a-z0-9_]{0,62}$ ]] || die "database name must match [a-z_][a-z0-9_]*"
+    [[ $user =~ ^[a-z_][a-z0-9_]{0,62}$ ]] || die "role name must match [a-z_][a-z0-9_]*"
+    id postgres >/dev/null 2>&1 || die "no 'postgres' user: install PostgreSQL first (apt install postgresql)"
+    command -v psql >/dev/null 2>&1 || die "psql not found: install PostgreSQL first (apt install postgresql)"
+    as_postgres psql -XAtqc 'select 1' >/dev/null 2>&1 || die "cannot connect to the local PostgreSQL as 'postgres' (is it running? systemctl status postgresql)"
+    ensure_env
+    [ "$ENV_LOADED" = 1 ] || die "cannot read $AGERN_ENV_FILE"
+
+    local port pw
+    port=$(as_postgres psql -XAtqc 'show port')
+    [[ $port =~ ^[0-9]+$ ]] || die "could not read PostgreSQL's port"
+    pw=${FACTORY_DB_PASSWORD:-}
+    # Keep a password that is already configured for this role; never the example's 'factory'.
+    if [ "${FACTORY_DB_USER:-}" != "$user" ] || [ -z "$pw" ] || [ "$pw" = factory ] || ! [[ $pw =~ ^[A-Za-z0-9._~-]+$ ]]; then
+        pw=$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)
+        [ ${#pw} -ge 24 ] || die "could not generate a password"
+    fi
+
+    # SQL goes through stdin (printf is a builtin): the password never appears in an argument list.
+    printf '%s\n' \
+        "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '$user') THEN CREATE ROLE \"$user\" LOGIN; END IF; END \$\$;" \
+        "ALTER ROLE \"$user\" WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '$pw';" |
+        as_postgres psql -X -q -v ON_ERROR_STOP=1 >/dev/null || die "creating/updating role $user failed"
+    if [ "$(as_postgres psql -XAtqc "select 1 from pg_database where datname = '$db'")" != 1 ]; then
+        as_postgres psql -X -q -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$db\" OWNER \"$user\"" >/dev/null || die "creating database $db failed"
+        info "created database $db (owner $user)"
+    else
+        info "database $db exists"
+    fi
+
+    set_env_key FACTORY_DB_URL "jdbc:postgresql://localhost:$port/$db"
+    set_env_key FACTORY_DB_USER "$user"
+    set_env_key FACTORY_DB_PASSWORD "$pw"
+    if PGPASSWORD=$pw PGCONNECT_TIMEOUT=5 psql -X -h localhost -p "$port" -U "$user" -d "$db" -Atqc 'select 1' >/dev/null 2>&1; then
+        info "role $user can log in to $db over TCP; FACTORY_DB_URL, FACTORY_DB_USER and FACTORY_DB_PASSWORD are set in $AGERN_ENV_FILE"
+    else
+        die "role $user cannot log in to $db over TCP at localhost:$port (check pg_hba.conf allows scram-sha-256 for 127.0.0.1/::1)"
+    fi
+    if [ -z "${FACTORY_GITHUB_ORG:-}" ]; then
+        info "next: set FACTORY_GITHUB_ORG (and FACTORY_PUBLIC_URL, FACTORY_ADMINS) in $AGERN_ENV_FILE, then 'agern start'"
+    else
+        info "next: 'agern restart' (or 'agern start') to use it"
+    fi
+}
+
+# ---------------------------------------------------------------------------------------------
 # run (foreground)
 
 resolve_java() {
@@ -429,9 +1043,9 @@ cmd_run() {
     if is_root && [ "${AGERN_ALLOW_ROOT:-}" != 1 ]; then
         die "refusing to run as root: agents would run as root. Run as the '$AGERN_USER' user (the service does)."
     fi
-    # Under systemd the unit's EnvironmentFile already provided the variables and the file is
-    # root-only; under launchd or without a service manager we read it ourselves.
-    load_env_file "$AGERN_ENV_FILE" || true
+    # Under systemd the unit's EnvironmentFile already provided the variables; under launchd or
+    # without a service manager we read the file ourselves.
+    load_env_file "$AGERN_ENV_FILE" all || true
     # PATH for the server (and thereby for finding 'claude') follows FACTORY_AGENT_PATH when set.
     if [ -n "${FACTORY_AGENT_PATH:-}" ]; then export PATH="$FACTORY_AGENT_PATH"; fi
     : "${FACTORY_DATA_DIR:=$AGERN_DATA_DIR}"
@@ -442,7 +1056,7 @@ cmd_run() {
     java=$(resolve_java)
     [ -n "$java" ] || die "java not found (set AGERN_JAVA or JAVA_HOME in $AGERN_ENV_FILE)"
     # shellcheck disable=SC2086 # AGERN_JAVA_OPTS is a list of options
-    exec "$java" ${AGERN_JAVA_OPTS:-} -jar "$PREFIX/current/agern.jar"
+    exec "$java" ${AGERN_JAVA_OPTS:-} -jar "$JAR"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -452,13 +1066,19 @@ cmd_status() {
     local cur prev run
     cur=$(installed_version current)
     prev=$(installed_version previous)
-    say "prefix:     $PREFIX"
+    if [ "$LAYOUT" = deb ]; then
+        say "layout:     deb ($SHARE_DIR, package $(deb_installed_version))"
+    else
+        say "prefix:     $PREFIX"
+    fi
     say "installed:  ${cur:-none}${prev:+ (previous: $prev)}"
     say "service:    $AGERN_SERVICE"
     if svc_is_running; then say "state:      running"; else say "state:      stopped"; fi
     run=$(running_version)
     if [ -n "$run" ]; then
         say "health:     ok, version $run ($(health_url))"
+        server_activity
+        say "activity:   $(describe_activity)"
     else
         say "health:     no answer ($(health_url))"
     fi
@@ -493,6 +1113,7 @@ cmd_version() {
     prev=$(installed_version previous)
     run=$(running_version)
     say "installed: ${cur:-none}"
+    [ "$LAYOUT" = deb ] && say "package:   agern $(deb_installed_version)"
     say "previous:  ${prev:-none}"
     say "running:   ${run:-not answering}"
 }
@@ -507,6 +1128,7 @@ bad()  { printf '  FAIL  %s\n' "$*"; DOCTOR_FAILS=$((DOCTOR_FAILS + 1)); }
 meh()  { printf '  warn  %s\n' "$*"; DOCTOR_WARNS=$((DOCTOR_WARNS + 1)); }
 
 owner_of() { stat -c %U "$1" 2>/dev/null || stat -f %Su "$1"; }
+group_of() { stat -c %G "$1" 2>/dev/null || stat -f %Sg "$1"; }
 mode_of()  { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 
 b64_len() {
@@ -518,37 +1140,92 @@ b64_len() {
     printf '%s\n' "${n// /}"
 }
 
+# May root execute PATH? Only when it and its directory are root-owned and not group/other-writable.
+root_may_exec() {
+    is_root || return 0
+    local p=$1
+    case $p in /*) ;; *) p=$(command -v "$p" 2>/dev/null) || return 1 ;; esac
+    p=$(readlink -f "$p" 2>/dev/null || printf '%s' "$p")
+    root_owned_file "$p" || return 1
+    local d m
+    d=$(dirname "$p")
+    [ "$(stat -c %u "$d" 2>/dev/null || stat -f %u "$d")" = 0 ] || return 1
+    m=$(mode_of "$d")
+    case $m in *[2367]? | *[2367]) case $m in 1???) ;; *) return 1 ;; esac ;; esac
+    return 0
+}
+
+db_hint() {
+    if [ "$(uname -s)" = Linux ]; then say "install PostgreSQL (apt install postgresql), then 'sudo agern setup-db'"
+    else say "create the role and database, see the README"; fi
+}
+
+install_hint() { # tool -> how to install it for the service
+    case $1 in
+        claude | */claude) say "install it for the service user: sudo -u $AGERN_USER -H bash -c 'curl -fsSL https://claude.ai/install.sh | bash' (lands in $AGERN_DATA_DIR/.local/bin, which is on the service PATH), or point FACTORY_CLAUDE_BIN at it" ;;
+        gh) say "apt install gh (or GitHub's apt repository for a current version: https://github.com/cli/cli/blob/trunk/docs/install_linux.md)" ;;
+        git) say "apt install git" ;;
+        *) say "install $1" ;;
+    esac
+}
+
 cmd_doctor() {
-    say "Agern doctor ($PREFIX)"
+    if [ "$LAYOUT" = deb ]; then say "Agern doctor (deb install, $SHARE_DIR)"; else say "Agern doctor ($PREFIX)"; fi
 
     say "installation"
     local cur
     cur=$(installed_version current)
-    if [ -n "$cur" ] && [ -f "$PREFIX/current/agern.jar" ]; then ok "version $cur installed"; else bad "no current version under $PREFIX"; fi
-    case $AGERN_SERVICE in
-        systemd) [ -f "/etc/systemd/system/$SYSTEMD_UNIT" ] && ok "systemd unit installed" || bad "/etc/systemd/system/$SYSTEMD_UNIT missing" ;;
-        launchd) [ -f "$LAUNCHD_PLIST" ] && ok "launchd daemon installed" || bad "$LAUNCHD_PLIST missing" ;;
-        *) meh "no service manager: Agern does not start at boot (managed with a pid file)" ;;
-    esac
+    if [ "$LAYOUT" = deb ]; then
+        local pv
+        pv=$(deb_installed_version)
+        if [ -n "$pv" ] && [ -f "$JAR" ]; then ok "package agern $pv installed (version $cur)"; else bad "the agern package is not (fully) installed"; fi
+        if [ "$AGERN_SERVICE" = systemd ]; then
+            if systemctl cat "$SYSTEMD_UNIT" >/dev/null 2>&1; then ok "systemd unit $SYSTEMD_UNIT"; else bad "systemd does not know $SYSTEMD_UNIT"; fi
+            systemctl is-enabled --quiet "$SYSTEMD_UNIT" 2>/dev/null && ok "$SYSTEMD_UNIT enabled (starts at boot)" || meh "$SYSTEMD_UNIT is not enabled"
+            if systemctl is-enabled --quiet "$UPGRADE_TIMER" 2>/dev/null; then ok "automatic upgrades on (channel ${AGERN_UPGRADE_CHANNEL:-stable})"; else ok "automatic upgrades off ('agern auto-upgrade on' enables them)"; fi
+        else
+            meh "systemd is not running: the service is not managed here"
+        fi
+        if [ -f "$CACHE_DIR/previous.deb" ]; then ok "rollback target kept: $(installed_version previous)"; else ok "no rollback target yet (kept after the first 'agern upgrade')"; fi
+    else
+        if [ -n "$cur" ] && [ -f "$PREFIX/current/agern.jar" ]; then ok "version $cur installed"; else bad "no current version under $PREFIX"; fi
+        case $AGERN_SERVICE in
+            systemd) [ -f "/etc/systemd/system/$SYSTEMD_UNIT" ] && ok "systemd unit installed" || bad "/etc/systemd/system/$SYSTEMD_UNIT missing" ;;
+            launchd) [ -f "$LAUNCHD_PLIST" ] && ok "launchd daemon installed" || bad "$LAUNCHD_PLIST missing" ;;
+            *) meh "no service manager: Agern does not start at boot (managed with a pid file)" ;;
+        esac
+    fi
     if [ "$AGERN_USER" = root ]; then bad "service user is root — agents must never run as root"; else ok "service user: $AGERN_USER"; fi
 
     say "configuration ($AGERN_ENV_FILE)"
     if [ ! -e "$AGERN_ENV_FILE" ]; then
         bad "$AGERN_ENV_FILE does not exist"
     elif ensure_env && [ "$ENV_LOADED" = 0 ]; then
-        meh "cannot read $AGERN_ENV_FILE as $(id -un) — run 'sudo agern doctor' for the configuration checks"
+        if is_root; then bad "$AGERN_ENV_FILE is not owned by root or is writable by group/others — root will not parse it"
+        else meh "cannot read $AGERN_ENV_FILE as $(id -un) — run 'sudo agern doctor' for the configuration checks"; fi
     else
-        local m
+        local m o g
         m=$(mode_of "$AGERN_ENV_FILE")
-        if [ "$m" = 600 ] || [ "$m" = 400 ]; then ok "file mode $m"; else bad "file mode is $m, expected 600"; fi
+        o=$(owner_of "$AGERN_ENV_FILE")
+        g=$(group_of "$AGERN_ENV_FILE")
+        if [ "$LAYOUT" = deb ]; then
+            if [ "$o" = root ] && [ "$g" = "$AGERN_USER" ] && [ "$m" = 640 ]; then ok "owner root:$AGERN_USER, mode 640"
+            else bad "owner $o:$g, mode $m — expected root:$AGERN_USER 640 (chown root:$AGERN_USER $AGERN_ENV_FILE; chmod 640 $AGERN_ENV_FILE)"; fi
+        elif [ "$m" = 600 ] || [ "$m" = 400 ]; then ok "file mode $m"; else bad "file mode is $m, expected 600"; fi
         if [ -z "${FACTORY_MASTER_KEY:-}" ]; then
             bad "FACTORY_MASTER_KEY is not set"
         elif [ "$(b64_len "$FACTORY_MASTER_KEY")" = 32 ]; then
-            ok "FACTORY_MASTER_KEY is 32 bytes"
+            ok "FACTORY_MASTER_KEY is 32 bytes (back it up together with the database)"
         else
             bad "FACTORY_MASTER_KEY does not decode to 32 bytes"
         fi
         if [ -n "${FACTORY_GITHUB_ORG:-}" ]; then ok "FACTORY_GITHUB_ORG=$FACTORY_GITHUB_ORG"; else bad "FACTORY_GITHUB_ORG is not set"; fi
+        if [ -n "${FACTORY_DB_URL:-}" ]; then ok "FACTORY_DB_URL=$FACTORY_DB_URL"; else bad "FACTORY_DB_URL is not set ('sudo agern setup-db' creates a local database and sets it)"; fi
+        case ${FACTORY_PUBLIC_URL:-} in
+            '' | http://localhost* | http://127.0.0.1*) meh "FACTORY_PUBLIC_URL is ${FACTORY_PUBLIC_URL:-unset} — set the URL people type in their browser, or every browser request from the LAN is rejected" ;;
+            https://*) ok "FACTORY_PUBLIC_URL=$FACTORY_PUBLIC_URL (Secure cookie)" ;;
+            *) ok "FACTORY_PUBLIC_URL=$FACTORY_PUBLIC_URL (plain HTTP: keep it on a trusted LAN)" ;;
+        esac
         local twofa auth
         twofa=$(printf '%s' "${FACTORY_2FA:-required}" | tr '[:upper:]' '[:lower:]')
         auth=$(printf '%s' "${FACTORY_AUTH:-os}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
@@ -560,9 +1237,9 @@ cmd_doctor() {
             case ",$auth," in
                 *,os,*)
                     if id -nG "$AGERN_USER" 2>/dev/null | tr ' ' '\n' | grep -qx shadow; then
-                        ok "$AGERN_USER is in group 'shadow' (PAM password checks)"
+                        ok "$AGERN_USER is in group 'shadow' (PAM password checks; agents can read password hashes too)"
                     else
-                        meh "FACTORY_AUTH has 'os' but $AGERN_USER is not in group 'shadow'; PAM cannot check other users' passwords"
+                        meh "FACTORY_AUTH has 'os' but $AGERN_USER is not in group 'shadow'; PAM cannot check other users' passwords (see the install docs)"
                     fi
                     ;;
             esac
@@ -574,6 +1251,8 @@ cmd_doctor() {
     java=$(resolve_java)
     if [ -z "$java" ]; then
         bad "java not found (install Java 17+, or set AGERN_JAVA / JAVA_HOME in the env file)"
+    elif ! root_may_exec "$java"; then
+        meh "$java is not root-owned; not running it as root (run 'agern doctor' as $AGERN_USER to check it)"
     else
         jv=$("$java" -version 2>&1 | sed -n 's/.*version "\([^"]*\)".*/\1/p' | head -n 1)
         major=${jv%%.*}
@@ -595,16 +1274,16 @@ cmd_doctor() {
     if (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; then
         ok "$host:$port accepts connections"
         if command -v psql >/dev/null 2>&1; then
-            if PGPASSWORD=${FACTORY_DB_PASSWORD:-factory} PGCONNECT_TIMEOUT=5 psql -h "$host" -p "$port" -U "${FACTORY_DB_USER:-factory}" -d "$db" -Atqc 'select 1' >/dev/null 2>&1; then
+            if PGPASSWORD=${FACTORY_DB_PASSWORD:-factory} PGCONNECT_TIMEOUT=5 psql -X -h "$host" -p "$port" -U "${FACTORY_DB_USER:-factory}" -d "$db" -Atqc 'select 1' >/dev/null 2>&1; then
                 ok "logged in to database '$db' as '${FACTORY_DB_USER:-factory}'"
             else
-                bad "cannot log in to database '$db' as '${FACTORY_DB_USER:-factory}' (create the role and database, see README)"
+                bad "cannot log in to database '$db' as '${FACTORY_DB_USER:-factory}' ($(db_hint))"
             fi
         else
             meh "psql not installed; only checked that the port is open"
         fi
     else
-        bad "cannot connect to PostgreSQL at $host:$port"
+        bad "cannot connect to PostgreSQL at $host:$port ($(db_hint))"
     fi
 
     say "agent tools (PATH the server and agents get)"
@@ -615,10 +1294,13 @@ cmd_doctor() {
     elif [ "$AGERN_SERVICE" = launchd ] && [ -z "${FACTORY_AGENT_PATH:-}" ] && [ -r "$LAUNCHD_PLIST" ]; then
         apath=$(awk '/<key>PATH<\/key>/{getline; gsub(/.*<string>|<\/string>.*/, ""); print; exit}' "$LAUNCHD_PLIST")
         apath=${apath:-$PATH}
+    elif [ "$LAYOUT" = deb ] && [ -z "${FACTORY_AGENT_PATH:-}" ]; then
+        apath="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$AGERN_DATA_DIR/.local/bin"
     fi
+    # Only looked up, never executed: as root this must not run programs the service user can replace.
     for tool in "$claude_bin" git gh; do
         found=$(PATH=$apath command -v "$tool" 2>/dev/null || true)
-        if [ -n "$found" ]; then ok "$tool: $found"; else bad "$tool not found on $apath"; fi
+        if [ -n "$found" ]; then ok "$tool: $found"; else bad "$tool not found on $apath — $(install_hint "$tool")"; fi
     done
     command -v curl >/dev/null 2>&1 && ok "curl (for upgrades)" || meh "curl not found ('agern upgrade' needs it)"
 
@@ -638,12 +1320,37 @@ cmd_doctor() {
         fi
     fi
 
+    if [ "$(uname -s)" = Linux ] && id "$AGERN_USER" >/dev/null 2>&1; then
+        say "privilege boundary (agents run as $AGERN_USER)"
+        local groups g
+        groups=$(id -nG "$AGERN_USER" 2>/dev/null || true)
+        ok "$AGERN_USER is in group(s): $groups"
+        for g in sudo admin wheel root; do
+            case " $groups " in *" $g "*) bad "$AGERN_USER is in group '$g' — agents could become root" ;; esac
+        done
+        for g in docker lxd incus libvirt disk; do
+            case " $groups " in *" $g "*) meh "$AGERN_USER is in group '$g', which is equivalent to root; prefer rootless Docker/Podman for agents" ;; esac
+        done
+        if is_root && command -v sudo >/dev/null 2>&1; then
+            if sudo -n -l -U "$AGERN_USER" 2>/dev/null | grep -q 'may run the following'; then
+                bad "$AGERN_USER has sudo rules ('sudo -l -U $AGERN_USER'); agents must not be able to become root"
+            else
+                ok "$AGERN_USER has no sudo rules"
+            fi
+        fi
+        if [ "$LAYOUT" = deb ] && [ -e "$AGERN_ENV_FILE" ] && ! root_owned_file "$AGERN_ENV_FILE"; then
+            bad "$AGERN_ENV_FILE must be owned by root and not writable by group or others"
+        fi
+    fi
+
     say "service"
     if svc_is_running; then
         local rv
         rv=$(running_version)
         if [ -n "$rv" ]; then
             [ "$rv" = "$cur" ] && ok "running, /api/health reports $rv" || meh "running $rv but $cur is installed (restart?)"
+            server_activity
+            ok "activity: $(describe_activity)"
         else
             bad "running but $(health_url) does not answer"
         fi
@@ -660,10 +1367,39 @@ cmd_doctor() {
 }
 
 usage() {
-    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # ---------------------------------------------------------------------------------------------
+
+cmd_upgrade() {
+    local want="" force=0 channel="" file=""
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --force) force=1 ;;
+            --version) shift; want=${1:?--version needs a value} ;;
+            --version=*) want=${1#--version=} ;;
+            --channel) shift; channel=${1:?--channel needs stable or main} ;;
+            --channel=*) channel=${1#--channel=} ;;
+            --file) shift; file=${1:?--file needs a path} ;;
+            --file=*) file=${1#--file=} ;;
+            -*) die "unknown option $1" ;;
+            *) [ -z "$want" ] || die "only one version, please"; want=$1 ;;
+        esac
+        shift
+    done
+    want=${want#v}
+    if [ -n "$want" ] && ! [[ $want =~ $SEMVER_RE ]]; then die "not a version: $want"; fi
+    [ -n "$channel" ] && valid_channel "$channel"
+    if [ -n "$file" ] && { [ -n "$want" ] || [ -n "$channel" ]; }; then die "--file cannot be combined with a version or channel"; fi
+    if [ "$LAYOUT" = deb ]; then
+        cmd_upgrade_deb "$channel" "$want" "$file" "$force"
+    else
+        [ -z "$file" ] || die "--file is for .deb installs"
+        [ -z "$channel" ] || [ "$channel" = stable ] || die "the $channel channel is only published as a .deb"
+        cmd_upgrade_tarball "$want" "$force"
+    fi
+}
 
 cmd=${1:-}
 [ $# -gt 0 ] && shift
@@ -687,8 +1423,12 @@ case $cmd in
     logs) cmd_logs "$@" ;;
     version | --version) cmd_version ;;
     upgrade) cmd_upgrade "$@" ;;
-    rollback) cmd_rollback ;;
+    rollback)
+        if [ "$LAYOUT" = deb ]; then cmd_rollback_deb "$@"; else cmd_rollback_tarball; fi
+        ;;
     doctor) cmd_doctor ;;
+    setup-db) cmd_setup_db "$@" ;;
+    auto-upgrade) cmd_auto_upgrade "$@" ;;
     run) cmd_run ;;
     activate) cmd_activate "$@" ;;
     '' | help | -h | --help) usage ;;
