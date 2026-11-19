@@ -78,7 +78,8 @@ tests `FACTORY_2FA=off` is accepted when `dev` is the only provider.
     round of CHANGES, `fake:always-changes` to exhaust the fix rounds (→ `needs_human`),
     `fake:escalate` for an approver ESCALATE, `fake:fail-<role>` to make a stage fail,
     `fake:hang-<role>` to make it hang (try the stage time limit or Cancel), `fake:slow` to make every
-    stage take ~1.5 s so the diagram can be watched advancing, `fake:busy-<role>` (spec-writer, builder) to
+    stage take ~1.5 s so the diagram can be watched advancing, `fake:markdown` to have reviewers and
+    the approver write their summaries and findings in Markdown, `fake:busy-<role>` (spec-writer, builder) to
     keep that agent working in short Bash steps until a message from the run owner contains `finish`
     (try the composer under its transcript on the run page). Like the real CLI, the spec-writer and
     builder pick up the owner's messages after their current tool call, or as a further turn when they

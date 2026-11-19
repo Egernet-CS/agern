@@ -128,3 +128,61 @@ test('an escalated run waits for a human; only the owner can approve, and that m
   await expect(bob.page.locator('.rh-title .pill')).toHaveText('merged');
   await bob.context.close();
 });
+
+test('agent-written summaries, findings and the needs-human reason are rendered as Markdown', async ({ page }) => {
+  await login(page, 'alice');
+  await newIssue(page, 'Markdown summaries', 'Markdown everywhere. fake:markdown fake:changes fake:escalate');
+  await startRunFor(page, 'Markdown summaries');
+  await expect(pill(page)).toHaveText('needs human', { timeout: 45_000 });
+
+  // The needs-human reason embeds the approver's Markdown summary; the label stays bold and inline.
+  const banner = page.locator('.run-error');
+  await expect(banner).toContainText('Needs a human: The approver escalated: Fake approver says ESCALATE.');
+  await expect(banner.locator('strong').first()).toContainText('Needs a human:');
+  await expect(banner.locator('li')).toContainText('Reason:');
+  await expect(banner.locator('code.md-code')).toHaveText('AGERN_FAKE.md');
+  await expect(banner).not.toContainText('**');
+
+  // The security reviewer's latest (PASS) summary uses every block type the renderer knows.
+  await node(page, 'security').click();
+  const detail = page.locator('.stage-detail');
+  const summary = detail.locator('.sd-summary');
+  await expect(summary.locator('p').first()).toContainText('Fake security reviewer is happy.');
+  await expect(summary.locator('ul > li')).toHaveCount(2);
+  await expect(summary.locator('ol > li')).toHaveCount(2);
+  await expect(summary.locator('strong', { hasText: 'Checked:' })).toBeVisible();
+  await expect(summary.locator('em')).toHaveText('e2e');
+  await expect(summary.locator('code.md-code')).toContainText('ExampleServiceImplementation.kt');
+  await expect(summary.locator('.md-pre')).toContainText('./gradlew build');
+  const link = summary.getByRole('link', { name: 'the docs' });
+  await expect(link).toHaveAttribute('href', 'https://example.com/docs');
+  await expect(link).toHaveAttribute('target', '_blank');
+  await expect(link).toHaveAttribute('rel', 'noreferrer');
+  // HTML in agent output is literal text, never an element.
+  await expect(summary.locator('img')).toHaveCount(0);
+  await expect(summary).toContainText('<img src=x onerror=alert(1)>');
+  const text = await summary.innerText();
+  expect(text).not.toContain('**');
+  expect(text).not.toContain('`');
+
+  // Narrow screen: the long inline path and the code block stay inside the stage detail panel.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(summary).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  const box = (await summary.boundingBox())!;
+  const info = (await detail.locator('.sd-info').boundingBox())!;
+  expect(box.x).toBeGreaterThanOrEqual(info.x - 1);
+  expect(box.x + box.width).toBeLessThanOrEqual(info.x + info.width + 1);
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  // The round-0 finding detail is Markdown too.
+  await detail.getByRole('tab', { name: 'build' }).click();
+  const finding = detail.locator('.findings .finding');
+  await expect(finding).toContainText('Fake finding from security.');
+  await expect(finding.locator('code.md-code')).toHaveText('oldName');
+  await expect(finding.locator('strong')).toHaveText('newName');
+
+  // Leave no needs-human run behind for later spec files.
+  await page.getByRole('button', { name: '✓ Approve & merge' }).click();
+  await expect(pill(page)).toHaveText('merged');
+});

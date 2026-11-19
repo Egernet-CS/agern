@@ -41,6 +41,8 @@ Behaviour
     - "fake:fail-<role>" anywhere in the prompt makes that role exit with status 1 and no result
     - "fake:hang-<role>" makes that role hang until it is killed (stage time limit, cancel)
     - "fake:slow" makes every stage take ~1.5 s, so the pipeline can be watched advancing
+    - "fake:markdown" makes reviewers and the approver write their summaries and findings in Markdown
+      (lists, bold, inline code with a long path, a code block, a link and literal HTML)
     - "fake:busy-<role>" makes that (stream-json) role work in Bash steps of ~0.4 s for up to ~2 minutes,
       until a message from the owner contains "finish"; each picked-up message is acknowledged with
       "Noted the owner's message: ..." and listed in the final result
@@ -369,6 +371,17 @@ def owner_text(t):
     return t.split("\n\n", 1)[1] if t.startswith(head) and "\n\n" in t else t
 
 
+# Appended to reviewer summaries with "fake:markdown": every block type the run page renders, a long
+# unbroken path for narrow screens, and HTML that must stay literal text.
+MARKDOWN_TAIL = (
+    "\n\n- **Checked:** `src/main/kotlin/a/very/long/path/that/must/wrap/on/narrow/screens/ExampleServiceImplementation.kt`"
+    "\n- **Not run:** the *e2e* suite <img src=x onerror=alert(1)>"
+    "\n\n1. first step\n2. second step"
+    "\n\n```sh\n./gradlew build\n```"
+    "\n\nSee [the docs](https://example.com/docs)."
+)
+
+
 def run_stage(prompt, checkpoint=lambda: None, received=()):
     """One pipeline stage's first turn. [checkpoint] is called between steps (after each tool round)."""
     init_event()
@@ -387,19 +400,27 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
             checkpoint()
             if any("finish" in m for m in received):
                 break
+    markdown = "fake:markdown" in prompt
+    md_tail = MARKDOWN_TAIL if markdown else ""
     if schema and "APPROVE" in schema:
         verdict = "ESCALATE" if "fake:escalate" in prompt else "APPROVE"
-        out = {"verdict": verdict, "summary": "Fake approver says %s." % verdict}
+        summary = "Fake approver says %s." % verdict
+        if markdown:
+            summary += "\n\n- **Reason:** see `AGERN_FAKE.md`"
+        out = {"verdict": verdict, "summary": summary}
         stream_text("Checked the change.")
         result(json.dumps(out), structured=out)
         return
     if schema and "PASS" in schema:
         changes = "fake:always-changes" in prompt or ("fake:changes" in prompt and "after fix round" not in prompt)
         if changes:
-            out = {"verdict": "CHANGES", "summary": "Fake %s reviewer wants changes." % role,
-                   "findings": [{"severity": "major", "file": "AGERN_FAKE.md", "detail": "Fake finding from %s." % role}]}
+            detail = "Fake finding from %s." % role
+            if markdown:
+                detail += "\n\n- rename `oldName` to **newName**"
+            out = {"verdict": "CHANGES", "summary": "Fake %s reviewer wants changes." % role + md_tail,
+                   "findings": [{"severity": "major", "file": "AGERN_FAKE.md", "detail": detail}]}
         else:
-            out = {"verdict": "PASS", "summary": "Fake %s reviewer is happy." % role, "findings": []}
+            out = {"verdict": "PASS", "summary": "Fake %s reviewer is happy." % role + md_tail, "findings": []}
         stream_text("Reviewed the diff.")
         result(json.dumps(out), structured=out)
         return
