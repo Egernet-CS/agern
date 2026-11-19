@@ -123,8 +123,15 @@ class PodmanRuntimeTest {
         assertEquals(listOf("podman", "volume", "create", "--label", "agern.repo=r", "v"), PodmanRuntime.createVolumeArgs(cfg, "v", mapOf("agern.repo" to "r")))
         assertEquals(listOf("podman", "ps", "--all", "--filter", "label=agern.run", "--format", "{{.Names}}\t{{index .Labels \"agern.run\"}}"),
             PodmanRuntime.listContainersArgs(cfg))
-        assertEquals(listOf("podman", "network", "ls", "--filter", "label=agern.run", "--format", "{{.Name}}\t{{index .Labels \"agern.run\"}}"),
+        assertEquals(listOf("podman", "network", "ls", "--filter", "label=agern.run", "--format", "json"),
             PodmanRuntime.listNetworksArgs(cfg))
+        // As Podman 4.9 prints it (other fields left out); no networks: [] (older versions: null).
+        val json = """[{"name":"agern-run-a","driver":"bridge","labels":{"agern.repo":"r","agern.run":"a"}},
+            {"name":"other","labels":{"x":"y"}},{"name":"agern-run-b","labels":{"agern.run":"b"}}]"""
+        assertEquals(listOf(LabelledResource("agern-run-a", "a"), LabelledResource("agern-run-b", "b")), PodmanRuntime.parseNetworksJson(json))
+        assertEquals(emptyList(), PodmanRuntime.parseNetworksJson("[]\n"))
+        assertEquals(emptyList(), PodmanRuntime.parseNetworksJson("null"))
+        assertFailsWith<SandboxRuntimeException> { PodmanRuntime.parseNetworksJson("Error: something") }
         assertEquals(listOf("/usr/bin/podman", "--url", "unix:///run/agern-podman/podman.sock", "exec", "--workdir", "/workspace", "c", "true"),
             PodmanRuntime.execArgs(remote, "c", "/workspace", listOf("true")))
     }

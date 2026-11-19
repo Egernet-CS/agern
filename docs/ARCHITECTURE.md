@@ -315,7 +315,7 @@ restart --time 0 agern-run-<id>                                    # after a com
 rm --force --ignore --volumes agern-run-<id> [agern-run-<id>-<svc> …]   # anonymous volumes (an image's VOLUME) too
 network rm --force agern-run-<id>
 ps --all --filter label=agern.run --format '{{.Names}}	{{index .Labels "agern.run"}}'          # reaper
-network ls --filter label=agern.run --format '{{.Name}}	{{index .Labels "agern.run"}}'         # reaper
+network ls --filter label=agern.run --format json                                               # reaper (name, labels)
 image inspect --format '{{json .Config.ExposedPorts}}' <service image>                          # ports for factory_sandbox_info
 ```
 
