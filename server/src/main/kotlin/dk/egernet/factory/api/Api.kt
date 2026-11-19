@@ -95,6 +95,7 @@ private val log = LoggerFactory.getLogger("dk.egernet.factory.api")
 @Serializable data class InputReq(val text: String = "", val attachmentIds: List<String> = emptyList())
 @Serializable data class ResolveReq(val status: String, val note: String? = null)
 @Serializable data class HealthDto(val status: String, val version: String, val name: String)
+@Serializable data class ActivityDto(val idle: Boolean, val activeRuns: Int, val busyAgents: Int, val version: String)
 @Serializable data class ProvidersDto(val providers: List<String>, val org: String, val twoFactor: Boolean)
 @Serializable data class RecoveryCodesDto(val recoveryCodes: List<String>)
 
@@ -129,6 +130,24 @@ private fun ApplicationCall.requireAdmin(s: Services): UserRecord =
     requireUser(s).also { if (!it.isAdmin) throw forbidden("Admins only") }
 
 private fun ApplicationCall.remote(): String = request.origin.remoteHost
+
+/** Headers a reverse proxy adds: a request carrying one came from elsewhere, even when the proxy connects over loopback. */
+private val PROXY_HEADERS = listOf(HttpHeaders.Forwarded, HttpHeaders.XForwardedFor, HttpHeaders.XForwardedHost, "X-Real-IP")
+
+/** True for a loopback IP literal (127.0.0.0/8, ::1, ::ffff:127.x). Never resolves host names. */
+internal fun isLoopbackAddress(address: String): Boolean {
+    val h = address.trim().removePrefix("[").removeSuffix("]")
+    if (h.equals("localhost", ignoreCase = true)) return true
+    if (h.isEmpty() || !h.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' || it == ':' || it == '.' }) return false
+    return runCatching { java.net.InetAddress.getByName(h).isLoopbackAddress }.getOrDefault(false)
+}
+
+/**
+ * A caller on this host talking to the server directly: the TCP peer (not `X-Forwarded-For`) is a loopback address
+ * and no proxy header is present. Used for host-local operations endpoints (the upgrade timer).
+ */
+internal fun ApplicationCall.isDirectLocalCaller(): Boolean =
+    isLoopbackAddress(request.local.remoteAddress) && PROXY_HEADERS.none { request.headers[it] != null }
 
 private fun ApplicationCall.setSessionCookie(cfg: Config, value: String?) {
     response.cookies.append(
@@ -195,6 +214,14 @@ fun Application.installApi(s: Services) {
     routing {
         route("/api") {
             get("/health") { call.respond(HealthDto("ok", BuildInfo.version, "agern")) }
+            // Host-local, unauthenticated: is a restart safe now? Read by `agern upgrade` / the upgrade timer
+            // (docs/ARCHITECTURE.md §9). Anyone else gets the generic 404.
+            get("/internal/activity") {
+                if (!call.isDirectLocalCaller()) throw notFound("No such API endpoint")
+                val runs = s.runs.countInProgress()
+                val agents = s.sessions.countBusy()
+                call.respond(ActivityDto(runs == 0 && agents == 0, runs, agents, BuildInfo.version))
+            }
             get("/auth/providers") { call.respond(ProvidersDto(s.auth.names, cfg.githubOrg, cfg.twoFactorRequired)) }
             get("/config") {
                 call.requireUser(s)
