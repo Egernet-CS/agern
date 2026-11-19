@@ -17,6 +17,7 @@ is described in the [README](../README.md#production-install); do not mix the tw
 - [10. Removing Agern](#10-removing-agern)
 - [11. Security boundary](#11-security-boundary)
 - [12. Developing Agern with Agern](#12-developing-agern-with-agern)
+- [13. Sandboxes](#13-sandboxes)
 - [Appendix: Proxmox](#appendix-proxmox)
 
 ## 1. The machine
@@ -262,6 +263,10 @@ reach:
   `sudo`/`wheel`/`admin`/`root` and warns about root-equivalent groups (`docker`, `lxd`, `incus`,
   `libvirt`, `disk`). Adding `agern` to `docker` gives every agent root on the host: use rootless
   Docker or Podman for agents instead.
+- **Sandboxes add no privilege.** The optional sandbox unit (§13) runs rootless Podman as `agern`
+  without `NoNewPrivileges`, so that `newuidmap`/`newgidmap` can map the subordinate ids root gave
+  `agern` — ids that belong to no account. Its socket is `agern`'s alone. No rootful Podman, no
+  `docker` group, no privileged helper, no sudo rule.
 - **Only root installs packages**, by hand or through the root-owned timer, and only an
   `agern_*.deb` from a GitHub release whose SHA-256 matches the release's `SHA256SUMS`, or a file
   the administrator names with `--file`. An agent can build a `.deb` but cannot get it installed.
@@ -305,6 +310,169 @@ Practical advice for `main`: keep at least one person able to reach the machine 
 web UI may be what broke), keep `AGERN_UPGRADE_MAX_WAIT_HOURS` moderate so long runs are not
 interrupted, and remember that database migrations are not undone by a rollback — a migration
 merged to `main` is effectively released on this machine.
+
+## 13. Sandboxes
+
+**What they are.** A project can describe a container for its builds and tests in
+`.agern/sandbox.yml` (image, setup script, sidecar services such as a database, cache directories,
+CPU and memory). Once an admin has approved that file, the builder agent of each run runs its builds
+and tests in that run's own container through two MCP tools, with the run's worktree mounted at
+`/workspace` and nothing else from the host. Projects then need no toolchain installed on the
+machine, a test database is per run, and a memory-hungry test is killed in its container instead of
+taking the machine down. The details are in [ARCHITECTURE.md §5](ARCHITECTURE.md#sandboxes).
+
+**What they are not, in this release.** The agent itself still runs on the host as the `agern`
+user, with its permissions bypassed. It can reach everything that user can — including Podman and
+the other runs' worktrees. A sandbox is a toolchain, sidecar and resource boundary, **not** a
+security boundary against the agent; containing the agent is a later release. What does hold: the
+containers are rootless (they belong to `agern`, never to root), never privileged, and Agern — not
+the project — decides their mounts, network, capabilities and limits.
+
+**How it runs.** Podman runs as the `agern` user in a unit of its own,
+`agern-sandbox.service`, started through `agern-sandbox.socket` (`/run/agern-podman/podman.sock`,
+which only `agern` can open). `agern.service` keeps its hardening (`NoNewPrivileges`, no
+capabilities): rootless Podman cannot start under it, so the server talks to the sandbox service
+over that socket instead. The sandbox unit gives Podman only what rootless containers need, and its
+cgroup is delegated to `agern` so per-container limits work. Images, containers and volumes are
+stored in `/var/lib/agern/containers`.
+
+### Enabling
+
+Sandboxes are off after installing the package. Install rootless Podman (the package only
+*suggests* it), then enable:
+
+```sh
+sudo apt install podman uidmap netavark aardvark-dns crun slirp4netns passt
+sudo agern sandbox enable
+```
+
+The same package names exist on Debian 12, Debian 13 and Ubuntu 24.04:
+
+| | Podman | crun | netavark / aardvark-dns | rootless network |
+|---|---|---|---|---|
+| Debian 12 | 4.3.1 | 1.8.1 | 1.4.0 | `slirp4netns` 1.2.0 |
+| Ubuntu 24.04 | 4.9.3 | 1.14.1 | 1.4.0 | `slirp4netns` 1.2.1 |
+| Debian 13 | 5.4.2 | 1.21 | 1.14.0 | `passt` (pasta) |
+
+`agern sandbox enable` never installs packages itself: if one is missing it prints the exact
+`apt install` line and changes nothing. Then it
+
+1. gives the `agern` user a range of 65536 subordinate uids and gids (`usermod --add-subuids
+   --add-subgids`), choosing a block that overlaps no other user's range and no uid or gid the
+   system knows; an existing range is kept. If your directory (LDAP, SSSD) has uids ≥ 100000 that
+   `getent passwd` does not list, give `agern` a range yourself first (`usermod --add-subuids
+   FIRST-LAST --add-subgids FIRST-LAST agern`) — a range that maps onto real accounts would let
+   container files belong to them;
+2. enables `agern-sandbox.socket` and starts the service;
+3. runs a **self-test as the `agern` user through the socket**: pulls a small image
+   (`docker.io/library/busybox`; set `AGERN_SANDBOX_TEST_IMAGE` in `agern.env` when that registry is
+   not allowed or not reachable), starts a sidecar and a sandbox on a private network exactly as the
+   server does, checks that the sidecar is reachable by name, that the limits are in the container's
+   cgroup, that a file written in `/workspace` belongs to `agern`, and that a process allocating more
+   than the memory limit is killed — then removes everything again;
+4. only if all of that passed, sets `FACTORY_SANDBOX=podman`, `FACTORY_SANDBOX_PODMAN_URL` and
+   `FACTORY_SANDBOX_CGROUP_PARENT` in `/etc/agern/agern.env`, enables the daily clean-up timer and
+   restarts Agern — if nobody's work is in progress; otherwise it tells you to `sudo agern restart`
+   later.
+
+Running it again is harmless (it re-runs the self-test). `sudo agern sandbox selftest` runs only
+the self-test. Then approve a project's `.agern/sandbox.yml` in the web UI; runs of that project use
+its sandbox from then on.
+
+### Limits and settings
+
+All in `/etc/agern/agern.env` (restart Agern after a change):
+
+| Variable | Default | |
+|---|---|---|
+| `FACTORY_SANDBOX_MAX_CPUS` | `2` | CPUs per container (cap and default) |
+| `FACTORY_SANDBOX_MAX_MEMORY` | `4g` | memory per container, no swap on top |
+| `FACTORY_SANDBOX_MAX_CONCURRENT` | `2` | sandboxes at the same time; a builder over the cap is told to wait |
+| `FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES` | `30` | longest single command |
+| `FACTORY_SANDBOX_REGISTRIES` | `docker.io,ghcr.io,quay.io,mcr.microsoft.com` | registries images may come from |
+| `AGERN_SANDBOX_PRUNE_HOURS` | `168` | age after which unused images and volumes are removed |
+
+Every container also gets a limit of 4096 processes. Sidecars have the same limits as the sandbox,
+so a run with one database uses up to twice the memory. Size the machine for
+`FACTORY_SANDBOX_MAX_CONCURRENT × (1 + sidecars) × FACTORY_SANDBOX_MAX_MEMORY` on top of the agents.
+To cap all sandboxes together, give their unit a limit, e.g. `sudo systemctl edit agern-sandbox`:
+
+```ini
+[Service]
+MemoryMax=12G
+CPUQuota=400%
+```
+
+Under memory pressure the kernel kills sandbox processes before the server and PostgreSQL, and the
+server gets the CPU first.
+
+### Disk use
+
+Images and per-project cache volumes (e.g. Gradle or npm caches) live in
+`/var/lib/agern/containers`; plan several GB per project image. `agern sandbox status` shows the
+sandboxes that exist, the cache volumes and Podman's disk use; `agern doctor` warns below 10 GB free
+and fails below 2 GB.
+
+`agern-sandbox-prune.timer` runs daily (as `agern`) and removes images no container uses that were
+*built* more than `AGERN_SANDBOX_PRUNE_HOURS` ago — Podman does not record when an image was last
+used, so an idle old base image is removed and simply pulled again on the next run — plus unused
+volumes of that age that are not caches. Cache volumes are kept until you remove them:
+
+```sh
+sudo agern sandbox prune             # what the timer does
+sudo agern sandbox prune --caches    # also unused cache volumes
+sudo agern sandbox prune --all       # every unused image and volume, regardless of age
+```
+
+### Troubleshooting
+
+```sh
+sudo agern sandbox status
+sudo agern doctor                     # section "sandboxes"
+sudo agern sandbox selftest
+journalctl -u agern-sandbox -n 100
+```
+
+- *"packages … not installed"*: install exactly the packages named.
+- *The self-test cannot create a user namespace*: `sysctl user.max_user_namespaces` must be above 0
+  and, on Debian, `kernel.unprivileged_userns_clone` 1. On Ubuntu,
+  `kernel.apparmor_restrict_unprivileged_userns=1` (the default) needs the AppArmor profiles that come
+  with Ubuntu's Podman and crun packages.
+- *"limits not applied"* / doctor: *controllers not enabled*: the unit's cgroup is not delegated
+  (a local override removed `Delegate=yes`?) or the host boots with cgroups v1; sandboxes need
+  cgroups v2, the default on all supported releases.
+- *An image cannot be pulled*: the registry must be in `FACTORY_SANDBOX_REGISTRIES` and reachable
+  from the machine; Docker Hub limits anonymous pulls per address.
+- *After changing the subordinate ids by hand*: `sudo systemctl restart agern-sandbox` (this stops
+  running sandboxes).
+
+### Disabling
+
+```sh
+sudo agern sandbox disable            # refuses while runs or agents are busy; --force overrides
+```
+
+It sets `FACTORY_SANDBOX=off`, restarts Agern, removes all sandbox containers and networks, and
+stops and disables the sandbox units. Images, cache volumes and the subordinate ids are kept, so
+enabling again is quick. To free the space as well: `sudo rm -rf /var/lib/agern/containers`
+after disabling (the files belong to `agern`'s subordinate ids, so only root can delete them).
+`apt purge agern` removes that directory too (and says so), and deleting the `agern` user drops its
+subordinate ids.
+
+### Testing a host
+
+The checks CI runs on Ubuntu 24.04 can be run on any machine with the package (Debian 12 and 13
+included). On a **throwaway** VM — it installs packages, starts services, and purges Agern at the
+end — from a checkout of the repository:
+
+```sh
+sudo bash packaging/deb/sandbox-host-test.sh ./agern_<version>_all.deb --it .
+```
+
+It prints `PASS`/`FAIL` per check: enabling and the self-test, `agern doctor`, the server (under its
+hardened unit) reaching the sandbox service, the Podman integration test run as `agern` inside
+`agern.service` (needs a JDK; one is installed if missing), an upgrade keeping sandboxes on,
+pruning, disabling and purging.
 
 ## Appendix: Proxmox
 
