@@ -113,7 +113,11 @@ export function RunPage() {
           )}
         </div>
       </header>
-      {run.error && <div className="run-error" role="alert"><strong>{run.status === 'needs_human' ? 'Needs a human:' : 'Error:'}</strong> {run.error}</div>}
+      {run.error && (
+        <div className="run-error" role="alert">
+          <Markdown text={`**${run.status === 'needs_human' ? 'Needs a human:' : 'Error:'}** ${run.error}`} />
+        </div>
+      )}
       {err && <p className="form-error" role="alert">{err}</p>}
 
       <PipelineDiagram run={run} nodes={nodes} selected={selected} onSelect={select} />
@@ -212,7 +216,7 @@ function StageDetail({ run, node, round, sessions, onRound }: { run: Run; node: 
             {role === 'builder' && stage.round > 0 && (
               <p className="muted small">Continues the builder conversation of {roundName(stage.round - 1)} (a new agent session resumed with <code>--resume</code>), given all reviewer findings.</p>
             )}
-            {stage.summary && <p className="sd-summary">{stage.summary}</p>}
+            {stage.summary && <div className="sd-summary"><Markdown text={stage.summary} /></div>}
             {stage.findings.length > 0 && (
               <>
                 <h3 className="sd-h">Findings <span className="muted">{stage.findings.length}</span></h3>
@@ -222,7 +226,7 @@ function StageDetail({ run, node, round, sessions, onRound }: { run: Run; node: 
                       <span className="sev">{f.severity}</span>
                       <div>
                         {f.file && <code className="finding-file">{f.file}</code>}
-                        <p>{f.detail}</p>
+                        <Markdown text={f.detail} />
                       </div>
                     </li>
                   ))}

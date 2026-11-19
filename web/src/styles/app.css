@@ -1689,6 +1689,9 @@ html.app-locked #root {
   gap: 20px;
   align-items: start;
 }
+.sd-info {
+  min-width: 0;
+}
 .sd-info h2 {
   font: 650 1.3rem/1.2 var(--font-mono);
   margin-bottom: 6px;
@@ -1711,6 +1714,7 @@ html.app-locked #root {
   color: var(--text);
   border-left: 2px solid var(--amber);
   padding: 2px 0 2px 12px;
+  margin: 0 0 0.6em;
 }
 .sd-h {
   font: 600 0.72rem/1 var(--font-mono);
@@ -1737,8 +1741,17 @@ html.app-locked #root {
   background: var(--surface);
   font-size: 0.88rem;
 }
-.finding p {
-  margin: 4px 0 0;
+.finding > div {
+  min-width: 0;
+}
+.finding .md {
+  margin-top: 4px;
+}
+/* Agent-written Markdown: long paths, URLs and inline code wrap instead of overflowing. */
+.sd-summary .md,
+.finding .md,
+.run-error .md {
+  overflow-wrap: anywhere;
 }
 .sev {
   font: 700 0.66rem/1.6 var(--font-mono);
