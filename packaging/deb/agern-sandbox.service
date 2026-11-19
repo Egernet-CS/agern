@@ -47,6 +47,12 @@ WorkingDirectory=/var/lib/agern
 # used (Ubuntu); '-' = only if it exists.
 TemporaryFileSystem=/run/systemd:ro
 BindReadOnlyPaths=/run/systemd/journal -/run/systemd/resolve
+# Podman 4.3 (Debian 12) bind-mounts an empty directory over /var/lib/cni in its rootless network
+# namespace, or, when /var/lib/cni does not exist, over the nearest existing parent: /var/lib. That
+# hides the network definitions in /var/lib/agern/containers, and every container on a network
+# fails with "unable to find network". An empty, root-owned /var/lib/cni keeps it to that directory
+# ('+': this one step runs as root; it only creates that fixed directory).
+ExecStartPre=+/usr/bin/install -d -m 0755 -o root -g root /var/lib/cni
 # Moves itself into a leaf cgroup, then becomes `podman system service --time=0` (socket-activated).
 ExecStart=/usr/lib/agern/sandbox-service
 Delegate=yes

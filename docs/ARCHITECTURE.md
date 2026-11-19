@@ -840,7 +840,11 @@ empty tmpfs; the journal socket and systemd-resolved's directory, where `/etc/re
 Ubuntu, are bound back in): netavark starts a network's DNS server, aardvark-dns,
 through `systemd-run --user --scope` whenever `/run/systemd/system` exists, which fails without a user
 session bus — and then containers cannot reach each other by name. Hidden, netavark starts it directly as
-a child of the unit (found on the first real-Podman CI run; netavark 1.4 and 1.14 behave the same). The server keeps every restriction and
+a child of the unit (found on the first real-Podman CI run; netavark 1.4 and 1.14 behave the same). Before Podman starts, the unit's one root step
+(`ExecStartPre=+`) creates an empty `/var/lib/cni`: Podman 4.3 (Debian 12) bind-mounts an empty directory over
+it in its rootless network namespace — or, when it is missing, over the nearest existing parent, `/var/lib`,
+which hides the network definitions under `/var/lib/agern/containers` so that every container on a network
+fails with "network not found" (found on a Debian 12 VM; harmless where the directory already exists). The server keeps every restriction and
 reaches Podman as a podman-remote client: `FACTORY_SANDBOX_PODMAN_URL=unix:///run/agern-podman/podman.sock`,
 a socket `agern:agern 0600`, so no other user can drive it. `agern.service` is ordered after the socket.
 
