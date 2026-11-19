@@ -833,7 +833,8 @@ capability is *added*; the unit runs unprivileged), its own `RuntimeDirectory` (
 `XDG_RUNTIME_DIR`, since the user has no login session and no lingering), root-owned Podman configuration
 (`CONTAINERS_CONF`, `CONTAINERS_STORAGE_CONF` in `/usr/share/agern/podman`: `cgroupfs` manager, `netavark`,
 `crun`, storage in `/var/lib/agern/containers`) and `Delegate=yes`. The unit hides `/run/systemd` (an
-empty tmpfs; the journal socket is bound back in): netavark starts a network's DNS server, aardvark-dns,
+empty tmpfs; the journal socket and systemd-resolved's directory, where `/etc/resolv.conf` points on
+Ubuntu, are bound back in): netavark starts a network's DNS server, aardvark-dns,
 through `systemd-run --user --scope` whenever `/run/systemd/system` exists, which fails without a user
 session bus — and then containers cannot reach each other by name. Hidden, netavark starts it directly as
 a child of the unit (found on the first real-Podman CI run; netavark 1.4 and 1.14 behave the same). The server keeps every restriction and
