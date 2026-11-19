@@ -24,6 +24,12 @@ sealed class FeedItem(val repo: String) {
 
     /** A chat session that was closed (deleted). */
     class SessionClosed(repo: String, val sessionId: String) : FeedItem(repo)
+
+    /** A release after a change (created, edited, issues added, removed, moved or reordered). */
+    class Release(val release: dk.egernet.factory.ReleaseDto) : FeedItem(release.repo)
+
+    /** A release that was deleted. */
+    class ReleaseDeleted(repo: String, val releaseId: String) : FeedItem(repo)
 }
 
 /** In-process fan-out of live events. Persisted state is in PostgreSQL; this only carries notifications. */

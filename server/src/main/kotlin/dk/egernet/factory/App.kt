@@ -72,8 +72,10 @@ class Services(
     val preferences = dk.egernet.factory.db.PreferenceStore(db, settings)
     val agents = AgentManager(cfg, sessions, events, access, launcher, bus, mcpRegistry, settings, prompts, workspaces, scope, attachments, preferences)
     val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences)
-    val factory = FactoryService(cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus)
-    val mcp = McpServer(mcpRegistry, users, sessions, factory, BuildInfo.version)
+    val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
+    val releases = ReleaseService(cfg, access, releaseStore, bus)
+    val factory = FactoryService(cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases)
+    val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version)
 
     init {
         agents.commandHandler = { session, owner, text -> factory.handleCommand(session, owner, text) }

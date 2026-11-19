@@ -79,6 +79,21 @@ data class IssueDto(
     val createdAt: String, val updatedAt: String, val htmlUrl: String,
     @OptIn(ExperimentalSerializationApi::class) @EncodeDefault(EncodeDefault.Mode.NEVER) val body: String? = null,
     val activeRunId: String?,
+    /** The release the issue is planned in, or null (docs/ARCHITECTURE.md §6 "Releases"). */
+    val release: IssueReleaseDto? = null,
+)
+
+@Serializable data class IssueReleaseDto(val id: String, val name: String)
+
+/** An issue as planned in a release: title and kind as they were when it was assigned. */
+@Serializable data class ReleaseIssueDto(val number: Int, val title: String, val kind: String)
+
+@Serializable
+data class ReleaseDto(
+    val id: String, val repo: String, val name: String, val description: String, val status: String,
+    val createdBy: OwnerDto, val createdAt: String, val updatedAt: String,
+    /** In build order. */
+    val issues: List<ReleaseIssueDto>,
 )
 
 @Serializable data class OwnerDto(val username: String, val displayName: String)
@@ -197,6 +212,10 @@ data class AttachmentDto(
     val issue: IssueDto? = null,
     /** `session_closed`: the id of the chat session that was closed. */
     val sessionId: String? = null,
+    /** `release`: the release after the change. */
+    val release: ReleaseDto? = null,
+    /** `release_deleted`: the id of the deleted release. */
+    val releaseId: String? = null,
 )
 
 object RunStatus {
@@ -206,6 +225,11 @@ object RunStatus {
     val ACTIVE = setOf(QUEUED, SPEC, BUILDING, REVIEWING, APPROVING, NEEDS_HUMAN)
     val TERMINAL = setOf(MERGED, FAILED, CANCELLED)
     val ALL = ACTIVE + TERMINAL
+}
+
+/** Release states. Step 1 of releases only plans; later steps add the building and releasing states. */
+object ReleaseStatus {
+    const val PLANNING = "planning"
 }
 
 object SessionStatus {

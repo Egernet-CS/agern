@@ -3,6 +3,7 @@ package dk.egernet.factory.mcp
 import dk.egernet.factory.ApiException
 import dk.egernet.factory.AppJson
 import dk.egernet.factory.FactoryService
+import dk.egernet.factory.ReleaseService
 import dk.egernet.factory.RunDto
 import dk.egernet.factory.db.SessionStore
 import dk.egernet.factory.db.UserStore
@@ -33,6 +34,7 @@ class McpServer(
     private val users: UserStore,
     private val sessions: SessionStore,
     private val factory: FactoryService,
+    private val releases: ReleaseService,
     private val version: String,
 ) {
     private val log = LoggerFactory.getLogger(McpServer::class.java)
@@ -52,6 +54,9 @@ class McpServer(
                 } else if (type == "kind") {
                     put("type", "string")
                     putJsonArray("enum") { add(JsonPrimitive("feature")); add(JsonPrimitive("bug")); add(JsonPrimitive("task")) }
+                } else if (type == "integers") {
+                    put("type", "array")
+                    putJsonObject("items") { put("type", "integer") }
                 } else put("type", type)
                 put("description", desc)
             }
@@ -87,6 +92,18 @@ class McpServer(
             schema(Triple("runId", "string", "Run id"), Triple("role", "role", "spec-writer or builder (optional with runId)"),
                 Triple("sessionId", "string", "The agent's session id (instead of runId + role)"),
                 Triple("message", "string", "The message, as the person meant it"), required = listOf("message"))),
+        Tool("factory_list_releases", "List the releases planned in this project, with their ids and their issues in build order.",
+            schema()),
+        Tool("factory_create_release", "Create a release (a named plan of issues) in this project. It starts nothing. " +
+            "Only create one when the person asks for it.",
+            schema(Triple("name", "string", "Release name, e.g. '1.4' or 'chat-cleanup': letters, digits, '.', '_', '-'"),
+                Triple("description", "string", "Optional description"), required = listOf("name"))),
+        Tool("factory_assign_issues", "Put open issues into a release of this project, appended in the given order. " +
+            "An issue that is in another release is moved.",
+            schema(Triple("release", "string", "Release name or id"), Triple("issueNumbers", "integers", "Issue numbers"),
+                required = listOf("release", "issueNumbers"))),
+        Tool("factory_unassign_issues", "Take issues out of whatever release of this project they are in.",
+            schema(Triple("issueNumbers", "integers", "Issue numbers"), required = listOf("issueNumbers"))),
         Tool("factory_request_software", "Ask an administrator to install software on the factory host. " +
             "Use this instead of installing system-wide software yourself.",
             schema(Triple("name", "string", "Software name, e.g. 'ffmpeg' or 'JDK 21'"),
@@ -151,11 +168,21 @@ class McpServer(
         fun int(k: String) = args[k]?.jsonPrimitive?.let { it.intOrNull ?: it.contentOrNull?.removePrefix("#")?.toIntOrNull() }
         fun uuid(k: String): UUID = str(k)?.let { runCatching { UUID.fromString(it) }.getOrNull() }
             ?: throw ApiException(io.ktor.http.HttpStatusCode.BadRequest, "bad_request", "$k must be a run id")
+        /** Integers or strings like `"#5"`; null when missing or not all are issue numbers. */
+        fun ints(k: String): List<Int>? {
+            val el = args[k] ?: return null
+            val items = (el as? JsonArray)?.toList() ?: listOf(el)
+            return items.map { item ->
+                val p = item as? JsonPrimitive ?: return null
+                p.intOrNull ?: p.contentOrNull?.trim()?.trimEnd(',')?.removePrefix("#")?.toIntOrNull() ?: return null
+            }
+        }
         val runs = ListSerializer(RunDto.serializer())
         return try {
             val text: String = when (name) {
                 "factory_list_issues" -> factory.listIssues(owner, repo, str("state") ?: "open").joinToString("\n") {
-                    "#${it.number} [${it.kind}] ${it.title}" + (it.activeRunId?.let { r -> " (active run $r)" } ?: "")
+                    "#${it.number} [${it.kind}] ${it.title}" + (it.activeRunId?.let { r -> " (active run $r)" } ?: "") +
+                        (it.release?.let { r -> " [release ${r.name}]" } ?: "")
                 }.ifEmpty { "No issues." }
                 "factory_get_issue" -> factory.issueForAgent(owner, repo, int("number") ?: return toolError("number is required"))
                 "factory_create_issue" -> {
@@ -188,6 +215,26 @@ class McpServer(
                     )
                     "Queued for the ${m.role} (message ${m.messageId}, session ${m.sessionId}). It is delivered at the agent's next " +
                         "step, after its current tool call; the agent's transcript on the run page shows when it was picked up."
+                }
+                "factory_list_releases" -> releases.describe(owner, repo, withIds = true)
+                "factory_create_release" -> {
+                    if (grant.runId != null) return toolError("Not available to pipeline agents")
+                    val r = releases.create(owner, repo, str("name") ?: return toolError("name is required"), str("description") ?: "")
+                    "Created release \"${r.name}\" (id ${r.id})."
+                }
+                "factory_assign_issues" -> {
+                    if (grant.runId != null) return toolError("Not available to pipeline agents")
+                    val key = str("release")?.takeIf { it.isNotBlank() } ?: return toolError("release is required")
+                    val numbers = ints("issueNumbers") ?: return toolError("issueNumbers must be an array of issue numbers")
+                    val target = releases.find(owner, repo, key)
+                    FactoryService.assignReply(target.name, releases.assign(owner, repo, numbers, target.id))
+                }
+                "factory_unassign_issues" -> {
+                    if (grant.runId != null) return toolError("Not available to pipeline agents")
+                    val numbers = ints("issueNumbers") ?: return toolError("issueNumbers must be an array of issue numbers")
+                    val out = releases.assign(owner, repo, numbers, null)
+                    if (out.removed.isEmpty()) "None of these issues is in a release."
+                    else "Removed ${out.removed.joinToString(", ") { "#$it" }} from their release."
                 }
                 "factory_request_software" -> {
                     val sr = factory.requestSoftware(owner, repo, grant.sessionId, str("name") ?: "", str("reason") ?: "")
