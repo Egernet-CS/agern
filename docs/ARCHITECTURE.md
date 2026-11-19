@@ -69,7 +69,7 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_ATTACHMENT_MAX_MB` | `20` | Largest single chat attachment (1–512) |
 | `FACTORY_ATTACHMENT_MAX_MESSAGE_MB` | `50` | All attachments of one message together (1–512, at least the per-file limit) |
 | `FACTORY_ATTACHMENT_MAX_COUNT` | `10` | Attachments per message (1–20) |
-| `FACTORY_SANDBOX` | `off` | `off` or `podman`: per-run build/test sandboxes in rootless Podman (§5 "Sandboxes"). `off`: runs behave as before and the builder gets no sandbox tools; definitions can still be approved |
+| `FACTORY_SANDBOX` | `off` | `off` or `podman`: per-run build/test sandboxes in rootless Podman (§5 "Sandboxes"). `off`: runs behave as before and the builder gets no sandbox tools; definitions can still be approved. `fake` (development and end-to-end tests only, accepted only with `FACTORY_DEV_FAKE_GITHUB`): an in-memory runtime that only pretends to run commands |
 | `FACTORY_SANDBOX_PODMAN` | `podman` | The podman binary |
 | `FACTORY_SANDBOX_PODMAN_URL` | unset | When set, every call is `podman --url <url> …` (podman-remote against a `podman system service`, e.g. `unix:///run/…/podman.sock`) |
 | `FACTORY_SANDBOX_REGISTRIES` | `docker.io,ghcr.io,quay.io,mcr.microsoft.com` | Registries sandbox and service images may come from (comma list of hosts, `host:port` allowed); images must name one |
@@ -329,6 +329,12 @@ kept), and the answer says `timedOut`. The agent gets the exit code, the last 20
 interleaved stdout/stderr, whether that is truncated, and the duration. The full output (its last
 1,000,000 characters) of every command and of the setup script is kept as a `system` event in the
 builder's transcript (`payload.sandbox`, §8), so the run page can show it; there is no separate log store.
+
+**Stopped by an admin.** An admin can remove a run's sandbox while the run is active (`DELETE
+/api/admin/sandboxes/{runId}`, the admin page's "Stop"): its containers and network are removed at once (cache
+volumes are kept) and the slot is freed. The run itself is not touched: a command running at that moment ends with
+a tool error saying the sandbox was stopped, a `system` warn event in the builder's transcript says who stopped it,
+and the builder's next `factory_sandbox_exec` creates a fresh sandbox (setup runs again) like the first one did.
 
 **Concurrency.** At most `FACTORY_SANDBOX_MAX_CONCURRENT` sandboxes exist at once on the server. A slot is
 taken when a sandbox is created and freed when it is removed. A builder whose first command would exceed
@@ -598,7 +604,20 @@ type SandboxStatus = { repo: string;
   sha256: string | null; content: string | null;
   errors: string[];          // state 'invalid'
   definition: SandboxDefinition | null;                    // when valid
-  approval: SandboxApproval | null };                      // the project's approval, possibly of other content (diff)
+  approval: SandboxApproval | null;                        // the project's approval, possibly of other content (diff)
+  approvers: { username: string; displayName: string }[] };  // who can approve: the admins (configured or known)
+
+type RunningSandbox = { runId: string; repo: string;
+  visible: boolean;          // false when the admin cannot see the repository: issueTitle is null then
+  issueNumber: number; issueTitle: string | null; runStatus: Run['status'];
+  owner: { username: string; displayName: string };
+  image: string; services: string[]; sha256: string;      // the approved definition's hash
+  createdAt: string; cpus: number; memory: string };       // per-container limits it runs with
+type SandboxOverview = { enabled: boolean; runtime: 'off' | 'podman' | 'fake'; inUse: number;
+  limits: { maxCpus: number; maxMemory: string; maxConcurrent: number; execTimeoutMinutes: number; registries: string[] };
+  sandboxes: RunningSandbox[] };                          // the sandboxes that exist right now, oldest first
+type PendingSandbox = { repo: string; sha256: string; image: string;
+  approvedSha256: string | null };                         // the approved older version, or null when none ever was
 
 type Attachment = { id: string; name: string;   // name: sanitised (no path, control/bidi characters or leading dots; ≤ 120 chars)
   mediaType: string;                 // decided by sniffing the bytes: image/png|jpeg|gif|webp, application/pdf, application/zip,
@@ -700,6 +719,9 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `DELETE /api/sessions/{id}` | → 204 | **Close a chat**: owner or admin (403 otherwise, 404 if the repo is not visible); chat only (409 `not_a_chat` for pipeline sessions — cancel the run instead). A live process is stopped first (as `stop`, up to 10 s; if it has not exited, 409 `agent_not_stopped` and nothing is deleted). Then the session is deleted permanently with its events, attachment rows and the files under `<dataDir>/attachments/<id>/`; its session sockets are closed with `4404` and the feed announces `session_closed`. Runs started from it keep running (their `startedBySessionId` becomes `null`). Afterwards every route for the id answers 404 |
 | `GET /api/admin/settings` · `PUT /api/admin/settings` | `Settings` | admin |
 | `GET /api/admin/users` | → `User[]` | admin |
+| `GET /api/admin/sandboxes` | → `SandboxOverview` | admin. Every sandbox that exists on this server (also of repositories the admin cannot see, without their issue titles) |
+| `GET /api/admin/sandboxes/pending` | → `PendingSandbox[]` | admin. The projects the admin can see whose valid `.agern/sandbox.yml` on the default branch is not approved in this version (one GitHub read per project; unreadable ones are left out), by name |
+| `DELETE /api/admin/sandboxes/{runId}` | → `SandboxOverview` | admin. Removes that run's sandbox now; the run continues (§5 "Stopped by an admin"). 404 when the run has no sandbox right now |
 | `GET /api/admin/software-requests` | → `SoftwareRequest[]` | admin |
 | `POST /api/admin/software-requests/{id}` | `{ status, note? }` → `SoftwareRequest` | admin |
 
@@ -779,6 +801,10 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   and one for the target. `{ type: 'release_deleted', repo: string, releaseId: string }` announces a deleted
   release. Both pass the same visibility filter; clients order versions by `updatedAt` and reload their release
   lists after a reconnect.
+  `{ type: 'sandbox_approval', repo: string, approval: SandboxApproval | null }` is sent after an admin approved
+  (`approval` set) or revoked (`null`) a project's sandbox definition, with the same visibility filter. Clients apply it
+  to a loaded `SandboxStatus` (`approved` when the approval's hash is the file's, else `pending`) and reload after a
+  reconnect.
 
 ## 9. Deployment and release
 
@@ -934,7 +960,7 @@ take nothing away from it (containing the agent is a later step).
 Routes: `/login`, `/` (projects), `/p/:repo` (issues · CLI chat · agents), `/p/:repo/runs/:runId`
 (pipeline diagram with live stages; selecting a stage shows that agent's transcript),
 `/p/:repo/releases/:releaseId` (a release's plan, below),
-`/agents` (everything running), `/settings` (own credentials, and "Models & cost": the user's own model per
+`/p/:repo/sandbox` (the project's sandbox definition and its approval, below), `/agents` (everything running), `/settings` (own credentials, and "Models & cost": the user's own model per
 role and fix rounds, with presets — *Default* clears every choice, *Economy* picks Sonnet for chat and spec,
 Haiku for the four reviewers and one fix round), `/admin` ("Factory settings": the default models and the
 default and maximum fix rounds; installing software stays admin-only).
@@ -990,5 +1016,25 @@ and "Delete" (confirmation; the issues stay open and unassigned; then back to th
 ordered list with "Move #n up", "Move #n down" and "Remove #n from release" buttons (no drag and drop), and an
 "Add an open issue" select listing open issues not in this release (those in another release are marked
 "(in <name>)" and moved). It updates live; if someone else deletes the release, the page says so.
+
+**Sandboxes.** The activity pane has a "Sandbox" row (the state as a pill — no definition, invalid, needs approval,
+changed, approved — and a short line) linking to the project's sandbox page `/p/:repo/sandbox`, a normal scrolling page
+for everyone who can see the project: the state with an explanation (switched off on this server; no definition, with
+an example; the validation errors; waiting for approval; changed since the approved version, by whom and when; approved),
+the definition (image, setup script, environment, services, caches, resources with the server's caps), a line diff
+between the approved and the current content when they differ, and the raw file. Admins get "Approve…" — the
+confirmation names every image and shows the setup script and says plainly that they will run on the factory host for
+every run of the project — and "Revoke…" (confirmation); others see who can approve. The page and the row follow
+`sandbox_approval` frames. The run page shows one line under the run's facts: "sandbox" with the image and the approved
+definition's hash prefix, or "none — <why>" (switched off, no definition, not approved, invalid), and a link to the
+sandbox page. In a builder's transcript every `system` event with `payload.sandbox` is a collapsible command block
+(`$ command` or "setup script", exit code or "timed out", duration, "truncated"; failures in red): opened, it shows the
+last 200 lines of the output in the terminal style with "Show all N lines", the full script or multi-line command, and
+nothing of the output is rendered while closed. The `factory_sandbox_exec` tool call itself is summarised as "Exit N in
+X s · full log below". The admin page has a "Sandboxes" card: runtime, sandboxes in use of the maximum, the per-container
+caps, the command time limit and the registries; the running sandboxes (run, project, owner, run status, age, image,
+services, limits, definition hash) with "Stop" (confirmation: the containers go, the run continues and its next sandbox
+command creates a new one); and the projects waiting for an approval, linking to their sandbox pages. The software
+requests card notes that build and test tools can go in the project's `.agern/sandbox.yml` instead of on the host.
 
 Artwork is served from `web/public/art/` (see `art/README.md`).
