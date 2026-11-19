@@ -162,6 +162,10 @@ class SandboxAdminTest {
         val root = login("root", "pw-r")
         val alice = login("alice", "pw-a")
         assertEquals("[]", root.get("/api/admin/sandboxes/pending").bodyAsText())
+        // Everyone who can see the project learns who can approve.
+        AppJson.parseToJsonElement(alice.get("/api/projects/demo-app/sandbox").bodyAsText()).jsonObject["approvers"]!!.jsonArray.let {
+            assertEquals(listOf("root"), it.map { o -> o.jsonObject["username"]!!.jsonPrimitive.content })
+        }
 
         world.sandboxFile(definition)
         val sha1 = SandboxDefinitions.sha256(definition)

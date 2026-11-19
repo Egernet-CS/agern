@@ -172,6 +172,8 @@ data class SandboxStatusDto(
     val definition: SandboxDefinitionDto?,
     /** The repository's approval, possibly of other content (compare [sha256]); null when none. */
     val approval: SandboxApprovalDto?,
+    /** Who can approve: the admins (so a non-admin knows whom to ask). */
+    val approvers: List<OwnerDto> = emptyList(),
 )
 
 /** A sandbox that exists right now (`GET /api/admin/sandboxes`). */

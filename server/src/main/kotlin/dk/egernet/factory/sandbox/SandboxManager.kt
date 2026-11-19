@@ -75,6 +75,8 @@ class SandboxManager(
      * its definition instead of the base commit, by repository. Null: from git, as in production.
      */
     private val devDefinitionSource: ((String) -> String?)? = null,
+    /** The admins, who can approve definitions (shown to everyone on the status). */
+    private val approvers: () -> List<OwnerDto> = { emptyList() },
 ) {
     private val log = LoggerFactory.getLogger(SandboxManager::class.java)
     private val sc: SandboxConfig get() = cfg.sandbox
@@ -452,15 +454,16 @@ class SandboxManager(
         val approval = approvals.get(repo)?.let {
             SandboxApprovalDto(it.sha256, it.content, OwnerDto(it.approvedByUsername, it.approvedByDisplayName), it.approvedAt.iso())
         }
+        val who = approvers()
         if (content == null) {
-            return@withContext SandboxStatusDto(repo, enabled, SANDBOX_FILE, r.defaultBranch, "none", null, null, emptyList(), null, approval)
+            return@withContext SandboxStatusDto(repo, enabled, SANDBOX_FILE, r.defaultBranch, "none", null, null, emptyList(), null, approval, who)
         }
         when (val p = SandboxDefinitions.parse(content, sc)) {
             is ParsedDefinition.Invalid ->
-                SandboxStatusDto(repo, enabled, SANDBOX_FILE, r.defaultBranch, "invalid", p.sha256, content, p.errors, null, approval)
+                SandboxStatusDto(repo, enabled, SANDBOX_FILE, r.defaultBranch, "invalid", p.sha256, content, p.errors, null, approval, who)
             is ParsedDefinition.Valid -> SandboxStatusDto(
                 repo, enabled, SANDBOX_FILE, r.defaultBranch, if (approval?.sha256 == p.sha256) "approved" else "pending",
-                p.sha256, content, emptyList(), dto(p.definition), approval,
+                p.sha256, content, emptyList(), dto(p.definition), approval, who,
             )
         }
     }
