@@ -213,6 +213,48 @@ export type SandboxStatus = {
   definition: SandboxDefinition | null;
   /** The project's approval, possibly of other content (compare `sha256`; its `content` allows a diff). */
   approval: SandboxApproval | null;
+  /** Who can approve (the admins), so a non-admin knows whom to ask. */
+  approvers: Owner[];
+};
+
+/** A sandbox that exists right now (`GET /api/admin/sandboxes`). */
+export type RunningSandbox = {
+  runId: string;
+  repo: string;
+  /** False when the admin cannot see the repository on GitHub: `issueTitle` is withheld and the UI does not link. */
+  visible: boolean;
+  issueNumber: number;
+  issueTitle: string | null;
+  runStatus: RunStatus;
+  owner: Owner;
+  image: string;
+  /** Sidecar service names. */
+  services: string[];
+  /** The approved definition's hash. */
+  sha256: string;
+  createdAt: string;
+  /** Per-container limits it runs with. */
+  cpus: number;
+  memory: string;
+};
+
+/** Admin overview of the sandbox runtime: its limits and the sandboxes that exist (oldest first). */
+export type SandboxOverview = {
+  enabled: boolean;
+  /** `fake` is a development mode that only pretends to run commands. */
+  runtime: 'off' | 'podman' | 'fake';
+  inUse: number;
+  limits: { maxCpus: number; maxMemory: string; maxConcurrent: number; execTimeoutMinutes: number; registries: string[] };
+  sandboxes: RunningSandbox[];
+};
+
+/** A project whose valid `.agern/sandbox.yml` is not approved in this exact version. */
+export type PendingSandbox = {
+  repo: string;
+  sha256: string;
+  image: string;
+  /** The approved (older) version's hash, or null when none was ever approved. */
+  approvedSha256: string | null;
 };
 
 /** On `system` events of sandbox commands: the full log (up to 1,000,000 characters, the tail). */
@@ -312,7 +354,9 @@ export type FeedFrame =
   | { type: 'session_closed'; repo: string; sessionId: string }
   /** A release after any change (created, edited, issues added, removed, moved or reordered). */
   | { type: 'release'; repo: string; release: Release }
-  | { type: 'release_deleted'; repo: string; releaseId: string };
+  | { type: 'release_deleted'; repo: string; releaseId: string }
+  /** An admin approved (approval set) or revoked (null) the project's sandbox definition. */
+  | { type: 'sandbox_approval'; repo: string; approval: SandboxApproval | null };
 
 /** Agents are working on these runs. */
 export const WORKING_RUN_STATUSES: RunStatus[] = ['queued', 'spec', 'building', 'reviewing', 'approving'];

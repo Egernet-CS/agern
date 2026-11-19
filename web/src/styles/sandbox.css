@@ -1,0 +1,460 @@
+/* ------------------------------------------------------------------ sandboxes (transcript, run page, project, admin) */
+
+/* A sandbox command in a builder's transcript: one collapsible line, output in the terminal style. */
+.t-sbx {
+  margin: 0 0 12px 18px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--pass);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.015);
+}
+.t-sbx--fail {
+  border-color: rgba(255, 100, 100, 0.35);
+  border-left-color: var(--fail);
+  background: var(--fail-wash);
+}
+.t-sbx-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  background: none;
+  border: 0;
+  font: inherit;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+.t-sbx-head:hover .t-sbx-caret,
+.t-sbx-head:focus-visible .t-sbx-caret {
+  color: var(--amber-hi);
+}
+.t-sbx-head:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+  border-radius: 4px;
+}
+.t-sbx-caret {
+  flex: none;
+  width: 10px;
+  color: var(--text-3);
+}
+.t-sbx-cmd {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.t-sbx-prompt {
+  color: var(--amber);
+}
+.t-sbx-setup {
+  color: var(--text-2);
+  font-style: italic;
+}
+.t-sbx-meta {
+  flex: none;
+  display: flex;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.t-sbx-exit {
+  color: var(--pass);
+}
+.t-sbx-exit--fail {
+  color: var(--fail);
+  font-weight: 700;
+}
+.t-sbx-trunc {
+  color: var(--amber-hi);
+}
+.t-sbx-body {
+  border-top: 1px solid var(--line);
+  padding: 8px 10px 10px;
+}
+.t-sbx-out {
+  margin: 0;
+  max-height: 480px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: 12.5px/1.5 var(--font-mono);
+  color: var(--text-2);
+  background: #07090d;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.t-sbx-out:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+}
+.t-sbx--fail .t-sbx-out {
+  color: #ffc0c0;
+}
+.t-sbx-note {
+  margin: 0 0 6px;
+  font: 12px/1.5 var(--font-ui);
+  color: var(--text-3);
+}
+.t-sbx-note--fail {
+  color: var(--fail);
+}
+.t-sbx-all {
+  display: inline;
+  color: var(--amber-hi);
+  text-decoration: underline;
+}
+.t-sbx-script {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.t-sbx-script summary {
+  cursor: pointer;
+}
+.t-sbx-script pre {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-2);
+}
+@media (max-width: 640px) {
+  .t-sbx {
+    margin-left: 0;
+  }
+  .t-sbx-head {
+    flex-wrap: wrap;
+  }
+  .t-sbx-meta {
+    width: 100%;
+    padding-left: 18px;
+  }
+}
+
+/* run page: which sandbox the run used */
+.run-sbx {
+  grid-column: 1;
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 10px 0 0;
+  font-size: 0.86rem;
+  color: var(--text-2);
+}
+.run-sbx-k {
+  font: 500 0.66rem/1 var(--font-mono);
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+.run-sbx-image {
+  color: var(--pass);
+  overflow-wrap: anywhere;
+}
+.run-sbx-why {
+  color: var(--text-3);
+}
+.run-sbx--off .run-sbx-why {
+  color: var(--text-2);
+}
+.run-sbx-link {
+  font-size: 0.8rem;
+}
+
+/* project activity pane */
+.sbx-row--pass {
+  border-color: rgba(90, 214, 160, 0.25);
+}
+.sbx-row--escalate {
+  border-color: rgba(255, 120, 174, 0.4);
+}
+.sbx-row--fail {
+  border-color: rgba(255, 100, 100, 0.35);
+}
+
+/* the project's sandbox page */
+.sbx-page {
+  max-width: 980px;
+}
+.sbx-about {
+  grid-column: 1;
+  margin: 6px 0 0;
+  max-width: 72ch;
+  color: var(--text-2);
+  font-size: 0.92rem;
+}
+.sbx-head .rh-actions {
+  grid-row: 2;
+}
+.sbx-who {
+  margin: -6px 0 16px;
+}
+.sbx-card {
+  padding: 18px 20px;
+  margin-bottom: 16px;
+}
+.sbx-h {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  font-size: 1.05rem;
+  margin: 0 0 10px;
+}
+.sbx-file summary {
+  cursor: pointer;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  font-weight: 600;
+}
+.sbx-file summary::-webkit-details-marker {
+  display: none;
+}
+.sbx-file summary::before {
+  content: '▸';
+  color: var(--text-3);
+}
+.sbx-file[open] summary::before {
+  content: '▾';
+}
+.sbx-file summary:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+  border-radius: 4px;
+}
+.sbx-file[open] summary {
+  margin-bottom: 10px;
+}
+.sbx-pre {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: #07090d;
+  font: 12.5px/1.55 var(--font-mono);
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 520px;
+  overflow: auto;
+}
+.sbx-pre--small {
+  max-height: 220px;
+}
+.sbx-dl-grid {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  gap: 12px 16px;
+  margin: 0;
+}
+.sbx-dl-grid dt {
+  font: 500 0.7rem/1.9 var(--font-mono);
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+.sbx-dl-grid dd {
+  margin: 0;
+  min-width: 0;
+  font-size: 0.9rem;
+}
+.sbx-image {
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.sbx-env,
+.sbx-services,
+.sbx-images,
+.sbx-errors {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+.sbx-services li {
+  display: grid;
+  gap: 4px;
+  overflow-wrap: anywhere;
+}
+.sbx-services .sbx-env {
+  padding-left: 12px;
+}
+.sbx-env-v {
+  color: var(--text-3);
+}
+.sbx-chip {
+  display: inline-block;
+  margin: 0 6px 4px 0;
+}
+.sbx-capped {
+  color: var(--amber-hi);
+}
+.sbx-images {
+  margin: 0 0 12px;
+}
+.sbx-images code {
+  overflow-wrap: anywhere;
+}
+.sbx-invalid {
+  align-items: flex-start;
+}
+.sbx-errors {
+  margin-top: 10px;
+}
+.sbx-errors code {
+  color: #ffc0c0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.sbx-diff-n {
+  font: 600 0.78rem var(--font-mono);
+}
+.sbx-add {
+  color: var(--pass);
+}
+.sbx-del {
+  color: var(--fail);
+}
+.sbx-diff {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #07090d;
+  font: 12.5px/1.6 var(--font-mono);
+  overflow: auto;
+  max-height: 520px;
+  padding: 6px 0;
+}
+.sbx-dl {
+  display: flex;
+  padding: 0 12px 0 0;
+  color: var(--text-3);
+}
+.sbx-dl-sign {
+  flex: none;
+  width: 26px;
+  text-align: center;
+  user-select: none;
+}
+.sbx-dl-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.sbx-dl--add {
+  background: rgba(90, 214, 160, 0.1);
+  color: #bdf2d9;
+}
+.sbx-dl--add .sbx-dl-sign {
+  color: var(--pass);
+}
+.sbx-dl--del {
+  background: rgba(255, 100, 100, 0.1);
+  color: #ffc4c4;
+}
+.sbx-dl--del .sbx-dl-sign {
+  color: var(--fail);
+}
+.sbx-dl--skip {
+  padding: 2px 12px 2px 26px;
+  color: var(--text-4);
+  font-style: italic;
+}
+
+/* admin: sandboxes */
+.req-hint {
+  margin: -4px 0 12px;
+}
+.sbx-limits {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 28px;
+  margin: 0 0 6px;
+}
+.sbx-limits dt {
+  font: 500 0.66rem/1 var(--font-mono);
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+.sbx-limits dd {
+  margin: 5px 0 0;
+  font-size: 0.9rem;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sbx-meter {
+  display: inline-block;
+  width: 64px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+.sbx-meter span {
+  display: block;
+  height: 100%;
+  background: var(--amber);
+}
+.sbx-run-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 550;
+}
+.sbx-run-title a {
+  color: var(--text);
+}
+.sbx-run-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 4px 0 8px;
+}
+.sbx-run-spec {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+}
+.sbx-run-spec code {
+  overflow-wrap: anywhere;
+}
+.sbx-pending {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 0 10px;
+}
+.sbx-pending .rr-bot {
+  flex-wrap: wrap;
+}
+.sbx-pending .rr-line {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 640px) {
+  .sbx-dl-grid {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+  .sbx-dl-grid dd {
+    margin-bottom: 10px;
+  }
+  .sbx-card {
+    padding: 14px;
+  }
+}
+@media (max-width: 760px) {
+  .sbx-head .rh-actions {
+    grid-column: 1;
+    grid-row: auto;
+    justify-content: flex-start;
+  }
+}

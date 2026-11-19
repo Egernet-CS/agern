@@ -15,6 +15,8 @@ import type {
   Release,
   Run,
   RunStatus,
+  PendingSandbox,
+  SandboxOverview,
   SandboxStatus,
   Settings,
   SoftwareRequest,
@@ -81,6 +83,15 @@ export interface Api {
   approveSandbox(repo: string, sha256: string): Promise<SandboxStatus>;
   /** Admin: removes the project's approval (runs already started keep their decision). */
   revokeSandboxApproval(repo: string): Promise<SandboxStatus>;
+  /** Admin: the sandbox runtime, its limits and the sandboxes that exist right now. */
+  sandboxes(): Promise<SandboxOverview>;
+  /** Admin: projects (that the admin can see) whose valid definition is not approved in this version. */
+  pendingSandboxes(): Promise<PendingSandbox[]>;
+  /**
+   * Admin: removes a run's sandbox now (containers and network; cache volumes stay). The run continues and the builder's
+   * next sandbox command creates a fresh one. 404 when the run has no sandbox right now. Answers the new overview.
+   */
+  stopSandbox(runId: string): Promise<SandboxOverview>;
 
   projectRuns(repo: string): Promise<Run[]>;
   startRun(repo: string, issueNumber: number): Promise<Run>;

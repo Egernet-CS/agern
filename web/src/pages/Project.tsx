@@ -3,11 +3,12 @@ import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { api, ApiError, isRunWorking, isSessionActive, type AgentSession, type Issue, type IssueKind, type Release, type Run } from '../api';
 import { ChatView } from '../components/chat/ChatView';
 import { REVIEWERS, roundName } from '../components/pipeline/model';
+import { sandboxSummary } from '../components/sandbox/SandboxBits';
 import { Dialog, Empty, ErrorBox, KindBadge, Loading, Notice, ReleaseStatusPill, RoleBadge, RunStatusPill, SessionStatusPill } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
 import { modelLabel, timeAgo } from '../lib/format';
-import { useFeed, useFeedReconnects, useIssueFeed, useLiveRuns, useLiveSessions, useProjectReleases } from '../lib/realtime';
+import { useFeed, useFeedReconnects, useIssueFeed, useLiveRuns, useLiveSessions, useProjectReleases, useSandboxApprovalFeed, withApproval } from '../lib/realtime';
 import { useNow } from '../lib/useNow';
 
 type Tab = 'chat' | 'issues' | 'activity';
@@ -678,6 +679,46 @@ function NewReleaseDialog({ repo, open, onClose }: { repo: string; open: boolean
 
 // ---------------------------------------------------------------- activity
 
+/** The project's sandbox state in one row, linking to its sandbox page; live when an admin approves or revokes. */
+function SandboxSection({ repo }: { repo: string }) {
+  const reconnects = useFeedReconnects();
+  const q = useAsync(() => api.sandboxStatus(repo), [repo, reconnects]);
+  useSandboxApprovalFeed(repo, (approval) => q.setData((st) => st && withApproval(st, approval)));
+  const s = q.data && sandboxSummary(q.data);
+  return (
+    <>
+      <div className="panel-head">
+        <h2>Sandbox</h2>
+      </div>
+      {q.loading && !q.data && <Loading />}
+      {q.error && !q.data && (
+        <p className="form-error pad" role="alert">
+          Could not read the sandbox definition: {q.error.message}{' '}
+          <button type="button" className="btn btn--ghost btn--sm" onClick={q.reload}>Retry</button>
+        </p>
+      )}
+      {q.data && s && (
+        <ul className="run-list">
+          <li>
+            <Link to={`/p/${repo}/sandbox`} className={`run-row sbx-row sbx-row--${s.tone}`}>
+              <div className="rr-top">
+                <span className="rr-title mono">{q.data.path}</span>
+              </div>
+              <div className="rr-bot">
+                <span className={`pill pill--${s.tone}`}>
+                  <span className="pill-dot" aria-hidden />
+                  {s.label}
+                </span>
+                <span className="rr-line">{s.line}</span>
+              </div>
+            </Link>
+          </li>
+        </ul>
+      )}
+    </>
+  );
+}
+
 export function runStageLine(r: Run): string {
   const running = r.stages.filter((s) => s.status === 'running').map((s) => s.role);
   if (r.status === 'reviewing') {
@@ -782,6 +823,7 @@ function ActivityPanel({
         ))}
       </ul>
       <NewReleaseDialog repo={repo} open={creatingRelease} onClose={() => setCreatingRelease(false)} />
+      <SandboxSection repo={repo} />
       <div className="panel-head">
         <h2>Runs</h2>
       </div>

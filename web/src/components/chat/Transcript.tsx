@@ -1,5 +1,6 @@
 import { memo, useState } from 'react';
 import { cost, duration, modelLabel } from '../../lib/format';
+import { SandboxLogBlock } from '../sandbox/SandboxLog';
 import { MessageAttachments } from './attachments';
 import { Markdown } from './Markdown';
 import { toolArgs, toolDisplayName, toolSummary, type Item } from './model';
@@ -130,6 +131,7 @@ const TranscriptItem = memo(function TranscriptItem({ item, me, sessionId }: { i
         </div>
       );
     case 'system':
+      if (item.sandbox) return <SandboxLogBlock log={item.sandbox} />;
       return (
         <div className={`t-system t-system--${item.level}`} role={item.level === 'error' ? 'alert' : undefined}>
           <span className="t-elbow" aria-hidden>※</span>
