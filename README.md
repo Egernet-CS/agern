@@ -117,7 +117,24 @@ screenshots of the main screens.
 ## Production install
 
 Agern runs directly on one host on your network: **Linux with systemd** or **macOS with launchd**.
-The host needs:
+
+**Debian 12, Debian 13, Ubuntu 24.04: use the Debian package** — it brings its dependencies,
+upgrades with `apt`/`agern upgrade`, can upgrade itself when idle, and is how a machine that
+develops Agern with Agern is set up. Step by step, from an empty VM (Proxmox notes included):
+**[docs/INSTALL-LINUX.md](docs/INSTALL-LINUX.md)**. In short:
+
+```sh
+sudo apt install postgresql
+base=https://github.com/Egernet-CS/agern/releases/latest/download
+curl -fsSLO "$base/SHA256SUMS" && deb=$(grep -o 'agern_[^ ]*_all\.deb' SHA256SUMS)
+curl -fsSLO "$base/$deb" && sha256sum --check --ignore-missing SHA256SUMS
+sudo apt install "./$deb"
+sudo agern setup-db                 # role, database, FACTORY_DB_* in /etc/agern/agern.env
+sudoedit /etc/agern/agern.env       # FACTORY_GITHUB_ORG, FACTORY_PUBLIC_URL, FACTORY_ADMINS, FACTORY_AUTH
+sudo agern doctor && sudo agern start
+```
+
+**Other Linux distributions and macOS: the tarball installer** below. The host needs:
 
 - Java 17 or newer
 - PostgreSQL 16, installed natively
@@ -195,7 +212,17 @@ agern version                 # installed, previous, and what /api/health report
 agern upgrade                 # latest release      — or: agern upgrade 1.2.3
 agern rollback                # back to the previous version
 agern doctor
+# .deb installs also:
+agern upgrade --channel main  # newest build of main;  --file ./agern_1.2.3_all.deb  installs a file
+agern setup-db                # PostgreSQL role and database on the local server
+agern auto-upgrade on|off|status   # install new versions automatically when no agent is working
 ```
+
+On `.deb` installs `agern upgrade` verifies the package against the release's `SHA256SUMS`,
+installs it with `apt-get` and keeps the previous package for `agern rollback`; it waits while
+runs or agents are active (`--force` overrides). See
+[docs/INSTALL-LINUX.md §8](docs/INSTALL-LINUX.md#8-upgrades-rollback-and-automatic-upgrades).
+For tarball installs:
 
 `agern upgrade` downloads the release tarball from GitHub Releases, verifies its SHA-256 against
 the release's `SHA256SUMS` (refusing on mismatch before anything changes), unpacks it next to the
@@ -218,16 +245,18 @@ The script checks that the version is semantic, the tree is clean, you are on `m
 `origin/main`, and the tag does not exist; then it creates and pushes the annotated tag `v1.2.0`.
 Nothing is built locally. The [release workflow](.github/workflows/release.yml) then runs the
 frontend checks and server tests, builds the jar with that version (`scripts/package.sh`, which you
-can also run locally) and publishes a GitHub Release with `agern-1.2.0.tar.gz`, `install.sh` and
-`SHA256SUMS`. Versions with a suffix (`1.3.0-rc.1`) become pre-releases, which `agern upgrade`
-without a version ignores.
+can also run locally; `--deb` needs `dpkg-deb`) and publishes a GitHub Release with
+`agern-1.2.0.tar.gz`, `install.sh`, `agern_1.2.0_all.deb` and `SHA256SUMS`. Versions with a suffix
+(`1.3.0-rc.1`) become pre-releases, which `agern upgrade` without a version ignores. Every push to
+`main` also publishes a `.deb` as the rolling pre-release `main-latest` (the `main` channel).
 
 ## Repository
 
 ```
 server/      Kotlin + Ktor backend          web/        React + TypeScript frontend
-packaging/   installer, agern CLI, service units
-scripts/     release.sh, package.sh         docs/       architecture and API contract
+packaging/   installer, agern CLI, service units, deb/ (Debian package)
+scripts/     release.sh, package.sh, main-version.sh
+docs/        architecture and API contract, INSTALL-LINUX.md
 art/         Blender sources of the artwork
 ```
 

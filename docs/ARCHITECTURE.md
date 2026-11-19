@@ -363,6 +363,7 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | Method & path | Body → Response | Notes |
 |---|---|---|
 | `GET /api/health` | → `{ status: 'ok', version, name: 'agern' }` | no auth |
+| `GET /api/internal/activity` | → `{ idle, activeRuns, busyAgents, version }` | no auth, **host-local only**: answered only when the TCP peer is a loopback address and no proxy header (`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP`) is present; anyone else gets the generic 404. `activeRuns`: runs in `queued`/`spec`/`building`/`reviewing`/`approving` (a restart fails them); `busyAgents`: sessions `starting`/`running` (pipeline agents, chats mid-turn). `needs_human` runs and chats between turns survive a restart and do not count. Used by the upgrade timer (§9) |
 | `GET /api/auth/providers` | → `{ providers: string[], org: string, twoFactor: boolean }` | no auth |
 | `POST /api/auth/login` | `{ username, password }` → `LoginStep` | sets cookie (pending until 2FA passes) |
 | `POST /api/auth/totp` | `{ code }` → `LoginStep` | pending session; `code` is a TOTP code or a recovery code; 423 when locked |
@@ -474,16 +475,18 @@ out. Not part of v1; they will plug in behind `AgentLauncher` / as agent tools.
 
 **Release artifact.** One self-contained `agern.jar` (server with the built frontend embedded on
 the classpath) — the host needs only Java 17 and PostgreSQL. `FACTORY_WEB_DIR` overrides the
-embedded frontend when set.
+embedded frontend when set. It ships in two packagings: the tarball for `install.sh` (Linux and
+macOS) and a Debian package for Debian 12/13 and Ubuntu 24.04 (below).
 
 **Cutting a release.** `./scripts/release.sh <version>` checks that the version is semantic, the
 tree is clean, `main` is level with `origin/main` and the tag is new, then creates and pushes the
 annotated tag `v<version>` (`--dry-run` only checks). GitHub Actions (`.github/workflows/release.yml`)
-then checks and tests frontend and server, builds with `scripts/package.sh <version>` (the same
-script works locally) and publishes a GitHub Release with `agern-<version>.tar.gz` (`agern.jar`,
-the `agern` CLI, `install.sh`, the systemd unit and launchd plist templates, `.env.example`,
-`VERSION`), `install.sh` on its own (for bootstrapping) and `SHA256SUMS` covering both. Versions
-with a suffix (`-rc.1`) are published as pre-releases.
+then checks and tests frontend and server, builds with `scripts/package.sh --deb <version>` (the
+same script works locally), smoke-tests the package and publishes a GitHub Release with
+`agern-<version>.tar.gz` (`agern.jar`, the `agern` CLI, `install.sh`, the systemd unit and launchd
+plist templates, `.env.example`, `VERSION`), `install.sh` on its own (for bootstrapping),
+`agern_<version>_all.deb` and `SHA256SUMS` covering all three. Versions with a suffix (`-rc.1`)
+are published as pre-releases.
 
 **Installing and upgrading a host** (`packaging/`). `install.sh` either runs from an unpacked
 release or, downloaded alone, fetches the latest (or `--version`) release, verifies it against
@@ -501,6 +504,94 @@ for an unprivileged, service-manager-less install (pid file), and `AGERN_RELEASE
 replaces `https://github.com/Egernet-CS/agern/releases` (any URL with the same `latest/download/…`
 and `download/v<version>/…` layout, `file://` included). Database migrations run on startup and
 are not undone by a rollback. The reported version comes from the build.
+
+**Debian package** (`packaging/deb/`, built by `scripts/package.sh` with plain
+`dpkg-deb --build --root-owner-group`; guide: [INSTALL-LINUX.md](INSTALL-LINUX.md)).
+`agern_<semver>_all.deb`, `Architecture: all`. The file name carries the semantic version; the
+package version replaces the `-` that starts a pre-release with `~` so dpkg sorts pre-releases
+first (`1.3.0-rc.1` → `1.3.0~rc.1` < `1.3.0`). Depends: `default-jre-headless (>= 2:1.17) |
+java17-runtime-headless` (checked with `apt-cache` on all three: Debian 12's default is OpenJDK 17,
+Debian 13's and Ubuntu 24.04's 21; `openjdk-17/21-jre-headless` provide `java17-runtime-headless`),
+`git`, `ca-certificates`, `curl`, `passwd`; Recommends `postgresql`; Suggests `gh`. The `claude`
+CLI is not a dependency (`agern doctor` reports it and how to install it). Layout: `/usr/bin/agern`,
+`/usr/share/agern/{agern.jar,VERSION,env.example}`, `/usr/lib/systemd/system/{agern.service,
+agern-upgrade.service,agern-upgrade.timer}` (`/usr/lib`, not `/lib`: all targets are merged-/usr),
+`/etc/agern/agern.env`, `/var/lib/agern`, `/var/cache/agern`, logs in journald. The `agern`
+command detects the layout from where it lives (`<dir>/../share/agern/agern.jar` → deb, otherwise
+the tarball layout), so one script serves both. Maintainer scripts:
+
+- `postinst configure`: system user and group `agern` (home `/var/lib/agern`, `nologin`, never in
+  `shadow` — `os` login on Linux needs that, which lets every agent read the password hashes, so
+  it is the administrator's decision); `/etc/agern` `root 0755`, `/var/lib/agern` `agern 0750`
+  (created once, never chowned recursively), `/var/cache/agern` `root 0755`;
+  `/etc/agern/agern.env` created from `env.example` on first install only (generated
+  `FACTORY_MASTER_KEY`, empty `FACTORY_GITHUB_ORG` and `FACTORY_DB_*`), `root:agern 0640`, not a
+  dpkg conffile, never overwritten. `daemon-reload`; enables `agern.service` on first install;
+  starts it (first install) or restarts it (upgrade, when enabled or running) only when
+  `FACTORY_DB_URL` and `FACTORY_GITHUB_ORG` are set, through `deb-systemd-invoke` (honours
+  `policy-rc.d`). The unit has `RestartPreventExitStatus=2` (the server's configuration-error exit),
+  so a misconfigured start fails once instead of looping.
+- `prerm remove`: stop and disable the service and timer. `prerm upgrade`: nothing — the old
+  server keeps running until `postinst` restarts it.
+- `postrm purge`: saves a root-only copy of `agern.env` to `/var/backups/agern.env.purged-<time>`
+  (the master key is needed to use the database), removes `agern.env`, `/var/cache/agern`, the
+  user and group, and prints what is left: `/var/lib/agern` and the database are never deleted.
+
+`agern setup-db` (root) creates the role and database on the local PostgreSQL as `postgres`
+(`runuser`), with a generated 32-character password sent over stdin (never in an argument list),
+writes `FACTORY_DB_URL/USER/PASSWORD` into `agern.env` and checks a TCP login; idempotent (an
+existing password for the same role is kept). The unit hardening keeps agents able to build and
+test (network, writable `/var/lib/agern`, private `/tmp`, devices) but closes the ways to root:
+`NoNewPrivileges`, empty `CapabilityBoundingSet`, `RestrictSUIDSGID`, `ProtectSystem=full`,
+`ProtectHome=true`, `ProtectProc=invisible`, kernel/cgroup/clock protection.
+
+**Upgrades of a deb install.** `agern upgrade [--channel stable|main] [--version X] [--file F]
+[--force]` (root): resolves `SHA256SUMS` of the release (`latest/download/`, `download/main-latest/`
+or `download/v<X>/`), downloads `agern_<semver>_all.deb` into root-only `/var/cache/agern/partial`,
+verifies the SHA-256 and the package's name, architecture and version, then installs with
+`apt-get install --allow-downgrades` (dependencies resolve) and waits for `/api/health` to report
+the new version — reinstalling the previous package if it does not. `--file` installs a package
+the admin names (copied root-only first; no checksum). The installed package and the one before
+it are kept as `/var/cache/agern/{current,previous}.deb`; `agern rollback` reinstalls
+`previous.deb` (downgrade). Without `--force`, upgrade and rollback refuse while the server is
+busy (below), refuse downgrades and do nothing when the version is installed. Downloads are
+anonymous (the repository is public); no token is ever used.
+
+**Channels.** `stable` is the latest GitHub release (`releases/latest` skips pre-releases). `main`
+is the rolling pre-release `main-latest`, which CI (`ci.yml`, job `publish-main`) replaces on every
+push to `main` after the tests and the package smoke tests on Debian 12, Debian 13 and Ubuntu 24.04
+passed: it moves the tag `main-latest` to the commit and uploads the package and its `SHA256SUMS`
+(only when the commit is still the head of `main`). Main builds are versioned by
+`scripts/main-version.sh`: `X.Y.(Z+1)-main.<commit time UTC YYYYMMDDHHMMSS>.g<sha>` after release
+`X.Y.Z` (after a pre-release `X.Y.Z-pre`: `X.Y.Z-pre.main.<time>.g<sha>`), package version with
+`~`, so dpkg orders them after the last release, before the next and by commit time (tested with
+`dpkg --compare-versions` in the smoke test).
+
+**Automatic upgrades.** `agern-upgrade.timer` (disabled by default; `agern auto-upgrade on|off|status`)
+runs `agern-upgrade.service` (root, `Type=oneshot`) every 15 minutes: `agern auto-upgrade run`
+reads `AGERN_UPGRADE_CHANNEL` (`stable`/`main`) and `AGERN_UPGRADE_MAX_WAIT_HOURS` (default 24)
+from `agern.env`, and when the channel has a newer version asks `GET /api/internal/activity` on
+`127.0.0.1` whether a restart is safe. *Idle* means no run in progress and no agent starting or
+mid-turn — the same states a restart would fail; a stopped server counts as idle, a running
+server that does not answer as busy. Busy: postpone to the next tick (state in
+`/var/cache/agern/auto-upgrade.state`). Waiting longer than the maximum for the same version:
+give up on that version with a warning-priority journal message; a newer version starts a new
+wait. Idle: download and verify, look once more, install as above. The endpoint was chosen over
+reading the database from the script because it needs no database credentials or `psql` in the
+root path and reflects exactly the states the server itself treats as unfinished.
+
+**Security boundary.** Agents run as `agern` with permissions bypassed, so the `agern` user is
+treated as hostile towards root: it has no sudo rules (the package adds none; `agern doctor`
+fails on `sudo`/`wheel`/`admin` membership and warns about root-equivalent groups such as
+`docker`); the service cannot gain privileges (above); only root installs packages, and only a
+release package that matches its `SHA256SUMS` or a file the admin passes — an agent can build a
+`.deb` but cannot have it installed. Nothing the `agern` user can write is executed or sourced by
+root on the upgrade path: units and `/usr/bin/agern` are root-owned package files, the timer runs
+with systemd's default `PATH`, `agern.env` is parsed as data (only known keys, set without
+`export`, and only when it is root-owned and not group/world-writable), downloads and state live
+in root-only `/var/cache/agern`, and root never runs a program found via the agents' `PATH`
+(`agern doctor` only looks those up). The checksum guards against corrupt downloads, not against
+a compromised GitHub release; the activity answer is advisory (it decides when, never what).
 
 ## 10. Frontend
 
