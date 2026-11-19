@@ -1,0 +1,142 @@
+#!/bin/sh
+# postinst for the agern .deb (packaging/deb/postinst).
+#
+# configure: creates the system user/group 'agern' (home = data directory), the directories,
+# /etc/agern/agern.env on first install (with a fresh FACTORY_MASTER_KEY; never overwritten
+# afterwards), reloads systemd, enables agern.service on first install, and (re)starts it only
+# when the configuration is complete (FACTORY_DB_URL and FACTORY_GITHUB_ORG set), so a fresh,
+# unconfigured install does not leave a failing service behind.
+#
+# The 'agern' user is NOT added to the 'shadow' group: 'os' (PAM) login on Linux needs that to
+# check other users' passwords, but then every agent can read the password hashes too. That is
+# the administrator's decision (see docs/INSTALL-LINUX.md).
+set -e
+
+USER_NAME=agern
+ENV_FILE=/etc/agern/agern.env
+DATA_DIR=/var/lib/agern
+CACHE_DIR=/var/cache/agern
+SHARE_DIR=/usr/share/agern
+
+say() { echo "agern: $*"; }
+
+has_value() { # has_value KEY — KEY=<non-empty value> in the env file (quotes ignored)
+    grep -Eq "^[[:space:]]*$1=[\"']?[^\"'[:space:]]" "$ENV_FILE" 2>/dev/null
+}
+
+systemd_running() { [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; }
+
+# start/restart through deb-systemd-invoke when present: it honours policy-rc.d (image builds,
+# chroots) like every other package's maintainer scripts.
+invoke() {
+    if command -v deb-systemd-invoke >/dev/null 2>&1; then deb-systemd-invoke "$@"; else systemctl "$@"; fi
+}
+
+create_user() {
+    if ! getent group "$USER_NAME" >/dev/null 2>&1; then
+        groupadd --system "$USER_NAME"
+    fi
+    if ! getent passwd "$USER_NAME" >/dev/null 2>&1; then
+        nologin=/usr/sbin/nologin
+        [ -x "$nologin" ] || nologin=/sbin/nologin
+        useradd --system --gid "$USER_NAME" --home-dir "$DATA_DIR" --no-create-home \
+            --shell "$nologin" --comment "Agern" "$USER_NAME"
+        say "created system user $USER_NAME"
+    fi
+}
+
+create_dirs() {
+    install -d -m 0755 -o root -g root /etc/agern
+    install -d -m 0755 -o root -g root "$CACHE_DIR"
+    if [ ! -d "$DATA_DIR" ]; then
+        install -d -m 0750 -o "$USER_NAME" -g "$USER_NAME" "$DATA_DIR"
+    elif [ "$(stat -c %U "$DATA_DIR")" != "$USER_NAME" ]; then
+        # Never chown an existing tree recursively as root; tell the admin instead.
+        say "warning: $DATA_DIR exists but is owned by $(stat -c %U:%G "$DATA_DIR"), not $USER_NAME"
+        say "         (after a purge and reinstall the user has a new uid): chown -R $USER_NAME:$USER_NAME $DATA_DIR"
+    fi
+}
+
+create_env_file() {
+    [ -e "$ENV_FILE" ] && return 0
+    key=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
+    [ "${#key}" -eq 44 ] || { echo "agern: could not generate a master key" >&2; exit 1; }
+    tmp=$(mktemp /etc/agern/.agern.env.XXXXXX)
+    chmod 0600 "$tmp"
+    # The key travels through the environment, not an argument list.
+    AGERN_NEW_KEY=$key awk '
+        /^FACTORY_MASTER_KEY=/  { print "FACTORY_MASTER_KEY=" ENVIRON["AGERN_NEW_KEY"]; next }
+        /^FACTORY_DATA_DIR=/    { print "FACTORY_DATA_DIR=/var/lib/agern"; next }
+        /^FACTORY_GITHUB_ORG=/  { print "FACTORY_GITHUB_ORG="; next }
+        /^FACTORY_DB_URL=/      { print "FACTORY_DB_URL="; next }
+        /^FACTORY_DB_USER=/     { print "FACTORY_DB_USER="; next }
+        /^FACTORY_DB_PASSWORD=/ { print "FACTORY_DB_PASSWORD="; next }
+        { print }
+    ' "$SHARE_DIR/env.example" >"$tmp"
+    unset key
+    cat >>"$tmp" <<'EOT'
+
+# --- Installation (.deb) ----------------------------------------------------------------------
+# Java used by the service (default: java on the PATH, i.e. the distribution's default JRE).
+# AGERN_JAVA=/usr/lib/jvm/java-21-openjdk-amd64/bin/java
+# Extra JVM options.
+# AGERN_JAVA_OPTS=-Xmx2g
+# Automatic upgrades (off until 'agern auto-upgrade on'): 'stable' = the latest release,
+# 'main' = a build of every commit on main (rolling pre-release).
+AGERN_UPGRADE_CHANNEL=stable
+# Postpone an automatic upgrade while runs or agents are active, for at most this many hours.
+AGERN_UPGRADE_MAX_WAIT_HOURS=24
+EOT
+    grep -q '^FACTORY_MASTER_KEY=.\{44\}$' "$tmp" || { rm -f "$tmp"; echo "agern: $SHARE_DIR/env.example has no FACTORY_MASTER_KEY line" >&2; exit 1; }
+    chown root:"$USER_NAME" "$tmp"
+    chmod 0640 "$tmp"
+    mv "$tmp" "$ENV_FILE"
+    say "created $ENV_FILE with a new FACTORY_MASTER_KEY (back it up: without it stored credentials are unreadable)"
+}
+
+case "$1" in
+    configure)
+        create_user
+        create_dirs
+        create_env_file
+        # Readable by the service user (systemd reads it as root anyway), writable only by root.
+        chown root:"$USER_NAME" "$ENV_FILE"
+        chmod 0640 "$ENV_FILE"
+
+        if command -v systemctl >/dev/null 2>&1; then
+            if systemd_running; then systemctl daemon-reload || true; fi
+            if [ -z "$2" ]; then
+                # First install (or reinstall after removal): start at boot from now on.
+                systemctl enable agern.service >/dev/null 2>&1 || say "warning: could not enable agern.service"
+            fi
+        fi
+
+        if has_value FACTORY_DB_URL && has_value FACTORY_GITHUB_ORG; then
+            if systemd_running; then
+                if [ -z "$2" ]; then
+                    invoke start agern.service || say "warning: agern.service did not start ('agern logs')"
+                elif systemctl is-enabled --quiet agern.service || systemctl is-active --quiet agern.service; then
+                    invoke restart agern.service || say "warning: agern.service did not restart ('agern logs')"
+                fi
+            fi
+        else
+            cat <<EOT
+
+Agern is installed but not configured yet, so it was not started. Next steps:
+
+  1. PostgreSQL (native):   sudo apt install postgresql && sudo agern setup-db
+  2. Edit $ENV_FILE: FACTORY_GITHUB_ORG, FACTORY_PUBLIC_URL (the URL people
+     type in their browser), FACTORY_ADMINS, FACTORY_AUTH.
+  3. Install 'claude' and 'gh' for the agern user (see 'sudo agern doctor').
+  4. sudo agern doctor && sudo agern start
+
+Guide: https://github.com/Egernet-CS/agern/blob/main/docs/INSTALL-LINUX.md
+
+EOT
+        fi
+        ;;
+    abort-upgrade | abort-remove | abort-deconfigure) ;;
+    *) echo "postinst called with unknown argument '$1'" >&2; exit 1 ;;
+esac
+
+exit 0

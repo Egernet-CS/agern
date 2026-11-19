@@ -1,0 +1,12 @@
+# Checks for a new Agern release every 15 minutes. Disabled by default; enable with
+# `sudo agern auto-upgrade on [--channel stable|main]`.
+[Unit]
+Description=Check for Agern upgrades every 15 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=15min
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,25 @@
+Agern for Debian and Ubuntu
+===========================
+
+Files
+  /usr/bin/agern                   the control command (agern help)
+  /usr/share/agern/agern.jar       the server, with the web frontend embedded
+  /etc/agern/agern.env             configuration (root:agern 0640), created on first install with
+                                   a fresh FACTORY_MASTER_KEY and never overwritten by upgrades
+  /var/lib/agern                   data: git workspaces, per-user homes (home of the 'agern' user)
+  /var/cache/agern                 current.deb / previous.deb kept for 'agern rollback' (root)
+  agern.service                    the server, runs as the unprivileged 'agern' user
+  agern-upgrade.timer/.service     automatic upgrades, off by default ('agern auto-upgrade on')
+  logs                             journald: 'agern logs' or 'journalctl -u agern'
+
+First steps
+  sudo apt install postgresql && sudo agern setup-db
+  sudoedit /etc/agern/agern.env    # FACTORY_GITHUB_ORG, FACTORY_PUBLIC_URL, FACTORY_ADMINS, FACTORY_AUTH
+  sudo agern doctor && sudo agern start
+
+Removing
+  apt remove agern   keeps configuration, data, the 'agern' user and the database
+  apt purge agern    also removes /etc/agern/agern.env (a copy goes to /var/backups), the
+                     package cache and the 'agern' user; /var/lib/agern and the database stay
+
+Full guide: https://github.com/Egernet-CS/agern/blob/main/docs/INSTALL-LINUX.md

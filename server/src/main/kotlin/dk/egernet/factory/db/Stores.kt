@@ -252,6 +252,10 @@ class SessionStore(private val db: Db) {
         "SELECT repo, count(*) AS n FROM agent_sessions WHERE status IN ('starting','running') GROUP BY repo",
     ) { it.getString("repo") to it.getInt("n") }.toMap()
 
+    /** Agents doing work right now: a chat mid-turn or a pipeline agent starting/running (all repos). */
+    fun countBusy(): Int =
+        db.queryOne("SELECT count(*) AS n FROM agent_sessions WHERE status IN ('starting','running')") { it.getInt("n") } ?: 0
+
     /** On startup no process can be alive: chats become idle (resumable), stage agents failed. */
     fun recoverAfterRestart() {
         db.update("UPDATE agent_sessions SET status = 'idle', updated_at = now() WHERE kind = 'chat' AND status IN ('starting','running')")
@@ -379,6 +383,13 @@ class RunStore(private val db: Db) {
     fun countActiveByRepo(): Map<String, Int> = db.query(
         "SELECT repo, count(*) AS n FROM runs WHERE status IN ('queued','spec','building','reviewing','approving','needs_human') GROUP BY repo",
     ) { it.getString("repo") to it.getInt("n") }.toMap()
+
+    /**
+     * Runs a restart would fail (see [failUnfinishedAfterRestart]): every active status except `needs_human`,
+     * which survives a restart.
+     */
+    fun countInProgress(): Int =
+        db.queryOne("SELECT count(*) AS n FROM runs WHERE status IN ('queued','spec','building','reviewing','approving')") { it.getInt("n") } ?: 0
 
     fun setStatus(id: UUID, status: String, error: String? = null, clearError: Boolean = false) = db.update(
         """UPDATE runs SET status = ?, error = CASE WHEN ? THEN NULL ELSE COALESCE(?, error) END, updated_at = now(),

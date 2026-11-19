@@ -227,7 +227,13 @@ class ApiTest {
         val sid = json(created.bodyAsText()).jsonObject["id"]!!.jsonPrimitive.content
 
         assertEquals(202, alice.postJson("/api/sessions/$sid/input", """{"text":"hello there"}""").status.value)
-        val events = waitForEvents(alice, sid) { ev -> ev.any { it.jsonObject["type"]!!.jsonPrimitive.content == "claude" && it.toString().contains("\"result\"") } }
+        // The result event is published before the session goes idle (a separate status event): wait for both.
+        val events = waitForEvents(alice, sid) { ev ->
+            val result = ev.indexOfFirst { it.jsonObject["type"]!!.jsonPrimitive.content == "claude" && it.toString().contains("\"result\"") }
+            result >= 0 && ev.drop(result + 1).any {
+                it.jsonObject["type"]!!.jsonPrimitive.content == "status" && it.jsonObject["payload"]!!.jsonObject["status"]!!.jsonPrimitive.content == "idle"
+            }
+        }
         assertTrue(events.any { it.jsonObject["type"]!!.jsonPrimitive.content == "user" && it.toString().contains("hello there") })
         val session = json(alice.get("/api/sessions/$sid").bodyAsText()).jsonObject
         assertEquals("idle", session["status"]!!.jsonPrimitive.content)

@@ -21,6 +21,8 @@ KillMode=mixed
 TimeoutStopSec=30
 Restart=on-failure
 RestartSec=5
+# Exit status 2 is a configuration error: restarting cannot fix it, so do not loop.
+RestartPreventExitStatus=2
 UMask=0027
 LimitNOFILE=65536
 

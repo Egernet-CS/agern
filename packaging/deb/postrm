@@ -1,0 +1,70 @@
+#!/bin/sh
+# postrm for the agern .deb (packaging/deb/postrm).
+#
+# remove: the program is gone; configuration, data, the 'agern' user and the database stay.
+# purge:  also removes /etc/agern/agern.env (a copy is saved first in /var/backups, because the
+#         master key in it is needed to read the credentials stored in the database),
+#         /var/cache/agern and the 'agern' user and group. The data directory /var/lib/agern
+#         and the PostgreSQL database are never deleted by the package.
+set -e
+
+ENV_FILE=/etc/agern/agern.env
+DATA_DIR=/var/lib/agern
+
+reload() {
+    rm -f /etc/systemd/system/multi-user.target.wants/agern.service \
+        /etc/systemd/system/timers.target.wants/agern-upgrade.timer
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed agern.service agern-upgrade.service >/dev/null 2>&1 || true
+    fi
+}
+
+case "$1" in
+    remove)
+        reload
+        ;;
+    purge)
+        reload
+        db_url=""
+        backup=""
+        if [ -f "$ENV_FILE" ]; then
+            db_url=$(sed -n 's/^FACTORY_DB_URL=["'\'']\{0,1\}\([^"'\'']*\).*/\1/p' "$ENV_FILE" | head -n 1)
+            if [ -d /var/backups ]; then
+                backup="/var/backups/agern.env.purged-$(date -u +%Y%m%dT%H%M%SZ)"
+                (umask 077 && cp "$ENV_FILE" "$backup")
+                chown root:root "$backup"
+                chmod 0600 "$backup"
+            fi
+            rm -f "$ENV_FILE"
+        fi
+        rm -f /etc/agern/.agern.env.*
+        rmdir /etc/agern 2>/dev/null || true
+        rm -rf /var/cache/agern
+        uid=""
+        if getent passwd agern >/dev/null 2>&1; then
+            uid=$(id -u agern)
+            userdel agern >/dev/null 2>&1 || echo "agern: warning: could not delete user agern (still running processes?)"
+        fi
+        if getent group agern >/dev/null 2>&1; then
+            groupdel agern >/dev/null 2>&1 || true
+        fi
+        echo "agern: purged the configuration, the package cache and the agern user."
+        echo "agern: left in place (delete them yourself if you mean it):"
+        if [ -d "$DATA_DIR" ]; then
+            echo "  - $DATA_DIR (workspaces and per-user homes${uid:+, owned by the former uid $uid}): rm -rf $DATA_DIR"
+        fi
+        if [ -n "$db_url" ]; then
+            echo "  - the database $db_url (sudo -u postgres dropdb <name>; dropuser <role>)"
+        else
+            echo "  - the PostgreSQL database, if one was created"
+        fi
+        if [ -n "$backup" ]; then
+            echo "  - $backup: a copy of agern.env with FACTORY_MASTER_KEY (needed to use that database again)"
+        fi
+        ;;
+    upgrade | failed-upgrade | abort-install | abort-upgrade | disappear) ;;
+    *) ;;
+esac
+
+exit 0
