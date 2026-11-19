@@ -93,8 +93,16 @@ systemctl stop agern.service >/dev/null 2>&1 || true
 
 section "agern sandbox enable"
 SUBUID_BEFORE=$(grep -c . /etc/subuid 2>/dev/null || echo 0)
-if agern sandbox enable >"$WORK/enable.log" 2>&1; then pass "agern sandbox enable"; else fail "agern sandbox enable"; fi
+if agern sandbox enable >"$WORK/enable.log" 2>&1; then pass "agern sandbox enable"; ENABLED=1; else fail "agern sandbox enable"; ENABLED=0; fi
 cat "$WORK/enable.log"
+if [ "$ENABLED" = 0 ]; then
+    # Everything after this needs sandboxes on: report and stop instead of a cascade of failures.
+    section "diagnostics (enable failed)"
+    journalctl -u agern-sandbox.service -n 60 --no-pager -o cat || true
+    journalctl -k --no-pager -o cat 2>/dev/null | grep -i 'apparmor="DENIED"' | tail -n 20 || true
+    printf '\n%s (sandbox host test): %d passed, %d failed (stopped after a failed enable)\n' "$PRETTY_NAME" "$PASS" "$FAIL"
+    exit 1
+fi
 grep -q '  FAIL' "$WORK/enable.log" && fail "the self-test reported a problem" || pass "self-test without problems"
 for s in "rootless Podman" "cgroups v2" "network backend netavark" "limits applied in the container's cgroup" \
     "belongs to agern on the host" "reachable by name" "is killed"; do

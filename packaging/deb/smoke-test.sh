@@ -196,9 +196,9 @@ printf '%s' "$out" | grep -q 'needs root' && pass "sandbox enable without root r
 eval "$(sed -n -e '/^subid_range() {/,/^}/p' -e '/^subid_free() {/,/^}/p' -e '/^sandbox_ensure_subids() {/,/^}/p' "$SRC_DIR/packaging/agern")"
 # shellcheck disable=SC2034 # used by the functions taken from packaging/agern
 AGERN_USER=agern SANDBOX_SUBID_COUNT=65536 SUBIDS_CHANGED=0
-# shellcheck disable=SC2317 # called by those functions
+# shellcheck disable=SC2317,SC2329 # called by those functions (taken in with eval above)
 info() { printf 'agern: %s\n' "$*"; }
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 die() { printf 'agern: error: %s\n' "$*" >&2; return 1; }
 printf 'alice:100000:65536\nbob:165536:65536\ncarol:300000:1000\n' >/etc/subuid
 printf 'alice:100000:65536\ndave:231072:65536\n' >/etc/subgid

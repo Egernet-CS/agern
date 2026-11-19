@@ -1301,8 +1301,15 @@ sandbox_selftest() {
         else
             bad "bind mount: writing in /workspace failed or the file is not owned by $AGERN_USER ($(stat -c %U "$dir/written-in-sandbox" 2>&1))"
         fi
-        out=$(spodman exec "$tag" sh -lc 'wget -q -T 10 -O - http://peer:8080/' 2>&1) || true
-        if [ "$out" = pong ]; then ok "the sidecar is reachable by name (DNS on the run's network)"; else bad "sidecar 'peer' not reachable by name: $out"; fi
+        # The sidecar may need a moment to listen; DNS itself answers as soon as it runs.
+        local i
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            out=$(spodman exec "$tag" sh -lc 'wget -q -T 5 -O - http://peer:8080/' 2>&1) || true
+            [ "$out" = pong ] && break
+            sleep 1
+        done
+        if [ "$out" = pong ]; then ok "the sidecar is reachable by name (DNS on the run's network)"
+        else bad "sidecar 'peer' not reachable by name after 10 tries: $out"; sandbox_dns_diagnostics "$tag"; fi
         # shellcheck disable=SC2016 # expanded in the container
         out=$(spodman exec "$tag" sh -lc 'x=$(head -c 200000000 /dev/zero | tr "\0" a); echo survived' 2>&1) && rc=0 || rc=$?
         if [ "$rc" != 0 ] && ! printf '%s' "$out" | grep -q survived; then
@@ -1316,6 +1323,35 @@ sandbox_selftest() {
     spodman network rm --force "$tag" >/dev/null 2>&1 || true
     as_agern rm -rf "$dir" || true
     [ "$rc" = 0 ] && [ "$DOCTOR_FAILS" = "$fails" ]
+}
+
+# What a failed name lookup between containers needs looked at (printed by the self-test).
+sandbox_dns_diagnostics() {
+    local tag=$1 d
+    say "  diagnostics (DNS on network $tag):"
+    {
+        echo "--- /etc/resolv.conf and /etc/hosts in the sandbox:"
+        spodman exec "$tag" cat /etc/resolv.conf /etc/hosts 2>&1
+        echo "--- nslookup peer in the sandbox:"
+        spodman exec "$tag" nslookup peer 2>&1
+        echo "--- podman network inspect:"
+        spodman network inspect "$tag" 2>&1
+        echo "--- podman info (network):"
+        spodman info --format 'netavark {{.Host.NetworkBackendInfo.Version}} dns {{.Host.NetworkBackendInfo.Dns.Version}} {{.Host.NetworkBackendInfo.Dns.Path}} pasta/slirp {{.Host.Slirp4NetNS.Executable}} {{.Host.Pasta.Executable}}' 2>&1
+        echo "--- processes of the network stack:"
+        pgrep -a -f 'aardvark|netavark|slirp4netns|pasta|rootlessport' 2>&1 || echo "(none)"
+        if is_root; then
+            d=/run/agern-sandbox/containers/networks/aardvark-dns
+            echo "--- $d:"
+            ls -la "$d" 2>&1
+            for f in "$d"/*; do [ -f "$f" ] && { echo "# $f"; cat "$f"; }; done
+            echo "--- journalctl -u $SANDBOX_UNIT (last 40):"
+            journalctl -u "$SANDBOX_UNIT" -n 40 --no-pager -o cat 2>&1
+            echo "--- AppArmor denials (kernel log, last 20):"
+            journalctl -k --no-pager -o cat 2>/dev/null | grep -i 'apparmor="DENIED"' | tail -n 20
+        fi
+    } 2>&1 | sed 's/^/        /'
+    return 0
 }
 
 # delete_env_key KEY — removes uncommented KEY= lines from agern.env (owner and mode kept). Root only.
