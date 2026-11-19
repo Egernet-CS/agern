@@ -164,6 +164,9 @@ class FakeLauncher(var stage: (FakeProcess) -> Unit = { it.init(); it.result("ok
 class FakeGitOps : GitOps {
     val pushes = CopyOnWriteArrayList<String>()
     @Volatile var commits = 1
+    /** Files in every commit, by path (what [readFile] returns). */
+    val files = java.util.concurrent.ConcurrentHashMap<String, String>()
+    override fun readFile(dir: Path, ref: String, path: String, home: Path, maxBytes: Int): String? = files[path]
     override fun ensureClone(id: AgentIdentity, cloneUrl: String, dir: Path, home: Path) { Files.createDirectories(dir) }
     override fun createWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, defaultBranch: String, home: Path): String {
         Files.createDirectories(worktree)
@@ -189,13 +192,26 @@ class TestWorld(
     twoFactor: Boolean = true,
     tweak: (Config) -> Config = { it },
     loginThrottle: dk.egernet.factory.auth.LoginThrottle = dk.egernet.factory.auth.LoginThrottle(stepDelay = java.time.Duration.ZERO),
+    /** Sandboxes on (FACTORY_SANDBOX=podman) with [sandboxRuntime] as the container runtime. */
+    sandbox: Boolean = false,
+    launcher: dk.egernet.factory.agent.AgentLauncher? = null,
 ) {
     val dataDir: Path = Files.createTempDirectory("agern-test")
-    val cfg = tweak(testConfig(dataDir, twoFactor))
+    val cfg = tweak(testConfig(dataDir, twoFactor).let { if (sandbox) it.copy(sandbox = it.sandbox.copy(mode = "podman")) else it })
     val github = FakeGitHub.seeded("test-org")
     val git = FakeGitOps()
     val launcher = FakeLauncher()
-    val services = Services(cfg, TestDb.fresh(), github, git, launcher, loginThrottle = loginThrottle)
+    val sandboxRuntime = FakeSandboxRuntime()
+    val services = Services(
+        cfg, TestDb.fresh(), github, git, launcher ?: this.launcher, loginThrottle = loginThrottle,
+        sandboxRuntime = if (sandbox) sandboxRuntime else null,
+    )
+
+    /** Puts `.agern/sandbox.yml` on the default branch (GitHub API and git alike); null removes it. */
+    fun sandboxFile(content: String?, repo: String = "demo-app") {
+        github.setFile(repo, dk.egernet.factory.sandbox.SANDBOX_FILE, content)
+        if (content == null) git.files.remove(dk.egernet.factory.sandbox.SANDBOX_FILE) else git.files[dk.egernet.factory.sandbox.SANDBOX_FILE] = content
+    }
 
     /** Creates a user with credentials registered, as if they had logged in and filled in Settings. */
     fun user(name: String, admin: Boolean = false, claude: Boolean = true, github: Boolean = true): UserRecord {
@@ -217,4 +233,64 @@ class TestWorld(
     }
 
     fun close() = services.stop()
+
+    /** [close], then give the pool's connections back to PostgreSQL (the embedded server allows only so many). */
+    fun closeAndReleaseDb() {
+        close()
+        (services.db.dataSource as java.io.Closeable).close()
+    }
+}
+
+/**
+ * A container runtime in memory: records every call, keeps the containers and networks it "created" (with their
+ * `agern.run` label) and answers commands through [onExec].
+ */
+class FakeSandboxRuntime : dk.egernet.factory.sandbox.SandboxRuntime {
+    /** Every call, e.g. `network create agern-run-…`, `start agern-run-…`, `exec agern-run-… ./gradlew test`. */
+    val calls = CopyOnWriteArrayList<String>()
+    val started = CopyOnWriteArrayList<dk.egernet.factory.sandbox.ContainerSpec>()
+    /** Commands run with exec: (container, command line after `sh -lc`, timeout ms). */
+    val execs = CopyOnWriteArrayList<Triple<String, String, Long>>()
+    /** Existing containers and networks: name → run id. */
+    val containers = java.util.concurrent.ConcurrentHashMap<String, String>()
+    val networks = java.util.concurrent.ConcurrentHashMap<String, String>()
+    val volumes: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+    @Volatile var onExec: (container: String, command: String, timeoutMs: Long) -> dk.egernet.factory.sandbox.ExecResult =
+        { _, cmd, _ -> dk.egernet.factory.sandbox.ExecResult(0, "ran: $cmd\n", false, false, 5) }
+    /** startContainer fails for names containing this. */
+    @Volatile var failStart: String? = null
+
+    override fun createNetwork(name: String, labels: Map<String, String>) {
+        calls += "network create $name"
+        networks[name] = labels.getValue("agern.run")
+    }
+    override fun ensureVolume(name: String, labels: Map<String, String>) {
+        calls += "volume $name"
+        volumes += name
+    }
+    override fun startContainer(spec: dk.egernet.factory.sandbox.ContainerSpec) {
+        calls += "start ${spec.name}"
+        failStart?.let { if (spec.name.contains(it)) throw dk.egernet.factory.sandbox.SandboxRuntimeException("image pull failed (fake)") }
+        started += spec
+        containers[spec.name] = spec.labels.getValue("agern.run")
+    }
+    override fun exec(container: String, command: List<String>, workdir: String, timeoutMs: Long): dk.egernet.factory.sandbox.ExecResult {
+        val line = command.drop(2).joinToString(" ")
+        calls += "exec $container $line"
+        if (!containers.containsKey(container)) throw dk.egernet.factory.sandbox.SandboxRuntimeException("no such container $container")
+        execs += Triple(container, line, timeoutMs)
+        return onExec(container, line, timeoutMs)
+    }
+    override fun restartContainer(name: String) { calls += "restart $name" }
+    override fun removeContainers(names: List<String>) {
+        calls += "rm ${names.joinToString(" ")}"
+        names.forEach { containers.remove(it) }
+    }
+    override fun removeNetwork(name: String) {
+        calls += "network rm $name"
+        networks.remove(name)
+    }
+    override fun listContainers() = containers.map { (n, r) -> dk.egernet.factory.sandbox.LabelledResource(n, r) }
+    override fun listNetworks() = networks.map { (n, r) -> dk.egernet.factory.sandbox.LabelledResource(n, r) }
+    override fun exposedPorts(image: String) = if (image.contains("postgres")) listOf("5432/tcp") else emptyList()
 }

@@ -21,6 +21,19 @@ How to work:
    focused commits are better than one mixed commit. Make sure the working tree is clean when you
    finish: everything that belongs to the change is committed, nothing else is.
 
+Sandbox (when your task prompt says this run has one):
+- The run has a container with the project's own toolchain and services (from `.agern/sandbox.yml`,
+  approved by an admin). Build and run the tests there with `factory_sandbox_exec` instead of on the
+  host; `factory_sandbox_info` shows the image, services (reachable by their names), caches and limits.
+- Commands run as `sh -lc <command>` in `/workspace`, which is your working directory: the same files,
+  so edit them on the host as usual. Use git on the host, not in the sandbox.
+- The first command creates the sandbox and can take a few minutes. You get the exit code and the tail
+  of the output; rerun narrower commands (e.g. one test class) when you need more detail.
+- If the tool says the sandboxes are busy, try again a bit later; do not install the toolchain on the
+  host instead. If the sandbox cannot be created or its setup fails, say so in your summary.
+- When the run has no sandbox, or the tools are not available to you, build and test on the host as
+  described above.
+
 Hard rules:
 - Stay on the branch you were given. Do not push, open or merge pull requests, rewrite published
   history, or touch other branches — the factory pushes and opens the pull request for you.

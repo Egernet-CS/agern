@@ -99,6 +99,7 @@ private val log = LoggerFactory.getLogger("dk.egernet.factory.api")
 @Serializable data class CreateSessionReq(val model: String? = null)
 @Serializable data class InputReq(val text: String = "", val attachmentIds: List<String> = emptyList())
 @Serializable data class ResolveReq(val status: String, val note: String? = null)
+@Serializable data class ApproveSandboxReq(val sha256: String)
 @Serializable data class HealthDto(val status: String, val version: String, val name: String)
 @Serializable data class ActivityDto(val idle: Boolean, val activeRuns: Int, val busyAgents: Int, val version: String)
 @Serializable data class ProvidersDto(val providers: List<String>, val org: String, val twoFactor: Boolean)
@@ -408,6 +409,16 @@ private fun Route.projectRoutes(s: Services) {
         val req = call.receive<CreateRunReq>()
         call.respond(HttpStatusCode.Created, s.factory.startRun(u, repoParam(), req.issueNumber, null))
     }
+    // Sandbox definition and its approval (docs/ARCHITECTURE.md §5 "Sandboxes", §8).
+    get("/projects/{repo}/sandbox") { call.respond(s.sandboxes.status(call.requireUser(s), repoParam())) }
+    post("/projects/{repo}/sandbox/approval") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        val req = call.receive<ApproveSandboxReq>()
+        if (!Regex("^[0-9a-fA-F]{64}$").matches(req.sha256.trim())) throw badRequest("sha256 must be 64 hex digits")
+        call.respond(s.sandboxes.approve(u, repo, req.sha256))
+    }
+    delete("/projects/{repo}/sandbox/approval") { call.respond(s.sandboxes.revoke(call.requireUser(s), repoParam())) }
 }
 
 private fun Route.runRoutes(s: Services) {

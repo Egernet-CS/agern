@@ -124,6 +124,54 @@ data class RunDto(
     val status: String, val round: Int, val maxRounds: Int, val branch: String?, val prNumber: Int?,
     val prUrl: String?, val owner: OwnerDto, val startedBySessionId: String?, val error: String?,
     val createdAt: String, val updatedAt: String, val endedAt: String?, val stages: List<StageDto>,
+    /** What the run decided about its sandbox when it started; null before that (and for runs from before sandboxes). */
+    val sandbox: RunSandboxDto? = null,
+)
+
+/**
+ * A run's sandbox decision (docs/ARCHITECTURE.md §5 "Sandboxes"), fixed when the run starts.
+ * `state`: `disabled` (FACTORY_SANDBOX=off), `none` (no definition file), `invalid`, `unapproved`, `approved`.
+ * Only `approved` gives the builder a sandbox; [reason] says why (not) in words.
+ */
+@Serializable
+data class RunSandboxDto(val state: String, val reason: String, val sha256: String?, val image: String?)
+
+@Serializable data class SandboxServiceDto(val name: String, val image: String, val env: Map<String, String>)
+
+@Serializable
+data class SandboxLimitsDto(
+    /** Effective per-container limits: what the file asks for, capped by the server's limits. */
+    val cpus: Double, val memory: String,
+    val requestedCpus: Double?, val requestedMemory: String?,
+    /** The file asked for more than the server allows. */
+    val capped: Boolean,
+)
+
+@Serializable
+data class SandboxDefinitionDto(
+    val image: String, val setup: String?, val env: Map<String, String>, val services: List<SandboxServiceDto>,
+    val caches: List<String>, val limits: SandboxLimitsDto,
+)
+
+@Serializable data class SandboxApprovalDto(val sha256: String, val content: String, val approvedBy: OwnerDto, val approvedAt: String)
+
+/** `GET /api/projects/{repo}/sandbox`: the definition on the default branch and its approval. */
+@Serializable
+data class SandboxStatusDto(
+    val repo: String,
+    /** FACTORY_SANDBOX is not `off`. Definitions can be approved either way. */
+    val enabled: Boolean,
+    val path: String,
+    /** The branch the definition is read from (the default branch, which runs start from). */
+    val branch: String,
+    /** `none` (no file), `invalid`, `pending` (valid, this content not approved) or `approved`. */
+    val state: String,
+    val sha256: String?,
+    val content: String?,
+    val errors: List<String>,
+    val definition: SandboxDefinitionDto?,
+    /** The repository's approval, possibly of other content (compare [sha256]); null when none. */
+    val approval: SandboxApprovalDto?,
 )
 
 @Serializable

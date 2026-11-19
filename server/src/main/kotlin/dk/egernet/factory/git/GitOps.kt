@@ -18,6 +18,11 @@ interface GitOps {
     fun commitsAhead(worktree: Path, baseRef: String, home: Path): Int
     fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path)
     fun removeWorktree(mainDir: Path, worktree: Path, home: Path)
+    /**
+     * The file at [path] in commit [ref] of the repository at [dir] (raw blob bytes as UTF-8), or null when it does not
+     * exist there. Throws [GitException] when it is larger than [maxBytes] or git fails.
+     */
+    fun readFile(dir: Path, ref: String, path: String, home: Path, maxBytes: Int): String?
 }
 
 /**
@@ -28,6 +33,13 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
     private val log = LoggerFactory.getLogger(CliGitOps::class.java)
 
     private fun git(cwd: Path?, home: Path, id: AgentIdentity?, vararg args: String, timeoutSec: Long = 600): String {
+        val (code, out) = gitStatus(cwd, home, id, *args, timeoutSec = timeoutSec)
+        if (code != 0) throw GitException("git ${args.take(2).joinToString(" ")} failed: ${out.takeLast(1000).trim()}")
+        return out
+    }
+
+    /** Runs git and returns its exit code and output instead of throwing on a non-zero exit. */
+    private fun gitStatus(cwd: Path?, home: Path, id: AgentIdentity?, vararg args: String, timeoutSec: Long = 600): Pair<Int, String> {
         val pb = ProcessBuilder(listOf("git") + args).redirectErrorStream(true)
         if (cwd != null) pb.directory(cwd.toFile())
         pb.environment().clear()
@@ -47,8 +59,7 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
             p.destroyForcibly()
             throw GitException("git ${args.firstOrNull()} timed out")
         }
-        if (p.exitValue() != 0) throw GitException("git ${args.take(2).joinToString(" ")} failed: ${out.takeLast(1000).trim()}")
-        return out
+        return p.exitValue() to out
     }
 
     override fun ensureClone(id: AgentIdentity, cloneUrl: String, dir: Path, home: Path) {
@@ -85,6 +96,17 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
     override fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path) {
         if (localOnly) return
         git(worktree, home, id, "push", "--force-with-lease", "origin", "HEAD:refs/heads/$branch")
+    }
+
+    override fun readFile(dir: Path, ref: String, path: String, home: Path, maxBytes: Int): String? {
+        require(!ref.startsWith("-") && !path.startsWith("-") && ':' !in path) { "Invalid ref or path" }
+        val obj = "$ref:$path"
+        // `cat-file -e` exits 0 when the object exists, non-zero (without output on stdout) when it does not.
+        if (gitStatus(dir, home, null, "cat-file", "-e", obj, timeoutSec = 60).first != 0) return null
+        if (git(dir, home, null, "cat-file", "-t", obj, timeoutSec = 60).trim() != "blob") return null
+        val size = git(dir, home, null, "cat-file", "-s", obj, timeoutSec = 60).trim().toLongOrNull() ?: throw GitException("git cat-file -s gave no size")
+        if (size > maxBytes) throw GitException("$path is larger than ${maxBytes / 1024} KiB")
+        return git(dir, home, null, "cat-file", "blob", obj, timeoutSec = 60)
     }
 
     override fun removeWorktree(mainDir: Path, worktree: Path, home: Path) {
