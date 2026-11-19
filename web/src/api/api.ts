@@ -70,6 +70,13 @@ export interface Api {
   assignIssues(repo: string, issueNumbers: number[], releaseId: string | null): Promise<Release[]>;
   /** The new complete order; 409 `release_issues_changed` when it is not exactly the release's current issues. */
   reorderRelease(id: string, issueNumbers: number[]): Promise<Release>;
+  /**
+   * Sets (caller becomes the owner) or changes (owner or admin) the scheduled start; `startAt` is an ISO instant.
+   * 400 past or more than a year ahead, 422 `claude_credential_required`, 403 not owner/admin, 409 `release_not_schedulable`.
+   */
+  scheduleRelease(id: string, startAt: string): Promise<Release>;
+  /** Back to `planning`; 409 `release_not_scheduled`, 403 not owner/admin. */
+  cancelReleaseSchedule(id: string): Promise<Release>;
 
   projectRuns(repo: string): Promise<Run[]>;
   startRun(repo: string, issueNumber: number): Promise<Run>;

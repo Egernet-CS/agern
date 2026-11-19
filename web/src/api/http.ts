@@ -128,6 +128,8 @@ export const httpApi: Api = {
   deleteRelease: (id) => del(`/api/releases/${enc(id)}`),
   assignIssues: (repo, issueNumbers, releaseId) => post(`/api/projects/${enc(repo)}/releases/assign`, { issueNumbers, releaseId }),
   reorderRelease: (id, issueNumbers) => put(`/api/releases/${enc(id)}/issues/order`, { issueNumbers }),
+  scheduleRelease: (id, startAt) => put(`/api/releases/${enc(id)}/schedule`, { startAt }),
+  cancelReleaseSchedule: (id) => del(`/api/releases/${enc(id)}/schedule`),
 
   projectRuns: (repo) => get(`/api/projects/${enc(repo)}/runs`),
   startRun: (repo, issueNumber) => post(`/api/projects/${enc(repo)}/runs`, { issueNumber }),

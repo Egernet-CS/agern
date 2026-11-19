@@ -1,15 +1,25 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api, ApiError, type Release } from '../api';
-import { Dialog, Empty, ErrorBox, KindBadge, Loading, ReleaseStatusPill } from '../components/ui/ui';
+import { Dialog, Empty, ErrorBox, KindBadge, Loading, Notice, ReleaseStatusPill } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
-import { timeAgo } from '../lib/format';
+import { useMe } from '../lib/auth';
+import { dateTime, timeAgo, toDateTimeLocal } from '../lib/format';
 import { useFeed, useFeedReconnects, useLiveRelease, useProjectReleases } from '../lib/realtime';
 
-/** One release in preparation: its issues in build order, editable (docs/ARCHITECTURE.md §10). */
+/** Codes after which the page's copy of the release is stale: reload it and show the server's message. */
+const STALE_SCHEDULE = new Set(['release_not_scheduled', 'release_not_schedulable', 'release_scheduled']);
+
+/** A time in the browser's time zone, machine-readable in `dateTime`. */
+function LocalTime({ iso }: { iso: string }) {
+  return <time dateTime={iso}>{dateTime(iso)}</time>;
+}
+
+/** One release in preparation or scheduled: its issues in build order, editable (docs/ARCHITECTURE.md §10). */
 export function ReleasePage() {
   const { repo = '', releaseId = '' } = useParams();
   const nav = useNavigate();
+  const me = useMe();
   const { noteReleases, markReleaseDeleted } = useFeed();
   const reconnects = useFeedReconnects();
   const releaseQ = useAsync(() => api.release(releaseId), [releaseId, reconnects]);
@@ -22,6 +32,7 @@ export function ReleasePage() {
   const [toAdd, setToAdd] = useState('');
   const [editing, setEditing] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [scheduling, setScheduling] = useState(false);
   // Set before this user's own delete request, so they are not told "This release was deleted".
   const deletedByMe = useRef(false);
 
@@ -74,7 +85,10 @@ export function ReleasePage() {
       if (e instanceof ApiError && e.code === 'release_issues_changed') {
         releaseQ.reload();
         setErr('The release changed in the meantime; try again.');
-      } else setErr((e as Error).message);
+      } else {
+        if (e instanceof ApiError && STALE_SCHEDULE.has(e.code)) releaseQ.reload();
+        setErr((e as Error).message);
+      }
       return false;
     } finally {
       setBusy(false);
@@ -102,6 +116,7 @@ export function ReleasePage() {
     } catch (e) {
       if (!(e instanceof ApiError && e.status === 404)) {
         deletedByMe.current = false;
+        if (e instanceof ApiError && STALE_SCHEDULE.has(e.code)) releaseQ.reload();
         setErr((e as Error).message);
         setBusy(false);
         setConfirmDelete(false);
@@ -113,6 +128,11 @@ export function ReleasePage() {
   };
 
   const n = release.issues.length;
+  const scheduled = release.status === 'scheduled';
+  const ownerName = release.owner?.username ?? 'its owner';
+  const mayChangeSchedule = scheduled && (release.owner?.username === me.username || me.isAdmin);
+  const cancelSchedule = () => void change(() => api.cancelReleaseSchedule(release.id));
+  const failure = release.status === 'planning' ? release.startFailure : null;
   return (
     <div className="page releasepage">
       <header className="run-head release-head">
@@ -125,10 +145,31 @@ export function ReleasePage() {
           <ReleaseStatusPill status={release.status} />
         </div>
         <div className="rh-actions">
+          {release.status === 'planning' && (
+            <button type="button" className="btn btn--ghost" onClick={() => setScheduling(true)} disabled={busy}>
+              Schedule start…
+            </button>
+          )}
+          {mayChangeSchedule && (
+            <>
+              <button type="button" className="btn btn--ghost" onClick={() => setScheduling(true)} disabled={busy}>
+                Change time
+              </button>
+              <button type="button" className="btn btn--ghost" onClick={cancelSchedule} disabled={busy}>
+                Cancel schedule
+              </button>
+            </>
+          )}
           <button type="button" className="btn btn--ghost" onClick={() => setEditing(true)} disabled={busy}>
             Edit
           </button>
-          <button type="button" className="btn btn--ghost btn--danger" onClick={() => setConfirmDelete(true)} disabled={busy}>
+          <button
+            type="button"
+            className="btn btn--ghost btn--danger"
+            onClick={() => setConfirmDelete(true)}
+            disabled={busy || scheduled}
+            aria-describedby={scheduled ? 'release-delete-hint' : undefined}
+          >
             Delete
           </button>
         </div>
@@ -137,11 +178,36 @@ export function ReleasePage() {
           <p className="muted small">
             created by {release.createdBy.username} · {timeAgo(release.createdAt)}
           </p>
-          <p className="muted small">This release is a plan. Nothing is built until it is started.</p>
+          {scheduled && release.scheduledAt ? (
+            <>
+              <p className="release-schedule">
+                Scheduled to start <LocalTime iso={release.scheduledAt} /> by {ownerName}.
+              </p>
+              {release.waitingFor && (
+                <p className="release-waiting" role="status">
+                  Its time has come. Waiting for release{' '}
+                  <Link to={`/p/${repo}/releases/${release.waitingFor.id}`}>{release.waitingFor.name}</Link> to finish building.
+                </p>
+              )}
+              {!mayChangeSchedule && <p className="muted small">Only {ownerName} or an admin can change the schedule.</p>}
+              <p id="release-delete-hint" className="muted small">Cancel the scheduled start to delete this release.</p>
+            </>
+          ) : (
+            <p className="muted small">This release is a plan. Nothing is built until it is started.</p>
+          )}
         </div>
       </header>
 
       {err && <p className="form-error" role="alert">{err}</p>}
+
+      {failure && (
+        <Notice tone="error" title="The scheduled start did not happen">
+          <p>{failure.reason}</p>
+          <p className="muted small">
+            Scheduled by {failure.owner.username} · tried <LocalTime iso={failure.at} />
+          </p>
+        </Notice>
+      )}
 
       <section className="release-issues" aria-labelledby="release-issues-h">
         <div className="section-head">
@@ -203,6 +269,13 @@ export function ReleasePage() {
       </section>
 
       <EditReleaseDialog release={release} open={editing} onClose={() => setEditing(false)} onSaved={(r) => noteReleases([r])} />
+      <ScheduleDialog
+        release={release}
+        open={scheduling}
+        onClose={() => setScheduling(false)}
+        onSaved={(r) => noteReleases([r])}
+        onStale={() => releaseQ.reload()}
+      />
       <Dialog open={confirmDelete} onClose={() => setConfirmDelete(false)} title="Delete release?">
         <div className="form">
           <p>
@@ -275,6 +348,100 @@ function EditReleaseDialog({ release, open, onClose, onSaved }: { release: Relea
           </button>
           <button className="btn btn--primary" disabled={busy || !name.trim()}>
             {busy ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </form>
+    </Dialog>
+  );
+}
+
+/** Today 22:00 local time if that is still ahead, otherwise tomorrow 22:00. */
+function defaultStart(now = new Date()): Date {
+  const d = new Date(now);
+  d.setHours(22, 0, 0, 0);
+  if (d.getTime() <= now.getTime()) d.setDate(d.getDate() + 1);
+  return d;
+}
+
+/** Sets the start of a release in preparation, or changes the time of a scheduled one. */
+function ScheduleDialog({
+  release,
+  open,
+  onClose,
+  onSaved,
+  onStale,
+}: {
+  release: Release;
+  open: boolean;
+  onClose: () => void;
+  onSaved: (r: Release) => void;
+  onStale: () => void;
+}) {
+  const changing = release.status === 'scheduled';
+  const [value, setValue] = useState('');
+  const [min, setMin] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  // Start from the current schedule (or the default) each time the dialog opens.
+  useEffect(() => {
+    if (!open) return;
+    const now = new Date();
+    setMin(toDateTimeLocal(now));
+    setValue(toDateTimeLocal(changing && release.scheduledAt ? new Date(release.scheduledAt) : defaultStart(now)));
+    setErr(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    const at = new Date(value);
+    if (Number.isNaN(at.getTime())) {
+      setErr('Enter a date and time.');
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    try {
+      onSaved(await api.scheduleRelease(release.id, at.toISOString()));
+      onClose();
+    } catch (e2) {
+      if (e2 instanceof ApiError && STALE_SCHEDULE.has(e2.code)) onStale();
+      setErr((e2 as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Dialog open={open} onClose={onClose} title={changing ? 'Change scheduled start' : `Schedule release ${release.name}`}>
+      <form className="form" onSubmit={submit}>
+        <div className="field">
+          <label htmlFor="rs-at">Start at</label>
+          <input
+            id="rs-at"
+            type="datetime-local"
+            required
+            min={min}
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            autoFocus
+            aria-describedby="rs-at-hint"
+          />
+          <p id="rs-at-hint" className="muted small">
+            Your local time ({zone}). The release is built with your Claude and GitHub credentials. If another release of this
+            project is still building at that time, this one waits for it.
+          </p>
+        </div>
+        {err && (
+          <p className="form-error" role="alert">
+            {err}
+          </p>
+        )}
+        <div className="dialog-actions">
+          <button type="button" className="btn btn--ghost" onClick={onClose} disabled={busy}>
+            Cancel
+          </button>
+          <button className="btn btn--primary" disabled={busy || !value}>
+            {busy ? 'Saving…' : changing ? 'Save' : 'Schedule'}
           </button>
         </div>
       </form>

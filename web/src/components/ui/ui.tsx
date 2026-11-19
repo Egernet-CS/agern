@@ -78,13 +78,15 @@ export function SessionStatusPill({ status }: { status: SessionStatus }) {
   );
 }
 
-const RELEASE_LABEL: Record<ReleaseStatus, string> = { planning: 'in preparation' };
-const RELEASE_TONE: Record<ReleaseStatus, string> = { planning: 'idle' };
-export function ReleaseStatusPill({ status }: { status: ReleaseStatus }) {
+const RELEASE_LABEL: Record<ReleaseStatus, string> = { planning: 'in preparation', scheduled: 'scheduled', building: 'building', paused: 'paused' };
+const RELEASE_TONE: Record<ReleaseStatus, string> = { planning: 'idle', scheduled: 'active', building: 'active', paused: 'idle' };
+/** A state this version does not know yet (from a newer server) shows as its raw text. */
+export function ReleaseStatusPill({ status }: { status: ReleaseStatus | (string & {}) }) {
+  const known = Object.prototype.hasOwnProperty.call(RELEASE_LABEL, status);
   return (
-    <span className={`pill pill--${RELEASE_TONE[status]}`}>
+    <span className={`pill pill--${known ? RELEASE_TONE[status as ReleaseStatus] : 'idle'}`}>
       <span className="pill-dot" aria-hidden />
-      {RELEASE_LABEL[status]}
+      {known ? RELEASE_LABEL[status as ReleaseStatus] : status}
     </span>
   );
 }

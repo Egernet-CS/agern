@@ -60,8 +60,14 @@ export type Issue = {
   release: { id: string; name: string } | null;
 };
 
-/** Step 1 of releases only plans; later steps add the building and releasing states. */
-export type ReleaseStatus = 'planning';
+/**
+ * `planning` and `scheduled` come from planning and the scheduler; `building` and `paused` (the project is occupied)
+ * belong to the next step of releases. Later steps may add states: render unknown ones as text.
+ */
+export type ReleaseStatus = 'planning' | 'scheduled' | 'building' | 'paused';
+
+/** A scheduled start that did not happen (docs/ARCHITECTURE.md §6 "Scheduled start"). */
+export type ReleaseStartFailure = { at: string; owner: Owner; reason: string };
 
 /** An issue as planned in a release: title and kind as they were when it was assigned. */
 export type ReleaseIssue = { number: number; title: string; kind: IssueKind };
@@ -79,6 +85,14 @@ export type Release = {
   updatedAt: string;
   /** In build order. */
   issues: ReleaseIssue[];
+  /** The user who scheduled the release; set while `scheduled`. */
+  owner: Owner | null;
+  /** ISO instant of the scheduled start; set exactly while `scheduled`. */
+  scheduledAt: string | null;
+  /** The release this one waits behind: only while `scheduled` and its time has come. */
+  waitingFor: { id: string; name: string } | null;
+  /** The last scheduled start that did not happen; kept until the release is scheduled again. */
+  startFailure: ReleaseStartFailure | null;
 };
 
 export type SessionKind = 'chat' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';

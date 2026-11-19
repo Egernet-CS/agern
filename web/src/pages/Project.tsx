@@ -6,7 +6,7 @@ import { REVIEWERS, roundName } from '../components/pipeline/model';
 import { Dialog, Empty, ErrorBox, KindBadge, Loading, Notice, ReleaseStatusPill, RoleBadge, RunStatusPill, SessionStatusPill } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
-import { modelLabel, timeAgo } from '../lib/format';
+import { dateTime, modelLabel, timeAgo } from '../lib/format';
 import { useFeed, useFeedReconnects, useIssueFeed, useLiveRuns, useLiveSessions, useProjectReleases } from '../lib/realtime';
 import { useNow } from '../lib/useNow';
 
@@ -775,6 +775,17 @@ function ActivityPanel({
                 <ReleaseStatusPill status={r.status} />
                 <span className="rr-line">
                   {r.issues.length} issue{r.issues.length === 1 ? '' : 's'}
+                  {r.status === 'scheduled' &&
+                    (r.waitingFor ? (
+                      <> · waiting for {r.waitingFor.name}</>
+                    ) : (
+                      r.scheduledAt && (
+                        <>
+                          {' '}· starts <time dateTime={r.scheduledAt}>{dateTime(r.scheduledAt)}</time>
+                        </>
+                      )
+                    ))}
+                  {r.status === 'planning' && r.startFailure && <span className="rr-failed"> · start failed</span>}
                 </span>
               </div>
             </Link>

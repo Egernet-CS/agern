@@ -383,7 +383,7 @@ export function chatInput(s: AgentSession, text: string, by: User, attachments: 
           systemReply(s, ['/factory run <issue>      start a pipeline run for an issue', '/factory status           list runs in this project', '/factory approve [runId]  approve a run waiting for a human', '/factory cancel <runId>   cancel a run', '/factory releases         list the releases planned in this project', '/factory release create <name> [description]', '/factory release add <name> <issue>…', '/factory release remove <issue>…', '/factory help             this help'].join('\n'));
         } else if (cmd === 'releases') {
           const list = releasesOf(s.repo);
-          systemReply(s, list.length ? list.map((r) => [`• ${r.name} — in preparation, ${r.issues.length} issue${r.issues.length === 1 ? '' : 's'}`, ...r.issues.map((i) => `    #${i.number} ${i.title}`)].join('\n')).join('\n\n') : `No releases in ${s.repo} yet.`);
+          systemReply(s, list.length ? list.map((r) => [`• ${r.name} — ${releaseState(r)}, ${r.issues.length} issue${r.issues.length === 1 ? '' : 's'}`, ...r.issues.map((i) => `    #${i.number} ${i.title}`)].join('\n')).join('\n\n') : `No releases in ${s.repo} yet.`);
         } else if (cmd === 'release') {
           const [, , sub, ...rest] = text.trim().split(/\s+/);
           const nums = (tokens: string[]) => tokens.flatMap((t) => t.split(',')).filter(Boolean).map((t) => Number(t.replace('#', '')));
@@ -784,7 +784,10 @@ export function getRelease(id: string): Release {
 
 export function createRelease(repo: string, body: { name: string; description: string }, by: User, createdMs = Date.now()): Release {
   const { name, description } = validRelease(repo, body.name, body.description ?? '');
-  const r: Release = { id: uid(), repo, name, description, status: 'planning', createdBy: ownerOf(by), createdAt: iso(createdMs), updatedAt: iso(createdMs), issues: [] };
+  const r: Release = {
+    id: uid(), repo, name, description, status: 'planning', createdBy: ownerOf(by), createdAt: iso(createdMs), updatedAt: iso(createdMs), issues: [],
+    owner: null, scheduledAt: null, waitingFor: null, startFailure: null,
+  };
   db.releases.set(r.id, r);
   feed({ type: 'release', repo, release: r });
   return r;
@@ -797,6 +800,7 @@ export function updateRelease(r: Release, body: { name: string; description: str
 }
 
 export function deleteRelease(r: Release) {
+  if (r.status === 'scheduled') throw new MockError(409, 'release_scheduled', 'Cancel the scheduled start before deleting this release');
   db.releases.delete(r.id);
   feed({ type: 'release_deleted', repo: r.repo, releaseId: r.id });
 }
@@ -834,6 +838,87 @@ export function assignIssues(repo: string, numbers: number[], releaseId: string 
   }
   changed.forEach(touchRelease);
   return releasesOf(repo);
+}
+
+// Scheduled start (docs/ARCHITECTURE.md §6 "Scheduled start"). The mock behaves like a default server build:
+// building is not available yet, so a release whose time comes returns to planning with that reason.
+
+export const RELEASE_START_UNAVAILABLE = 'Building releases is not available in this version of Agern yet (issue #19).';
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})$/i;
+const scheduleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** `/factory releases` state text, as the server's `ReleaseService.describe`. */
+export function releaseState(r: Release): string {
+  if (r.status === 'scheduled') {
+    const at = r.scheduledAt ? new Date(r.scheduledAt).toISOString().replace('.000Z', 'Z') : '?';
+    return `scheduled for ${at} by ${r.owner?.username ?? 'unknown'}${r.waitingFor ? `, waiting for release "${r.waitingFor.name}"` : ''}`;
+  }
+  if (r.status === 'planning') return `in preparation${r.startFailure ? ` (scheduled start failed: ${r.startFailure.reason})` : ''}`;
+  return r.status;
+}
+
+function armSchedule(r: Release) {
+  clearTimeout(scheduleTimers.get(r.id));
+  scheduleTimers.delete(r.id);
+  if (r.status !== 'scheduled' || !r.scheduledAt) return;
+  // setTimeout holds at most ~24.8 days; longer waits re-arm when they fire.
+  const wait = Math.min(Math.max(0, Date.parse(r.scheduledAt) - Date.now()), 2 ** 31 - 1);
+  scheduleTimers.set(r.id, setTimeout(() => releaseDue(r.id), wait));
+}
+
+function releaseDue(id: string) {
+  scheduleTimers.delete(id);
+  const r = db.releases.get(id);
+  if (!r || r.status !== 'scheduled' || !r.scheduledAt) return;
+  if (Date.parse(r.scheduledAt) > Date.now()) return armSchedule(r);
+  const busy = releasesOf(r.repo).find((x) => x.id !== r.id && (x.status === 'building' || x.status === 'paused'));
+  if (busy) {
+    if (r.waitingFor?.id !== busy.id) {
+      r.waitingFor = { id: busy.id, name: busy.name };
+      touchRelease(r);
+    }
+    scheduleTimers.set(r.id, setTimeout(() => releaseDue(r.id), 15_000));
+    return;
+  }
+  const owner = r.owner ?? r.createdBy;
+  Object.assign(r, { status: 'planning', owner: null, scheduledAt: null, waitingFor: null, startFailure: { at: iso(Date.now()), owner, reason: RELEASE_START_UNAVAILABLE } });
+  touchRelease(r);
+}
+
+function requireScheduleOwner(r: Release, by: User) {
+  if (!by.isAdmin && r.owner?.username !== by.username)
+    throw new MockError(403, 'forbidden', `Only ${r.owner?.username ?? 'its owner'} or an admin can change this schedule`);
+}
+
+/** Sets (caller becomes the owner) or changes (owner or admin) the scheduled start. */
+export function scheduleRelease(r: Release, startAt: string, by: User): Release {
+  const ms = Date.parse(startAt);
+  if (!ISO_INSTANT.test(startAt.trim()) || Number.isNaN(ms)) throw new MockError(400, 'bad_request', 'startAt must be an ISO-8601 time');
+  if (ms <= Date.now()) throw new MockError(400, 'bad_request', 'The start time must be in the future');
+  if (ms > Date.now() + 366 * 86400_000) throw new MockError(400, 'bad_request', 'The start time is too far ahead (at most a year)');
+  if (r.status === 'planning') {
+    if (!by.hasClaudeCredential) throw new MockError(422, 'claude_credential_required', 'Register a Claude credential in Settings first');
+    if (!by.hasGithubToken) throw new MockError(403, 'forbidden', 'Register a GitHub token in Settings first');
+    Object.assign(r, { status: 'scheduled', owner: ownerOf(by), scheduledAt: iso(ms), waitingFor: null, startFailure: null });
+  } else if (r.status === 'scheduled') {
+    requireScheduleOwner(r, by);
+    Object.assign(r, { scheduledAt: iso(ms), waitingFor: null });
+  } else {
+    throw new MockError(409, 'release_not_schedulable', `Release is ${r.status}; only a release in preparation can be scheduled`);
+  }
+  armSchedule(r);
+  touchRelease(r);
+  return r;
+}
+
+/** Back to a shared plan: owner, time and waiting cleared; an earlier start failure is kept. */
+export function cancelReleaseSchedule(r: Release, by: User): Release {
+  if (r.status !== 'scheduled') throw new MockError(409, 'release_not_scheduled', 'This release has no scheduled start');
+  requireScheduleOwner(r, by);
+  Object.assign(r, { status: 'planning', owner: null, scheduledAt: null, waitingFor: null });
+  armSchedule(r);
+  touchRelease(r);
+  return r;
 }
 
 export function reorderRelease(r: Release, numbers: number[]) {
@@ -925,7 +1010,13 @@ function seed() {
     const i = db.issues['web-shop'].find((x) => x.number === n)!;
     return { number: n, title: i.title, kind: i.kind };
   });
-  createRelease('web-shop', { name: 'chat-cleanup', description: '' }, bob, Date.now() - 86400_000);
+  const cleanup = createRelease('web-shop', { name: 'chat-cleanup', description: '' }, bob, Date.now() - 86400_000);
+  // Scheduled by its creator for tomorrow 22:00 local time.
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  tomorrow.setHours(22, 0, 0, 0);
+  Object.assign(cleanup, { status: 'scheduled', owner: ownerOf(bob), scheduledAt: iso(tomorrow.getTime()) });
+  armSchedule(cleanup);
 
   // Historical runs (instant).
   const never = () => false;
