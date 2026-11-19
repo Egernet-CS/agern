@@ -94,7 +94,17 @@ data class ReleaseDto(
     val createdBy: OwnerDto, val createdAt: String, val updatedAt: String,
     /** In build order. */
     val issues: List<ReleaseIssueDto>,
+    /** The user who scheduled the release; non-null while `scheduled`. */
+    val owner: OwnerDto?,
+    /** ISO instant of the scheduled start; non-null exactly while `scheduled`. */
+    val scheduledAt: String?,
+    /** The release this one waits behind (only while `scheduled` and due). */
+    val waitingFor: IssueReleaseDto?,
+    /** The last scheduled start that did not happen; kept until the release is scheduled again. */
+    val startFailure: ReleaseStartFailureDto?,
 )
+
+@Serializable data class ReleaseStartFailureDto(val at: String, val owner: OwnerDto, val reason: String)
 
 @Serializable data class OwnerDto(val username: String, val displayName: String)
 
@@ -227,9 +237,17 @@ object RunStatus {
     val ALL = ACTIVE + TERMINAL
 }
 
-/** Release states. Step 1 of releases only plans; later steps add the building and releasing states. */
+/**
+ * Release states. `planning` and `scheduled` are set by planning and the scheduler; `building` and `paused` belong to
+ * step 2 (#19) and are only set by a [ReleaseStarter] so far.
+ */
 object ReleaseStatus {
     const val PLANNING = "planning"
+    const val SCHEDULED = "scheduled"
+    const val BUILDING = "building"
+    const val PAUSED = "paused"
+    /** States in which a release occupies its project: a due release of the same project waits. */
+    val OCCUPYING = setOf(BUILDING, PAUSED)
 }
 
 object SessionStatus {

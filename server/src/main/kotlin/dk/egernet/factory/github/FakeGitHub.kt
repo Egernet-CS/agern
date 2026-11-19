@@ -18,6 +18,8 @@ class FakeGitHub(private val org: String) : GitHub {
     val pulls = mutableMapOf<String, MutableList<GhPull>>()
     /** Lets tests make merges fail. */
     @Volatile var failMerge = false
+    /** Lets tests make `getRepo` fail with this HTTP status (e.g. 503 for a transient GitHub error). */
+    @Volatile var getRepoFailure: Int? = null
 
     override val isFake = true
     override fun cloneUrl(org: String, repo: String) = "fake://$org/$repo"
@@ -81,6 +83,7 @@ class FakeGitHub(private val org: String) : GitHub {
         }
 
         override fun getRepo(org: String, repo: String) = synchronized(this@FakeGitHub) {
+            getRepoFailure?.let { throw GitHubException(it, "GitHub getRepo failed: $it") }
             runCatching { ghRepo(repo(org, repo)) }.getOrNull()
         }
 

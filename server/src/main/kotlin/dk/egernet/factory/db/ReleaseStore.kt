@@ -1,8 +1,10 @@
 package dk.egernet.factory.db
 
+import dk.egernet.factory.IssueReleaseDto
 import dk.egernet.factory.OwnerDto
 import dk.egernet.factory.ReleaseDto
 import dk.egernet.factory.ReleaseIssueDto
+import dk.egernet.factory.ReleaseStartFailureDto
 import dk.egernet.factory.ReleaseStatus
 import dk.egernet.factory.conflict
 import java.sql.Connection
@@ -17,10 +19,27 @@ data class ReleaseRecord(
     val id: UUID, val repo: String, val name: String, val description: String, val status: String,
     val createdBy: UUID, val createdByUsername: String, val createdByDisplayName: String,
     val createdAt: Instant, val updatedAt: Instant, val issues: List<ReleaseIssueRecord>,
+    /** The user who scheduled the release (later: whose credentials build it). */
+    val ownerId: UUID? = null, val ownerUsername: String? = null, val ownerDisplayName: String? = null,
+    val scheduledAt: Instant? = null,
+    val waitingForId: UUID? = null, val waitingForName: String? = null,
+    val startFailedAt: Instant? = null, val startFailedOwnerId: UUID? = null,
+    val startFailedOwnerUsername: String? = null, val startFailedOwnerDisplayName: String? = null,
+    val startFailedReason: String? = null,
 ) {
     fun toDto() = ReleaseDto(
         id.toString(), repo, name, description, status, OwnerDto(createdByUsername, createdByDisplayName),
         createdAt.iso(), updatedAt.iso(), issues.map { ReleaseIssueDto(it.number, it.title, it.kind) },
+        owner = ownerUsername?.let { OwnerDto(it, ownerDisplayName ?: it) },
+        scheduledAt = scheduledAt?.iso(),
+        waitingFor = if (waitingForId != null && waitingForName != null) IssueReleaseDto(waitingForId.toString(), waitingForName) else null,
+        startFailure = if (startFailedAt != null && startFailedReason != null) {
+            ReleaseStartFailureDto(
+                startFailedAt.iso(),
+                OwnerDto(startFailedOwnerUsername ?: "unknown", startFailedOwnerDisplayName ?: startFailedOwnerUsername ?: "unknown"),
+                startFailedReason,
+            )
+        } else null,
     )
 }
 
@@ -32,13 +51,27 @@ data class IssueToAssign(val number: Int, val title: String, val kind: String)
  * (primary key of `release_issues`); changes to assignments and order are serialised per repo by an advisory lock.
  */
 class ReleaseStore(private val db: Db) {
-    private val select = """SELECT r.*, u.username AS created_by_username, u.display_name AS created_by_display_name
-        FROM releases r JOIN users u ON u.id = r.created_by"""
+    private val select = """SELECT r.*, u.username AS created_by_username, u.display_name AS created_by_display_name,
+          o.username AS owner_username, o.display_name AS owner_display_name,
+          fo.username AS start_failed_owner_username, fo.display_name AS start_failed_owner_display_name,
+          w.name AS waiting_for_name
+        FROM releases r JOIN users u ON u.id = r.created_by
+        LEFT JOIN users o ON o.id = r.owner_id
+        LEFT JOIN users fo ON fo.id = r.start_failed_owner
+        LEFT JOIN releases w ON w.id = r.waiting_for"""
 
     private fun mapRow(rs: ResultSet) = ReleaseRecord(
         rs.uuid("id"), rs.getString("repo"), rs.getString("name"), rs.getString("description"), rs.getString("status"),
         rs.uuid("created_by"), rs.getString("created_by_username"), rs.getString("created_by_display_name"),
         rs.instant("created_at"), rs.instant("updated_at"), emptyList(),
+        ownerId = rs.uuidOrNull("owner_id"), ownerUsername = rs.getString("owner_username"),
+        ownerDisplayName = rs.getString("owner_display_name"),
+        scheduledAt = rs.instantOrNull("scheduled_at"),
+        waitingForId = rs.uuidOrNull("waiting_for"), waitingForName = rs.getString("waiting_for_name"),
+        startFailedAt = rs.instantOrNull("start_failed_at"), startFailedOwnerId = rs.uuidOrNull("start_failed_owner"),
+        startFailedOwnerUsername = rs.getString("start_failed_owner_username"),
+        startFailedOwnerDisplayName = rs.getString("start_failed_owner_display_name"),
+        startFailedReason = rs.getString("start_failed_reason"),
     )
 
     private fun issuesOf(ids: List<UUID>): Map<UUID, List<ReleaseIssueRecord>> {
@@ -94,7 +127,70 @@ class ReleaseStore(private val db: Db) {
         }
     }
 
-    fun delete(id: UUID): Boolean = db.update("DELETE FROM releases WHERE id = ?", id) > 0
+    /** Deletes the release unless it is `scheduled` (the schedule must be cancelled first). */
+    fun delete(id: UUID): Boolean = db.update("DELETE FROM releases WHERE id = ? AND status <> ?", id, ReleaseStatus.SCHEDULED) > 0
+
+    // ---------------------------------------------------------------- scheduled start (§6 "Scheduled start")
+    // Every state change is conditional on the expected status and reports whether it applied.
+
+    private val bump = "updated_at = GREATEST(now(), date_trunc('milliseconds', updated_at) + interval '1 millisecond')"
+
+    /** `planning` → `scheduled` with [ownerId] as owner; clears an earlier start failure. */
+    fun schedule(id: UUID, ownerId: UUID, at: Instant): Boolean = db.update(
+        """UPDATE releases SET status = ?, owner_id = ?, scheduled_at = ?, waiting_for = NULL,
+           start_failed_at = NULL, start_failed_owner = NULL, start_failed_reason = NULL, $bump
+           WHERE id = ? AND status = ?""",
+        ReleaseStatus.SCHEDULED, ownerId, at, id, ReleaseStatus.PLANNING,
+    ) > 0
+
+    /** A new time for a `scheduled` release; the owner stays. */
+    fun reschedule(id: UUID, at: Instant): Boolean = db.update(
+        "UPDATE releases SET scheduled_at = ?, waiting_for = NULL, $bump WHERE id = ? AND status = ?",
+        at, id, ReleaseStatus.SCHEDULED,
+    ) > 0
+
+    /** `scheduled` → `planning`; the owner, time and waiting are cleared, an earlier start failure is kept. */
+    fun unschedule(id: UUID): Boolean = db.update(
+        "UPDATE releases SET status = ?, owner_id = NULL, scheduled_at = NULL, waiting_for = NULL, $bump WHERE id = ? AND status = ?",
+        ReleaseStatus.PLANNING, id, ReleaseStatus.SCHEDULED,
+    ) > 0
+
+    /** Scheduled releases whose time has come, oldest first. */
+    fun due(now: Instant): List<ReleaseRecord> = withIssues(
+        db.query(
+            "$select WHERE r.status = ? AND r.scheduled_at <= ? ORDER BY r.scheduled_at, r.created_at, r.id",
+            ReleaseStatus.SCHEDULED, now, map = ::mapRow,
+        ),
+    )
+
+    /** A release of [repo] other than [exceptId] that occupies the project (`building` or `paused`), if any. */
+    fun occupying(repo: String, exceptId: UUID): ReleaseRecord? {
+        val states = ReleaseStatus.OCCUPYING.toList()
+        return db.queryOne(
+            "$select WHERE r.repo = ? AND r.id <> ? AND r.status IN (${states.joinToString(",") { "?" }}) ORDER BY r.created_at, r.id LIMIT 1",
+            repo, exceptId, *states.toTypedArray(), map = ::mapRow,
+        )
+    }
+
+    /** Sets or clears what a `scheduled` release waits behind; true only if the value changed. */
+    fun setWaitingFor(id: UUID, otherId: UUID?): Boolean = db.update(
+        "UPDATE releases SET waiting_for = CAST(? AS uuid) WHERE id = ? AND status = ? AND waiting_for IS DISTINCT FROM CAST(? AS uuid)",
+        otherId, id, ReleaseStatus.SCHEDULED, otherId,
+    ) > 0
+
+    /** `scheduled` → `planning`, recording why the scheduled start did not happen. */
+    fun failStart(id: UUID, at: Instant, ownerId: UUID?, reason: String): Boolean = db.update(
+        """UPDATE releases SET status = ?, owner_id = NULL, scheduled_at = NULL, waiting_for = NULL,
+           start_failed_at = ?, start_failed_owner = ?, start_failed_reason = ?, $bump
+           WHERE id = ? AND status = ?""",
+        ReleaseStatus.PLANNING, at, ownerId, reason, id, ReleaseStatus.SCHEDULED,
+    ) > 0
+
+    /** `scheduled` → `building`, keeping the owner. For [dk.egernet.factory.ReleaseStarter]s and tests. */
+    fun markBuilding(id: UUID): Boolean = db.update(
+        "UPDATE releases SET status = ?, scheduled_at = NULL, waiting_for = NULL, $bump WHERE id = ? AND status = ?",
+        ReleaseStatus.BUILDING, id, ReleaseStatus.SCHEDULED,
+    ) > 0
 
     /** Release id and name per assigned issue number of [repo]. */
     fun releaseByIssue(repo: String): Map<Int, Pair<UUID, String>> = db.query(

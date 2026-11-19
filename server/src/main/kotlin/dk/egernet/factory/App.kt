@@ -51,6 +51,10 @@ class Services(
     val launcher: AgentLauncher,
     val auth: AuthService = AuthService.fromConfig(cfg),
     val loginThrottle: dk.egernet.factory.auth.LoginThrottle = dk.egernet.factory.auth.LoginThrottle(),
+    /** Time source of the release scheduler (tests use a controllable clock). */
+    val clock: java.time.Clock = java.time.Clock.systemUTC(),
+    /** What a scheduled start calls; [ReleaseStarter.Unavailable] until step 2 (#19) provides building releases. */
+    releaseStarter: ReleaseStarter = ReleaseStarter.Unavailable,
 ) {
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     val box = SecretBox(cfg.masterKey)
@@ -73,7 +77,8 @@ class Services(
     val agents = AgentManager(cfg, sessions, events, access, launcher, bus, mcpRegistry, settings, prompts, workspaces, scope, attachments, preferences)
     val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences)
     val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
-    val releases = ReleaseService(cfg, access, releaseStore, bus)
+    val releaseScheduler = ReleaseScheduler(cfg, clock, releaseStore, users, access, bus, releaseStarter)
+    val releases = ReleaseService(cfg, access, releaseStore, bus, releaseScheduler)
     val factory = FactoryService(cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases)
     val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version)
 
@@ -91,6 +96,7 @@ class Services(
 
     fun start() {
         recoverAfterRestart()
+        releaseScheduler.start(scope)
         agents.startIdleReaper()
         attachments.startReaper(scope)
     }

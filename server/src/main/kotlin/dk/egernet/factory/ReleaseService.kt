@@ -10,6 +10,8 @@ import dk.egernet.factory.github.Access
 import dk.egernet.factory.github.GitHubException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.time.Instant
+import java.time.format.DateTimeParseException
 import java.util.UUID
 
 /**
@@ -22,6 +24,7 @@ class ReleaseService(
     private val access: Access,
     private val store: ReleaseStore,
     private val bus: EventBus,
+    private val scheduler: ReleaseScheduler,
 ) {
     companion object {
         /** Safe as the git branch `release/<name>` and in URLs. */
@@ -117,8 +120,28 @@ class ReleaseService(
 
     suspend fun delete(user: UserRecord, id: UUID) {
         val r = visible(user, id)
-        if (io { store.delete(id) }) bus.emitFeed(FeedItem.ReleaseDeleted(r.repo, r.id.toString()))
+        val scheduled = conflict("Cancel the scheduled start before deleting this release", "release_scheduled")
+        if (r.status == ReleaseStatus.SCHEDULED) throw scheduled
+        if (io { store.delete(id) }) {
+            bus.emitFeed(FeedItem.ReleaseDeleted(r.repo, r.id.toString()))
+        } else if (io { store.get(id) }?.status == ReleaseStatus.SCHEDULED) {
+            throw scheduled // scheduled in the meantime
+        }
     }
+
+    /** Sets or changes the scheduled start (§6 "Scheduled start"); [startAt] is an ISO-8601 instant. */
+    suspend fun schedule(user: UserRecord, id: UUID, startAt: String): ReleaseRecord {
+        val r = visible(user, id)
+        val at = try {
+            Instant.parse(startAt.trim())
+        } catch (e: DateTimeParseException) {
+            throw badRequest("startAt must be an ISO-8601 time")
+        }
+        return scheduler.schedule(user, r, at)
+    }
+
+    /** Cancels the scheduled start; the release is in preparation again. */
+    suspend fun cancelSchedule(user: UserRecord, id: UUID): ReleaseRecord = scheduler.cancel(user, visible(user, id))
 
     /** What an assignment did, for `/factory` and MCP replies. */
     data class AssignOutcome(val release: ReleaseRecord?, val added: List<Int>, val movedFrom: Map<String, List<Int>>, val removed: List<Int>)
@@ -170,6 +193,15 @@ class ReleaseService(
     fun releaseByIssue(repo: String): Map<Int, IssueReleaseDto> =
         store.releaseByIssue(repo).mapValues { (_, v) -> IssueReleaseDto(v.first.toString(), v.second) }
 
+    private fun state(r: ReleaseRecord): String = when (r.status) {
+        ReleaseStatus.PLANNING -> "in preparation" + (r.startFailedReason?.let { " (scheduled start failed: $it)" } ?: "")
+        ReleaseStatus.SCHEDULED -> buildString {
+            append("scheduled for ${r.scheduledAt} by ${r.ownerUsername ?: "unknown"}")
+            r.waitingForName?.let { append(", waiting for release \"$it\"") }
+        }
+        else -> r.status
+    }
+
     /** Plain-text overview for `/factory releases` and `factory_list_releases`. */
     suspend fun describe(user: UserRecord, repo: String, withIds: Boolean): String {
         val list = list(user, repo)
@@ -177,7 +209,7 @@ class ReleaseService(
         return list.joinToString("\n\n", "Releases in $repo (newest first):\n") { r ->
             val n = r.issues.size
             buildString {
-                append("• ${r.name} — in preparation, $n issue${if (n == 1) "" else "s"}")
+                append("• ${r.name} — ${state(r)}, $n issue${if (n == 1) "" else "s"}")
                 if (withIds) append(" (id ${r.id})")
                 r.issues.forEach { append("\n    #${it.number} ${it.title}") }
             }
