@@ -46,6 +46,9 @@ class McpServer(
                 if (type == "state") {
                     put("type", "string")
                     putJsonArray("enum") { add(JsonPrimitive("open")); add(JsonPrimitive("closed")); add(JsonPrimitive("all")) }
+                } else if (type == "role") {
+                    put("type", "string")
+                    putJsonArray("enum") { add(JsonPrimitive("spec-writer")); add(JsonPrimitive("builder")) }
                 } else if (type == "kind") {
                     put("type", "string")
                     putJsonArray("enum") { add(JsonPrimitive("feature")); add(JsonPrimitive("bug")); add(JsonPrimitive("task")) }
@@ -76,6 +79,14 @@ class McpServer(
             schema(Triple("runId", "string", "Run id"), required = listOf("runId"))),
         Tool("factory_cancel_run", "Cancel a pipeline run.",
             schema(Triple("runId", "string", "Run id"), required = listOf("runId"))),
+        Tool("factory_send_to_agent", "Pass a message from the person you are talking to (who must own the run) to a running " +
+            "pipeline agent — the spec-writer or the builder — e.g. \"tell the builder the button should be blue\". Address it " +
+            "by runId (+ role; without role: the run's running spec-writer or builder) or by sessionId. The message is queued " +
+            "and picked up at the agent's next step (after its current tool call). Reviewers, the approver and finished agents " +
+            "do not accept messages. The message is not posted on GitHub.",
+            schema(Triple("runId", "string", "Run id"), Triple("role", "role", "spec-writer or builder (optional with runId)"),
+                Triple("sessionId", "string", "The agent's session id (instead of runId + role)"),
+                Triple("message", "string", "The message, as the person meant it"), required = listOf("message"))),
         Tool("factory_request_software", "Ask an administrator to install software on the factory host. " +
             "Use this instead of installing system-wide software yourself.",
             schema(Triple("name", "string", "Software name, e.g. 'ffmpeg' or 'JDK 21'"),
@@ -166,6 +177,18 @@ class McpServer(
                 }
                 "factory_approve_run" -> factory.approveRun(owner, uuid("runId")).let { "Run ${it.id}: ${it.status}" + (it.error?.let { e -> " — $e" } ?: "") }
                 "factory_cancel_run" -> factory.cancelRun(owner, uuid("runId")).let { "Run ${it.id}: ${it.status}" }
+                "factory_send_to_agent" -> {
+                    if (grant.runId != null) return toolError("Not available to pipeline agents")
+                    val ids = listOf("runId", "sessionId").associateWith { k -> str(k)?.trim()?.takeIf { it.isNotEmpty() } }
+                    val bad = ids.entries.firstOrNull { (_, v) -> v != null && runCatching { UUID.fromString(v) }.isFailure }
+                    if (bad != null) return toolError("${bad.key} is not a valid id")
+                    val m = factory.sendToAgent(
+                        owner, ids["runId"]?.let(UUID::fromString), str("role")?.takeIf { it.isNotBlank() }, ids["sessionId"]?.let(UUID::fromString),
+                        str("message") ?: return toolError("message is required"), viaChatSession = grant.sessionId, repo = repo,
+                    )
+                    "Queued for the ${m.role} (message ${m.messageId}, session ${m.sessionId}). It is delivered at the agent's next " +
+                        "step, after its current tool call; the agent's transcript on the run page shows when it was picked up."
+                }
                 "factory_request_software" -> {
                     val sr = factory.requestSoftware(owner, repo, grant.sessionId, str("name") ?: "", str("reason") ?: "")
                     "Request ${sr.id} filed for '${sr.name}'. An administrator will handle it; continue without it for now."

@@ -15,6 +15,8 @@ Behaviour
     - text containing "env"   -> replies with the names of its environment variables
     - text containing "install" -> files a software request through the MCP tool factory_request_software
     - text containing "long"  -> replies with 80 numbered lines (a transcript taller than the screen)
+    - "forward <runId> <role>: <message>" -> passes <message> to that run's agent through the MCP tool
+                                 factory_send_to_agent and reports the tool's answer
     - content blocks: image blocks are decoded and reported ("IMAGE 1: image/png 32x32, 70 bytes"); the
       "[Attachments]" text block's paths are checked on disk ("FILE ok name 123 bytes" / "FILE missing ...").
       Trigger words are only looked for in the user's own text, not in that listing.
@@ -22,7 +24,13 @@ Behaviour
   Conversations are remembered under $HOME/.fake-claude/sessions/<id>. Like the real CLI,
   --resume <id> of an unknown conversation fails at once ("No conversation found with session ID").
   A Claude credential containing "invalid" is rejected like a bad key ("Invalid API key").
-  One-shot (prompt on stdin), role taken from "# Role: <role>" in --append-system-prompt:
+  Pipeline stages, role taken from "# Role: <role>" in --append-system-prompt. Reviewers and the approver
+  are one-shot (prompt on stdin as text). With --input-format stream-json (spec-writer, builder) the prompt
+  is the first stream-json user message and stdin stays open; this mirrors the real CLI (verified with
+  Claude Code 2.1.328, see docs/ARCHITECTURE.md §6): a message written mid-turn is picked up after the
+  current tool round of the same turn (with --replay-user-messages it is echoed back with "isReplay": true
+  at that moment), and one that arrives after the last tool round starts a further turn with its own
+  `result`. The process exits when stdin is closed.
     - spec-writer: prints a small spec
     - builder: appends a line to AGERN_FAKE.md and commits it (if the cwd is a git repository)
     - reviewers (--json-schema with PASS/CHANGES): PASS, unless the prompt contains
@@ -31,10 +39,14 @@ Behaviour
     - "fake:fail-<role>" anywhere in the prompt makes that role exit with status 1 and no result
     - "fake:hang-<role>" makes that role hang until it is killed (stage time limit, cancel)
     - "fake:slow" makes every stage take ~1.5 s, so the pipeline can be watched advancing
+    - "fake:busy-<role>" makes that (stream-json) role work in Bash steps of ~0.4 s for up to ~2 minutes,
+      until a message from the owner contains "finish"; each picked-up message is acknowledged with
+      "Noted the owner's message: ..." and listed in the final result
 """
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -279,6 +291,19 @@ def chat_mode():
                                if isinstance(c, dict) and c.get("type") == "text" and not c.get("text", "").startswith("[Attachments]"))
         interrupt_flag["set"] = False
         init_event()
+        forward = re.match(r"\s*forward (\S+) (\S+?):\s*(.+)$", content, re.S)
+        if forward and mcp_config:
+            try:
+                mcp_call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake-claude", "version": "0"}}, 1)
+                res = mcp_call("tools/call", {"name": "factory_send_to_agent", "arguments": {
+                    "runId": forward.group(1), "role": forward.group(2), "message": forward.group(3).strip()}}, 2)
+                text = res["result"]["content"][0]["text"]
+                reply = ("Could not forward it: " if res["result"].get("isError") else "Forwarded. ") + text
+            except Exception as e:  # noqa
+                reply = "MCP call failed: %s" % e
+            stream_text(reply)
+            result(reply)
+            continue
         if "crash" in content:
             sys.stderr.write("fake-claude: crashing as requested\n")
             sys.exit(3)
@@ -307,7 +332,7 @@ def chat_mode():
                 reply += "\n" + res["result"]["content"][0]["text"]
             except Exception as e:  # noqa
                 reply += "\nMCP call failed: %s" % e
-        if "slow" in content:
+        if "slow" in content and not forward:
             chunks = ["%d " % i for i in range(1, 41)]
             ok, sent = stream_text("".join(chunks), chunk_delay=0.25, chunks=chunks,
                                    interrupted=lambda: (drain_controls() or interrupt_flag["set"]))
@@ -323,8 +348,14 @@ def chat_mode():
 
 # --------------------------------------------------------------------------- one-shot mode
 
-def one_shot():
-    prompt = sys.stdin.read()
+def owner_text(t):
+    """The owner's own words of a forwarded message (the server prefixes it with who sent it)."""
+    head = "Message from the run owner"
+    return t.split("\n\n", 1)[1] if t.startswith(head) and "\n\n" in t else t
+
+
+def run_stage(prompt, checkpoint=lambda: None, received=()):
+    """One pipeline stage's first turn. [checkpoint] is called between steps (after each tool round)."""
     init_event()
     if ("fake:fail-%s" % role) in prompt:
         sys.stderr.write("fake-claude: failing %s as requested\n" % role)
@@ -335,6 +366,12 @@ def one_shot():
             time.sleep(1)
     if "fake:slow" in prompt:
         time.sleep(1.5)
+    if ("fake:busy-%s" % role) in prompt:
+        for i in range(1, 301):
+            tool_roundtrip("sleep 0.4; echo working, step %d" % i)
+            checkpoint()
+            if any("finish" in m for m in received):
+                break
     if schema and "APPROVE" in schema:
         verdict = "ESCALATE" if "fake:escalate" in prompt else "APPROVE"
         out = {"verdict": verdict, "summary": "Fake approver says %s." % verdict}
@@ -353,23 +390,105 @@ def one_shot():
         return
     if role == "builder":
         tool_roundtrip("git status --short | head -5")
+        checkpoint()
         if os.path.isdir(".git") or os.path.isfile(".git"):
             with open("AGERN_FAKE.md", "a") as f:
                 f.write("fake build at %s\n" % time.strftime("%Y-%m-%dT%H:%M:%S"))
             subprocess.run(["git", "add", "AGERN_FAKE.md"], check=False)
             subprocess.run(["git", "commit", "-q", "-m", "Fake build commit"], check=False)
         text = "Implemented the change (fake). Ran no tests because I am a stub."
+        if received:
+            text += "\nOwner messages handled: " + "; ".join(received)
         stream_text(text)
         result(text)
         return
     if role == "spec-writer":
+        checkpoint()
         text = "## Summary\nA fake spec.\n\n## Acceptance criteria\n- [ ] Something happens\n"
+        if received:
+            text += "\n## Notes from the owner\n" + "".join("- %s\n" % m for m in received)
         stream_text(text)
         result(text)
         return
     text = "Done (fake)."
     stream_text(text)
     result(text)
+
+
+def one_shot():
+    run_stage(sys.stdin.read())
+
+
+def stage_stream_mode():
+    """A spec-writer/builder with stream-json input: the first user message is the task, later ones steer it."""
+    replay = "--replay-user-messages" in args
+    inbox = queue.Queue()
+
+    def reader():
+        for line in sys.stdin:
+            line = line.strip()
+            if line:
+                try:
+                    inbox.put(json.loads(line))
+                except ValueError:
+                    pass
+        inbox.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    received = []
+    state = {"eof": False}
+
+    def pick_up(m):
+        if replay:
+            emit({"type": "user", "message": m.get("message", {}), "session_id": session_id, "parent_tool_use_id": None,
+                  "uuid": str(uuid.uuid4()), "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "isReplay": True})
+        c = m.get("message", {}).get("content", "")
+        if isinstance(c, list):
+            c = " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+        return c
+
+    def next_user(block):
+        while True:
+            if state["eof"]:
+                return None
+            try:
+                m = inbox.get() if block else inbox.get_nowait()
+            except queue.Empty:
+                return None
+            if m is None:
+                state["eof"] = True
+                return None
+            if m.get("type") == "control_request":
+                emit({"type": "control_response", "response": {"subtype": "success", "request_id": m.get("request_id"), "response": {}}})
+                continue
+            if m.get("type") == "user":
+                return m
+
+    def checkpoint():
+        # Like the real CLI: what arrived during the current step is picked up before the next one.
+        while True:
+            m = next_user(False)
+            if m is None:
+                return
+            t = owner_text(pick_up(m))
+            received.append(t)
+            stream_text("Noted the owner's message: " + t)
+
+    first = next_user(True)
+    if first is None:
+        return
+    run_stage(pick_up(first), checkpoint, received)
+    # Messages that arrive after the last step start a further turn, each with its own result.
+    while True:
+        m = next_user(True)
+        if m is None:
+            return
+        t = owner_text(pick_up(m))
+        received.append(t)
+        init_event()
+        reply = "Follow-up from the owner handled: " + t
+        stream_text(reply)
+        result(reply)
 
 
 def credential_rejected():
@@ -389,7 +508,9 @@ if __name__ == "__main__":
         emit({"type": "result", "subtype": "success", "is_error": True, "duration_ms": 10, "num_turns": 1,
               "result": "Invalid API key · Please run /login", "session_id": session_id, "total_cost_usd": 0})
         sys.exit(1)
-    if interactive:
+    if interactive and role != "chat":
+        stage_stream_mode()
+    elif interactive:
         chat_mode()
     else:
         one_shot()

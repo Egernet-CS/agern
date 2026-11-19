@@ -26,10 +26,10 @@ class LocalLauncherTest {
     private val launcher = LocalProcessLauncher(bin, "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin")
     private val tmp = Files.createTempDirectory("agern-launch")
 
-    private fun spec(interactive: Boolean, role: String, schema: String? = null, prompt: String? = null) = LaunchSpec(
+    private fun spec(interactive: Boolean, role: String, schema: String? = null, prompt: String? = null, steerable: Boolean = false) = LaunchSpec(
         sessionId = UUID.randomUUID(), kind = role, model = "fake", workDir = tmp.resolve("work"), home = tmp.resolve("home"),
         identity = AgentIdentity("alice", "Alice", "alice", "ghp_x", ClaudeCredential("oauth_token", "sk-ant-oat-x")),
-        interactive = interactive, appendSystemPrompt = "# Role: $role\n", prompt = prompt, jsonSchema = schema,
+        interactive = interactive, steerable = steerable, appendSystemPrompt = "# Role: $role\n", prompt = prompt, jsonSchema = schema,
         mcpConfigJson = """{"mcpServers":{}}""",
     )
 
@@ -72,6 +72,39 @@ class LocalLauncherTest {
         assertTrue("CLAUDE_CODE_OAUTH_TOKEN" in names)
         p.closeInput()
         assertNotNull(withTimeout(10_000) { p.awaitExit() })
+        Unit
+    }
+
+    @Test
+    fun `steerable builder picks up a message after its current tool round, like the real CLI`() = runBlocking {
+        val p = launcher.launch(spec(false, "builder", prompt = "unused", steerable = true))
+        fun msg(t: String) = """{"type":"user","message":{"role":"user","content":${kotlinx.serialization.json.JsonPrimitive(t)}}}"""
+        p.send(msg("Build it. fake:busy-builder"))
+        val seen = mutableListOf<JsonObject>()
+        var sent = 0
+        withTimeout(30_000) {
+            for (line in p.lines) {
+                val o = AppJson.parseToJsonElement(line).jsonObject
+                if (o["type"]!!.jsonPrimitive.content == "stream_event") continue
+                seen += o
+                val toolResult = o["type"]!!.jsonPrimitive.content == "user" && o["isReplay"] == null
+                if (toolResult && sent == 0) { p.send(msg("Message from the run owner (alice) while you work:\n\nmake it blue")); sent++ }
+                else if (toolResult && sent == 1 && seen.count { it["isReplay"] != null } == 2) { p.send(msg("finish")); sent++ }
+                if (o["type"]!!.jsonPrimitive.content == "result") break
+            }
+        }
+        // Prompt and both messages are replayed (picked up) within the one turn, each right after a tool result.
+        val replays = seen.withIndex().filter { it.value["isReplay"] != null }
+        assertEquals(3, replays.size)
+        for (r in replays.drop(1)) assertEquals("user", seen[r.index - 1]["type"]!!.jsonPrimitive.content, "picked up after a tool round")
+        assertEquals(1, seen.count { it["type"]!!.jsonPrimitive.content == "result" })
+        assertTrue(seen.last()["result"]!!.jsonPrimitive.content.contains("Owner messages handled: make it blue; finish"))
+        // A message after the result is a further turn; closing stdin ends the process.
+        p.send(msg("one more"))
+        val more = withTimeout(10_000) { readUntilResult(p) }
+        assertTrue(more.last()["result"]!!.jsonPrimitive.content.contains("one more"))
+        p.closeInput()
+        assertEquals(0, withTimeout(10_000) { p.awaitExit() })
         Unit
     }
 }
