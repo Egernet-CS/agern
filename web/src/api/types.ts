@@ -228,7 +228,11 @@ export type SoftwareRequest = {
   resolvedAt: string | null;
 };
 
-export type FeedFrame = { type: 'session'; session: AgentSession } | { type: 'run'; run: Run };
+export type FeedFrame =
+  | { type: 'session'; session: AgentSession }
+  | { type: 'run'; run: Run }
+  /** An issue created through Agern, in list shape (no body). Event only: not replayed, not sent for changes made on GitHub. */
+  | { type: 'issue'; repo: string; issue: Issue };
 
 /** Agents are working on these runs. */
 export const WORKING_RUN_STATUSES: RunStatus[] = ['queued', 'spec', 'building', 'reviewing', 'approving'];

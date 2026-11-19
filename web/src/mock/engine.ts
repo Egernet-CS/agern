@@ -151,6 +151,12 @@ export function touchRun(r: Run, ts = iso(Date.now())) {
   r.updatedAt = ts;
   feed({ type: 'run', run: r });
 }
+/** Announces an issue created through Agern, in list shape (no body) like the server's `issue` frame. */
+export function announceIssue(repo: string, issue: Issue) {
+  const listed = { ...issue };
+  delete listed.body;
+  feed({ type: 'issue', repo, issue: listed });
+}
 
 function emit(sessionId: string, type: FactoryEvent['type'], payload: unknown, ts: string, live = false) {
   const list = db.events.get(sessionId) ?? [];
