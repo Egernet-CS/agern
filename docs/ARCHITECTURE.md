@@ -506,7 +506,12 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   streams live. Frames are `Event` JSON. Live-only partial deltas are sent as
   `{ seq: -1, type: 'claude', payload: { type: 'stream_event', … } }`.
 - `GET /api/ws/feed` — frames `{ type: 'session', session: AgentSession }` and
-  `{ type: 'run', run: Run }` whenever one the user may see changes.
+  `{ type: 'run', run: Run }` whenever one the user may see changes, and
+  `{ type: 'issue', repo: string, issue: Issue }` when an issue is created through Agern (the REST
+  route `POST /api/projects/{repo}/issues` or the MCP tool `factory_create_issue`). The issue is in
+  list shape (no `body`), and the frame passes the same per-user visibility filter as the others. The
+  feed is live only (no replay), so clients reload their issue lists and the project's open-issue count
+  after a reconnect. Issues created, edited or closed directly on GitHub are not announced.
 
 ## 9. Deployment and release
 
