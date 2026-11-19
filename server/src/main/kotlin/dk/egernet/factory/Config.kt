@@ -39,6 +39,8 @@ data class Config(
     val attachmentMaxMessageBytes: Long = 50L shl 20,
     /** FACTORY_ATTACHMENT_MAX_COUNT: attachments per message. */
     val attachmentMaxCount: Int = 10,
+    /** FACTORY_SANDBOX*: per-run build/test sandboxes (docs/ARCHITECTURE.md §5 "Sandboxes"). */
+    val sandbox: SandboxConfig = SandboxConfig(),
 ) {
     /** Agents reach the MCP endpoint over loopback, never through the public URL. */
     val mcpUrl: String get() = "http://127.0.0.1:$port/mcp"
@@ -60,7 +62,7 @@ data class Config(
         "Config(host=$host, port=$port, dbUrl=$dbUrl, dbUser=$dbUser, githubOrg=$githubOrg, auth=$authProviders, " +
             "admins=$admins, dataDir=$dataDir, webDir=$webDir, claudeBin=$claudeBin, publicUrl=$publicUrl, " +
             "maxAgentsPerUser=$maxAgentsPerUser, chatIdleMinutes=$chatIdleMinutes, stageTimeoutMs=$stageTimeoutMs, fakeGithub=$fakeGithub, " +
-            "attachments=${attachmentMaxCount}x${attachmentMaxBytes shr 20}MB/${attachmentMaxMessageBytes shr 20}MB)"
+            "attachments=${attachmentMaxCount}x${attachmentMaxBytes shr 20}MB/${attachmentMaxMessageBytes shr 20}MB, sandbox=$sandbox)"
 
     companion object {
         fun defaultAgentPath(): String =
@@ -133,6 +135,7 @@ data class Config(
                 attachmentMaxCount = (get("FACTORY_ATTACHMENT_MAX_COUNT")?.toIntOrNull() ?: get("FACTORY_ATTACHMENT_MAX_COUNT")?.let {
                     throw IllegalArgumentException("FACTORY_ATTACHMENT_MAX_COUNT must be a whole number")
                 } ?: 10).also { require(it in 1..20) { "FACTORY_ATTACHMENT_MAX_COUNT must be between 1 and 20" } },
+                sandbox = SandboxConfig.fromEnv(::get),
             ).also {
                 require(it.attachmentMaxMessageBytes >= it.attachmentMaxBytes) {
                     "FACTORY_ATTACHMENT_MAX_MESSAGE_MB must be at least FACTORY_ATTACHMENT_MAX_MB"
@@ -178,4 +181,89 @@ data class LdapConfig(
     val bindPassword: String? = null,
 ) {
     override fun toString() = "LdapConfig(url=$url, userDnTemplate=$userDnTemplate, baseDn=$baseDn, bindDn=$bindDn)"
+}
+
+/** Sandbox settings (docs/ARCHITECTURE.md §3, §5 "Sandboxes"). */
+data class SandboxConfig(
+    /** `off` (default) or `podman` (rootless Podman through its CLI). */
+    val mode: String = "off",
+    /** FACTORY_SANDBOX_PODMAN: the podman binary. */
+    val podmanBin: String = "podman",
+    /** FACTORY_SANDBOX_PODMAN_URL: when set, every call is `podman --url <url> …` (podman-remote against `podman system service`). */
+    val podmanUrl: String? = null,
+    /** FACTORY_SANDBOX_REGISTRIES: registries images may come from (host, or host:port), lower case. */
+    val registries: List<String> = DEFAULT_REGISTRIES,
+    /** FACTORY_SANDBOX_MAX_CPUS: upper limit (and default) for one container's CPUs. */
+    val maxCpus: Double = 2.0,
+    /** FACTORY_SANDBOX_MAX_MEMORY: upper limit (and default) for one container's memory, in bytes. */
+    val maxMemoryBytes: Long = 4L shl 30,
+    /** FACTORY_SANDBOX_MAX_CONCURRENT: sandboxes that may exist at the same time on this server. */
+    val maxConcurrent: Int = 2,
+    /** FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES: default and maximum for one command (also capped by the stage time limit). */
+    val execTimeoutMs: Long = 30 * 60_000L,
+) {
+    val enabled: Boolean get() = mode != "off"
+
+    override fun toString() = if (!enabled) "off" else
+        "SandboxConfig(mode=$mode, podman=$podmanBin, url=${podmanUrl ?: "-"}, registries=$registries, maxCpus=$maxCpus, " +
+            "maxMemory=${formatMemory(maxMemoryBytes)}, maxConcurrent=$maxConcurrent, execTimeoutMs=$execTimeoutMs)"
+
+    companion object {
+        val DEFAULT_REGISTRIES = listOf("docker.io", "ghcr.io", "quay.io", "mcr.microsoft.com")
+        private val REGISTRY_RE = Regex("^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]{1,5})?$")
+
+        fun fromEnv(get: (String) -> String?): SandboxConfig {
+            val mode = (get("FACTORY_SANDBOX") ?: "off").lowercase()
+            require(mode in setOf("off", "podman")) { "FACTORY_SANDBOX must be 'off' or 'podman'" }
+            val registries = get("FACTORY_SANDBOX_REGISTRIES")?.split(',')?.map { it.trim().lowercase() }?.filter { it.isNotEmpty() }
+                ?: DEFAULT_REGISTRIES
+            for (r in registries) require(REGISTRY_RE.matches(r)) { "FACTORY_SANDBOX_REGISTRIES: '$r' is not a registry host name" }
+            val cpus = get("FACTORY_SANDBOX_MAX_CPUS")?.let {
+                it.toDoubleOrNull() ?: throw IllegalArgumentException("FACTORY_SANDBOX_MAX_CPUS must be a number")
+            } ?: 2.0
+            require(cpus > 0 && cpus <= 256) { "FACTORY_SANDBOX_MAX_CPUS must be between 0 and 256" }
+            val memory = get("FACTORY_SANDBOX_MAX_MEMORY")?.let {
+                parseMemory(it) ?: throw IllegalArgumentException("FACTORY_SANDBOX_MAX_MEMORY must be a size like 4g or 512m")
+            } ?: (4L shl 30)
+            require(memory >= MIN_MEMORY) { "FACTORY_SANDBOX_MAX_MEMORY must be at least 64m" }
+            val concurrent = get("FACTORY_SANDBOX_MAX_CONCURRENT")?.let {
+                it.toIntOrNull() ?: throw IllegalArgumentException("FACTORY_SANDBOX_MAX_CONCURRENT must be a whole number")
+            } ?: 2
+            require(concurrent in 1..100) { "FACTORY_SANDBOX_MAX_CONCURRENT must be between 1 and 100" }
+            val execMinutes = get("FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES")?.let {
+                it.toLongOrNull() ?: throw IllegalArgumentException("FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES must be a whole number of minutes")
+            } ?: 30
+            require(execMinutes in 1..24 * 60) { "FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES must be between 1 and 1440" }
+            return SandboxConfig(
+                mode = mode,
+                podmanBin = get("FACTORY_SANDBOX_PODMAN") ?: "podman",
+                podmanUrl = get("FACTORY_SANDBOX_PODMAN_URL"),
+                registries = registries,
+                maxCpus = cpus,
+                maxMemoryBytes = memory,
+                maxConcurrent = concurrent,
+                execTimeoutMs = execMinutes * 60_000L,
+            )
+        }
+
+        const val MIN_MEMORY = 64L shl 20
+        private val MEMORY_RE = Regex("^([0-9]+)\\s*([kmgt]?)i?b?$", RegexOption.IGNORE_CASE)
+
+        /** `4g`, `512m`, `1024k`, `2048` (bytes) → bytes; null when malformed. Units are binary (1k = 1024). */
+        fun parseMemory(s: String): Long? {
+            val m = MEMORY_RE.matchEntire(s.trim()) ?: return null
+            val n = m.groupValues[1].toLongOrNull() ?: return null
+            val shift = when (m.groupValues[2].lowercase()) { "" -> 0; "k" -> 10; "m" -> 20; "g" -> 30; else -> 40 }
+            if (n > (Long.MAX_VALUE shr shift)) return null
+            return n shl shift
+        }
+
+        /** Bytes → the largest exact unit podman understands: `4g`, `1536m`, `100k`, or plain bytes. */
+        fun formatMemory(bytes: Long): String = when {
+            bytes > 0 && bytes % (1L shl 30) == 0L -> "${bytes shr 30}g"
+            bytes > 0 && bytes % (1L shl 20) == 0L -> "${bytes shr 20}m"
+            bytes > 0 && bytes % (1L shl 10) == 0L -> "${bytes shr 10}k"
+            else -> bytes.toString()
+        }
+    }
 }
