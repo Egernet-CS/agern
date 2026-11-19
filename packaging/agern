@@ -640,7 +640,9 @@ repack_installed() {
     local inst=$1 info=/var/lib/dpkg/info part root p f
     [ "$(deb_installed_version)" = "$inst" ] || return 1
     [ -r "$info/agern.list" ] || return 1
-    if [ -n "$(dpkg --verify agern 2>&1)" ]; then
+    # Documentation that dpkg was told not to install (path-exclude, e.g. Ubuntu's minimized images)
+    # is reported missing; it is left out of the copy. Any other difference: no copy.
+    if dpkg --verify agern 2>&1 | grep -q -v -E '^missing +/usr/share/(doc|man|locale)/'; then
         warn "installed files differ from the package ('dpkg --verify agern'); not rebuilding a copy from them"
         return 1
     fi
@@ -659,6 +661,7 @@ repack_installed() {
             mkdir -p "$root$(dirname "$p")"
             cp -p "$p" "$root$p"
         else
+            case $p in /usr/share/doc/* | /usr/share/man/* | /usr/share/locale/*) continue ;; esac
             warn "$p from the file list is missing"; rm -rf "$root"; return 1
         fi
     done <"$info/agern.list"
@@ -671,7 +674,14 @@ repack_installed() {
         fi
     done
     chmod 0644 "$root/DEBIAN/control"
-    [ ! -f "$root/DEBIAN/md5sums" ] || chmod 0644 "$root/DEBIAN/md5sums"
+    if [ -f "$root/DEBIAN/md5sums" ]; then
+        # Only the files that are in the copy.
+        while IFS= read -r line; do
+            [ -f "$root/${line#*  }" ] && printf '%s\n' "$line"
+        done <"$root/DEBIAN/md5sums" >"$root/DEBIAN/md5sums.new"
+        mv -f "$root/DEBIAN/md5sums.new" "$root/DEBIAN/md5sums"
+        chmod 0644 "$root/DEBIAN/md5sums"
+    fi
     for f in postinst prerm postrm; do [ ! -f "$root/DEBIAN/$f" ] || chmod 0755 "$root/DEBIAN/$f"; done
     if dpkg-deb --build --root-owner-group -Zxz "$root" "$part/repack.deb" >/dev/null 2>&1 &&
         [ "$(dpkg-deb -f "$part/repack.deb" Version 2>/dev/null || true)" = "$inst" ]; then

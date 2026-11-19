@@ -162,7 +162,7 @@ B_SEMVER="${B_SEMVER%.*}.$((${B_SEMVER##*.} + 1))"
 repack "$B_SEMVER" "$WORK/b.deb"
 # Installed with apt, so there is no cached copy of the installed version, and its release is not
 # downloadable (as for a main build in CI): the upgrade rebuilds a copy from the installed files.
-check "installed files match the package (dpkg --verify)" test -z "$(dpkg --verify agern 2>&1)"
+check "installed files match the package (dpkg --verify)" test -z "$(dpkg --verify agern 2>&1 | grep -v -E '^missing +/usr/share/doc/')"
 if agern upgrade --file "$WORK/b.deb" >"$WORK/up1.log" 2>&1; then pass "agern upgrade --file b.deb"; else fail "agern upgrade --file b.deb"; cat "$WORK/up1.log"; fi
 grep -q 'rebuilt from the installed files' "$WORK/up1.log" && pass "a copy of the installed version was rebuilt for rollback" || { fail "rebuilt copy"; cat "$WORK/up1.log"; }
 eq "now $B_SEMVER" "$(semver_to_deb "$B_SEMVER")" "$(dpkg-query -W -f='${Version}' agern)"
@@ -183,7 +183,7 @@ if agern rollback >"$WORK/rb.log" 2>&1; then pass "agern rollback"; else fail "a
 eq "rolled back to $A_DEB" "$A_DEB" "$(dpkg-query -W -f='${Version}' agern)"
 eq "previous.deb is now $B_SEMVER" "$(semver_to_deb "$B_SEMVER")" "$(dpkg-deb -f /var/cache/agern/previous.deb Version 2>/dev/null || echo none)"
 eq "env file unchanged after rollback" "$SUM_BEFORE" "$(sha256sum /etc/agern/agern.env | cut -d' ' -f1)"
-check "the rebuilt package reinstalled the original files (dpkg --verify)" test -z "$(dpkg --verify agern 2>&1)"
+check "the rebuilt package reinstalled the original files (dpkg --verify)" test -z "$(dpkg --verify agern 2>&1 | grep -v -E '^missing +/usr/share/doc/')"
 eq "VERSION after rollback" "$A_SEMVER" "$(cat /usr/share/agern/VERSION)"
 check "agern works after rollback" agern version
 agern version
@@ -233,7 +233,7 @@ agern rollback >"$WORK/rb2.log" 2>&1
 rc=$?
 set -e
 [ "$rc" != 0 ] && grep -q 'nothing to roll back to.*--version X.Y.Z --force' "$WORK/rb2.log" && pass "rollback fails with a helpful message" || { fail "rollback without a copy"; cat "$WORK/rb2.log"; }
-check "the upgrade replaced the changed file (dpkg --verify)" test -z "$(dpkg --verify agern 2>&1)"
+check "the upgrade replaced the changed file (dpkg --verify)" test -z "$(dpkg --verify agern 2>&1 | grep -v -E '^missing +/usr/share/doc/')"
 eq "now $NEXT" "$NEXT" "$(dpkg-query -W -f='${Version}' agern)"
 eq "env file unchanged after all upgrades" "$SUM_BEFORE" "$(sha256sum /etc/agern/agern.env | cut -d' ' -f1)"
 eq "master key unchanged" "$KEY_BEFORE" "$(grep '^FACTORY_MASTER_KEY=' /etc/agern/agern.env)"
