@@ -137,7 +137,8 @@ jobs:
           distribution: temurin
           java-version: 17
       - uses: gradle/actions/setup-gradle@v4
-      - run: ./gradlew --no-daemon :server:testClasses
+      # Maven Central sometimes answers 429/404 to hosted runners: one retry after a pause.
+      - run: ./gradlew --no-daemon :server:testClasses || { sleep 60; ./gradlew --no-daemon --refresh-dependencies :server:testClasses; }
       # Installs the package, PostgreSQL and Podman with apt; 'agern sandbox enable' and its
       # self-test; doctor; the server under the hardened unit reaping a leftover sandbox through the
       # socket; PodmanIntegrationTest as the agern user inside agern.service; upgrade, prune,
