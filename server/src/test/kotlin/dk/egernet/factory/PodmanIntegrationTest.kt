@@ -276,6 +276,25 @@ class PodmanIntegrationTest {
         val denied = rt.exec(main, SandboxManager.shellCommand("touch /etc/agern-user-test"), SandboxManager.WORKDIR, 30_000, builder)
         assertTrue(denied.exitCode != 0, "the user is not root: ${denied.output}")
 
+        // Limits under keep-id: the container has its own cgroup (--cgroup-parent applies) with the limits, and a command run
+        // as the user may raise its own oom_score_adj, so a memory hog is what the kernel kills, not the keep-alive process.
+        assertEquals(memory.toString(), asUser(main, "cat /sys/fs/cgroup/memory.max"), "memory.max under keep-id")
+        assertEquals("4096", asUser(main, "cat /sys/fs/cgroup/pids.max"), "pids.max under keep-id")
+        cfg.cgroupParent?.let { parent ->
+            val cg = podman("inspect", "--format", "{{.HostConfig.CgroupParent}}", main).output.trim()
+            assertEquals(parent, cg, "cgroup parent of a keep-id container")
+        }
+        val adj = asUser(main, "echo self \$(cat /proc/self/oom_score_adj) pid1 \$(cat /proc/1/oom_score_adj)")
+        println("keep-id, as the user: $adj")
+        assertTrue(adj.startsWith("self 1000 "), "the user's command raised its oom_score_adj: $adj")
+        val hog = rt.exec(main, SandboxManager.shellCommand("x=\$(head -c 400000000 /dev/zero | tr '\\0' a); echo survived \${#x}"),
+            SandboxManager.WORKDIR, 120_000, builder)
+        val state = podman("inspect", "--format", "{{.State.Status}} exit={{.State.ExitCode}} oomkilled={{.State.OOMKilled}}", main).output.trim()
+        println("keep-id memory hog as the user: exit ${hog.exitCode}, container $state")
+        assertTrue(hog.exitCode != 0 && !hog.output.contains("survived"), "a 400 MB allocation as the user was not stopped: ${hog.exitCode} ${hog.output}")
+        assertTrue(state.startsWith("running"), "the keep-id sandbox did not survive the user's memory hog ($state)")
+        assertEquals("alive", asUser(main, "echo alive"))
+
         // The platform container: another image, the same worktree and network, its own cache volume.
         assertTrue(asUser(alt, "cat /etc/os-release").contains("Alpine", ignoreCase = true))
         assertEquals("by-user", asUser(alt, "cat by-user.txt"))
