@@ -844,7 +844,23 @@ a child of the unit (found on the first real-Podman CI run; netavark 1.4 and 1.1
 (`ExecStartPre=+`) creates an empty `/var/lib/cni`: Podman 4.3 (Debian 12) bind-mounts an empty directory over
 it in its rootless network namespace — or, when it is missing, over the nearest existing parent, `/var/lib`,
 which hides the network definitions under `/var/lib/agern/containers` so that every container on a network
-fails with "network not found" (found on a Debian 12 VM; harmless where the directory already exists). The server keeps every restriction and
+fails with "network not found" (found on a Debian 12 VM; harmless where the directory already exists).
+*Rootless networking: slirp4netns on every version.* Podman 5 (Debian 13) defaults to pasta for the rootless
+network namespace. Debian 13's AppArmor profile for pasta allows it to write only under `/run/user/<uid>` and
+`/tmp`, and has no `local/` include, so pasta cannot create its PID file in `/run/agern-sandbox` and every
+container on a run network fails ("setting up Pasta … Permission denied", audit `profile="pasta"
+operation="mknod"`). The options were: (a) move the runtime directory to `/run/user/<uid>` — but that directory
+belongs to logind, which mounts a fresh tmpfs over it when anybody opens a session as `agern` (`su -`, `runuser
+-l`) and removes it when that session ends, under the running sandboxes; (b) extend the profile — impossible
+without editing a distribution file, since it has no `local/` include, and an edit would be overwritten by
+package upgrades; (c) use slirp4netns, whose AppArmor profile is `flags=(unconfined)` and which confines itself
+(Podman starts it with `--enable-sandbox --enable-seccomp`). (c) is chosen: one key in Agern's own
+`containers.conf` (`default_rootless_network_cmd = "slirp4netns"`), no host file outside the package changed,
+and the same helper on every supported release. Podman 4.3 does not know the key and ignores it (logged at debug
+level only) and 4.3 and 4.9 already default to slirp4netns, so Debian 12 and Ubuntu 24.04 behave exactly as
+before. The cost is throughput: slirp4netns is a user-space TCP/IP stack, slower than pasta, which matters only
+for large downloads during builds. `agern sandbox selftest` and `agern doctor` print the kernel's
+`apparmor="DENIED"` lines for the agern user's processes, so a profile that refuses a path again is named. The server keeps every restriction and
 reaches Podman as a podman-remote client: `FACTORY_SANDBOX_PODMAN_URL=unix:///run/agern-podman/podman.sock`,
 a socket `agern:agern 0600`, so no other user can drive it. `agern.service` is ordered after the socket.
 
@@ -859,7 +875,7 @@ agern-sandbox` can cap them together (`MemoryMax=`, `CPUQuota=`), and `OOMScoreA
 `IOWeight=50` make the kernel sacrifice and throttle sandboxes before the server and PostgreSQL.
 
 *Enabling* (`agern sandbox enable`, root): checks the packages (`podman` ≥ 4.3, `uidmap`, `netavark`,
-`aardvark-dns`, `crun`, and `slirp4netns` for Podman 4 or `passt` for Podman 5 — never installed by Agern;
+`aardvark-dns`, `crun`, `slirp4netns` — never installed by Agern;
 the missing ones are named in one `apt install` line and nothing is changed), cgroups v2 and systemd;
 gives `agern` a subordinate uid and gid range of 65536 with `usermod --add-subuids/--add-subgids` (the first
 `100000 + k·65536` block that overlaps no range in `/etc/subuid`/`/etc/subgid` and no uid/gid the name
@@ -889,10 +905,10 @@ Cache volumes are removed only by `prune --caches`/`--all`. Containers are remov
 image's anonymous volumes (e.g. PostgreSQL's data) go with the run.
 
 *Packaging.* The Podman stack is in `Suggests:` (`podman (>= 4.3), uidmap, netavark, aardvark-dns, crun,
-slirp4netns | passt`), not `Recommends:`, so an install without sandboxes gets no container runtime.
+slirp4netns`), not `Recommends:`, so an install without sandboxes gets no container runtime.
 Versions checked with `apt-cache` in the distribution images: Debian 12 Podman 4.3.1 (crun 1.8.1, netavark/
 aardvark-dns 1.4.0, slirp4netns 1.2.0), Ubuntu 24.04 Podman 4.9.3 (crun 1.14.1, netavark 1.4.0), Debian 13
-Podman 5.4.2 (crun 1.21, netavark 1.14.0, passt). An upgrade only reloads systemd: it never disables
+Podman 5.4.2 (crun 1.21, netavark 1.14.0, slirp4netns 1.2.1). An upgrade only reloads systemd: it never disables
 sandboxes, never restarts the sandbox service (that would stop the sandboxes of runs in progress) and never
 touches `/etc/subuid`; `postinst` re-enables the socket and timer when `agern.env` has
 `FACTORY_SANDBOX=podman` (e.g. after `remove` and reinstall). `prerm remove` stops and disables the sandbox

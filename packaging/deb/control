@@ -7,7 +7,7 @@ Priority: optional
 Installed-Size: @INSTALLED_SIZE@
 Depends: default-jre-headless (>= 2:1.17) | java17-runtime-headless, git, ca-certificates, curl, passwd
 Recommends: postgresql
-Suggests: gh, podman (>= 4.3), uidmap, netavark, aardvark-dns, crun, slirp4netns | passt
+Suggests: gh, podman (>= 4.3), uidmap, netavark, aardvark-dns, crun, slirp4netns
 Homepage: https://github.com/Egernet-CS/agern
 Description: Agern - the software factory
  A self-hosted web system where people put Claude agents to work building

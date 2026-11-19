@@ -342,7 +342,7 @@ Sandboxes are off after installing the package. Install rootless Podman (the pac
 *suggests* it), then enable:
 
 ```sh
-sudo apt install podman uidmap netavark aardvark-dns crun slirp4netns passt
+sudo apt install podman uidmap netavark aardvark-dns crun slirp4netns
 sudo agern sandbox enable
 ```
 
@@ -352,7 +352,7 @@ The same package names exist on Debian 12, Debian 13 and Ubuntu 24.04:
 |---|---|---|---|---|
 | Debian 12 | 4.3.1 | 1.8.1 | 1.4.0 | `slirp4netns` 1.2.0 |
 | Ubuntu 24.04 | 4.9.3 | 1.14.1 | 1.4.0 | `slirp4netns` 1.2.1 |
-| Debian 13 | 5.4.2 | 1.21 | 1.14.0 | `passt` (pasta) |
+| Debian 13 | 5.4.2 | 1.21 | 1.14.0 | `slirp4netns` 1.2.1 (not Podman 5's default pasta, see below) |
 
 `agern sandbox enable` never installs packages itself: if one is missing it prints the exact
 `apt install` line and changes nothing. Then it
@@ -441,6 +441,13 @@ journalctl -u agern-sandbox -n 100
 - *"limits not applied"* / doctor: *controllers not enabled*: the unit's cgroup is not delegated
   (a local override removed `Delegate=yes`?) or the host boots with cgroups v1; sandboxes need
   cgroups v2, the default on all supported releases.
+- *"setting up Pasta … Permission denied"*, or an `apparmor="DENIED"` line that `agern sandbox
+  selftest` or `agern doctor` shows: a distribution AppArmor profile refuses one of the sandbox
+  service's paths. Debian 13 confines pasta (Podman 5's default network helper) to `/run/user/<uid>`
+  and `/tmp`, and its profile has no `local/` include to extend it, so Agern's Podman configuration
+  uses slirp4netns instead (`default_rootless_network_cmd` in `/usr/share/agern/podman/containers.conf`).
+  If you see it, check that the package's copy of that file is unmodified (`dpkg --verify agern`) and
+  that `slirp4netns` is installed.
 - *An image cannot be pulled*: the registry must be in `FACTORY_SANDBOX_REGISTRIES` and reachable
   from the machine; Docker Hub limits anonymous pulls per address.
 - *After changing the subordinate ids by hand*: `sudo systemctl restart agern-sandbox` (this stops

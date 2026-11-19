@@ -183,7 +183,7 @@ rc=$?
 set -e
 printf '%s\n' "$out"
 [ "$rc" != 0 ] && pass "sandbox enable without Podman fails" || fail "sandbox enable without Podman (rc $rc)"
-printf '%s' "$out" | grep -qx '  sudo apt install podman uidmap netavark aardvark-dns crun slirp4netns passt' && pass "sandbox enable names the exact packages to install" || fail "sandbox enable install hint"
+printf '%s' "$out" | grep -qx '  sudo apt install podman uidmap netavark aardvark-dns crun slirp4netns' && pass "sandbox enable names the exact packages to install" || fail "sandbox enable install hint"
 printf '%s' "$out" | grep -q 'nothing was changed' && pass "sandbox enable says nothing was changed" || fail "sandbox enable: nothing changed message"
 eq "agern.env unchanged by the failed enable" "$ENV_SUM" "$(sha256sum /etc/agern/agern.env | cut -d' ' -f1)"
 eq "subordinate ids unchanged by the failed enable" "$SUBID_SUM" "$(cat /etc/subuid /etc/subgid 2>/dev/null | sha256sum | cut -d' ' -f1)"
@@ -227,7 +227,7 @@ set +e
 doc=$(agern doctor 2>&1)
 set -e
 printf '%s\n' "$doc" | sed -n '/^sandboxes$/,/^service$/p'
-printf '%s' "$doc" | grep -q 'FAIL  packages for rootless Podman missing: podman uidmap netavark aardvark-dns crun slirp4netns passt (sudo apt install' && pass "doctor (sandboxes on): missing packages with the install command" || fail "doctor: sandbox packages"
+printf '%s' "$doc" | grep -q 'FAIL  packages for rootless Podman missing: podman uidmap netavark aardvark-dns crun slirp4netns (sudo apt install' && pass "doctor (sandboxes on): missing packages with the install command" || fail "doctor: sandbox packages"
 printf '%s' "$doc" | grep -q 'ok    subordinate ids of agern: uids 427680+65536, gids 493216+65536' && pass "doctor: subordinate ids" || fail "doctor: subordinate ids"
 printf '%s' "$doc" | grep -q 'ok    FACTORY_SANDBOX_PODMAN_URL=unix:///run/agern-podman/podman.sock' && pass "doctor: podman url" || fail "doctor: podman url"
 printf '%s' "$doc" | grep -q 'FAIL  systemd is not running: the sandbox service cannot run here' && pass "doctor: no systemd for the sandbox service" || fail "doctor: sandbox without systemd"
