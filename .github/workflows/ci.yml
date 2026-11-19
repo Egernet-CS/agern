@@ -53,4 +53,109 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck packaging/agern packaging/install.sh scripts/*.sh
+        run: |
+          shellcheck packaging/agern packaging/install.sh scripts/*.sh \
+            packaging/deb/postinst packaging/deb/prerm packaging/deb/postrm packaging/deb/smoke-test.sh
+
+  deb:
+    name: Debian package (build)
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags: the main-build version is derived from the latest release tag
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Version
+        id: version
+        run: echo "version=$(scripts/main-version.sh)" >> "$GITHUB_OUTPUT"
+      - name: Package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+        run: scripts/package.sh --deb "$VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: build/release/agern_${{ steps.version.outputs.version }}_all.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  deb-smoke:
+    name: Debian package (install smoke test, ${{ matrix.image }})
+    needs: deb
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:12", "debian:13", "ubuntu:24.04"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb
+          path: dist
+      # A clean container per distribution: apt resolves the dependencies, then install, upgrade,
+      # rollback, the server against native PostgreSQL, automatic upgrade, remove and purge.
+      - name: Smoke test
+        env:
+          IMAGE: ${{ matrix.image }}
+          VERSION: ${{ needs.deb.outputs.version }}
+        run: |
+          docker run --rm -v "$PWD":/src:ro "$IMAGE" \
+            bash /src/packaging/deb/smoke-test.sh "/src/dist/agern_${VERSION}_all.deb" --server
+
+  publish-main:
+    name: Publish the rolling main pre-release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [web, server, packaging, deb, deb-smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # move the main-latest tag and update its release assets
+    concurrency:
+      group: publish-main
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb
+          path: dist
+      - name: Publish main-latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.deb.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Only the newest commit on main is published: a slower run of an older commit stops here.
+          head=$(git ls-remote origin refs/heads/main | cut -f1)
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "main is now at $head, not $GITHUB_SHA; not publishing"
+            exit 0
+          fi
+          deb="agern_${VERSION}_all.deb"
+          (cd dist && sha256sum "$deb" > SHA256SUMS)
+          git tag -f main-latest "$GITHUB_SHA"
+          git push -f origin refs/tags/main-latest
+          notes="Rolling build of main (${GITHUB_SHA}), version ${VERSION}. Replaced on every push to main; for 'agern upgrade --channel main' and 'agern auto-upgrade on --channel main'. Not a release."
+          if gh release view main-latest >/dev/null 2>&1; then
+            gh release edit main-latest --prerelease --latest=false --title "Agern main (rolling)" --notes "$notes"
+          else
+            gh release create main-latest --verify-tag --prerelease --latest=false --title "Agern main (rolling)" --notes "$notes"
+          fi
+          # New package first, then the checksums that point at it, then drop the old packages.
+          gh release upload main-latest "dist/$deb" --clobber
+          gh release upload main-latest dist/SHA256SUMS --clobber
+          gh release view main-latest --json assets --jq '.assets[].name' |
+            grep -E '^agern_.*_all\.deb$' | grep -vxF "$deb" |
+            while read -r old; do gh release delete-asset main-latest "$old" --yes; done
