@@ -85,8 +85,39 @@ tests `FACTORY_2FA=off` is accepted when `dev` is the only provider.
     builder pick up the owner's messages after their current tool call, or as a further turn when they
     were finishing.
 
+    Put `fake:sandbox` in the issue body to make the builder call `factory_sandbox_info` and
+    `factory_sandbox_exec` (`echo built in the sandbox && ls`) through MCP and report both answers.
+
 With both, the whole product — chat, runs with live stages, needs-human approval — works locally for
 UI development at zero cost.
+
+### Trying sandboxes with a local Podman
+
+Sandboxes (docs/ARCHITECTURE.md §5 "Sandboxes") need rootless Podman for the user running the server;
+nothing else (no Docker). The tests do not: they use `FakeSandboxRuntime`. To try the real thing:
+
+```sh
+podman info --format '{{.Host.Security.Rootless}}'        # must print true (Linux: subuid/subgid ranges for your user)
+# macOS: podman machine init && podman machine start      # the VM must see the data directory: keep
+#        FACTORY_DATA_DIR under your home, which podman machine mounts by default
+export FACTORY_SANDBOX=podman FACTORY_SANDBOX_MAX_CONCURRENT=1
+./gradlew :server:run
+```
+
+Then, in a project the server can reach (a real GitHub repository; the fake GitHub's local `git init`
+repositories have no definition file):
+
+1. Commit `.agern/sandbox.yml` to the default branch, e.g. `image: docker.io/library/eclipse-temurin:21-jdk`.
+2. As an admin, read `GET /api/projects/<repo>/sandbox` (state `pending`, with its `sha256`) and approve it:
+   `POST /api/projects/<repo>/sandbox/approval` with `{"sha256":"…"}` (there is no UI for this yet).
+3. Start a run. The builder's transcript starts with "Sandbox: …"; its first `factory_sandbox_exec`
+   creates `agern-run-<runId>` (watch with `podman ps --filter label=agern.run`), every command's full log
+   is a `system` event in the transcript, and the containers and network disappear when the build/review
+   loop ends (cache volumes `agern-cache-*` stay).
+
+With the fake CLI, put `fake:sandbox` in the issue body to see the tool calls without spending tokens.
+Leftovers of a crashed server are removed at the next start; by hand:
+`podman rm -f $(podman ps -aq --filter label=agern.run)`.
 
 ## Layout
 
@@ -103,6 +134,7 @@ src/main/kotlin/dk/egernet/factory/
   agent/                                  AgentLauncher (local processes), AgentManager, event bus, prompts
   pipeline/Orchestrator.kt                the run state machine
   mcp/                                    MCP endpoint (JSON-RPC over HTTP) and per-process tokens
+  sandbox/                                .agern/sandbox.yml parsing, SandboxRuntime (rootless Podman CLI), per-run SandboxManager
 src/main/resources/prompts/               system prompts per role (chat, spec-writer, builder, reviewers, approver)
 src/test/resources/fake-claude            the CLI stub described above
 ```
@@ -120,3 +152,6 @@ src/test/resources/fake-claude            the CLI stub described above
   service is used.
 * Known limitation (v1): all agents run as the server's OS user with permissions bypassed — run
   Agern on a dedicated machine or VM.
+* Sandboxes are not a security boundary yet: the agent runs on the host as the user that owns the
+  rootless containers. They are never privileged, get no added capabilities and no credentials of the
+  run's owner, and only the run's worktree is mounted (at `/workspace`).

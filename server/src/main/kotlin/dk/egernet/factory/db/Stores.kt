@@ -311,6 +311,8 @@ data class RunRecord(
     val status: String, val round: Int, val maxRounds: Int, val branch: String?, val prNumber: Int?, val prUrl: String?,
     val ownerId: UUID, val ownerUsername: String, val ownerDisplayName: String, val startedBySessionId: UUID?,
     val error: String?, val createdAt: Instant, val updatedAt: Instant, val endedAt: Instant?,
+    /** JSON of [dk.egernet.factory.RunSandboxDto], set when the run prepared its workspace. */
+    val sandboxJson: String? = null,
 )
 
 class RunStore(private val db: Db) {
@@ -323,7 +325,7 @@ class RunStore(private val db: Db) {
         rs.getString("status"), rs.getInt("round"), rs.getInt("max_rounds"), rs.getString("branch"), rs.intOrNull("pr_number"),
         rs.getString("pr_url"), rs.uuid("owner_id"), rs.getString("owner_username"), rs.getString("owner_display_name"),
         rs.uuidOrNull("started_by_session_id"), rs.getString("error"), rs.instant("created_at"), rs.instant("updated_at"),
-        rs.instantOrNull("ended_at"),
+        rs.instantOrNull("ended_at"), rs.getString("sandbox"),
     )
 
     private fun mapStage(rs: ResultSet) = StageRecord(
@@ -412,6 +414,11 @@ class RunStore(private val db: Db) {
         "UPDATE runs SET updated_at = GREATEST(now(), date_trunc('milliseconds', updated_at) + interval '1 millisecond') WHERE id = ?", id,
     )
 
+    fun setSandbox(id: UUID, info: dk.egernet.factory.RunSandboxDto) = db.update(
+        "UPDATE runs SET sandbox = ?, updated_at = now() WHERE id = ?",
+        JsonbParam(AppJson.encodeToString(dk.egernet.factory.RunSandboxDto.serializer(), info)), id,
+    )
+
     fun setRound(id: UUID, round: Int) = db.update("UPDATE runs SET round = ?, updated_at = now() WHERE id = ?", round, id)
     fun setBranch(id: UUID, branch: String) = db.update("UPDATE runs SET branch = ?, updated_at = now() WHERE id = ?", branch, id)
     fun setPr(id: UUID, number: Int, url: String) =
@@ -451,6 +458,7 @@ class RunStore(private val db: Db) {
         owner = OwnerDto(r.ownerUsername, r.ownerDisplayName), startedBySessionId = r.startedBySessionId?.toString(),
         error = r.error, createdAt = r.createdAt.iso(), updatedAt = r.updatedAt.iso(), endedAt = r.endedAt?.iso(),
         stages = stages(r.id).map { it.toDto() },
+        sandbox = r.sandboxJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunSandboxDto.serializer(), it) }.getOrNull() },
     )
 
     /** v1: runs cannot survive a restart. needs_human runs have no process and stay as they are. */

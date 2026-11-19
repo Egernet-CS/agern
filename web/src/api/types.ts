@@ -172,6 +172,58 @@ export type Run = {
   updatedAt: string;
   endedAt: string | null;
   stages: Stage[];
+  /** The run's sandbox decision, fixed when it starts; null before that and for runs from before sandboxes. */
+  sandbox: RunSandbox | null;
+};
+
+/**
+ * Whether a run's builder got a sandbox (docs/ARCHITECTURE.md §5 "Sandboxes"). Only `approved` does:
+ * `disabled` = FACTORY_SANDBOX is off; `none` = no `.agern/sandbox.yml`; `invalid`; `unapproved` = not approved, or changed since.
+ */
+export type RunSandboxState = 'disabled' | 'none' | 'invalid' | 'unapproved' | 'approved';
+export type RunSandbox = { state: RunSandboxState; reason: string; sha256: string | null; image: string | null };
+
+export type SandboxService = { name: string; image: string; env: Record<string, string> };
+
+/** A validated `.agern/sandbox.yml`. `limits`: effective per-container limits (the request, capped by the server). */
+export type SandboxDefinition = {
+  image: string;
+  setup: string | null;
+  env: Record<string, string>;
+  services: SandboxService[];
+  caches: string[];
+  limits: { cpus: number; memory: string; requestedCpus: number | null; requestedMemory: string | null; capped: boolean };
+};
+
+export type SandboxApproval = { sha256: string; content: string; approvedBy: Owner; approvedAt: string };
+
+/** `GET /api/projects/{repo}/sandbox`: the definition on the default branch and the project's approval. */
+export type SandboxStatus = {
+  repo: string;
+  /** FACTORY_SANDBOX is not off. Definitions can be approved either way. */
+  enabled: boolean;
+  path: string;
+  /** The branch the file is read from (runs start from it). */
+  branch: string;
+  /** `pending`: valid, but this exact content is not approved. */
+  state: 'none' | 'invalid' | 'pending' | 'approved';
+  sha256: string | null;
+  content: string | null;
+  errors: string[];
+  definition: SandboxDefinition | null;
+  /** The project's approval, possibly of other content (compare `sha256`; its `content` allows a diff). */
+  approval: SandboxApproval | null;
+};
+
+/** On `system` events of sandbox commands: the full log (up to 1,000,000 characters, the tail). */
+export type SandboxLog = {
+  kind: 'setup' | 'exec';
+  command: string;
+  exitCode: number;
+  timedOut: boolean;
+  durationMs: number;
+  output: string;
+  outputTruncated: boolean;
 };
 
 export type EventType = 'user' | 'claude' | 'system' | 'status';
@@ -206,7 +258,7 @@ export type ClientConfig = {
 };
 
 export type UserPayload = { text: string; username: string; attachments?: Attachment[] };
-export type SystemPayload = { level: 'info' | 'warn' | 'error'; text: string };
+export type SystemPayload = { level: 'info' | 'warn' | 'error'; text: string; messageId?: string; sandbox?: SandboxLog };
 export type StatusPayload = { status: SessionStatus };
 
 export type Settings = {

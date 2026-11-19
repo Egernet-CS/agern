@@ -14,7 +14,10 @@ import {
   reorderRelease,
   updateRelease,
   approveRun,
+  approveSandbox,
   cancelRun,
+  revokeSandboxApproval,
+  sandboxStatus,
   chatInput,
   closeChat,
   createChat,
@@ -273,6 +276,10 @@ export const mockApi: Api = {
       announceIssue(repo, i);
       return i;
     }),
+
+  sandboxStatus: (repo) => ok(() => sandboxStatus(repo, project(repo).defaultBranch)),
+  approveSandbox: (repo, sha256) => ok(() => (project(repo), approveSandbox(repo, sha256, me()))),
+  revokeSandboxApproval: (repo) => ok(() => (project(repo), revokeSandboxApproval(repo, me()))),
 
   releases: (repo) => ok(() => (project(repo), releasesOf(repo))),
   release: (id) =>

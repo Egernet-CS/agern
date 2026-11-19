@@ -11,7 +11,9 @@ import java.util.concurrent.CopyOnWriteArrayList
  */
 class FakeGitHub(private val org: String) : GitHub {
     data class Repo(val name: String, val description: String?, val private: Boolean, val visibleTo: Set<String>? = null,
-                    val issues: MutableList<GhIssue> = mutableListOf(), val comments: MutableMap<Int, MutableList<GhComment>> = mutableMapOf())
+                    val issues: MutableList<GhIssue> = mutableListOf(), val comments: MutableMap<Int, MutableList<GhComment>> = mutableMapOf(),
+                    /** Files on the default branch, by path (only what tests put there). */
+                    val files: MutableMap<String, String> = mutableMapOf())
 
     val repos = mutableMapOf<String, Repo>()
     val actions = CopyOnWriteArrayList<String>()
@@ -37,6 +39,12 @@ class FakeGitHub(private val org: String) : GitHub {
             r.issues += issue
             issue
         }
+
+    /** Puts (or with null removes) a file on [repo]'s default branch. */
+    fun setFile(repo: String, path: String, content: String?) = synchronized(this) {
+        val r = repos.getValue(repo)
+        if (content == null) r.files.remove(path) else r.files[path] = content
+    }
 
     override fun client(token: String): GitHubClient {
         if (!token.startsWith("fake-") || token.length < 6) throw GitHubException(401, "Bad credentials")
@@ -143,6 +151,10 @@ class FakeGitHub(private val org: String) : GitHub {
                 actions += "pr $repo $head -> $base #$n"
                 pr
             }
+
+        override fun getFile(org: String, repo: String, path: String, ref: String): String? = synchronized(this@FakeGitHub) {
+            repo(org, repo).files[path]
+        }
 
         override fun squashMerge(org: String, repo: String, number: Int, title: String) = synchronized(this@FakeGitHub) {
             repo(org, repo)

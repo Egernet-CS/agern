@@ -39,6 +39,9 @@ dependencies {
 
     implementation("ch.qos.logback:logback-classic:1.5.18")
 
+    // YAML for `.agern/sandbox.yml` (Apache-2.0; pulls in snakeyaml-engine-kmp and okio, both Apache-2.0)
+    implementation("com.charleskorn.kaml:kaml:0.67.0")
+
     testImplementation(kotlin("test"))
     testImplementation("io.ktor:ktor-server-test-host:$ktorVersion")
     testImplementation("io.ktor:ktor-client-websockets:$ktorVersion")

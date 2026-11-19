@@ -29,7 +29,15 @@ import dk.egernet.factory.mcp.McpServer
 import dk.egernet.factory.pipeline.Orchestrator
 import dk.egernet.factory.security.SecretBox
 import io.ktor.server.application.Application
+import dk.egernet.factory.db.SandboxApprovalStore
+import dk.egernet.factory.sandbox.PodmanRuntime
+import dk.egernet.factory.sandbox.SandboxManager
+import dk.egernet.factory.sandbox.SandboxRuntime
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -51,6 +59,8 @@ class Services(
     val launcher: AgentLauncher,
     val auth: AuthService = AuthService.fromConfig(cfg),
     val loginThrottle: dk.egernet.factory.auth.LoginThrottle = dk.egernet.factory.auth.LoginThrottle(),
+    /** The container runtime for sandboxes; null (sandboxes off) unless FACTORY_SANDBOX names one. */
+    val sandboxRuntime: SandboxRuntime? = if (cfg.sandbox.mode == "podman") PodmanRuntime(cfg.sandbox) else null,
 ) {
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     val box = SecretBox(cfg.masterKey)
@@ -71,11 +81,17 @@ class Services(
     val attachments = dk.egernet.factory.agent.Attachments(cfg, dk.egernet.factory.db.AttachmentStore(db))
     val preferences = dk.egernet.factory.db.PreferenceStore(db, settings)
     val agents = AgentManager(cfg, sessions, events, access, launcher, bus, mcpRegistry, settings, prompts, workspaces, scope, attachments, preferences)
-    val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences)
+    val sandboxes = SandboxManager(
+        cfg, sandboxRuntime, SandboxApprovalStore(db), runs, access, git,
+    ) { sessionId, payload -> agents.publish(sessionId, "system", payload) }
+    val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes)
     val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
     val releases = ReleaseService(cfg, access, releaseStore, bus)
     val factory = FactoryService(cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases)
-    val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version)
+    val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes)
+
+    /** The start-up removal of leftover sandboxes (runs in the background; tests wait for it). */
+    @Volatile var sandboxReaper: Job? = null
 
     init {
         agents.commandHandler = { session, owner, text -> factory.handleCommand(session, owner, text) }
@@ -91,12 +107,15 @@ class Services(
 
     fun start() {
         recoverAfterRestart()
+        // After the restart recovery: sandboxes of runs that are no longer active are leftovers.
+        if (sandboxes.enabled) sandboxReaper = scope.launch { sandboxes.reapOrphans() }
         agents.startIdleReaper()
         attachments.startReaper(scope)
     }
 
     fun stop() {
         agents.shutdown()
+        runCatching { runBlocking { withTimeoutOrNull(30_000) { sandboxes.shutdown() } } }
         scope.cancel()
     }
 
