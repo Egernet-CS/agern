@@ -273,8 +273,16 @@ class AgentManager(
         l.lastUse = System.currentTimeMillis()
         l.pending += content
         val msg = userLine(content)
-        withContext(Dispatchers.IO) { l.proc.send(msg) }
-        if (sessions.get(l.sessionId)?.status != SessionStatus.RUNNING) setStatus(l.sessionId, SessionStatus.RUNNING)
+        // Running before the write: a fast agent can answer (and go idle) before this coroutine continues, and
+        // setting the status afterwards would then leave the session "running" with nothing going on.
+        val before = sessions.get(l.sessionId)?.status
+        if (before != SessionStatus.RUNNING) setStatus(l.sessionId, SessionStatus.RUNNING)
+        try {
+            withContext(Dispatchers.IO) { l.proc.send(msg) }
+        } catch (e: Exception) {
+            if (before != null && before != SessionStatus.RUNNING && isLive(l.sessionId)) setStatus(l.sessionId, before)
+            throw e
+        }
     }
 
     private suspend fun startChat(sessionId: UUID, owner: UserRecord): Live {
