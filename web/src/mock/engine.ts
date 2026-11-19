@@ -1,5 +1,7 @@
 // In-memory simulation of the Agern backend. Only loaded when VITE_MOCK=1.
+import { STEERABLE_ROLES } from '../api/types';
 import type {
+  AgentMessage,
   AgentSession,
   Attachment,
   FactoryEvent,
@@ -433,6 +435,27 @@ export function interrupt(s: AgentSession) {
   emit(s.id, 'claude', { type: 'result', subtype: 'error_during_execution', is_error: true, num_turns: s.numTurns ?? 0, total_cost_usd: s.costUsd ?? 0, duration_ms: 0, result: '' }, ts);
   emit(s.id, 'system', { level: 'warn', text: 'Interrupted by user' }, ts);
   setStatus(s, 'idle', ts);
+}
+
+/** Like the backend: the owner's message to a running spec-writer / builder is queued, then picked up at its next step. */
+export function messageAgent(s: AgentSession, text: string, by: User): AgentMessage {
+  if (s.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner of this run can send messages to its agents');
+  if (!STEERABLE_ROLES.includes(s.kind as StageRole)) {
+    throw new MockError(409, 'agent_does_not_accept_messages', `The ${s.kind} agent does not accept messages: reviewers and the approver answer in a fixed verdict format. Only a running spec-writer or builder can be messaged.`);
+  }
+  if (!text.trim()) throw new MockError(400, 'bad_request', 'text must not be empty');
+  if (s.status !== 'running' || !db.players.has(s.id)) {
+    throw new MockError(409, 'agent_not_running', `The ${s.kind} agent is no longer running (it is ${s.status}), so the message cannot be delivered. To change finished work, start a new run instead.`);
+  }
+  const messageId = uid();
+  emit(s.id, 'user', { text, username: by.username, messageId, origin: 'direct' }, iso(Date.now()));
+  setTimeout(() => {
+    const picked = db.players.has(s.id);
+    emit(s.id, 'system', picked
+      ? { level: 'info', text: `Message from ${by.username} delivered to the agent.`, messageId }
+      : { level: 'warn', text: `Message from ${by.username} was not delivered: the agent stopped before picking it up.`, messageId }, iso(Date.now()));
+  }, 1500);
+  return { status: 'queued', messageId, sessionId: s.id, runId: s.runId, role: s.kind as StageRole, note: 'Queued — delivered at the agent’s next step (after its current tool call, or as a further turn if it is finishing).' };
 }
 
 export function stopSession(s: AgentSession) {

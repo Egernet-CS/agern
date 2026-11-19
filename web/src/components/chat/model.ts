@@ -4,8 +4,17 @@ import type { Attachment, FactoryEvent, SessionStatus } from '../../api/types';
 
 export type ToolResult = { text: string; isError: boolean; images: number };
 
+/** A message the run's owner sent to a running pipeline agent (directly, or forwarded by their chat agent). */
+export type Forwarded = {
+  messageId: string;
+  origin: 'direct' | 'chat';
+  viaSessionId: string | null;
+  /** `queued` until the CLI picks it up (a `system` event with the same messageId), `undelivered` if the agent stopped first. */
+  delivery: 'queued' | 'delivered' | 'undelivered';
+};
+
 export type Item =
-  | { k: 'user'; id: string; text: string; username: string; ts: string; attachments: Attachment[] }
+  | { k: 'user'; id: string; text: string; username: string; ts: string; attachments: Attachment[]; forwarded?: Forwarded }
   | { k: 'text'; id: string; text: string; streaming?: boolean }
   | { k: 'thinking'; id: string; text: string; streaming?: boolean }
   | { k: 'tool'; id: string; name: string; input: unknown; inputPartial?: string; result?: ToolResult; streaming?: boolean }
@@ -73,6 +82,7 @@ export function buildTranscript(events: FactoryEvent[], partials: unknown[]): { 
   const tools = new Map<string, Extract<Item, { k: 'tool' }>>();
   const blocksPerMessage = new Map<string, number>();
   const summary: TranscriptSummary = { model: null, costUsd: null, turns: null, status: null, turnOpen: false, turnStartedAt: null, lastActivity: null };
+  const forwarded = new Map<string, Forwarded>();
 
   for (const ev of events) {
     const id = `e${ev.seq}`;
@@ -80,9 +90,15 @@ export function buildTranscript(events: FactoryEvent[], partials: unknown[]): { 
     try {
       if (ev.type === 'user') {
         const u = isObj(p) ? p : {};
-        items.push({ k: 'user', id, text: str(u.text) ?? '', username: str(u.username) ?? '', ts: ev.ts, attachments: attachmentsOf(u.attachments) });
+        const messageId = str(u.messageId);
+        const fwd: Forwarded | undefined = messageId
+          ? { messageId, origin: u.origin === 'chat' ? 'chat' : 'direct', viaSessionId: str(u.viaSessionId), delivery: 'queued' }
+          : undefined;
+        if (fwd) forwarded.set(fwd.messageId, fwd);
+        items.push({ k: 'user', id, text: str(u.text) ?? '', username: str(u.username) ?? '', ts: ev.ts, attachments: attachmentsOf(u.attachments), forwarded: fwd });
         const isCommand = (str(u.text) ?? '').trim().startsWith('/factory');
-        if (!isCommand) {
+        // A message to a working pipeline agent joins the running turn; it does not start one.
+        if (!isCommand && !fwd) {
           summary.turnOpen = true;
           summary.turnStartedAt = ev.ts;
         }
@@ -90,6 +106,12 @@ export function buildTranscript(events: FactoryEvent[], partials: unknown[]): { 
       }
       if (ev.type === 'system') {
         const s = isObj(p) ? p : {};
+        // Delivery confirmation of a forwarded message: shown on the message itself.
+        const fwd = forwarded.get(str(s.messageId) ?? '');
+        if (fwd) {
+          fwd.delivery = s.level === 'warn' || s.level === 'error' ? 'undelivered' : 'delivered';
+          continue;
+        }
         const level = s.level === 'warn' || s.level === 'error' ? s.level : 'info';
         items.push({ k: 'system', id, level, text: str(s.text) ?? compactJson(p) });
         continue;

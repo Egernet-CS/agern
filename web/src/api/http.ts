@@ -140,7 +140,10 @@ export const httpApi: Api = {
   session: (id) => get(`/api/sessions/${enc(id)}`),
   events: (id, after = 0, limit) =>
     get(`/api/sessions/${enc(id)}/events?after=${after}${limit ? `&limit=${limit}` : ''}`),
-  sendInput: (id, text, attachmentIds) => post(`/api/sessions/${enc(id)}/input`, attachmentIds?.length ? { text, attachmentIds } : { text }),
+  sendInput: async (id, text, attachmentIds) => {
+    await post(`/api/sessions/${enc(id)}/input`, attachmentIds?.length ? { text, attachmentIds } : { text });
+  },
+  sendToAgent: (id, text) => post(`/api/sessions/${enc(id)}/input`, { text }),
   uploadAttachment: (sessionId, file, opts) => upload(`/api/sessions/${enc(sessionId)}/attachments?name=${enc(file.name)}`, file, opts),
   deleteAttachment: (sessionId, id) => del(`/api/sessions/${enc(sessionId)}/attachments/${enc(id)}`),
   attachmentUrl: (sessionId, id, opts) => `/api/sessions/${enc(sessionId)}/attachments/${enc(id)}${opts?.preview ? '?preview=1' : ''}`,
