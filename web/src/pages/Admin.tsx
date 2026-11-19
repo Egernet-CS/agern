@@ -6,7 +6,7 @@ import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
 import { timeAgo } from '../lib/format';
 
-const MODELS = ['opus', 'sonnet', 'haiku'];
+const MODELS = ['opus', 'sonnet', 'haiku', 'fable'];
 const ROLES: StageRole[] = ['spec-writer', 'builder', 'security', 'ux', 'ui-design', 'code', 'approver'];
 
 export function AdminPage() {
