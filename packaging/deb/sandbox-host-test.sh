@@ -225,7 +225,12 @@ A_SEMVER=$(cat /usr/share/agern/VERSION)
 # health check on its version. (A repacked higher version would carry the same agern.jar, which
 # reports the old version, so the health check after the restart could not pass.)
 SRV_PID=$(systemctl show -p MainPID --value agern.service)
-if agern upgrade --file "$WORK/a.deb" --force >"$WORK/upgrade.log" 2>&1; then pass "agern upgrade --file --force (reinstall $A_SEMVER)"; else fail "agern upgrade"; cat "$WORK/upgrade.log"; fi
+T0=$(date +%s)
+if agern upgrade --file "$WORK/a.deb" --force >"$WORK/upgrade.log" 2>&1; then pass "agern upgrade --file --force (reinstall $A_SEMVER)"; else fail "agern upgrade"; fi
+grep -v -E '^\(Reading database|^$' "$WORK/upgrade.log" || true
+echo "--- agern.service around the upgrade:"
+journal_since agern.service "$T0" | grep -E 'Stopp|Start|Deactivated|exited' || true
+echo "--- agern.service: MainPID $SRV_PID before, $(systemctl show -p MainPID --value agern.service) after; is-enabled $(systemctl is-enabled agern.service 2>&1)"
 check "the server was restarted by the upgrade" test "$SRV_PID" != "$(systemctl show -p MainPID --value agern.service)"
 eq "agern.env unchanged by the upgrade" "$ENV_SUM" "$(sha256sum /etc/agern/agern.env | cut -d' ' -f1)"
 eq "subordinate ids unchanged by the upgrade" "$SUBID_SUM" "$(cat /etc/subuid /etc/subgid | sha256sum | cut -d' ' -f1)"
