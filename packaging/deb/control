@@ -1,0 +1,20 @@
+Package: agern
+Version: @VERSION@
+Architecture: all
+Maintainer: Agern developers <https://github.com/Egernet-CS/agern/issues>
+Section: devel
+Priority: optional
+Installed-Size: @INSTALLED_SIZE@
+Depends: default-jre-headless (>= 2:1.17) | java17-runtime-headless, git, ca-certificates, curl, passwd
+Recommends: postgresql
+Suggests: gh
+Homepage: https://github.com/Egernet-CS/agern
+Description: Agern - the software factory
+ A self-hosted web system where people put Claude agents to work building
+ software. A GitHub organization is the source of truth: repositories are
+ projects and issues are tasks. Agents are 'claude' CLI processes started by
+ the server as the unprivileged 'agern' user.
+ .
+ Needs a PostgreSQL database ('agern setup-db' creates one on a local
+ PostgreSQL), the 'claude' CLI and 'gh' for the agern user ('agern doctor'
+ says what is missing). See /usr/share/doc/agern/README.Debian.

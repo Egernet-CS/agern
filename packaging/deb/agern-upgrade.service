@@ -1,0 +1,21 @@
+# Agern automatic upgrade. Started only by agern-upgrade.timer, which is disabled by default:
+# `agern auto-upgrade on|off|status`. Settings (AGERN_UPGRADE_CHANNEL,
+# AGERN_UPGRADE_MAX_WAIT_HOURS) are read from /etc/agern/agern.env as data, never sourced.
+#
+# Runs as root because it installs a package. It executes only root-owned files (/usr/bin/agern,
+# apt, dpkg) and installs only an agern_*.deb from a GitHub release whose SHA-256 matches the
+# release's SHA256SUMS. It postpones the restart while runs or agents are active
+# (GET /api/internal/activity on loopback) and gives up after AGERN_UPGRADE_MAX_WAIT_HOURS.
+[Unit]
+Description=Agern automatic upgrade (installs a new release when no agent is working)
+Documentation=https://github.com/Egernet-CS/agern/blob/main/docs/INSTALL-LINUX.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/agern auto-upgrade run
+Nice=10
+IOSchedulingClass=idle
+# Generous: apt may wait for the dpkg lock (unattended-upgrades) and the restart for /api/health.
+TimeoutStartSec=45min

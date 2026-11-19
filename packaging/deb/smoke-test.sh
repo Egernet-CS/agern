@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+# Install smoke test for the agern .deb. Runs as root on a clean, throwaway Debian/Ubuntu system
+# (a container: it installs packages, creates users and deletes things). Used by CI and locally:
+#
+#   docker run --rm -v "$PWD":/src:ro debian:12 bash /src/packaging/deb/smoke-test.sh \
+#       /src/build/release/agern_<version>_all.deb [--server]
+#
+# Checks: apt resolves the dependencies; files, permissions and the 'agern' user; 'agern version'
+# and 'agern doctor'; the configuration survives upgrades; 'agern upgrade --file', upgrades from
+# a release directory (stable and main channel, checksum verification, refusal on mismatch);
+# 'agern rollback'; dpkg ordering of main builds; remove and purge. Higher versions are made by
+# repacking the given package with another version number.
+#
+# --server also starts the server against a native PostgreSQL (without systemd: 'agern run' as
+# the agern user), checks /api/health and /api/internal/activity, and drives the automatic
+# upgrade: postponed while an agent is busy, given up after the maximum wait, installed when idle.
+
+# shellcheck disable=SC2015 # 'test && pass || fail': pass always succeeds
+set -euo pipefail
+
+DEB=${1:?usage: smoke-test.sh path/to/agern_<version>_all.deb [--server]}
+SERVER=0
+[ "${2:-}" = --server ] && SERVER=1
+SRC_DIR=$(cd -P "$(dirname "$0")/../.." && pwd -P)
+
+PASS=0
+FAIL=0
+pass() { printf 'PASS  %s\n' "$*"; PASS=$((PASS + 1)); }
+fail() { printf 'FAIL  %s\n' "$*"; FAIL=$((FAIL + 1)); }
+check() { # check "description" command...
+    local d=$1
+    shift
+    if "$@" >/dev/null 2>&1; then pass "$d"; else fail "$d"; fi
+}
+eq() { # eq "description" expected actual
+    if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (expected '$2', got '$3')"; fi
+}
+section() { printf '\n== %s\n' "$*"; }
+stat_of() { stat -c '%U:%G %a' "$1"; }
+
+export DEBIAN_FRONTEND=noninteractive
+[ "$(id -u)" -eq 0 ] || { echo "run as root (in a throwaway container)" >&2; exit 2; }
+# shellcheck source=/dev/null
+. /etc/os-release
+echo "smoke test on $PRETTY_NAME ($(uname -m))"
+
+WORK=$(mktemp -d /tmp/agern-smoke.XXXXXX)
+cp "$DEB" "$WORK/a.deb"
+A_DEB=$(dpkg-deb -f "$WORK/a.deb" Version)
+A_SEMVER=$(dpkg-deb --fsys-tarfile "$WORK/a.deb" | tar -xO ./usr/share/agern/VERSION)
+echo "package under test: $A_DEB (semver $A_SEMVER)"
+
+# Same mapping as packaging/agern (taken from there, so the real function is tested).
+eval "$(sed -n '/^semver_to_deb() {/,/^}/p' "$SRC_DIR/packaging/agern")"
+
+repack() { # repack SEMVER OUT — the package under test with another version number
+    local v=$1 out=$2 d="$WORK/repack"
+    rm -rf "$d"
+    dpkg-deb -R "$WORK/a.deb" "$d"
+    sed -i "s/^Version: .*/Version: $(semver_to_deb "$v")/" "$d/DEBIAN/control"
+    printf '%s\n' "$v" >"$d/usr/share/agern/VERSION"
+    dpkg-deb --build --root-owner-group -Zxz "$d" "$out" >/dev/null
+    rm -rf "$d"
+}
+
+# A release directory with GitHub's layout, served over file://.
+REL="$WORK/releases"
+publish() { # publish DIR SEMVER [corrupt]
+    local dir="$REL/$1" v=$2 f="agern_$2_all.deb"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    repack "$v" "$dir/$f"
+    (cd "$dir" && sha256sum "$f" >SHA256SUMS)
+    if [ "${3:-}" = corrupt ]; then printf '%064d  %s\n' 0 "$f" >"$dir/SHA256SUMS"; fi
+}
+export AGERN_RELEASE_BASE_URL="file://$REL"
+
+section "version ordering (dpkg --compare-versions)"
+while read -r lo hi; do
+    if dpkg --compare-versions "$(semver_to_deb "$lo")" lt "$(semver_to_deb "$hi")"; then
+        pass "$lo < $hi"
+    else
+        fail "$lo < $hi"
+    fi
+done <<'EOF'
+0.2.0 0.2.1-main.20261119101500.g1a2b3c4
+0.2.1-main.20261119101500.g1a2b3c4 0.2.1-main.20261119101501.g0000000
+0.2.1-main.20261119235959.gffffff0 0.2.1-main.20261120000000.g0123456
+0.2.1-main.20261119101500.g1a2b3c4 0.2.1
+0.2.1-main.20261119101500.g1a2b3c4 0.3.0-rc.1
+0.3.0-rc.1 0.3.0-rc.1.main.20261119101500.g1a2b3c4
+0.3.0-rc.1.main.20261119101500.g1a2b3c4 0.3.0-rc.2
+0.3.0-rc.2 0.3.0
+EOF
+
+section "install with apt (dependencies resolve)"
+apt-get update -qq
+if apt-get install -y -q "$WORK/a.deb" >"$WORK/install.log" 2>&1; then pass "apt-get install ./agern.deb"; else fail "apt-get install ./agern.deb"; tail -n 40 "$WORK/install.log"; exit 1; fi
+grep -q 'not configured yet' "$WORK/install.log" && pass "postinst explains the next steps" || fail "postinst next-steps message"
+eq "package installed" "install ok installed $A_DEB" "$(dpkg-query -W -f='${Status} ${Version}' agern)"
+check "java is installed" command -v java
+java -version 2>&1 | head -n 1
+check "git is installed" command -v git
+check "curl is installed" command -v curl
+check "postgresql (Recommends) is installed" dpkg-query -W postgresql
+
+section "files, permissions, user"
+eq "/usr/bin/agern" "root:root 755" "$(stat_of /usr/bin/agern)"
+eq "/usr/share/agern/agern.jar" "root:root 644" "$(stat_of /usr/share/agern/agern.jar)"
+check "agern.service at /usr/lib/systemd/system" test -f /usr/lib/systemd/system/agern.service
+check "agern-upgrade.timer at /usr/lib/systemd/system" test -f /usr/lib/systemd/system/agern-upgrade.timer
+eq "/etc/agern" "root:root 755" "$(stat_of /etc/agern)"
+eq "/etc/agern/agern.env" "root:agern 640" "$(stat_of /etc/agern/agern.env)"
+eq "/var/lib/agern" "agern:agern 750" "$(stat_of /var/lib/agern)"
+eq "/var/cache/agern" "root:root 755" "$(stat_of /var/cache/agern)"
+check "master key generated (44 base64 chars)" grep -Eq '^FACTORY_MASTER_KEY=[A-Za-z0-9+/]{43}=$' /etc/agern/agern.env
+check "FACTORY_DATA_DIR=/var/lib/agern" grep -qx 'FACTORY_DATA_DIR=/var/lib/agern' /etc/agern/agern.env
+check "FACTORY_GITHUB_ORG left empty" grep -qx 'FACTORY_GITHUB_ORG=' /etc/agern/agern.env
+check "FACTORY_DB_URL left empty" grep -qx 'FACTORY_DB_URL=' /etc/agern/agern.env
+check "AGERN_UPGRADE_CHANNEL=stable" grep -qx 'AGERN_UPGRADE_CHANNEL=stable' /etc/agern/agern.env
+IFS=: read -r _ _ uid _ _ home shell < <(getent passwd agern)
+check "agern is a system user (uid $uid < 1000)" test "$uid" -lt 1000
+eq "agern home" /var/lib/agern "$home"
+case $shell in */nologin) pass "agern shell $shell" ;; *) fail "agern shell $shell" ;; esac
+eq "agern groups (not shadow, no sudo)" agern "$(id -nG agern)"
+KEY_BEFORE=$(grep '^FACTORY_MASTER_KEY=' /etc/agern/agern.env)
+
+section "agern version / doctor"
+out=$(agern version 2>&1) && pass "agern version (root)" || fail "agern version (root)"
+printf '%s\n' "$out"
+printf '%s' "$out" | grep -q "installed: $A_SEMVER" && pass "reports $A_SEMVER" || fail "reports $A_SEMVER"
+check "agern version (as agern)" runuser -u agern -- agern version
+set +e
+doc=$(agern doctor 2>&1)
+rc=$?
+set -e
+printf '%s\n' "$doc"
+eq "doctor exits 1 (problems found, no crash)" 1 "$rc"
+printf '%s' "$doc" | grep -q 'Agern doctor (deb install' && pass "doctor detects the deb layout" || fail "doctor detects the deb layout"
+printf '%s' "$doc" | grep -q 'ok    owner root:agern, mode 640' && pass "doctor: env file permissions ok" || fail "doctor: env file permissions"
+printf '%s' "$doc" | grep -q 'ok    FACTORY_MASTER_KEY is 32 bytes' && pass "doctor: master key read" || fail "doctor: master key read"
+printf '%s' "$doc" | grep -q 'ok    agern is in group(s): agern$' && pass "doctor: agern only in its own group" || fail "doctor: agern groups"
+printf '%s' "$doc" | grep -q 'FAIL  claude not found.*claude.ai/install.sh' && pass "doctor: claude missing, with install hint" || fail "doctor: claude hint"
+printf '%s' "$doc" | grep -q 'FAIL  gh not found.*apt install gh' && pass "doctor: gh missing, with install hint" || fail "doctor: gh hint"
+printf '%s' "$doc" | grep -q 'FAIL  FACTORY_GITHUB_ORG is not set' && pass "doctor: org not set" || fail "doctor: org not set"
+
+section "configuration survives an upgrade (agern upgrade --file)"
+sed -i 's/^FACTORY_GITHUB_ORG=$/FACTORY_GITHUB_ORG=smoke-test-org/' /etc/agern/agern.env
+printf '# local edit by the smoke test\n' >>/etc/agern/agern.env
+SUM_BEFORE=$(sha256sum /etc/agern/agern.env | cut -d' ' -f1)
+B_SEMVER=${A_SEMVER%%[-+]*}
+B_SEMVER="${B_SEMVER%.*}.$((${B_SEMVER##*.} + 1))"
+repack "$B_SEMVER" "$WORK/b.deb"
+# The first upgrade keeps a copy of the installed version for rollback; a tagged release is
+# fetched again (here from the file:// release directory).
+mkdir -p "$REL/download/v$A_SEMVER"
+cp "$WORK/a.deb" "$REL/download/v$A_SEMVER/agern_${A_SEMVER}_all.deb"
+(cd "$REL/download/v$A_SEMVER" && sha256sum "agern_${A_SEMVER}_all.deb" >SHA256SUMS)
+if agern upgrade --file "$WORK/b.deb" >"$WORK/up1.log" 2>&1; then pass "agern upgrade --file b.deb"; else fail "agern upgrade --file b.deb"; cat "$WORK/up1.log"; fi
+eq "now $B_SEMVER" "$(semver_to_deb "$B_SEMVER")" "$(dpkg-query -W -f='${Version}' agern)"
+eq "env file unchanged" "$SUM_BEFORE" "$(sha256sum /etc/agern/agern.env | cut -d' ' -f1)"
+eq "env file permissions kept" "root:agern 640" "$(stat_of /etc/agern/agern.env)"
+eq "previous.deb is $A_DEB" "$A_DEB" "$(dpkg-deb -f /var/cache/agern/previous.deb Version 2>/dev/null || echo none)"
+eq "current.deb is the new version" "$(semver_to_deb "$B_SEMVER")" "$(dpkg-deb -f /var/cache/agern/current.deb Version 2>/dev/null || echo none)"
+out=$(agern upgrade --file "$WORK/b.deb" 2>&1) && printf '%s' "$out" | grep -q 'already installed' && pass "same version again: nothing to do" || fail "same version again"
+set +e
+agern upgrade --file "$WORK/a.deb" >"$WORK/down.log" 2>&1
+rc=$?
+set -e
+[ "$rc" != 0 ] && grep -q 'older than the installed' "$WORK/down.log" && pass "downgrade without --force refused" || fail "downgrade without --force refused"
+check "a file that is not an agern package is refused" bash -c '! agern upgrade --file /usr/share/agern/VERSION'
+
+section "rollback"
+if agern rollback >"$WORK/rb.log" 2>&1; then pass "agern rollback"; else fail "agern rollback"; cat "$WORK/rb.log"; fi
+eq "rolled back to $A_DEB" "$A_DEB" "$(dpkg-query -W -f='${Version}' agern)"
+eq "previous.deb is now $B_SEMVER" "$(semver_to_deb "$B_SEMVER")" "$(dpkg-deb -f /var/cache/agern/previous.deb Version 2>/dev/null || echo none)"
+eq "env file unchanged after rollback" "$SUM_BEFORE" "$(sha256sum /etc/agern/agern.env | cut -d' ' -f1)"
+agern version
+
+section "upgrade from a release (stable channel, checksum)"
+C_SEMVER="${B_SEMVER%.*}.$((${B_SEMVER##*.} + 1))"
+publish latest/download "$C_SEMVER" corrupt
+set +e
+agern upgrade >"$WORK/bad.log" 2>&1
+rc=$?
+set -e
+[ "$rc" != 0 ] && grep -q 'checksum mismatch' "$WORK/bad.log" && pass "checksum mismatch refused" || { fail "checksum mismatch refused"; cat "$WORK/bad.log"; }
+eq "nothing changed after the mismatch" "$A_DEB" "$(dpkg-query -W -f='${Version}' agern)"
+publish latest/download "$C_SEMVER"
+if agern upgrade >"$WORK/up2.log" 2>&1; then pass "agern upgrade (stable)"; else fail "agern upgrade (stable)"; cat "$WORK/up2.log"; fi
+eq "now $C_SEMVER" "$(semver_to_deb "$C_SEMVER")" "$(dpkg-query -W -f='${Version}' agern)"
+out=$(agern upgrade 2>&1) && printf '%s' "$out" | grep -q 'already installed' && pass "stable again: already installed" || fail "stable again"
+
+section "main channel"
+NEXT=${C_SEMVER%.*}.$((${C_SEMVER##*.} + 1))
+M1="$NEXT-main.20261119101500.g1a2b3c4"
+publish download/main-latest "$M1"
+if agern upgrade --channel main >"$WORK/up3.log" 2>&1; then pass "agern upgrade --channel main"; else fail "agern upgrade --channel main"; cat "$WORK/up3.log"; fi
+eq "now the main build" "$(semver_to_deb "$M1")" "$(dpkg-query -W -f='${Version}' agern)"
+eq "VERSION file" "$M1" "$(cat /usr/share/agern/VERSION)"
+set +e
+out=$(agern upgrade 2>&1)
+rc=$?
+set -e
+[ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'older than the installed' && pass "stable $C_SEMVER is older than the main build: refused" || fail "stable older than main refused ($out)"
+publish latest/download "$NEXT"
+if agern upgrade >"$WORK/up4.log" 2>&1; then pass "release $NEXT replaces the main build"; else fail "release replaces main build"; cat "$WORK/up4.log"; fi
+eq "now $NEXT" "$NEXT" "$(dpkg-query -W -f='${Version}' agern)"
+eq "env file unchanged after all upgrades" "$SUM_BEFORE" "$(sha256sum /etc/agern/agern.env | cut -d' ' -f1)"
+eq "master key unchanged" "$KEY_BEFORE" "$(grep '^FACTORY_MASTER_KEY=' /etc/agern/agern.env)"
+LAST=$NEXT
+
+if [ "$SERVER" = 1 ]; then
+    section "server against native PostgreSQL (no systemd: agern run as agern)"
+    pgver=$(find /usr/lib/postgresql -mindepth 1 -maxdepth 1 -printf '%f\n' | sort -n | tail -n 1)
+    pg_ctlcluster "$pgver" main start
+    if agern setup-db >"$WORK/db.log" 2>&1; then pass "agern setup-db"; else fail "agern setup-db"; cat "$WORK/db.log"; fi
+    cat "$WORK/db.log"
+    check "FACTORY_DB_URL written" grep -Eq '^FACTORY_DB_URL=jdbc:postgresql://localhost:[0-9]+/factory$' /etc/agern/agern.env
+    check "FACTORY_DB_PASSWORD generated" grep -Eq '^FACTORY_DB_PASSWORD=[A-Za-z0-9]{32}$' /etc/agern/agern.env
+    PW1=$(grep '^FACTORY_DB_PASSWORD=' /etc/agern/agern.env)
+    if agern setup-db >"$WORK/db2.log" 2>&1; then pass "agern setup-db again (idempotent)"; else fail "agern setup-db again"; cat "$WORK/db2.log"; fi
+    eq "password kept on the second run" "$PW1" "$(grep '^FACTORY_DB_PASSWORD=' /etc/agern/agern.env)"
+    eq "env file permissions after setup-db" "root:agern 640" "$(stat_of /etc/agern/agern.env)"
+    sed -i 's/^FACTORY_AUTH=os$/FACTORY_AUTH=ldap/' /etc/agern/agern.env
+    printf 'FACTORY_LDAP_URL=ldap://127.0.0.1:1\nFACTORY_LDAP_USER_DN_TEMPLATE=uid={0},dc=example\n' >>/etc/agern/agern.env
+
+    mkdir -p /run/agern
+    start_server() {
+        runuser -u agern -- agern run >"$WORK/server.log" 2>&1 &
+        echo $! >/run/agern/agern.pid
+        for _ in $(seq 1 90); do
+            curl -fsS http://127.0.0.1:8080/api/health >/dev/null 2>&1 && return 0
+            sleep 1
+        done
+        return 1
+    }
+    stop_server() {
+        kill "$(cat /run/agern/agern.pid)" 2>/dev/null || true
+        for _ in $(seq 1 30); do kill -0 "$(cat /run/agern/agern.pid)" 2>/dev/null || break; sleep 1; done
+    }
+    if start_server; then pass "server answers /api/health"; else fail "server did not start"; tail -n 60 "$WORK/server.log"; fi
+    curl -fsS http://127.0.0.1:8080/api/health && echo
+    jowner=""
+    for p in /proc/[0-9]*; do
+        if grep -qa 'agern.jar' "$p/cmdline" 2>/dev/null; then jowner=$(stat -c %U "$p"); break; fi
+    done
+    eq "server (java) runs as agern" agern "$jowner"
+    act=$(curl -fsS http://127.0.0.1:8080/api/internal/activity || true)
+    echo "$act"
+    case $act in *'"idle":true'*) pass "/api/internal/activity: idle" ;; *) fail "/api/internal/activity: $act" ;; esac
+    code=$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Forwarded-For: 192.0.2.1' http://127.0.0.1:8080/api/internal/activity)
+    eq "activity refused through a proxy" 404 "$code"
+    set +e
+    doc=$(agern doctor 2>&1)
+    set -e
+    printf '%s\n' "$doc" | sed -n '/postgresql/,/agent tools/p;/^service/,$p'
+    printf '%s' "$doc" | grep -q "ok    logged in to database 'factory' as 'factory'" && pass "doctor: database login ok" || fail "doctor: database login"
+    printf '%s' "$doc" | grep -q 'ok    activity: idle' && pass "doctor: activity idle" || fail "doctor: activity"
+
+    section "automatic upgrade (agern auto-upgrade run)"
+    db_pw=$(sed -n 's/^FACTORY_DB_PASSWORD=//p' /etc/agern/agern.env)
+    psql_factory() { PGPASSWORD=$db_pw psql -X -h localhost -U factory -d factory -Atqc "$1"; }
+    psql_factory "INSERT INTO users(id, username, display_name, is_admin) VALUES ('00000000-0000-0000-0000-000000000001', 'smoke', 'Smoke', false)" >/dev/null
+    psql_factory "INSERT INTO agent_sessions(id, repo, kind, model, status, owner_id, title) VALUES ('00000000-0000-0000-0000-000000000002', 'demo', 'chat', 'sonnet', 'running', '00000000-0000-0000-0000-000000000001', 'busy')" >/dev/null
+    act=$(curl -fsS http://127.0.0.1:8080/api/internal/activity || true)
+    case $act in *'"idle":false'*'"busyAgents":1'*) pass "activity: busy with one agent" ;; *) fail "activity busy: $act" ;; esac
+    NEXT2=${LAST%.*}.$((${LAST##*.} + 1))
+    publish latest/download "$NEXT2"
+    out=$(agern auto-upgrade run 2>&1) || true
+    printf '%s\n' "$out"
+    printf '%s' "$out" | grep -q 'postponing the upgrade' && pass "auto-upgrade postponed while busy" || fail "auto-upgrade postponed"
+    eq "still on $LAST" "$LAST" "$(dpkg-query -W -f='${Version}' agern)"
+    check "state file records the pending upgrade" grep -q "^pending_target=$NEXT2$" /var/cache/agern/auto-upgrade.state
+    sed -i 's/^AGERN_UPGRADE_MAX_WAIT_HOURS=.*/AGERN_UPGRADE_MAX_WAIT_HOURS=0/' /etc/agern/agern.env
+    out=$(agern auto-upgrade run 2>&1) || true
+    printf '%s\n' "$out"
+    printf '%s' "$out" | grep -q 'giving up on the automatic upgrade' && pass "auto-upgrade gives up after the maximum wait" || fail "auto-upgrade gives up"
+    out=$(agern auto-upgrade run 2>&1) || true
+    printf '%s' "$out" | grep -q 'gave up waiting' && pass "the given-up version is not retried" || fail "given-up version not retried ($out)"
+    sed -i 's/^AGERN_UPGRADE_MAX_WAIT_HOURS=.*/AGERN_UPGRADE_MAX_WAIT_HOURS=24/' /etc/agern/agern.env
+    NEXT3=${NEXT2%.*}.$((${NEXT2##*.} + 1))
+    publish latest/download "$NEXT3"
+    psql_factory "UPDATE agent_sessions SET status = 'idle'" >/dev/null
+    out=$(agern auto-upgrade run 2>&1) || true
+    printf '%s\n' "$out"
+    eq "a newer release is installed once idle" "$NEXT3" "$(dpkg-query -W -f='${Version}' agern)"
+    out=$(agern auto-upgrade run 2>&1) || true
+    printf '%s' "$out" | grep -q 'up to date' && pass "auto-upgrade: up to date" || fail "auto-upgrade up to date ($out)"
+    stop_server
+    LAST=$NEXT3
+fi
+
+section "remove"
+apt-get remove -y -q agern >"$WORK/remove.log" 2>&1 && pass "apt-get remove agern" || { fail "apt-get remove agern"; cat "$WORK/remove.log"; }
+check "program removed" test ! -e /usr/bin/agern
+check "jar removed" test ! -e /usr/share/agern/agern.jar
+check "configuration kept" test -f /etc/agern/agern.env
+eq "configuration unchanged" "$KEY_BEFORE" "$(grep '^FACTORY_MASTER_KEY=' /etc/agern/agern.env)"
+check "data kept" test -d /var/lib/agern
+check "user kept" getent passwd agern
+eq "package state" "deinstall ok config-files" "$(dpkg-query -W -f='${Status}' agern)"
+
+section "reinstall after remove keeps the configuration"
+apt-get install -y -q "$WORK/a.deb" >/dev/null 2>&1 && pass "reinstall" || fail "reinstall"
+eq "master key kept" "$KEY_BEFORE" "$(grep '^FACTORY_MASTER_KEY=' /etc/agern/agern.env)"
+
+section "purge"
+apt-get purge -y -q agern >"$WORK/purge.log" 2>&1 && pass "apt-get purge agern" || { fail "apt-get purge agern"; cat "$WORK/purge.log"; }
+grep '^agern:\|^  - ' "$WORK/purge.log" || true
+check "configuration removed" test ! -e /etc/agern/agern.env
+check "/etc/agern removed" test ! -e /etc/agern
+check "package cache removed" test ! -e /var/cache/agern
+check "user removed" bash -c '! getent passwd agern'
+check "group removed" bash -c '! getent group agern'
+check "data directory left in place" test -d /var/lib/agern
+backup=$(find /var/backups -maxdepth 1 -name 'agern.env.purged-*' | head -n 1)
+check "a root-only copy of the configuration is in /var/backups" test -n "$backup"
+[ -n "$backup" ] && eq "backup permissions" "root:root 600" "$(stat_of "$backup")"
+[ -n "$backup" ] && eq "backup has the master key" "$KEY_BEFORE" "$(grep '^FACTORY_MASTER_KEY=' "$backup")"
+grep -q 'left in place' "$WORK/purge.log" && pass "purge says what it left behind" || fail "purge message"
+eq "package gone" "" "$(dpkg-query -W -f='${Status}' agern 2>/dev/null || true)"
+
+printf '\n%s: %d passed, %d failed\n' "$PRETTY_NAME" "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ]

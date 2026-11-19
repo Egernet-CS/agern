@@ -1,0 +1,65 @@
+# Agern — the software factory. Installed by the agern .deb as
+# /usr/lib/systemd/system/agern.service. Local changes: `systemctl edit agern`.
+[Unit]
+Description=Agern - the software factory
+Documentation=https://github.com/Egernet-CS/agern/blob/main/docs/INSTALL-LINUX.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agern
+Group=agern
+# FACTORY_* configuration: root:agern 0640, never writable by the service user.
+EnvironmentFile=/etc/agern/agern.env
+# The service user's ~/.local/bin is last, for a 'claude' installed with the native installer.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/var/lib/agern/.local/bin
+Environment=HOME=/var/lib/agern
+WorkingDirectory=/var/lib/agern
+ExecStart=/usr/bin/agern run
+# SIGTERM to the server first (it stops its agents), then everything left in the cgroup.
+KillMode=mixed
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+# Exit status 2 is a configuration error (missing FACTORY_GITHUB_ORG, bad master key, ...):
+# restarting cannot fix it, so the unit stays failed instead of looping.
+RestartPreventExitStatus=2
+UMask=0027
+LimitNOFILE=65536
+
+# Hardening that leaves agents able to work. Agents are child processes of the server and get
+# exactly these restrictions. They build and test software, so they need: the network (git,
+# package registries, the Claude API), a writable home and workspaces (/var/lib/agern, which
+# holds the per-user homes with their tool caches), /tmp, and possibly device nodes (emulators)
+# and a Docker socket to test what they build. Hence no PrivateNetwork, IPAddressDeny,
+# ProtectSystem=strict, PrivateDevices, MemoryDenyWriteExecute (the JVM and other JITs need W+X
+# memory), SystemCallFilter or RestrictNamespaces (sandboxing tools and browsers use namespaces).
+#
+# What is restricted is the way to root: no new privileges (setuid binaries such as sudo or su
+# do not elevate), an empty capability bounding set, no SUID/SGID files can be created.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+# A private /tmp and /var/tmp, removed when the service stops.
+PrivateTmp=true
+# /usr, /boot and /etc are read-only (they are not writable by the agern user anyway; this
+# also covers a misconfigured permission).
+ProtectSystem=full
+# /home, /root and /run/user are invisible: agents have no business in people's home directories.
+ProtectHome=true
+# Other users' processes (and their command lines and environments) are invisible in /proc.
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+LockPersonality=true
+ReadWritePaths=/var/lib/agern
+
+[Install]
+WantedBy=multi-user.target

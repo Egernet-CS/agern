@@ -1,0 +1,25 @@
+#!/bin/sh
+# prerm for the agern .deb (packaging/deb/prerm).
+# remove: stop and disable the service and the upgrade timer. upgrade: nothing — the server keeps
+# running on the old files until the new package's postinst restarts it.
+set -e
+
+case "$1" in
+    remove | deconfigure)
+        if command -v systemctl >/dev/null 2>&1; then
+            if [ -d /run/systemd/system ]; then
+                systemctl stop agern-upgrade.timer >/dev/null 2>&1 || true
+                if command -v deb-systemd-invoke >/dev/null 2>&1; then
+                    deb-systemd-invoke stop agern.service >/dev/null 2>&1 || true
+                else
+                    systemctl stop agern.service >/dev/null 2>&1 || true
+                fi
+            fi
+            systemctl disable agern.service agern-upgrade.timer >/dev/null 2>&1 || true
+        fi
+        ;;
+    upgrade | failed-upgrade) ;;
+    *) ;;
+esac
+
+exit 0
