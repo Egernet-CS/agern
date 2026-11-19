@@ -1,0 +1,30 @@
+{
+  "fps": 24,
+  "fade": 0.5,
+  "segments": [
+    {"id": "factory", "kind": "3d", "start": 0.0, "end": 35.0},
+    {"id": "chat", "kind": "ui", "remap": [[1.5, 5.9, 2.2], [5.9, 15.6, 1.45]]},
+    {"id": "run", "kind": "ui", "remap": [[0.2, 32.6, 3.2]]},
+    {"id": "floor", "kind": "ui", "remap": [[0.4, 5.0, 1.0]]},
+    {"id": "observe", "kind": "ui", "remap": [[0.9, 6.6, 1.0]]},
+    {"id": "end", "kind": "card", "duration": 6.0}
+  ],
+  "captions": [
+    {"id": "title", "seg": "factory", "at": [0.6, 5.2], "kind": "title"},
+    {"id": "spec", "seg": "factory", "at": [6.4, 9.9], "label": "01 · spec-writer · opus", "text": "An issue comes in. The spec-writer turns it into a spec."},
+    {"id": "build", "seg": "factory", "at": [10.2, 13.7], "label": "02 · builder · opus", "text": "The builder implements the spec on a branch and opens a PR."},
+    {"id": "review", "seg": "factory", "at": [14.0, 18.0], "label": "03 · four reviewers in parallel · read-only", "text": "security · ux · ui-design · code, then wait for all four."},
+    {"id": "changes", "seg": "factory", "at": [18.3, 21.0], "label": "03 · verdict", "text": "One reviewer says CHANGES: back to the builder."},
+    {"id": "fix", "seg": "factory", "at": [21.3, 24.6], "label": "fix round 1 · max 2", "text": "The same builder conversation resumes and fixes the findings."},
+    {"id": "pass", "seg": "factory", "at": [25.0, 28.4], "label": "03 · verdict", "text": "Second review: all four PASS."},
+    {"id": "approve", "seg": "factory", "at": [28.7, 32.3], "label": "04 · approver · opus", "text": "APPROVE: squash-merge. ESCALATE: needs-human, a person approves."},
+    {"id": "ship", "seg": "factory", "at": [32.5, 35.0], "label": "05 · merged", "text": "Merged to main, issue closed."},
+    {"id": "ui-chat", "seg": "chat", "at": [0.3, -0.45], "label": "the real product · project chat", "text": "A Claude agent in every project chat: streamed, with tool calls."},
+    {"id": "ui-run", "seg": "run", "at": [0.3, -0.45], "label": "pipeline run · live · 3× speed", "text": "Two reviewers ask for changes, one fix round, approved, merged."},
+    {"id": "ui-floor", "seg": "floor", "at": [0.3, -0.45], "label": "agents · on the floor", "text": "Every agent you can see, across projects: yours and colleagues'."},
+    {"id": "ui-observe", "seg": "observe", "at": [0.3, -0.45], "label": "observing a colleague", "text": "Watch bob's agent work, live. Read-only: only bob can drive it."},
+    {"id": "end", "seg": "end", "at": [0.0, 0.0], "kind": "end"}
+  ],
+  "title": {"name": "Agern", "tagline": "the software factory", "sub": "Self-hosted. Claude agents at work on your GitHub issues."},
+  "end": {"lines": ["your own Claude account", "four reviewers before every merge", "a human for the hard calls"], "url": "github.com/Egernet-CS/agern"}
+}

@@ -38,3 +38,10 @@ export function modelLabel(m: string | null | undefined): string {
   if (!x) return m;
   return `${x[1]} ${x[2]}${x[3] && x[3].length < 3 ? `.${x[3]}` : ''}`;
 }
+
+/** 1536 → "1.5 KB" (binary units, like the server's messages). */
+export function bytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}

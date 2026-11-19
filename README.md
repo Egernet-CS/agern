@@ -13,6 +13,13 @@
   <img src="web/public/art/hero.webp" alt="The Agern factory line: specs arrive, are built, reviewed by four gates and shipped" width="100%">
 </p>
 
+<p align="center">
+  <a href="docs/media/agern-concept.mp4">
+    <img src="docs/media/agern-concept-poster.webp" alt="Watch the Agern concept video (67 seconds)" width="70%">
+  </a><br>
+  <sub><a href="docs/media/agern-concept.mp4">▶ Watch the concept video (67 s)</a></sub>
+</p>
+
 Agern is a web application you run on your own machine. A GitHub organization is the source of
 truth: **repositories are projects** and **issues are the work**. Every project has a terminal-like
 chat with a Claude agent, and that agent — or a person — can start a *pipeline run* in which a team

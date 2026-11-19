@@ -14,6 +14,10 @@ Behaviour
     - text containing "crash" -> exits with status 3
     - text containing "env"   -> replies with the names of its environment variables
     - text containing "install" -> files a software request through the MCP tool factory_request_software
+    - text containing "long"  -> replies with 80 numbered lines (a transcript taller than the screen)
+    - content blocks: image blocks are decoded and reported ("IMAGE 1: image/png 32x32, 70 bytes"); the
+      "[Attachments]" text block's paths are checked on disk ("FILE ok name 123 bytes" / "FILE missing ...").
+      Trigger words are only looked for in the user's own text, not in that listing.
     - control_request {subtype: interrupt} stops the current turn
   Conversations are remembered under $HOME/.fake-claude/sessions/<id>. Like the real CLI,
   --resume <id> of an unknown conversation fails at once ("No conversation found with session ID").
@@ -158,6 +162,66 @@ def mcp_call(method, params, req_id):
         return json.loads(resp.read().decode())
 
 
+def image_size(data):
+    """(width, height) of PNG/GIF/JPEG bytes, or None."""
+    import struct
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return struct.unpack(">II", data[16:24])
+    if data[:4] == b"GIF8":
+        return struct.unpack("<HH", data[6:10])
+    if data[:3] == b"\xff\xd8\xff":
+        i = 2
+        while i + 9 < len(data):
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            mk = data[i + 1]
+            if 0xC0 <= mk <= 0xCF and mk not in (0xC4, 0xC8, 0xCC):
+                h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                return w, h
+            if mk in (0xD8, 0x01) or 0xD0 <= mk <= 0xD7 or mk == 0xFF:
+                i += 2 if mk != 0xFF else 1
+                continue
+            i += 2 + struct.unpack(">H", data[i + 2:i + 4])[0]
+    return None
+
+
+def describe_blocks(blocks):
+    """What an attachment-carrying user turn contained, so tests can see the agent really got it."""
+    import base64
+    import re
+    out = []
+    n = 0
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "image":
+            n += 1
+            src = b.get("source", {})
+            try:
+                data = base64.b64decode(src.get("data", ""), validate=True)
+                size = image_size(data)
+                dims = "%dx%d" % size if size else "?x?"
+                out.append("IMAGE %d: %s %s, %d bytes" % (n, src.get("media_type"), dims, len(data)))
+            except Exception as e:  # noqa
+                out.append("IMAGE %d: undecodable (%s)" % (n, e))
+        elif b.get("type") == "text" and b.get("text", "").startswith("[Attachments]"):
+            lines = b["text"].splitlines()
+            for i, line in enumerate(lines):
+                m = re.match(r"\s+path: (.+)$", line)
+                if not m:
+                    continue
+                path = m.group(1)
+                head = re.match(r"\d+\. (.+?) — ", lines[i - 1]) if i > 0 else None
+                name = head.group(1) if head else os.path.basename(path)
+                if os.path.isfile(path):
+                    inside_repo = os.path.abspath(path).startswith(os.getcwd() + os.sep)
+                    out.append("FILE ok %s %d bytes%s" % (name, os.path.getsize(path), " (INSIDE THE REPO!)" if inside_repo else ""))
+                else:
+                    out.append("FILE missing %s at %s" % (name, path))
+    return out
+
+
 # --------------------------------------------------------------------------- chat mode
 
 def chat_mode():
@@ -208,8 +272,11 @@ def chat_mode():
         if m.get("type") != "user":
             continue
         content = m.get("message", {}).get("content", "")
+        attachment_report = []
         if isinstance(content, list):
-            content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+            attachment_report = describe_blocks(content)
+            content = " ".join(c.get("text", "") for c in content
+                               if isinstance(c, dict) and c.get("type") == "text" and not c.get("text", "").startswith("[Attachments]"))
         interrupt_flag["set"] = False
         init_event()
         if "crash" in content:
@@ -218,6 +285,10 @@ def chat_mode():
         if "tool" in content:
             tool_roundtrip("echo hello from fake-claude && pwd")
         reply = "You said: " + content
+        if attachment_report:
+            reply += "\n" + "\n".join(attachment_report)
+        if "long" in content:
+            reply += "\n" + "\n".join("line %d of a long answer" % i for i in range(1, 81))
         if "env" in content:
             reply += "\nENV: " + ",".join(sorted(os.environ.keys()))
         if "mcp" in content and mcp_config:

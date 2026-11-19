@@ -74,13 +74,15 @@ function SettingsCard() {
           </span>
         </span>
       </label>
+      <h3 className="sd-h">Default models <span className="muted">(used when a user has not chosen their own)</span></h3>
+      <p className="muted small">Each user can choose their own models and fix rounds under Settings → Models &amp; cost; agents run on their own Claude account.</p>
       <div className="form-grid">
         <label htmlFor="m-chat">chat</label>
         <ModelSelect id="m-chat" value={draft.chatModel} onChange={(v) => setDraft({ ...draft, chatModel: v })} />
         {ROLES.map((r) => (
           <FragmentRow key={r} role={r} value={draft.pipelineModels[r]} onChange={(v) => setDraft({ ...draft, pipelineModels: { ...draft.pipelineModels, [r]: v } })} />
         ))}
-        <label htmlFor="m-rounds">max fix rounds</label>
+        <label htmlFor="m-rounds">default and maximum fix rounds</label>
         <input id="m-rounds" type="number" min={0} max={10} value={draft.maxFixRounds} onChange={(e) => setDraft({ ...draft, maxFixRounds: Math.min(10, Math.max(0, Number(e.target.value))) })} />
       </div>
       {err && <p className="form-error" role="alert">{err}</p>}

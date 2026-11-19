@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { useEffect, useId, useMemo, useRef, useState, type ClipboardEvent, type KeyboardEvent, type ReactNode } from 'react';
 
 export const FACTORY_COMMANDS = [
   { cmd: '/factory run ', usage: '/factory run <issue>', help: 'Start a pipeline run for an issue' },
@@ -13,14 +13,23 @@ type Props = {
   onInterrupt: () => void;
   working: boolean;
   history: string[];
+  /** Chips of the attachments being composed, shown above the input. */
+  attachments?: ReactNode;
+  /** Files picked, pasted (`pasted`) or dropped. Absent: no attach affordances. */
+  onFiles?: (files: File[], pasted?: boolean) => void;
+  /** At least one uploaded attachment is ready: a message without text may be sent. */
+  hasAttachments?: boolean;
+  /** Why sending is not possible right now (uploads in flight, failed uploads). */
+  blocked?: string | null;
 };
 
-export function Prompt({ onSubmit, onInterrupt, working, history }: Props) {
+export function Prompt({ onSubmit, onInterrupt, working, history, attachments, onFiles, hasAttachments = false, blocked = null }: Props) {
   const [value, setValue] = useState('');
   const [sel, setSel] = useState(0);
   const [dismissed, setDismissed] = useState(false);
   const [histIdx, setHistIdx] = useState<number | null>(null);
   const ta = useRef<HTMLTextAreaElement>(null);
+  const picker = useRef<HTMLInputElement>(null);
   const listId = useId();
 
   const suggestions = useMemo(() => {
@@ -36,7 +45,8 @@ export function Prompt({ onSubmit, onInterrupt, working, history }: Props) {
     const el = ta.current;
     if (!el) return;
     el.style.height = '0px';
-    el.style.height = `${Math.min(el.scrollHeight, 240)}px`;
+    // Capped (see .prompt textarea max-height): beyond it the textarea scrolls instead of pushing the pane.
+    el.style.height = `${el.scrollHeight}px`;
   }, [value]);
 
   useEffect(() => {
@@ -51,14 +61,28 @@ export function Prompt({ onSubmit, onInterrupt, working, history }: Props) {
     ta.current?.focus();
   };
 
+  const canSend = (value.trim().length > 0 || hasAttachments) && !blocked;
   const submit = async () => {
     const text = value.trim();
-    if (!text || working) return;
+    if ((!text && !hasAttachments) || working || blocked) return;
     setValue('');
     setHistIdx(null);
     setDismissed(false);
     const ok = await onSubmit(text);
-    if (!ok) setValue(text);
+    if (!ok) {
+      // Give the text back without popping the command suggestions over the error message.
+      setValue(text);
+      setDismissed(true);
+    }
+  };
+
+  const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    if (!onFiles) return;
+    const files = Array.from(e.clipboardData?.files ?? []);
+    if (files.length === 0) return;
+    // A copied file or screenshot: attach it instead of pasting its name.
+    e.preventDefault();
+    onFiles(files, true);
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -117,6 +141,8 @@ export function Prompt({ onSubmit, onInterrupt, working, history }: Props) {
 
   return (
     <div className={`prompt ${working ? 'is-working' : ''}`}>
+      {attachments}
+      {blocked && <div className="prompt-blocked muted small" role="status">{blocked}</div>}
       {open && (
         <ul className="prompt-suggest" id={listId} role="listbox" aria-label="Factory commands">
           {suggestions.map((s, i) => (
@@ -155,13 +181,34 @@ export function Prompt({ onSubmit, onInterrupt, working, history }: Props) {
             setHistIdx(null);
           }}
           onKeyDown={onKeyDown}
+          onPaste={onPaste}
         />
+        {onFiles && (
+          <>
+            <input
+              ref={picker}
+              type="file"
+              multiple
+              hidden
+              tabIndex={-1}
+              aria-hidden
+              onChange={(e) => {
+                onFiles(Array.from(e.target.files ?? []));
+                e.target.value = '';
+                ta.current?.focus();
+              }}
+            />
+            <button type="button" className="prompt-btn prompt-btn--attach" onClick={() => picker.current?.click()} aria-label="Attach files" title="Attach files — or paste / drop them">
+              +
+            </button>
+          </>
+        )}
         {working ? (
           <button type="button" className="prompt-btn prompt-btn--stop" onClick={onInterrupt} aria-label="Interrupt (Esc)">
             ■
           </button>
         ) : (
-          <button type="button" className="prompt-btn" onClick={() => void submit()} disabled={!value.trim()} aria-label="Send (Enter)">
+          <button type="button" className="prompt-btn" onClick={() => void submit()} disabled={!canSend} aria-label="Send (Enter)" title={blocked ?? undefined}>
             ⏎
           </button>
         )}

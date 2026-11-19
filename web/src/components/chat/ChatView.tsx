@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { api, ApiError, type AgentSession } from '../../api';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type ReactNode } from 'react';
+import { api, ApiError, type AgentSession, type Attachment } from '../../api';
 import { useMe } from '../../lib/auth';
 import { cost, duration, modelLabel } from '../../lib/format';
 import { useSessionStream } from '../../lib/realtime';
 import { useNow } from '../../lib/useNow';
-import { buildTranscript } from './model';
+import { DraftChips, MessageAttachments, useAttachmentDrafts } from './attachments';
+import { attachmentsOf, buildTranscript } from './model';
 import { Prompt } from './Prompt';
 import { TranscriptItems } from './Transcript';
 
@@ -53,45 +54,112 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
   const ended = !isChat && (status === 'stopped' || status === 'failed' || status === 'done');
   const resumable = isChat && status === 'stopped';
   const working = status === 'running' || status === 'starting';
-  const [sending, setSending] = useState<string | null>(null);
+  const [sending, setSending] = useState<{ text: string; attachments: Attachment[] } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const canCompose = canDrive && !ended && !disabledReason;
+  const att = useAttachmentDrafts(sessionId, canCompose);
 
-  // --- scrolling: stick to bottom unless the reader scrolled up
+  // --- scrolling: stick to the bottom while the agent streams, unless the reader scrolled up
   const scroller = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
+  const [atBottom, setAtBottom] = useState(true);
   const onScroll = () => {
     const el = scroller.current;
-    if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    if (!el) return;
+    stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    setAtBottom(stick.current);
   };
   useLayoutEffect(() => {
     const el = scroller.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
   });
+  // The pane shrinks when the composer grows (chips, more lines): keep the bottom in view.
+  useEffect(() => {
+    const el = scroller.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => {
+      if (stick.current) el.scrollTop = el.scrollHeight;
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   useEffect(() => {
     stick.current = true;
+    setAtBottom(true);
   }, [sessionId]);
+  const jumpToLatest = () => {
+    const el = scroller.current;
+    stick.current = true;
+    setAtBottom(true);
+    el?.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+  };
 
   // Clear optimistic echo once the server's user event arrives.
   useEffect(() => {
-    if (sending && stream.events.some((e) => e.type === 'user' && (e.payload as { text?: string })?.text === sending)) setSending(null);
+    if (!sending) return;
+    const ids = sending.attachments.map((a) => a.id).join();
+    const arrived = stream.events.some((e) => {
+      if (e.type !== 'user') return false;
+      const p = e.payload as { text?: string; attachments?: unknown };
+      return p?.text === sending.text && attachmentsOf(p.attachments).map((a) => a.id).join() === ids;
+    });
+    if (arrived) setSending(null);
   }, [stream.events, sending]);
 
   const send = useCallback(
     async (text: string) => {
       setError(null);
-      setSending(text);
+      const attachments = att.ready;
+      if (attachments.length && text.trim().startsWith('/factory')) {
+        setError('/factory commands do not take attachments. Remove them, or send them in a normal message.');
+        return false;
+      }
+      setSending({ text, attachments });
       stick.current = true;
       try {
-        await api.sendInput(sessionId, text);
+        await api.sendInput(sessionId, text, attachments.map((a) => a.id));
       } catch (e) {
         setSending(null);
         setError(e instanceof ApiError ? e.message : 'Could not send.');
         return false;
       }
+      att.clearSent();
       return true;
     },
-    [sessionId],
+    [sessionId, att],
   );
+
+  // --- drag and drop anywhere on the chat pane (owner only)
+  const [dropping, setDropping] = useState(false);
+  const dragDepth = useRef(0);
+  const hasFiles = (e: ReactDragEvent) => Array.from(e.dataTransfer?.types ?? []).includes('Files');
+  const dropHandlers = canCompose
+    ? {
+        onDragEnter: (e: ReactDragEvent) => {
+          if (!hasFiles(e)) return;
+          e.preventDefault();
+          dragDepth.current++;
+          setDropping(true);
+        },
+        onDragOver: (e: ReactDragEvent) => {
+          if (!hasFiles(e)) return;
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'copy';
+        },
+        onDragLeave: (e: ReactDragEvent) => {
+          if (!hasFiles(e)) return;
+          dragDepth.current = Math.max(0, dragDepth.current - 1);
+          if (dragDepth.current === 0) setDropping(false);
+        },
+        onDrop: (e: ReactDragEvent) => {
+          if (!hasFiles(e)) return;
+          e.preventDefault();
+          dragDepth.current = 0;
+          setDropping(false);
+          att.add(Array.from(e.dataTransfer.files));
+        },
+      }
+    : {};
 
   const interrupt = useCallback(async () => {
     try {
@@ -125,7 +193,12 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
   const loading = stream.events.length === 0 && stream.conn !== 'live';
 
   return (
-    <section className={`chat ${embedded ? 'chat--embedded' : ''}`} aria-label="Agent transcript">
+    <section className={`chat ${embedded ? 'chat--embedded' : ''} ${dropping ? 'is-dropping' : ''}`} aria-label="Agent transcript" {...dropHandlers}>
+      {dropping && (
+        <div className="chat-drop" aria-hidden>
+          <span>Drop files to attach</span>
+        </div>
+      )}
       {header}
       {session && !isOwner && (
         <div className="chat-banner" role="note">
@@ -133,17 +206,21 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
           <span className="chat-banner-sub"> · read-only — only {session.owner.username} can drive this agent</span>
         </div>
       )}
+      <div className="chat-scroll-wrap">
       <div className="chat-scroll" ref={scroller} onScroll={onScroll} tabIndex={0} aria-label="Transcript">
         <div className="chat-log" aria-live="polite" aria-relevant="additions">
           {loading && <div className="t-meta">connecting to session…</div>}
           {!loading && items.length === 0 && (
             <div className="t-meta">{isChat ? 'Empty session. Say hello — or type /factory help.' : 'Waiting for the agent to start…'}</div>
           )}
-          <TranscriptItems items={items} me={me.username} />
+          <TranscriptItems items={items} me={me.username} sessionId={sessionId} />
           {sending && (
             <div className="t-user t-user--pending">
               <span className="t-prompt" aria-hidden>&gt;</span>
-              <div className="t-user-text">{sending}</div>
+              <div className="t-user-body">
+                {sending.text && <div className="t-user-text">{sending.text}</div>}
+                <MessageAttachments sessionId={sessionId} list={sending.attachments} />
+              </div>
             </div>
           )}
           {working && (
@@ -155,6 +232,12 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
           )}
         </div>
       </div>
+      {!atBottom && (
+        <button type="button" className="chat-jump" onClick={jumpToLatest}>
+          ↓ jump to latest
+        </button>
+      )}
+      </div>
       {error && (
         <div className="chat-error" role="alert">
           {error}
@@ -164,7 +247,18 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
       {canDrive && resumable && !disabledReason && (
         <div className="chat-resume muted small" role="note">This chat’s agent was stopped. Your next message resumes the conversation.</div>
       )}
-      {canDrive && !ended && !disabledReason && <Prompt onSubmit={send} onInterrupt={interrupt} working={working} history={history} />}
+      {canCompose && (
+        <Prompt
+          onSubmit={send}
+          onInterrupt={interrupt}
+          working={working}
+          history={history}
+          attachments={<DraftChips drafts={att.drafts} onRemove={att.remove} />}
+          onFiles={att.add}
+          hasAttachments={att.ready.length > 0}
+          blocked={att.uploading ? 'Waiting for uploads to finish…' : att.failed ? 'Remove the attachments that failed before sending.' : null}
+        />
+      )}
       {canDrive && !ended && disabledReason && <div className="chat-disabled">{disabledReason}</div>}
       {canDrive && ended && <div className="chat-disabled">This session has {status}.</div>}
       <footer className="chat-footer">
@@ -175,7 +269,7 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
           <span aria-hidden>●</span> {stream.conn === 'live' ? 'live' : stream.conn}
         </span>
         {canDrive && !ended && !disabledReason && (
-          <span className="cf-hints" aria-hidden>⏎ send · ⇧⏎ newline · esc interrupt · / commands</span>
+          <span className="cf-hints" aria-hidden>⏎ send · ⇧⏎ newline · esc interrupt · / commands · paste or drop files</span>
         )}
       </footer>
     </section>

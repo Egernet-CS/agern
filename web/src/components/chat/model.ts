@@ -1,11 +1,11 @@
 // Turns raw session events (incl. Claude Code stream-json) into renderable transcript items.
 // Everything here is defensive: unknown shapes become compact "unknown" items, never throws.
-import type { FactoryEvent, SessionStatus } from '../../api/types';
+import type { Attachment, FactoryEvent, SessionStatus } from '../../api/types';
 
 export type ToolResult = { text: string; isError: boolean; images: number };
 
 export type Item =
-  | { k: 'user'; id: string; text: string; username: string; ts: string }
+  | { k: 'user'; id: string; text: string; username: string; ts: string; attachments: Attachment[] }
   | { k: 'text'; id: string; text: string; streaming?: boolean }
   | { k: 'thinking'; id: string; text: string; streaming?: boolean }
   | { k: 'tool'; id: string; name: string; input: unknown; inputPartial?: string; result?: ToolResult; streaming?: boolean }
@@ -41,6 +41,16 @@ function compactJson(v: unknown, max = 220): string {
   return s.length > max ? `${s.slice(0, max)}…` : s;
 }
 
+/** Attachment refs of a `user` event, defensively (only well-formed entries). */
+export function attachmentsOf(v: unknown): Attachment[] {
+  if (!Array.isArray(v)) return [];
+  return v.filter((a): a is Attachment => isObj(a) && typeof a.id === 'string' && typeof a.name === 'string').map((a) => ({
+    ...a,
+    kind: a.kind === 'image' ? 'image' : 'file',
+    size: num(a.size) ?? 0,
+  }));
+}
+
 export function normalizeToolContent(c: unknown): { text: string; images: number } {
   if (typeof c === 'string') return { text: c, images: 0 };
   if (Array.isArray(c)) {
@@ -70,7 +80,7 @@ export function buildTranscript(events: FactoryEvent[], partials: unknown[]): { 
     try {
       if (ev.type === 'user') {
         const u = isObj(p) ? p : {};
-        items.push({ k: 'user', id, text: str(u.text) ?? '', username: str(u.username) ?? '', ts: ev.ts });
+        items.push({ k: 'user', id, text: str(u.text) ?? '', username: str(u.username) ?? '', ts: ev.ts, attachments: attachmentsOf(u.attachments) });
         const isCommand = (str(u.text) ?? '').trim().startsWith('/factory');
         if (!isCommand) {
           summary.turnOpen = true;

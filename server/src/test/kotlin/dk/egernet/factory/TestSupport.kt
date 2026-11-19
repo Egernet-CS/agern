@@ -91,13 +91,19 @@ class FakeProcess(val spec: LaunchSpec, private val onInput: (FakeProcess, Strin
  */
 class FakeLauncher(var stage: (FakeProcess) -> Unit = { it.init(); it.result("ok"); it.exit(0) }) : AgentLauncher {
     val launched = CopyOnWriteArrayList<FakeProcess>()
+    /** Every chat `user` message written to a process (the stream-json `message.content`). */
+    val chatInputs = CopyOnWriteArrayList<kotlinx.serialization.json.JsonElement>()
 
     override fun launch(spec: LaunchSpec): AgentProcess {
         val p = if (spec.interactive) {
             FakeProcess(spec) { proc, line ->
                 val o = AppJson.parseToJsonElement(line).jsonObject
                 if (o["type"]?.jsonPrimitive?.contentOrNull == "user") {
-                    val text = o["message"]!!.jsonObject["content"]!!.jsonPrimitive.content
+                    val content = o["message"]!!.jsonObject["content"]!!
+                    chatInputs += content
+                    val text = (content as? kotlinx.serialization.json.JsonArray)
+                        ?.mapNotNull { (it as? JsonObject)?.get("text")?.jsonPrimitive?.contentOrNull }?.joinToString(" ")
+                        ?: content.jsonPrimitive.content
                     proc.init(proc.spec.resumeClaudeSessionId ?: "chat-claude-${proc.spec.sessionId}")
                     proc.assistantText("echo: $text")
                     proc.result("echo: $text")

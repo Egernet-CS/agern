@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { useLocation } from 'react-router-dom';
-import { api, type CredentialKind } from '../api';
+import { api, type CredentialKind, type PreferenceOverrides, type Preferences, type StageRole } from '../api';
 import { CodeInput } from '../components/ui/CodeInput';
 import { RecoveryCodes } from '../components/ui/RecoveryCodes';
 import { CopyButton, Dialog, Notice } from '../components/ui/ui';
@@ -27,6 +27,7 @@ export function SettingsPage() {
       </div>
       <ClaudeSection />
       <GithubSection />
+      <ModelsSection />
       <SecuritySection />
       <p className="muted small pad-top">Signed in as <strong>{me.username}</strong>{me.isAdmin ? ' · admin' : ''}.</p>
     </div>
@@ -245,6 +246,164 @@ function SecuritySection() {
           </div>
         )}
       </Dialog>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------- models & cost
+
+const ROLES: StageRole[] = ['spec-writer', 'builder', 'security', 'ux', 'ui-design', 'code', 'approver'];
+const EMPTY: PreferenceOverrides = { chatModel: null, pipelineModels: {}, maxFixRounds: null };
+
+/** One-click choices. Economy: cheaper models where depth matters least (chat, reviews), one fix round. */
+function presets(max: number): { name: string; help: string; value: PreferenceOverrides }[] {
+  return [
+    { name: 'Default', help: 'Use the factory defaults for everything', value: EMPTY },
+    {
+      name: 'Economy',
+      help: 'Sonnet for chat and spec, Haiku for the four reviewers, at most one fix round',
+      value: {
+        chatModel: 'sonnet',
+        pipelineModels: { 'spec-writer': 'sonnet', security: 'haiku', ux: 'haiku', 'ui-design': 'haiku', code: 'haiku' },
+        maxFixRounds: Math.min(1, max),
+      },
+    },
+  ];
+}
+
+const same = (a: PreferenceOverrides, b: PreferenceOverrides) =>
+  (a.chatModel ?? null) === (b.chatModel ?? null) &&
+  (a.maxFixRounds ?? null) === (b.maxFixRounds ?? null) &&
+  ROLES.every((r) => (a.pipelineModels[r] ?? null) === (b.pipelineModels[r] ?? null));
+
+function ModelsSection() {
+  const [prefs, setPrefs] = useState<Preferences | null>(null);
+  const [draft, setDraft] = useState<PreferenceOverrides>(EMPTY);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+  useEffect(() => {
+    api.preferences().then(
+      (p) => {
+        setPrefs(p);
+        setDraft(p.overrides);
+      },
+      (e: Error) => setErr(e.message),
+    );
+  }, []);
+  if (!prefs) {
+    return (
+      <section className="card settings-card" id="models" aria-labelledby="models-h">
+        <header className="sc-head"><h2 id="models-h">Models &amp; cost</h2></header>
+        {err ? <p className="form-error" role="alert">{err}</p> : <p className="muted">Loading…</p>}
+      </section>
+    );
+  }
+  const max = prefs.effective.maxFixRounds.max;
+  const dirty = !same(draft, prefs.overrides);
+  const save = async (value: PreferenceOverrides, label?: string) => {
+    setBusy(true);
+    setErr(null);
+    setMsg(null);
+    try {
+      const p = await api.putPreferences(value);
+      setPrefs(p);
+      setDraft(p.overrides);
+      setMsg(label ? `${label} applied. New chats and runs you start use it.` : 'Saved. New chats and runs you start use it.');
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const defaultOf = (role: StageRole | 'chat') => {
+    // What the factory default is, i.e. what applies once this row is reset.
+    const e = role === 'chat' ? prefs.effective.chatModel : prefs.effective.pipelineModels[role];
+    return e.source === 'default' ? e.value : null;
+  };
+  const row = (role: StageRole | 'chat') => {
+    const value = role === 'chat' ? draft.chatModel : draft.pipelineModels[role] ?? null;
+    const set = (v: string | null) =>
+      setDraft((d) => (role === 'chat' ? { ...d, chatModel: v } : { ...d, pipelineModels: { ...d.pipelineModels, [role]: v ?? undefined } }));
+    const def = defaultOf(role);
+    return (
+      <div key={role} className="pref-row">
+        <label htmlFor={`pref-${role}`}>{role}</label>
+        <input
+          id={`pref-${role}`}
+          className="mono"
+          list="model-suggestions"
+          value={value ?? ''}
+          placeholder={def ? `default (${def})` : 'default'}
+          spellCheck={false}
+          autoComplete="off"
+          onChange={(e) => set(e.target.value.trim() ? e.target.value : null)}
+        />
+        <span className={`pref-src ${value ? 'pref-src--user' : ''}`}>{value ? 'your choice' : 'default'}</span>
+        <button type="button" className="btn btn--ghost btn--sm" disabled={!value} onClick={() => set(null)} aria-label={`Reset ${role} to the default`}>
+          reset
+        </button>
+      </div>
+    );
+  };
+  const rounds = prefs.effective.maxFixRounds;
+  return (
+    <section className="card settings-card" id="models" aria-labelledby="models-h">
+      <header className="sc-head">
+        <h2 id="models-h">Models &amp; cost</h2>
+        <span className="muted small">for agents you start</span>
+      </header>
+      <p>
+        Every chat and pipeline run you start runs on <strong>your</strong> Claude account and is billed to it. Choose cheaper models here — an alias
+        ({prefs.suggestions.join(', ')}) or a full model id. Empty means the factory default. A run keeps the models and fix rounds it started with.
+      </p>
+      <div className="row pref-presets" role="group" aria-label="Presets">
+        {presets(max).map((p) => (
+          <button key={p.name} type="button" className="btn btn--sm" title={p.help} disabled={busy} onClick={() => void save(p.value, p.name)}>
+            {p.name}
+          </button>
+        ))}
+        <span className="muted small">Economy: Sonnet for chat and spec, Haiku reviewers, one fix round.</span>
+      </div>
+      <datalist id="model-suggestions">
+        {prefs.suggestions.map((m) => <option key={m} value={m} />)}
+      </datalist>
+      <div className="pref-grid">
+        {row('chat')}
+        {ROLES.map(row)}
+        <div className="pref-row">
+          <label htmlFor="pref-rounds">fix rounds</label>
+          <select
+            id="pref-rounds"
+            value={draft.maxFixRounds == null ? '' : String(draft.maxFixRounds)}
+            onChange={(e) => setDraft((d) => ({ ...d, maxFixRounds: e.target.value === '' ? null : Number(e.target.value) }))}
+          >
+            <option value="">default ({max})</option>
+            {Array.from({ length: max + 1 }, (_, n) => (
+              <option key={n} value={n}>{n === 0 ? '0 — no fix rounds' : n}</option>
+            ))}
+            {draft.maxFixRounds != null && draft.maxFixRounds > max && <option value={draft.maxFixRounds}>{draft.maxFixRounds} (above the maximum)</option>}
+          </select>
+          <span className={`pref-src ${draft.maxFixRounds != null ? 'pref-src--user' : ''}`}>{draft.maxFixRounds != null ? 'your choice' : 'default'}</span>
+          <button type="button" className="btn btn--ghost btn--sm" disabled={draft.maxFixRounds == null} onClick={() => setDraft((d) => ({ ...d, maxFixRounds: null }))} aria-label="Reset fix rounds to the default">
+            reset
+          </button>
+        </div>
+      </div>
+      <p className="muted small">
+        Fix rounds: how often the builder may answer reviewer changes before a human decides (0–{max}; the factory allows at most {max}). 0 sends any requested change straight to you.
+      </p>
+      {rounds.clamped && (
+        <Notice tone="info" title="Fix rounds capped">
+          You chose {prefs.overrides.maxFixRounds}, but the factory now allows at most {max}; your runs use {rounds.value}.
+        </Notice>
+      )}
+      {err && <p className="form-error" role="alert">{err}</p>}
+      {msg && !dirty && <p className="form-ok" role="status">{msg}</p>}
+      <div className="row">
+        <button className="btn btn--primary" disabled={!dirty || busy} onClick={() => void save(draft)}>Save models</button>
+        {dirty && <button className="btn btn--ghost" onClick={() => setDraft(prefs.overrides)}>Revert</button>}
+      </div>
     </section>
   );
 }

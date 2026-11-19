@@ -36,6 +36,36 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 }
 
 const enc = encodeURIComponent;
+
+/** Raw-body upload with progress (fetch cannot report upload progress). */
+function upload<T>(path: string, file: File, opts?: { onProgress?: (loaded: number, total: number) => void; signal?: AbortSignal }): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', path);
+    xhr.withCredentials = true;
+    xhr.setRequestHeader('X-Factory-Request', '1');
+    xhr.setRequestHeader('Accept', 'application/json');
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.upload.onprogress = (e) => opts?.onProgress?.(e.loaded, e.lengthComputable ? e.total : file.size);
+    xhr.onload = () => {
+      let data: unknown;
+      try {
+        data = xhr.responseText ? JSON.parse(xhr.responseText) : undefined;
+      } catch {
+        data = undefined;
+      }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(data as T);
+      else {
+        const err = (data as { error?: { code?: string; message?: string } } | undefined)?.error;
+        reject(new ApiError(xhr.status, err?.code ?? `http_${xhr.status}`, err?.message ?? (xhr.status === 413 ? 'The file is too large.' : 'Upload failed')));
+      }
+    };
+    xhr.onerror = () => reject(new ApiError(0, 'network', 'The upload did not reach the factory server.'));
+    xhr.onabort = () => reject(new ApiError(0, 'aborted', 'Upload cancelled'));
+    opts?.signal?.addEventListener('abort', () => xhr.abort());
+    xhr.send(file);
+  });
+}
 const get = <T>(p: string) => request<T>('GET', p);
 const post = <T>(p: string, b?: unknown) => request<T>('POST', p, b ?? {});
 const put = <T>(p: string, b: unknown) => request<T>('PUT', p, b);
@@ -82,6 +112,8 @@ export const httpApi: Api = {
   deleteClaudeCredential: () => del('/api/me/claude-credential'),
   putGithubToken: (token) => put('/api/me/github-token', { token }),
   deleteGithubToken: () => del('/api/me/github-token'),
+  preferences: () => get('/api/me/preferences'),
+  putPreferences: (p) => put('/api/me/preferences', p),
 
   projects: () => get('/api/projects'),
   project: (repo) => get(`/api/projects/${enc(repo)}`),
@@ -108,7 +140,11 @@ export const httpApi: Api = {
   session: (id) => get(`/api/sessions/${enc(id)}`),
   events: (id, after = 0, limit) =>
     get(`/api/sessions/${enc(id)}/events?after=${after}${limit ? `&limit=${limit}` : ''}`),
-  sendInput: (id, text) => post(`/api/sessions/${enc(id)}/input`, { text }),
+  sendInput: (id, text, attachmentIds) => post(`/api/sessions/${enc(id)}/input`, attachmentIds?.length ? { text, attachmentIds } : { text }),
+  uploadAttachment: (sessionId, file, opts) => upload(`/api/sessions/${enc(sessionId)}/attachments?name=${enc(file.name)}`, file, opts),
+  deleteAttachment: (sessionId, id) => del(`/api/sessions/${enc(sessionId)}/attachments/${enc(id)}`),
+  attachmentUrl: (sessionId, id, opts) => `/api/sessions/${enc(sessionId)}/attachments/${enc(id)}${opts?.preview ? '?preview=1' : ''}`,
+  config: () => get('/api/config'),
   interrupt: (id) => post(`/api/sessions/${enc(id)}/interrupt`),
   stopSession: (id) => post(`/api/sessions/${enc(id)}/stop`),
 

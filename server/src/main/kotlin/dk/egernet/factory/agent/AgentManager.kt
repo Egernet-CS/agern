@@ -1,6 +1,8 @@
 package dk.egernet.factory.agent
 
 import dk.egernet.factory.AppJson
+import dk.egernet.factory.AttachmentDto
+import kotlinx.serialization.builtins.ListSerializer
 import dk.egernet.factory.Config
 import dk.egernet.factory.EventDto
 import dk.egernet.factory.SessionStatus
@@ -100,6 +102,8 @@ class AgentManager(
     private val prompts: Prompts,
     private val workspaces: Workspaces,
     private val scope: CoroutineScope,
+    private val attachments: Attachments,
+    private val preferences: dk.egernet.factory.db.PreferenceStore,
 ) {
     private val log = LoggerFactory.getLogger(AgentManager::class.java)
 
@@ -121,8 +125,8 @@ class AgentManager(
         var resumedFrom: String? = null
         @Volatile var sawInit = false
         @Volatile var authFailed = false
-        /** Chat inputs written to this process and not yet answered by a `result`. */
-        val pending = java.util.Collections.synchronizedList(mutableListOf<String>())
+        /** Chat inputs (stream-json `message.content`) written to this process and not yet answered by a `result`. */
+        val pending = java.util.Collections.synchronizedList(mutableListOf<JsonElement>())
     }
 
     private val live = ConcurrentHashMap<UUID, Live>()
@@ -170,7 +174,8 @@ class AgentManager(
 
     fun createChat(owner: UserRecord, repo: String, model: String?): SessionRecord {
         if (owner.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
-        val m = model?.trim()?.takeIf { it.isNotEmpty() } ?: settings.get().chatModel
+        // The owner's own chat model unless the call names one; the admin default otherwise.
+        val m = model?.trim()?.takeIf { it.isNotEmpty() } ?: preferences.effective(owner.id).chatModel
         require(Regex("^[A-Za-z0-9._\\[\\]-]{1,100}$").matches(m)) { "Invalid model name" }
         val s = sessions.create(repo, "chat", m, SessionStatus.IDLE, owner.id, null)
         systemEvent(s.id, "info", "New chat in ${cfg.githubOrg}/$repo with model $m. Type /factory help for factory commands.")
@@ -178,22 +183,35 @@ class AgentManager(
         return sessions.get(s.id)!!
     }
 
-    /** Owner-only. Returns immediately; the turn runs in the background. */
-    fun sendInput(user: UserRecord, s: SessionRecord, text: String) {
+    /**
+     * Owner-only. Returns immediately; the turn runs in the background. [attachmentIds]: unsent uploads of this
+     * session by [user], in order; they are bound to this message (marked sent) before it is accepted.
+     */
+    fun sendInput(user: UserRecord, s: SessionRecord, text: String, attachmentIds: List<UUID> = emptyList()) {
         if (s.ownerId != user.id) throw forbidden("Only the owner of this session can send input")
         if (s.kind != "chat") throw conflict("Only chat sessions accept input")
         val trimmed = text.trim()
-        if (trimmed.isEmpty()) throw dk.egernet.factory.badRequest("text must not be empty")
+        if (trimmed.isEmpty() && attachmentIds.isEmpty()) throw dk.egernet.factory.badRequest("text must not be empty")
         if (text.length > 100_000) throw dk.egernet.factory.badRequest("text is too long")
+        if (attachmentIds.size > cfg.attachmentMaxCount) throw attachments.tooMany()
 
         val isCommand = trimmed == "/factory" || trimmed.startsWith("/factory ")
+        if (isCommand && attachmentIds.isNotEmpty()) {
+            throw unprocessable("/factory commands do not take attachments. Remove them, or send them in a normal message.", "attachments_not_allowed")
+        }
         if (!isCommand && !isLive(s.id)) {
             if (user.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
             if (slot(user.id).availablePermits == 0) throw conflict("You already have ${cfg.maxAgentsPerUser} agents running", "too_many_agents")
         }
 
-        publish(s.id, "user", buildJsonObject { put("text", text); put("username", user.username) })
-        sessions.setTitle(s.id, trimmed.lineSequence().first().take(80))
+        val attached = attachments.store.markSent(s.id, user.id, attachmentIds)
+            ?: throw conflict("An attachment is unknown, belongs to another session, or was already sent", "attachment_unavailable")
+
+        publish(s.id, "user", buildJsonObject {
+            put("text", text); put("username", user.username)
+            if (attached.isNotEmpty()) put("attachments", AppJson.encodeToJsonElement(ListSerializer(AttachmentDto.serializer()), attached.map { it.toDto() }))
+        })
+        sessions.setTitle(s.id, (trimmed.lineSequence().firstOrNull()?.takeIf { it.isNotEmpty() } ?: "Attachment: ${attached.first().name}").take(80))
 
         if (isCommand) {
             scope.launch {
@@ -215,9 +233,10 @@ class AgentManager(
             val mutex = chatLocks.computeIfAbsent(s.id) { Mutex() }
             try {
                 mutex.withLock {
+                    val content = withContext(Dispatchers.IO) { attachments.content(text, attached) }
                     val l = live[s.id] ?: startChat(s.id, user)
                     try {
-                        deliver(l, text)
+                        deliver(l, content)
                     } catch (e: Exception) {
                         // A resume launch that already died is relaunched by finishChat with this input.
                         if (l.resumed && !l.sawInit) return@withLock
@@ -232,13 +251,13 @@ class AgentManager(
         }
     }
 
-    private suspend fun deliver(l: Live, text: String) {
+    private suspend fun deliver(l: Live, content: JsonElement) {
         l.turnActive = true
         l.lastUse = System.currentTimeMillis()
-        l.pending += text
+        l.pending += content
         val msg = buildJsonObject {
             put("type", "user")
-            putJsonObject("message") { put("role", "user"); put("content", text) }
+            putJsonObject("message") { put("role", "user"); put("content", content) }
         }
         withContext(Dispatchers.IO) { l.proc.send(msg.toString()) }
         if (sessions.get(l.sessionId)?.status != SessionStatus.RUNNING) setStatus(l.sessionId, SessionStatus.RUNNING)
@@ -255,6 +274,8 @@ class AgentManager(
             setStatus(sessionId, SessionStatus.STARTING)
             val identity = AgentIdentity(owner.username, owner.displayName, owner.githubLogin, access.githubToken(owner), cred)
             val workDir = withContext(Dispatchers.IO) { workspaces.ensureMain(identity, s.repo) }
+            // The attachment files are a cache of the database: put back what a cleaned data dir lost.
+            withContext(Dispatchers.IO) { attachments.materialiseSession(sessionId) }
             val mayInstall = settings.get().agentsMayInstallSoftware
             val tools = if (mayInstall) McpRegistry.CHAT_TOOLS - "factory_request_software" else McpRegistry.CHAT_TOOLS
             token = mcp.issue(McpGrant(sessionId, owner.id, s.repo, null, tools))

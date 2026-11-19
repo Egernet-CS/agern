@@ -14,6 +14,9 @@ import dk.egernet.factory.Services
 import dk.egernet.factory.SettingsDto
 import dk.egernet.factory.SoftwareRequestDto
 import dk.egernet.factory.agent.FeedItem
+import dk.egernet.factory.agent.INLINE_IMAGE_TYPES
+import io.ktor.utils.io.readAvailable
+import io.ktor.server.request.receiveChannel
 import dk.egernet.factory.agent.requireSafeSegment
 import dk.egernet.factory.badRequest
 import dk.egernet.factory.conflict
@@ -89,7 +92,7 @@ private val log = LoggerFactory.getLogger("dk.egernet.factory.api")
 @Serializable data class CreateIssueReq(val title: String, val body: String = "", val kind: String = "task")
 @Serializable data class CreateRunReq(val issueNumber: Int)
 @Serializable data class CreateSessionReq(val model: String? = null)
-@Serializable data class InputReq(val text: String)
+@Serializable data class InputReq(val text: String = "", val attachmentIds: List<String> = emptyList())
 @Serializable data class ResolveReq(val status: String, val note: String? = null)
 @Serializable data class HealthDto(val status: String, val version: String, val name: String)
 @Serializable data class ProvidersDto(val providers: List<String>, val org: String, val twoFactor: Boolean)
@@ -193,6 +196,14 @@ fun Application.installApi(s: Services) {
         route("/api") {
             get("/health") { call.respond(HealthDto("ok", BuildInfo.version, "agern")) }
             get("/auth/providers") { call.respond(ProvidersDto(s.auth.names, cfg.githubOrg, cfg.twoFactorRequired)) }
+            get("/config") {
+                call.requireUser(s)
+                call.respond(
+                    dk.egernet.factory.ClientConfigDto(
+                        dk.egernet.factory.AttachmentLimitsDto(cfg.attachmentMaxBytes, cfg.attachmentMaxMessageBytes, cfg.attachmentMaxCount, INLINE_IMAGE_TYPES),
+                    ),
+                )
+            }
             authRoutes(s)
             meRoutes(s)
             projectRoutes(s)
@@ -317,6 +328,11 @@ private fun Route.meRoutes(s: Services) {
         s.access.invalidate(u.id)
         call.respond(s.users.byId(u.id)!!.toDto())
     }
+    get("/me/preferences") { call.respond(s.preferences.dto(call.requireUser(s).id)) }
+    put("/me/preferences") {
+        val u = call.requireUser(s)
+        call.respond(s.preferences.put(u.id, call.receive<dk.egernet.factory.PreferenceOverridesDto>()))
+    }
     post("/me/recovery-codes") {
         val u = call.requireUser(s)
         val req = call.receive<CodeReq>()
@@ -386,6 +402,7 @@ private suspend fun visibleSession(s: Services, u: UserRecord, id: UUID): Sessio
 }
 
 private fun Route.sessionRoutes(s: Services) {
+    val cfg = s.cfg
     get("/projects/{repo}/sessions") {
         val u = call.requireUser(s)
         val repo = repoParam()
@@ -421,8 +438,61 @@ private fun Route.sessionRoutes(s: Services) {
         val u = call.requireUser(s)
         val rec = visibleSession(s, u, uuidParam("id"))
         val req = call.receive<InputReq>()
-        s.agents.sendInput(u, rec, req.text)
+        val ids = req.attachmentIds.map { runCatching { UUID.fromString(it) }.getOrNull() ?: throw badRequest("Invalid attachment id") }
+        s.agents.sendInput(u, rec, req.text, ids)
         call.respond(HttpStatusCode.Accepted, mapOf("status" to "accepted"))
+    }
+    // ---- attachments (docs/ARCHITECTURE.md §8 "Attachments")
+    post("/sessions/{id}/attachments") {
+        val u = call.requireUser(s)
+        val rec = visibleSession(s, u, uuidParam("id"))
+        if (rec.ownerId != u.id) throw forbidden("Only the owner of this session can attach files")
+        if (rec.kind != "chat") throw conflict("Only chat sessions take attachments")
+        val att = s.attachments
+        // Cheap early refusals before reading the body; the store checks again under a lock.
+        val unsent = withContext(Dispatchers.IO) { att.store.forSession(rec.id, sentOnly = false) }.filter { it.sentAt == null && it.uploaderId == u.id }
+        if (unsent.size >= cfg.attachmentMaxCount) throw att.tooMany()
+        val declared = call.request.header(HttpHeaders.ContentLength)?.toLongOrNull()
+        if (declared != null && declared > cfg.attachmentMaxBytes) throw att.fileTooLarge()
+        if (declared != null && declared + unsent.sumOf { it.size } > cfg.attachmentMaxMessageBytes) throw att.messageTooLarge()
+        // Enforced while streaming: never more than the limit is buffered.
+        val bytes = readLimited(call.receiveChannel(), cfg.attachmentMaxBytes) ?: throw att.fileTooLarge()
+        val meta = withContext(Dispatchers.IO) { att.upload(rec.id, u.id, call.request.queryParameters["name"], bytes) }
+        call.respond(HttpStatusCode.Created, meta.toDto())
+    }
+    get("/sessions/{id}/attachments/{aid}") {
+        val u = call.requireUser(s)
+        val rec = visibleSession(s, u, uuidParam("id"))
+        val aid = uuidParam("aid")
+        // Unsent uploads are the owner's draft: nobody else sees them.
+        val m = withContext(Dispatchers.IO) { s.attachments.store.get(aid) }
+            ?.takeIf { it.sessionId == rec.id && (it.sentAt != null || it.uploaderId == u.id) } ?: throw notFound("Attachment not found")
+        val preview = call.request.queryParameters["preview"] == "1" && m.inlineMode == "downscaled"
+        val bytes = withContext(Dispatchers.IO) { if (preview) s.attachments.store.inlineData(m.id) else s.attachments.store.data(m.id) }
+            ?: throw notFound("Attachment not found")
+        // Only the four raster types are ever served as what they are, and inline; everything else (SVG, HTML, …)
+        // is an opaque download, so an attachment can never run script in our origin.
+        val image = m.kind == "image" && m.mediaType in INLINE_IMAGE_TYPES
+        val type = if (!image) "application/octet-stream" else if (preview) m.inlineMediaType ?: m.mediaType else m.mediaType
+        call.response.header("X-Content-Type-Options", "nosniff")
+        call.response.header("Content-Security-Policy", "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox")
+        call.response.header("Cross-Origin-Resource-Policy", "same-origin")
+        call.response.header(HttpHeaders.CacheControl, "private, max-age=31536000, immutable")
+        call.response.header(HttpHeaders.ContentDisposition, contentDisposition(if (image) "inline" else "attachment", m.name))
+        call.respondBytes(bytes, ContentType.parse(type))
+    }
+    delete("/sessions/{id}/attachments/{aid}") {
+        val u = call.requireUser(s)
+        val rec = visibleSession(s, u, uuidParam("id"))
+        if (rec.ownerId != u.id) throw forbidden("Only the owner of this session can remove attachments")
+        val aid = uuidParam("aid")
+        val removed = withContext(Dispatchers.IO) { s.attachments.store.deleteUnsent(rec.id, u.id, aid) }
+        if (!removed) {
+            val m = withContext(Dispatchers.IO) { s.attachments.store.get(aid) }
+            if (m != null && m.sessionId == rec.id && m.sentAt != null) throw conflict("The attachment was already sent", "attachment_sent")
+            throw notFound("Attachment not found")
+        }
+        call.respond(HttpStatusCode.NoContent)
     }
     post("/sessions/{id}/interrupt") {
         val u = call.requireUser(s)
@@ -437,6 +507,29 @@ private fun Route.sessionRoutes(s: Services) {
     }
 }
 
+/** Reads a request body, giving up (null) as soon as it exceeds [max] bytes. */
+private suspend fun readLimited(ch: io.ktor.utils.io.ByteReadChannel, max: Long): ByteArray? {
+    val out = java.io.ByteArrayOutputStream()
+    val buf = ByteArray(64 * 1024)
+    while (true) {
+        val n = ch.readAvailable(buf, 0, buf.size)
+        if (n == -1) break
+        out.write(buf, 0, n)
+        if (out.size() > max) {
+            ch.cancel(null)
+            return null
+        }
+    }
+    return out.toByteArray()
+}
+
+/** `inline|attachment; filename="ascii"; filename*=UTF-8''…` (RFC 6266 / 5987). */
+private fun contentDisposition(kind: String, name: String): String {
+    val ascii = name.map { if (it.code in 0x20..0x7e && it != '"' && it != '\\') it else '_' }.joinToString("")
+    val encoded = java.net.URLEncoder.encode(name, Charsets.UTF_8).replace("+", "%20")
+    return "$kind; filename=\"$ascii\"; filename*=UTF-8''$encoded"
+}
+
 // ------------------------------------------------------------------ admin
 
 private fun Route.adminRoutes(s: Services) {
@@ -444,7 +537,7 @@ private fun Route.adminRoutes(s: Services) {
     put("/admin/settings") {
         call.requireAdmin(s)
         val req = call.receive<SettingsDto>()
-        val modelRe = Regex("^[A-Za-z0-9._\\[\\]-]{1,100}$")
+        val modelRe = dk.egernet.factory.db.MODEL_RE
         if (!modelRe.matches(req.chatModel)) throw badRequest("Invalid chatModel")
         val unknown = req.pipelineModels.keys - PIPELINE_ROLES.toSet()
         if (unknown.isNotEmpty()) throw badRequest("Unknown roles in pipelineModels: $unknown")

@@ -1,5 +1,9 @@
 import type {
   AgentSession,
+  Attachment,
+  ClientConfig,
+  PreferenceOverrides,
+  Preferences,
   CredentialKind,
   FactoryEvent,
   FeedFrame,
@@ -38,6 +42,9 @@ export interface Api {
   putClaudeCredential(kind: CredentialKind, value: string): Promise<User>;
   deleteClaudeCredential(): Promise<User>;
   putGithubToken(token: string): Promise<User>;
+  preferences(): Promise<Preferences>;
+  /** Replaces the user's own choices (validated like the admin settings; maxFixRounds 0..admin value, else 422). */
+  putPreferences(p: PreferenceOverrides): Promise<Preferences>;
   deleteGithubToken(): Promise<User>;
 
   projects(): Promise<Project[]>;
@@ -59,7 +66,16 @@ export interface Api {
   agents(activeOnly?: boolean): Promise<AgentSession[]>;
   session(id: string): Promise<AgentSession>;
   events(id: string, after?: number, limit?: number): Promise<FactoryEvent[]>;
-  sendInput(id: string, text: string): Promise<void>;
+  /** `attachmentIds`: unsent uploads of this session, in order. */
+  sendInput(id: string, text: string, attachmentIds?: string[]): Promise<void>;
+  /** Owner only. Rejects with ApiError (413 attachment_too_large / attachments_too_large, 409 too_many_attachments, …). */
+  uploadAttachment(sessionId: string, file: File, opts?: { onProgress?: (loaded: number, total: number) => void; signal?: AbortSignal }): Promise<Attachment>;
+  /** Removes an unsent upload. */
+  deleteAttachment(sessionId: string, id: string): Promise<void>;
+  /** URL of the bytes; `preview` serves the downscaled copy when there is one. */
+  attachmentUrl(sessionId: string, id: string, opts?: { preview?: boolean }): string;
+  /** Server limits for the client (attachments). */
+  config(): Promise<ClientConfig>;
   interrupt(id: string): Promise<void>;
   stopSession(id: string): Promise<AgentSession>;
 

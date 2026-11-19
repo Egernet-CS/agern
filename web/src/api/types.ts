@@ -148,7 +148,28 @@ export type FactoryEvent = {
   payload: unknown;
 };
 
-export type UserPayload = { text: string; username: string };
+/** A file or image attached to a chat message (docs/ARCHITECTURE.md §8 "Attachments"). */
+export type Attachment = {
+  id: string;
+  name: string;
+  /** Decided by the server from the bytes, not from the browser's guess. */
+  mediaType: string;
+  size: number;
+  /** `image`: png/jpeg/gif/webp, shown inline. `file`: anything else, download only. */
+  kind: 'image' | 'file';
+  width: number | null;
+  height: number | null;
+  /** How the model sees it: the original image, a downscaled copy, or not inline at all (file only). */
+  inline: 'original' | 'downscaled' | 'none';
+  /** Why an image was downscaled or is file only. */
+  note: string | null;
+};
+
+export type ClientConfig = {
+  attachments: { maxFileBytes: number; maxMessageBytes: number; maxCount: number; imageTypes: string[] };
+};
+
+export type UserPayload = { text: string; username: string; attachments?: Attachment[] };
 export type SystemPayload = { level: 'info' | 'warn' | 'error'; text: string };
 export type StatusPayload = { status: SessionStatus };
 
@@ -157,6 +178,28 @@ export type Settings = {
   chatModel: string;
   pipelineModels: Record<StageRole, string>;
   maxFixRounds: number;
+};
+
+/** Where an effective value comes from: the user's own choice, or the admin default. */
+export type PreferenceSource = 'user' | 'default';
+
+/** A user's own choices; null / missing = use the admin default (docs/ARCHITECTURE.md §6 "Whose models"). */
+export type PreferenceOverrides = {
+  chatModel: string | null;
+  pipelineModels: Partial<Record<StageRole, string>>;
+  maxFixRounds: number | null;
+};
+
+export type Preferences = {
+  overrides: PreferenceOverrides;
+  effective: {
+    chatModel: { value: string; source: PreferenceSource };
+    pipelineModels: Record<StageRole, { value: string; source: PreferenceSource }>;
+    /** `max`: the admin default, also the highest allowed. `clamped`: the user's choice is above it and capped. */
+    maxFixRounds: { value: number; source: PreferenceSource; max: number; clamped: boolean };
+  };
+  /** Model aliases to offer; any full model id is accepted too. */
+  suggestions: string[];
 };
 
 export type SoftwareRequest = {
