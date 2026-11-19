@@ -172,6 +172,48 @@ data class SandboxStatusDto(
     val definition: SandboxDefinitionDto?,
     /** The repository's approval, possibly of other content (compare [sha256]); null when none. */
     val approval: SandboxApprovalDto?,
+    /** Who can approve: the admins (so a non-admin knows whom to ask). */
+    val approvers: List<OwnerDto> = emptyList(),
+)
+
+/** A sandbox that exists right now (`GET /api/admin/sandboxes`). */
+@Serializable
+data class RunningSandboxDto(
+    val runId: String, val repo: String,
+    /** False when the admin cannot see the repository on GitHub: then [issueTitle] is withheld and the UI does not link. */
+    val visible: Boolean,
+    val issueNumber: Int, val issueTitle: String?, val runStatus: String, val owner: OwnerDto,
+    val image: String, val services: List<String>,
+    /** The approved definition's hash. */
+    val sha256: String,
+    val createdAt: String,
+    /** Per-container limits it runs with. */
+    val cpus: Double, val memory: String,
+)
+
+@Serializable
+data class SandboxServerLimitsDto(
+    val maxCpus: Double, val maxMemory: String, val maxConcurrent: Int, val execTimeoutMinutes: Long, val registries: List<String>,
+)
+
+/** `GET /api/admin/sandboxes`: the runtime, its limits and the sandboxes that exist. */
+@Serializable
+data class SandboxOverviewDto(
+    val enabled: Boolean,
+    /** `off`, `podman` or `fake` (development). */
+    val runtime: String,
+    val inUse: Int,
+    val limits: SandboxServerLimitsDto,
+    /** Oldest first. */
+    val sandboxes: List<RunningSandboxDto>,
+)
+
+/** `GET /api/admin/sandboxes/pending`: a project whose valid `.agern/sandbox.yml` is not approved in this exact version. */
+@Serializable
+data class PendingSandboxDto(
+    val repo: String, val sha256: String, val image: String,
+    /** The hash of the version that is approved (the file changed since), or null when none ever was. */
+    val approvedSha256: String?,
 )
 
 @Serializable
@@ -264,6 +306,8 @@ data class AttachmentDto(
     val release: ReleaseDto? = null,
     /** `release_deleted`: the id of the deleted release. */
     val releaseId: String? = null,
+    /** `sandbox_approval`: the project's approval after the change; null when it was revoked. */
+    val approval: SandboxApprovalDto? = null,
 )
 
 object RunStatus {

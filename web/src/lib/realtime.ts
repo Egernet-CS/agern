@@ -1,6 +1,6 @@
 import { createContext, createElement, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useAsync } from './async';
-import { api, type AgentSession, type Channel, type FactoryEvent, type Issue, type Release, type Run } from '../api';
+import { api, type AgentSession, type Channel, type FactoryEvent, type Issue, type Release, type Run, type SandboxApproval, type SandboxStatus } from '../api';
 
 /** `closed`: the server ended the channel for good (e.g. the chat was closed); it is not reopened. */
 export type ConnState = 'connecting' | 'live' | 'reconnecting' | 'closed';
@@ -141,6 +141,7 @@ export function useSessionStream(sessionId: string | null): SessionStream {
 // ---------------------------------------------------------------- global feed
 
 type IssueListener = (repo: string, issue: Issue) => void;
+type SandboxApprovalListener = (repo: string, approval: SandboxApproval | null) => void;
 
 type FeedState = {
   sessions: Map<string, AgentSession>;
@@ -151,6 +152,8 @@ type FeedState = {
   reconnects: number;
   /** Registers a listener for `issue` frames; returns the unsubscribe function. Stable identity. */
   subscribeIssues: (fn: IssueListener) => () => void;
+  /** Registers a listener for `sandbox_approval` frames; returns the unsubscribe function. Stable identity. */
+  subscribeSandboxApprovals: (fn: SandboxApprovalListener) => () => void;
   /** Ids of chats closed while this app was open (tombstones: they never reappear). */
   closedSessions: Set<string>;
   /** Records a chat as closed and drops it from the live sessions. Stable identity. */
@@ -176,6 +179,7 @@ const FeedContext = createContext<FeedState>({
   conn: 'connecting',
   reconnects: 0,
   subscribeIssues: () => () => {},
+  subscribeSandboxApprovals: () => () => {},
   closedSessions: new Set(),
   markSessionClosed: () => {},
   releases: new Map(),
@@ -202,6 +206,13 @@ export function FeedProvider({ enabled, children }: { enabled: boolean; children
     issueListeners.current.add(fn);
     return () => {
       issueListeners.current.delete(fn);
+    };
+  }, []);
+  const approvalListeners = useRef(new Set<SandboxApprovalListener>());
+  const subscribeSandboxApprovals = useCallback((fn: SandboxApprovalListener) => {
+    approvalListeners.current.add(fn);
+    return () => {
+      approvalListeners.current.delete(fn);
     };
   }, []);
   const opened = useRef(false);
@@ -257,6 +268,10 @@ export function FeedProvider({ enabled, children }: { enabled: boolean; children
             for (const fn of issueListeners.current) fn(f.repo, f.issue);
             return;
           }
+          if (f.type === 'sandbox_approval') {
+            for (const fn of approvalListeners.current) fn(f.repo, f.approval);
+            return;
+          }
           if (f.type === 'session_closed') {
             markSessionClosed(f.sessionId);
             return;
@@ -286,6 +301,7 @@ export function FeedProvider({ enabled, children }: { enabled: boolean; children
       conn,
       reconnects,
       subscribeIssues,
+      subscribeSandboxApprovals,
       closedSessions: store.current.closed,
       markSessionClosed,
       releases: store.current.releases,
@@ -295,7 +311,7 @@ export function FeedProvider({ enabled, children }: { enabled: boolean; children
       releaseMark,
       releaseSeen: store.current.releaseSeen,
     }),
-    [version, conn, reconnects, subscribeIssues, markSessionClosed, noteReleases, markReleaseDeleted, releaseMark],
+    [version, conn, reconnects, subscribeIssues, subscribeSandboxApprovals, markSessionClosed, noteReleases, markReleaseDeleted, releaseMark],
   );
   return createElement(FeedContext.Provider, { value }, children);
 }
@@ -317,6 +333,29 @@ export function useIssueFeed(repo: string, onIssue: (issue: Issue) => void) {
       }),
     [repo, subscribeIssues],
   );
+}
+
+/** Calls `onChange` whenever an admin approves or revokes `repo`'s sandbox definition while mounted. */
+export function useSandboxApprovalFeed(repo: string, onChange: (approval: SandboxApproval | null) => void) {
+  const { subscribeSandboxApprovals } = useFeed();
+  const cb = useRef(onChange);
+  cb.current = onChange;
+  useEffect(
+    () =>
+      subscribeSandboxApprovals((r, approval) => {
+        if (r === repo) cb.current(approval);
+      }),
+    [repo, subscribeSandboxApprovals],
+  );
+}
+
+/**
+ * Applies a new approval to a fetched status: the state follows from whether the approval is of this exact content
+ * (an invalid or missing file stays as it is).
+ */
+export function withApproval(st: SandboxStatus, approval: SandboxApproval | null): SandboxStatus {
+  if (st.state === 'none' || st.state === 'invalid') return { ...st, approval };
+  return { ...st, approval, state: approval && approval.sha256 === st.sha256 ? 'approved' : 'pending' };
 }
 
 /** The feed version wins unless the fetched one is strictly newer (the server bumps updatedAt on every change, stages included). */

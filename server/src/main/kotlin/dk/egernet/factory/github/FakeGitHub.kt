@@ -40,6 +40,22 @@ class FakeGitHub(private val org: String) : GitHub {
             issue
         }
 
+    /**
+     * Development (FACTORY_DEV_FAKE_GITHUB): a directory whose `<repo>/<path>` files are on that repository's default
+     * branch too, so a developer or an end-to-end test can add and change files (e.g. `.agern/sandbox.yml`) while the
+     * server runs. Files set with [setFile] take precedence.
+     */
+    @Volatile var filesDir: java.nio.file.Path? = null
+
+    /** The file at [path] on [repo]'s default branch, or null (no visibility check: server-side use only). */
+    fun fileOf(repo: String, path: String): String? = synchronized(this) {
+        repos[repo]?.files?.get(path)
+    } ?: filesDir?.let { dir ->
+        if (path.split('/').any { it == ".." || it.isEmpty() } || repo.contains('/') || repo.startsWith(".")) return@let null
+        val f = dir.resolve(repo).resolve(path)
+        if (java.nio.file.Files.isRegularFile(f)) java.nio.file.Files.readString(f) else null
+    }
+
     /** Puts (or with null removes) a file on [repo]'s default branch. */
     fun setFile(repo: String, path: String, content: String?) = synchronized(this) {
         val r = repos.getValue(repo)
@@ -152,8 +168,9 @@ class FakeGitHub(private val org: String) : GitHub {
                 pr
             }
 
-        override fun getFile(org: String, repo: String, path: String, ref: String): String? = synchronized(this@FakeGitHub) {
-            repo(org, repo).files[path]
+        override fun getFile(org: String, repo: String, path: String, ref: String): String? {
+            synchronized(this@FakeGitHub) { repo(org, repo) }
+            return fileOf(repo, path)
         }
 
         override fun squashMerge(org: String, repo: String, number: Int, title: String) = synchronized(this@FakeGitHub) {

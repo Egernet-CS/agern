@@ -12,6 +12,7 @@ import { ProjectPage } from './pages/Project';
 import { ProjectsPage } from './pages/Projects';
 import { ReleasePage } from './pages/Release';
 import { RunPage } from './pages/Run';
+import { SandboxPage } from './pages/Sandbox';
 import { SettingsPage } from './pages/Settings';
 
 export function App() {
@@ -26,6 +27,7 @@ export function App() {
               <Route path="/p/:repo" element={<ProjectPage />} />
               <Route path="/p/:repo/runs/:runId" element={<RunPage />} />
               <Route path="/p/:repo/releases/:releaseId" element={<ReleasePage />} />
+              <Route path="/p/:repo/sandbox" element={<SandboxPage />} />
               <Route path="/agents" element={<AgentsPage />} />
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="/admin" element={<AdminPage />} />

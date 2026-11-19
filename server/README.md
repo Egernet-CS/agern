@@ -87,6 +87,19 @@ tests `FACTORY_2FA=off` is accepted when `dev` is the only provider.
 
     Put `fake:sandbox` in the issue body to make the builder call `factory_sandbox_info` and
     `factory_sandbox_exec` (`echo built in the sandbox && ls`) through MCP and report both answers.
+* `FACTORY_SANDBOX=fake` (only together with `FACTORY_DEV_FAKE_GITHUB`): sandboxes with an in-memory runtime
+  that pretends to run commands (`echo …`, `ls` of the worktree, `seq N`, `sleep N`, `exit N`/`false`; anything
+  else prints what would have run), so the sandbox UI works without Podman. The fake GitHub also serves files from
+  `$FACTORY_DATA_DIR/fake-github/<repo>/<path>` on the repository's default branch, and runs read their sandbox
+  definition from there (the local `git init` workspaces have none). For example:
+
+  ```sh
+  mkdir -p "$FACTORY_DATA_DIR/fake-github/demo-app/.agern"
+  printf 'image: docker.io/library/eclipse-temurin:21-jdk\nsetup: echo installing\n' > "$FACTORY_DATA_DIR/fake-github/demo-app/.agern/sandbox.yml"
+  ```
+
+  then approve it as an admin on `/p/demo-app/sandbox` and start a run with `fake:sandbox` in the issue body.
+  The end-to-end suite (`web/e2e/server.mjs`) runs with this mode.
 
 With both, the whole product — chat, runs with live stages, needs-human approval — works locally for
 UI development at zero cost.
@@ -108,8 +121,8 @@ Then, in a project the server can reach (a real GitHub repository; the fake GitH
 repositories have no definition file):
 
 1. Commit `.agern/sandbox.yml` to the default branch, e.g. `image: docker.io/library/eclipse-temurin:21-jdk`.
-2. As an admin, read `GET /api/projects/<repo>/sandbox` (state `pending`, with its `sha256`) and approve it:
-   `POST /api/projects/<repo>/sandbox/approval` with `{"sha256":"…"}` (there is no UI for this yet).
+2. As an admin, read `GET /api/projects/<repo>/sandbox` (state `pending`, with its `sha256`) and approve it with
+   `POST /api/projects/<repo>/sandbox/approval` with `{"sha256":"…"}`, or on the project's sandbox page `/p/<repo>/sandbox`.
 3. Start a run. The builder's transcript starts with "Sandbox: …"; its first `factory_sandbox_exec`
    creates `agern-run-<runId>` (watch with `podman ps --filter label=agern.run`), every command's full log
    is a `system` event in the transcript, and the containers and network disappear when the build/review

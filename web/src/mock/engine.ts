@@ -12,9 +12,12 @@ import type {
   Project,
   Release,
   Run,
+  PendingSandbox,
   RunSandbox,
+  RunningSandbox,
   SandboxApproval,
   SandboxDefinition,
+  SandboxOverview,
   SandboxStatus,
   SessionKind,
   SessionStatus,
@@ -25,7 +28,7 @@ import type {
   User,
   Verdict,
 } from '../api/types';
-import { approverScript, builderScript, chatReplies, reviewerScript, seededChat, specScript, type Step } from './scripts';
+import { approverScript, builderScript, chatReplies, reviewerScript, sandboxBuilderScript, seededChat, specScript, type Step } from './scripts';
 
 export const ORG = 'Egernet-CS';
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -128,6 +131,10 @@ export const db = {
   sandboxFiles: new Map<string, MockSandboxFile>(),
   /** Admin approvals by content hash, one per project. */
   sandboxApprovals: new Map<string, SandboxApproval>(),
+  /** FACTORY_SANDBOX is not off (scenario `nosandbox`: switched off). */
+  sandboxEnabled: scenario !== 'nosandbox',
+  /** Sandboxes that exist right now, by run id (created when an approved run's builder starts, removed after review). */
+  runningSandboxes: new Map<string, { createdAt: string; builderSessionId: string }>(),
   players: new Map<string, Player>(),
   settings: {
     agentsMayInstallSoftware: false,
@@ -286,8 +293,11 @@ function play(
       touchSession(s, ts);
     });
   };
+  const system = (st: Extract<Step, { kind: 'system' }>, gap: number) =>
+    p.after(gap, (ts) => emit(sid, 'system', { level: st.level, text: st.text, ...(st.sandbox ? { sandbox: st.sandbox } : {}) }, ts));
   for (const step of steps) {
     if (step.kind === 'pause') p.after(step.ms, () => {});
+    else if (step.kind === 'system') system(step, step.ms ?? 300);
     else if (step.kind === 'think') streamBlock('thinking', step.text);
     else if (step.kind === 'text') {
       turns++;
@@ -304,7 +314,9 @@ function play(
         s.lastActivity = shortArgs(step.name, step.input);
         touchSession(s, ts);
       });
-      p.after(step.ms ?? 900, (ts) =>
+      const logs = step.logs ?? [];
+      logs.forEach((l) => system(l, Math.round((step.ms ?? 900) / (logs.length + 1))));
+      p.after(logs.length ? Math.round((step.ms ?? 900) / (logs.length + 1)) : step.ms ?? 900, (ts) =>
         emit(sid, 'claude', {
           type: 'user',
           session_id: claudeSid,
@@ -594,7 +606,12 @@ function runStage(r: Run, role: StageRole, round: number, plan: Plan, startMs: n
     summary = 'Spec posted as an issue comment.';
   } else if (role === 'builder') {
     const prev = r.stages.filter((x) => x.round === round - 1 && x.verdict === 'CHANGES').flatMap((x) => x.findings.map((f) => f.detail));
-    steps = builderScript(round, prev);
+    const sb = r.sandbox;
+    const def = sb?.state === 'approved' ? db.sandboxFiles.get(r.repo)?.definition : null;
+    steps = def ? sandboxBuilderScript(round, def.image, def.setup, def.services.map((x) => x.name)) : builderScript(round, prev);
+    // Like the backend: the builder's transcript starts with the run's sandbox decision.
+    if (sb && sb.state !== 'disabled') steps = [{ kind: 'system', level: sb.state === 'approved' ? 'info' : 'warn', text: `Sandbox: ${sb.reason}`, ms: 50 }, ...steps];
+    if (def && !db.runningSandboxes.has(r.id)) db.runningSandboxes.set(r.id, { createdAt: iso(Math.min(Date.now(), p.endMs + 4000)), builderSessionId: s.id });
     summary = round > 0 ? 'Addressed review findings; tests green.' : 'Implemented the spec; 9 tests added, all green.';
   } else if (role === 'approver') {
     verdict = plan.approver;
@@ -663,12 +680,14 @@ function pipeline(r: Run, plan: Plan, owner: User, startMs: number) {
         else if (changes) {
           for (const st of r.stages) if (st.role === 'approver' && st.status === 'pending') st.status = 'skipped';
           r.error = `Reviewers still request changes after ${round} fix round(s).`;
+          db.runningSandboxes.delete(r.id);
           setRunStatus(r, 'needs_human', iso(end));
         } else approve(round, end + 400);
       });
     }
   };
   const approve = (round: number, t: number) => {
+    db.runningSandboxes.delete(r.id);
     for (const st of r.stages) if (st.role === 'approver' && st.status === 'pending') st.round = round;
     setRunStatus(r, 'approving', iso(t));
     runStage(r, 'approver', round, plan, t, owner, (t2, stage) => {
@@ -687,7 +706,8 @@ export type MockSandboxFile = { content: string; sha256: string; definition: San
 export function sandboxStatus(repo: string, branch = 'main'): SandboxStatus {
   const f = db.sandboxFiles.get(repo);
   const approval = db.sandboxApprovals.get(repo) ?? null;
-  const base = { repo, enabled: true, path: '.agern/sandbox.yml', branch, approval };
+  const approvers = db.users.filter((u) => u.isAdmin).map(ownerOf);
+  const base = { repo, enabled: db.sandboxEnabled, path: '.agern/sandbox.yml', branch, approval, approvers };
   if (!f) return { ...base, state: 'none', sha256: null, content: null, errors: [], definition: null };
   const state = f.definition === null ? 'invalid' : approval?.sha256 === f.sha256 ? 'approved' : 'pending';
   return { ...base, state, sha256: f.sha256, content: f.content, errors: f.errors, definition: f.definition };
@@ -701,20 +721,66 @@ export function approveSandbox(repo: string, sha256: string, by: User): SandboxS
     throw new MockError(409, 'sandbox_definition_changed', `.agern/sandbox.yml on main has changed (it is now ${f.sha256}); review it again`);
   }
   if (!f.definition) throw new MockError(422, 'sandbox_definition_invalid', `The definition is invalid: ${f.errors.join('; ')}`);
-  db.sandboxApprovals.set(repo, { sha256: f.sha256, content: f.content, approvedBy: ownerOf(by), approvedAt: iso(Date.now()) });
+  const approval = { sha256: f.sha256, content: f.content, approvedBy: ownerOf(by), approvedAt: iso(Date.now()) };
+  db.sandboxApprovals.set(repo, approval);
+  feed({ type: 'sandbox_approval', repo, approval });
   return sandboxStatus(repo);
 }
 
 export function revokeSandboxApproval(repo: string, by: User): SandboxStatus {
   if (!by.isAdmin) throw new MockError(403, 'forbidden', 'Only an admin can revoke a sandbox approval');
-  db.sandboxApprovals.delete(repo);
+  if (db.sandboxApprovals.delete(repo)) feed({ type: 'sandbox_approval', repo, approval: null });
   return sandboxStatus(repo);
+}
+
+export function sandboxOverview(): SandboxOverview {
+  const sandboxes: RunningSandbox[] = [];
+  for (const [runId, sb] of db.runningSandboxes) {
+    const r = db.runs.get(runId);
+    const def = r && db.sandboxFiles.get(r.repo)?.definition;
+    if (!r || !def) continue;
+    sandboxes.push({
+      runId, repo: r.repo, visible: true, issueNumber: r.issueNumber, issueTitle: r.issueTitle, runStatus: r.status, owner: r.owner,
+      image: def.image, services: def.services.map((x) => x.name), sha256: r.sandbox?.sha256 ?? '', createdAt: sb.createdAt,
+      cpus: def.limits.cpus, memory: def.limits.memory,
+    });
+  }
+  sandboxes.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  return {
+    enabled: db.sandboxEnabled,
+    runtime: db.sandboxEnabled ? 'podman' : 'off',
+    inUse: sandboxes.length,
+    limits: { maxCpus: 2, maxMemory: '4g', maxConcurrent: 2, execTimeoutMinutes: 30, registries: ['docker.io', 'ghcr.io', 'quay.io', 'mcr.microsoft.com'] },
+    sandboxes,
+  };
+}
+
+export function pendingSandboxes(): PendingSandbox[] {
+  const out: PendingSandbox[] = [];
+  for (const [repo, f] of db.sandboxFiles) {
+    const approved = db.sandboxApprovals.get(repo)?.sha256 ?? null;
+    if (f.definition && approved !== f.sha256) out.push({ repo, sha256: f.sha256, image: f.definition.image, approvedSha256: approved });
+  }
+  return out.sort((a, b) => a.repo.localeCompare(b.repo));
+}
+
+/** Like the backend: removes the run's sandbox now; the run continues (its builder's next command would create a new one). */
+export function stopSandbox(runId: string, by: User): SandboxOverview {
+  const sb = db.runningSandboxes.get(runId);
+  if (!sb) throw new MockError(404, 'not_found', `Run ${runId} has no sandbox right now`);
+  db.runningSandboxes.delete(runId);
+  emit(sb.builderSessionId, 'system', {
+    level: 'warn',
+    text: `An admin (${by.username}) stopped this run's sandbox: its containers and network were removed (cache volumes are kept). The run continues; the next sandbox command creates a new sandbox and runs the setup script again.`,
+  }, iso(Date.now()));
+  return sandboxOverview();
 }
 
 /** What a run starting now decides, like the backend's RunSandbox. */
 function runSandboxFor(repo: string): RunSandbox {
   const st = sandboxStatus(repo);
   const short = st.sha256?.slice(0, 12);
+  if (!st.enabled) return { state: 'disabled', reason: 'Sandboxes are switched off on this server (FACTORY_SANDBOX=off).', sha256: null, image: null };
   switch (st.state) {
     case 'none':
       return { state: 'none', reason: 'The repository has no .agern/sandbox.yml on its default branch (origin/main).', sha256: null, image: null };
@@ -808,6 +874,7 @@ export function cancelRun(r: Run) {
       st.endedAt = iso(Date.now());
     }
   }
+  db.runningSandboxes.delete(r.id);
   setRunStatus(r, 'cancelled', iso(Date.now()));
 }
 
@@ -991,6 +1058,20 @@ function seed() {
     content: 'image: docker.io/library/eclipse-temurin:17-jdk\n',
     approvedBy: ownerOf(alice),
     approvedAt: ago(60 * 24 * 9),
+  });
+  // data-pipeline: a new definition no admin has approved yet.
+  db.sandboxFiles.set('data-pipeline', {
+    content: 'image: docker.io/library/python:3.12-slim\nsetup: pip install -r requirements-dev.txt\nenv: { PYTHONUNBUFFERED: "1" }\nservices:\n  warehouse:\n    image: docker.io/library/postgres:17\n    env: { POSTGRES_PASSWORD: dev, POSTGRES_DB: warehouse }\ncaches: [ /root/.cache/pip ]\n',
+    sha256: '5b7e4c2a90d1f3e6b8a7c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4',
+    definition: {
+      image: 'docker.io/library/python:3.12-slim',
+      setup: 'pip install -r requirements-dev.txt',
+      env: { PYTHONUNBUFFERED: '1' },
+      services: [{ name: 'warehouse', image: 'docker.io/library/postgres:17', env: { POSTGRES_PASSWORD: 'dev', POSTGRES_DB: 'warehouse' } }],
+      caches: ['/root/.cache/pip'],
+      limits: { cpus: 2, memory: '4g', requestedCpus: null, requestedMemory: null, capped: false },
+    },
+    errors: [],
   });
   db.sandboxFiles.set('design-system', {
     content: 'image: node:22\nprivileged: true\n',

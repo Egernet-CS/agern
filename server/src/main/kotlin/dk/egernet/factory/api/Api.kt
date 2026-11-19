@@ -654,6 +654,15 @@ private fun Route.adminRoutes(s: Services) {
         s.webSessions.deleteAllFor(target.id)
         call.respond(s.users.byId(target.id)!!.toDto())
     }
+    // Sandboxes (docs/ARCHITECTURE.md §5 "Sandboxes", §8).
+    get("/admin/sandboxes") { call.respond(s.sandboxes.overview(call.requireAdmin(s))) }
+    get("/admin/sandboxes/pending") { call.respond(s.sandboxes.pending(call.requireAdmin(s))) }
+    delete("/admin/sandboxes/{runId}") {
+        val admin = call.requireAdmin(s)
+        val runId = uuidParam("runId")
+        s.sandboxes.stop(admin, runId)
+        call.respond(s.sandboxes.overview(admin))
+    }
     get("/admin/software-requests") { call.requireAdmin(s); call.respond(s.softwareRequests.all()) }
     post("/admin/software-requests/{id}") {
         call.requireAdmin(s)
@@ -732,6 +741,7 @@ private fun Route.wsRoutes(s: Services) {
                     is FeedItem.SessionClosed -> FeedFrame(type = "session_closed", repo = item.repo, sessionId = item.sessionId)
                     is FeedItem.Release -> FeedFrame(type = "release", repo = item.repo, release = item.release)
                     is FeedItem.ReleaseDeleted -> FeedFrame(type = "release_deleted", repo = item.repo, releaseId = item.releaseId)
+                    is FeedItem.SandboxApproval -> FeedFrame(type = "sandbox_approval", repo = item.repo, approval = item.approval)
                 }
                 send(Frame.Text(AppJson.encodeToString(FeedFrame.serializer(), frame)))
             }

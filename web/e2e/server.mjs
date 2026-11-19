@@ -1,5 +1,5 @@
 // Starts a throwaway Agern server for the end-to-end suite: fake GitHub, fake Claude CLI, dev users,
-// 2FA required, a fresh database in the development PostgreSQL (docker-compose.dev.yml), a free port,
+// 2FA required, fake sandboxes (FACTORY_SANDBOX=fake), a fresh database in the development PostgreSQL (docker-compose.dev.yml), a free port,
 // a temporary data directory and a frontend built into a temporary directory (web/dist is not touched).
 //
 //   node e2e/server.mjs            start it and keep it running (Ctrl-C stops it and drops the database)
@@ -90,6 +90,9 @@ export async function startServer({ log = false } = {}) {
     FACTORY_DEV_FAKE_GITHUB: 'true',
     FACTORY_CLAUDE_BIN: join(repo, 'server', 'src', 'test', 'resources', 'fake-claude'),
     FACTORY_DATA_DIR: dataDir,
+    // Sandboxes with the in-memory development runtime; files under <dataDir>/fake-github/<repo>/ are on the fake
+    // GitHub's default branches (e.g. .agern/sandbox.yml, written by the sandbox spec).
+    FACTORY_SANDBOX: 'fake',
     FACTORY_WEB_DIR: webDir,
   };
   const proc = spawn(serverBin, [], { env, stdio: log ? 'inherit' : ['ignore', 'pipe', 'pipe'] });
@@ -123,7 +126,7 @@ export async function startServer({ log = false } = {}) {
     await stop();
     throw e;
   }
-  return { url, db, stop, output: () => output };
+  return { url, db, dataDir, stop, output: () => output };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
