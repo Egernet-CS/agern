@@ -122,7 +122,7 @@ export function buildNodes(run: Run, sessions: Map<string, AgentSession>): Recor
     round: currentRound,
   };
 
-  nodes.merge = { ...base('merge'), state: run.status === 'merged' ? 'done' : TERMINAL_FAIL.includes(run.status) ? 'skipped' : 'pending', sub: run.prNumber ? `PR #${run.prNumber}` : null, tone: run.status === 'merged' ? 'pass' : null, verdict: run.status === 'merged' ? 'MERGED' : null, endedAt: run.status === 'merged' ? run.endedAt : null };
+  nodes.merge = { ...base('merge'), title: run.baseBranch ? 'merge to release' : ROLE_TITLE.merge, state: run.status === 'merged' ? 'done' : TERMINAL_FAIL.includes(run.status) ? 'skipped' : 'pending', sub: run.prNumber ? `PR #${run.prNumber}` : null, tone: run.status === 'merged' ? 'pass' : null, verdict: run.status === 'merged' ? 'MERGED' : null, endedAt: run.status === 'merged' ? run.endedAt : null };
   const approver = latestStage(run, 'approver');
   const approvedByHuman = run.status === 'merged' && (approver?.verdict === 'ESCALATE' || approver?.status === 'skipped');
   nodes.human = {

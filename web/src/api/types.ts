@@ -60,11 +60,25 @@ export type Issue = {
   release: { id: string; name: string } | null;
 };
 
-/** Step 1 of releases only plans; later steps add the building and releasing states. */
-export type ReleaseStatus = 'planning';
+/** `planning` until started; then `building` / `paused` until it is `cancelled` (docs/ARCHITECTURE.md §6 "Releases"). */
+export type ReleaseStatus = 'planning' | 'building' | 'paused' | 'cancelled';
+
+/** Where an issue is in its release's build. All issues of a `planning` release are `waiting`. */
+export type ReleaseIssueState = 'waiting' | 'running' | 'merged' | 'held' | 'skipped';
 
 /** An issue as planned in a release: title and kind as they were when it was assigned. */
-export type ReleaseIssue = { number: number; title: string; kind: IssueKind };
+export type ReleaseIssue = {
+  number: number;
+  title: string;
+  kind: IssueKind;
+  state: ReleaseIssueState;
+  /** The issue's latest release run. */
+  runId: string | null;
+  /** Why it is held or skipped, or that it will be built again. */
+  note: string | null;
+};
+
+export type ReleasePauseReason = 'manual' | 'usage_limit' | 'credentials';
 
 /** A named plan of issues for one project (docs/ARCHITECTURE.md §6 "Releases"). */
 export type Release = {
@@ -79,7 +93,18 @@ export type Release = {
   updatedAt: string;
   /** In build order. */
   issues: ReleaseIssue[];
+  /** Who started it; null while `planning`. */
+  owner: Owner | null;
+  /** `release/<name>` once started. */
+  branch: string | null;
+  startedAt: string | null;
+  endedAt: string | null;
+  /** Set while `paused`. */
+  pause: { reason: ReleasePauseReason; note: string | null; resumeAt: string | null } | null;
 };
+
+/** Building or paused: at most one per project. */
+export const isReleaseActive = (r: Release) => r.status === 'building' || r.status === 'paused';
 
 export type SessionKind = 'chat' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
 export type StageRole = Exclude<SessionKind, 'chat'>;
@@ -172,6 +197,10 @@ export type Run = {
   updatedAt: string;
   endedAt: string | null;
   stages: Stage[];
+  /** The release this run builds an issue of; null for a single run. */
+  releaseId: string | null;
+  /** The branch the run branches from and merges into (`release/<name>`); null for a single run (default branch). */
+  baseBranch: string | null;
 };
 
 export type EventType = 'user' | 'claude' | 'system' | 'status';

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import type { IssueKind, ReleaseStatus, RunStatus, SessionKind, SessionStatus } from '../../api/types';
+import type { IssueKind, ReleaseIssueState, ReleaseStatus, RunStatus, SessionKind, SessionStatus } from '../../api/types';
 
 /** Decorative artwork from /art that degrades to a gradient (never a broken-image icon). */
 export function Art({ src, className = '', children }: { src: string; className?: string; children?: ReactNode }) {
@@ -78,13 +78,24 @@ export function SessionStatusPill({ status }: { status: SessionStatus }) {
   );
 }
 
-const RELEASE_LABEL: Record<ReleaseStatus, string> = { planning: 'in preparation' };
-const RELEASE_TONE: Record<ReleaseStatus, string> = { planning: 'idle' };
+const RELEASE_LABEL: Record<ReleaseStatus, string> = { planning: 'in preparation', building: 'building', paused: 'paused', cancelled: 'cancelled' };
+const RELEASE_TONE: Record<ReleaseStatus, string> = { planning: 'idle', building: 'active', paused: 'escalate', cancelled: 'idle' };
 export function ReleaseStatusPill({ status }: { status: ReleaseStatus }) {
   return (
     <span className={`pill pill--${RELEASE_TONE[status]}`}>
       <span className="pill-dot" aria-hidden />
       {RELEASE_LABEL[status]}
+    </span>
+  );
+}
+
+const ISSUE_STATE_TONE: Record<ReleaseIssueState, string> = { waiting: 'idle', running: 'active', merged: 'pass', held: 'escalate', skipped: 'idle' };
+/** An issue's state within a release; the text always carries the state (not colour alone). */
+export function IssueStateBadge({ state }: { state: ReleaseIssueState }) {
+  return (
+    <span className={`pill pill--${ISSUE_STATE_TONE[state]} issue-state issue-state--${state}`}>
+      <span className="pill-dot" aria-hidden />
+      {state}
     </span>
   );
 }
@@ -148,7 +159,11 @@ export function Dialog({ open, onClose, title, children, wide }: { open: boolean
   useEffect(() => {
     const d = ref.current;
     if (!d) return;
-    if (open && !d.open) d.showModal();
+    if (open && !d.open) {
+      d.showModal();
+      // showModal focuses the first focusable element (✕); a child marked data-autofocus gets the focus instead.
+      d.querySelector<HTMLElement>('[data-autofocus]')?.focus();
+    }
     if (!open && d.open) d.close();
   }, [open]);
   return (

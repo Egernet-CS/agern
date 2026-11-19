@@ -1,7 +1,7 @@
 // Mock implementation of the Api interface. Enabled with VITE_MOCK=1 (npm run dev:mock).
 // Scenarios via ?mock=default|fresh|noclaude|observer|loggedout (remembered per tab).
 import { ApiError, type Api, type Channel } from '../api/api';
-import { isRunActive, isSessionActive, type AgentSession, type Attachment, type ClientConfig, type Issue, type LoginStep, type Preferences, type Run, type StageRole, type User } from '../api/types';
+import { isRunActive, isSessionActive, type AgentSession, type Attachment, type ClientConfig, type Issue, type LoginStep, type Preferences, type Release, type Run, type StageRole, type User } from '../api/types';
 import {
   announceIssue,
   assignIssues,
@@ -13,6 +13,11 @@ import {
   releasesOf,
   reorderRelease,
   updateRelease,
+  startRelease,
+  pauseRelease,
+  resumeRelease,
+  cancelRelease,
+  retryReleaseIssue,
   approveRun,
   cancelRun,
   chatInput,
@@ -97,6 +102,12 @@ function project(repo: string) {
   const sessions = [...db.sessions.values()].filter((s) => s.repo === repo && isSessionActive(s));
   const runs = [...db.runs.values()].filter((r) => r.repo === repo && isRunActive(r));
   return { ...p, activeAgents: sessions.length, activeRuns: runs.length, openIssues: (db.issues[repo] ?? []).filter((i) => i.state === 'open').length };
+}
+/** A release the caller can see (404 before any 403, like the server). */
+function withRelease<T>(id: string, fn: (r: Release) => T): T {
+  const r = getRelease(id);
+  project(r.repo);
+  return fn(r);
 }
 function session(id: string): AgentSession {
   const s = db.sessions.get(id);
@@ -286,21 +297,26 @@ export const mockApi: Api = {
     ok(() => {
       const r = getRelease(id);
       project(r.repo);
-      return updateRelease(r, body);
+      return updateRelease(r, body, me());
     }),
   deleteRelease: (id) =>
     ok(() => {
       const r = getRelease(id);
       project(r.repo);
-      deleteRelease(r);
+      deleteRelease(r, me());
     }),
-  assignIssues: (repo, numbers, releaseId) => ok(() => (project(repo), assignIssues(repo, numbers, releaseId))),
+  assignIssues: (repo, numbers, releaseId) => ok(() => (project(repo), assignIssues(repo, numbers, releaseId, me()))),
   reorderRelease: (id, numbers) =>
     ok(() => {
       const r = getRelease(id);
       project(r.repo);
-      return reorderRelease(r, numbers);
+      return reorderRelease(r, numbers, me());
     }),
+  startRelease: (id) => ok(() => withRelease(id, (r) => startRelease(r, me()))),
+  pauseRelease: (id) => ok(() => withRelease(id, (r) => pauseRelease(r, me()))),
+  resumeRelease: (id) => ok(() => withRelease(id, (r) => resumeRelease(r, me()))),
+  cancelRelease: (id) => ok(() => withRelease(id, (r) => cancelRelease(r, me()))),
+  retryReleaseIssue: (id, n) => ok(() => withRelease(id, (r) => retryReleaseIssue(r, n, me()))),
 
   projectRuns: (repo) => ok(() => (project(repo), [...db.runs.values()].filter((r) => r.repo === repo).sort(byNewest))),
   startRun: (repo, n) =>

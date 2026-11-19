@@ -182,7 +182,8 @@ Launch rules:
 
 Workspaces: `$FACTORY_DATA_DIR/workspaces/<username>/<repo>/main` is the owner's clone used by
 chat. A pipeline run works in a git worktree `…/<repo>/runs/<runId>` on branch
-`factory/issue-<number>-<slug>`.
+`factory/issue-<number>-<slug>`; a release run (§6 "Releases") on `factory/release-<name>/issue-<number>-<slug>`,
+so it never reuses the open pull request of an earlier single run of the same issue.
 
 **Known limitation (v1).** All agents run under the server's OS user with permissions bypassed.
 The factory must run on a dedicated machine or VM. Per-user OS accounts or containers are the
@@ -205,6 +206,9 @@ issue → spec-writer (opus) → builder (opus) ─┬→ security  (opus)   ┐
                                                           ├ APPROVE  → merge to main
                                                           └ ESCALATE → needs-human ← /factory approve
 ```
+
+"main" is the repository's default branch for a single run, and `release/<name>` for a release run (§6
+"Releases"): the run's worktree starts from that branch and its pull request merges into it.
 
 - **spec-writer** reads the issue and the repo and writes a spec; it is posted as an issue comment.
 - **builder** implements the spec on the run branch and commits. The orchestrator pushes the branch
@@ -270,7 +274,8 @@ issue → spec-writer (opus) → builder (opus) ─┬→ security  (opus)   ┐
     echoes falls back to closing stdin at the first `result`.)
   - The stage time limit is unchanged and not extended by messages; cancel works as before.
 - Orchestration is a deterministic state machine in the server, not something an LLM decides. On
-  server restart, unfinished runs are marked `failed` with a clear reason (v1).
+  server restart, unfinished runs are marked `failed` with a clear reason (v1); a building release then builds
+  the interrupted issue again (§6 "Releases").
 
 Run `status`: `queued`, `spec`, `building`, `reviewing`, `approving`, `merged`, `needs_human`,
 `failed`, `cancelled`.
@@ -281,37 +286,133 @@ Stage `verdict`: `PASS`, `CHANGES`, `APPROVE`, `ESCALATE` or null.
 
 ### Releases
 
-A **release** is a named plan of issues for one project, in the order they will be built. Building a release
-unattended on a release branch is delivered in steps (issue #13): this step only **plans**. Starting a release,
-its branch `release/<name>`, runs that branch from and merge into it, the release pull request, approval and
-scheduling come later; single runs are unaffected and still merge into the default branch.
+A **release** is a named plan of issues for one project, in the order they will be built. Once **started**, Agern
+builds it unattended on the branch `release/<name>`: one issue at a time, each run branching from and squash-merging
+into the release branch, without closing its issue. Delivered in steps (issue #13): planning (#17), starting and
+building (#19, this section). The release pull request, approval and merge into the default branch (#20) and
+scheduled starts (#21) come later. Single runs are unaffected and still merge into the default branch.
 
-- **Model.** Tables `releases` (`id`, `repo`, `name`, `description`, `status`, `created_by`, timestamps) and
-  `release_issues` (`release_id`, `repo`, `issue_number`, `position`, `issue_title`, `issue_kind`, `added_by`,
-  `added_at`). Several releases may exist per project. Creating one creates no branch, no run and makes no
-  GitHub write.
-- **States.** `status` is free text; the only value so far is `planning` (shown as "in preparation"). Later steps
-  add `scheduled`, `building`, `paused`, `ready`, `released` and `cancelled`.
+- **Model.** Tables `releases` (`id`, `repo`, `name`, `description`, `status`, `created_by`, timestamps; once
+  started also `owner_id`, `branch`, `started_at`, `ended_at`, and while paused `pause_reason`, `pause_note`,
+  `resume_at`) and `release_issues` (`release_id`, `repo`, `issue_number`, `position`, `issue_title`, `issue_kind`,
+  `added_by`, `added_at`, `state`, `run_id` = the issue's latest release run, `note`). `runs` carry `release_id`
+  (`ON DELETE SET NULL`) and `base_branch` (null = the default branch). Several releases may exist per project.
+  Creating one creates no branch, no run and makes no GitHub write.
+- **States.** Release `status`: `planning` (shown as "in preparation"), `building`, `paused`, `cancelled`; later
+  steps add `scheduled`, `ready` and `released`. *Started* means `building`, `paused` or `cancelled`. Issue
+  `state` within a release: `waiting`, `running`, `merged`, `held`, `skipped`; all issues of a planned release are
+  `waiting`. A `building` release with no `waiting` or `running` issue is *idle*: it stays `building` (and keeps the
+  project's slot until it is cancelled) and continues by itself when an issue is added or retried. **At most one
+  release per project is `building` or `paused`**, enforced by the partial unique index `releases_one_building`.
 - **Names** are trimmed, match `^[A-Za-z0-9][A-Za-z0-9._-]{0,49}$`, contain no `..` and do not end with `.` or
   `.lock`, so they are safe as the git branch `release/<name>` and in URLs (400 otherwise). They are unique per
   project, case-insensitively, across all releases including future history (409 `release_name_taken`); renaming
-  to another casing of the release's own name is allowed. Descriptions are optional, at most 2000 characters.
+  to another casing of the release's own name is allowed. A started release cannot be renamed (409
+  `release_name_locked`). Descriptions are optional, at most 2000 characters. The branch name is only ever built
+  from the validated name.
 - **Issues.** Only open issues can be assigned (checked with the caller's GitHub token; pull requests are not
   issues). An issue is in **at most one** release per project, enforced by the primary key `(repo, issue_number)`;
-  assigning an issue that is in another release moves it. New and moved issues go last, in the order given;
-  assigning an issue already in the target release changes nothing. The title and kind are stored at assignment
-  time (like `runs.issue_title`) and not refreshed. An issue closed on GitHub afterwards stays until removed.
-  Assignments and reorders run in one transaction under a per-repo advisory lock (`releases:<repo>`); an
-  assignment is all-or-nothing.
+  assigning an issue that is in another release moves it. New and moved issues go last, in the order given, as
+  `waiting`; assigning an issue already in the target release changes nothing. The title and kind are stored at
+  assignment time (like `runs.issue_title`) and not refreshed. An issue closed on GitHub afterwards stays until
+  removed. Assignments and reorders run in one transaction under a per-repo advisory lock (`releases:<repo>`),
+  where the rules of started releases below are checked for the target and every source; an assignment is
+  all-or-nothing. When an issue leaves a release while its linked run is still active (`needs_human`), that run is
+  cancelled.
 - **Order.** Positions are explicit; a reorder must name exactly the release's current issues (else 409
-  `release_issues_changed`) and rewrites them densely.
-- **Access.** Everyone who can see the project sees its releases; any logged-in user who can see it may create,
-  edit, delete, assign and reorder — the rule that also gates creating issues and starting runs. A release of a
-  repository the caller cannot see answers 404, never 403. (Once a release can be started, changes after the
-  start are limited to the user who started it and admins.)
-- **Deleting** a release removes the plan and its assignments only; the issues stay open on GitHub.
-- **Live.** Every change emits a `release` feed frame per affected release (a move: source and target), deletion
-  `release_deleted` (§8). `updatedAt` strictly increases on every change at millisecond resolution.
+  `release_issues_changed`) and rewrites them densely. In a `building` or `paused` release every issue that is not
+  `waiting` must keep its index (409 `release_issue_started`); a cancelled release cannot be reordered (409
+  `release_closed`).
+- **Access.** Everyone who can see the project sees its releases; a release of a repository the caller cannot see
+  answers 404, never 403, checked before any other rule. Who may change a release:
+
+  | Release status | Action | Allowed for |
+  |---|---|---|
+  | `planning` | everything, including start | anyone who can see the project |
+  | started | pause, cancel, take an issue out, edit the description | owner or admin |
+  | started | resume, add issues, reorder, retry an issue | owner only |
+  | `cancelled` | delete | owner or admin |
+
+  The owner is the user who started the release. Admins are refused the owner-only actions because those make
+  agents run on the owner's credentials (§4: admins may stop, never drive). Anyone else gets 403 `forbidden` "Only
+  <owner>, who started this release, can do this" ("…, or an admin can do this" where admins are allowed).
+- **Starting** (`POST /api/releases/{id}/start`). Checked in this order: visible (404); `planning` (409
+  `release_not_planning`); the caller has a Claude credential (422 `claude_credential_required`) and a GitHub token
+  (403, as for every GitHub action); at least one issue (409 `release_empty`); no other release of the project is
+  `building` or `paused` (409 `release_already_building`, naming it). Then the release is claimed with an update
+  guarded by `status = 'planning'` (`building`, owner, `branch = release/<name>`, `started_at`; a violation of the
+  one-building index is 409 `release_already_building`), and the branch is created on GitHub from the current tip of
+  the default branch with the caller's token. An existing branch is 409 `release_branch_exists` ("Branch
+  release/<name> already exists on GitHub; delete it or rename the release."); GitHub refusing (401/403/404) is 422
+  `github_push_denied`. On any failure the claim is rolled back to `planning` with no owner, branch or start time,
+  and nothing else changes. Then every issue is skip-checked and the first run starts. All later GitHub calls use
+  the owner's token.
+- **Building.** Issues are built one at a time, lowest position first among `waiting` issues; no second run of a
+  release starts while one of its issues is `running`. The builder (`ReleaseBuilder`) is event-driven — start, a
+  run settling, resume, retry, adding an issue, restart and the resume ticker each call `advance`, which runs under
+  a per-release mutex, re-reads the database and starts the next run only when the release is `building` and
+  nothing runs. *Skip check*, at start and again at each issue's turn: an issue closed or missing on GitHub becomes
+  `skipped` ("Closed on GitHub"); one with an active run outside the release becomes `skipped` ("Has an active run
+  outside the release"). A skipped issue never blocks the build and can be retried. If a run cannot be started for
+  another reason, the issue is `held` with the message and the build goes on.
+- **Release runs** are created as the release owner, with the owner's preferences as for single runs, with
+  `releaseId` and `baseBranch = release/<name>`, and go through the unchanged pipeline except: the branch is
+  `factory/release-<name>/issue-<n>-<slug>`; the worktree is created from the current tip of the release branch
+  (fetched first), so it builds on the issues merged before it; the pull request targets the release branch and its
+  body starts with "Issue #n · release `<name>`" with no closing keyword; build, review and approver prompts name
+  the release branch as the merge target; on merge the issue is **not** closed and the comment reads "**Agern:
+  merged** pull request #p into `release/<name>` (approved by …). The issue stays open until the release is merged
+  into `<default branch>`." Release runs use the same per-user agent slots as all pipeline agents.
+- **Outcomes.** A run that ends `merged` makes its issue `merged`; `needs_human`, `failed` or `cancelled` (also
+  through the run's own cancel) makes it `held` with the run's error as note (or "Run failed"). Then the next issue
+  starts. The orchestrator reports every settled release run (end of its pipeline, approve, cancel — not a
+  cancelled coroutine) through a callback that the builder dispatches asynchronously; settling is idempotent and
+  ignores runs no longer linked to an issue.
+- **Held issues.** The owner can approve the held run (`POST /api/runs/{id}/approve`, `/factory approve`): when it
+  merges the issue becomes `merged`, if the merge fails it stays `held` with the new reason (a branch that is behind
+  is merged by GitHub's squash merge; a conflict fails). The owner can retry it, or anyone allowed can take it out.
+- **Retry** (`POST /api/releases/{id}/issues/{number}/retry`, owner only): the release must be `building` or
+  `paused` (409 `release_not_building`), the issue `held` or `skipped` (409 `release_issue_not_held`). It becomes
+  `waiting` at its position with note and run link cleared; a linked run that is still active (`needs_human`) is
+  cancelled; the build continues.
+- **Pause** (owner or admin): `building` → `paused`, reason `manual`, note "Paused by <username>" (else 409
+  `release_not_building`). The running run is not stopped: it finishes, its outcome is recorded, and no further
+  issue starts. **Resume** (owner only, needs a Claude credential): `paused` → `building` (else 409
+  `release_not_paused`), clearing the pause, and continues.
+- **Cancel** (owner or admin): `building` or `paused` → `cancelled` with `ended_at` (else 409
+  `release_not_building`). The `running` issue becomes `held` ("Cancelled with the release") before every active run
+  of the release (running or `needs_human`) is cancelled through the orchestrator; `waiting` issues stay `waiting`.
+  The release branch and what was merged into it are left alone; nothing starts afterwards. A cancelled release is
+  final: it cannot be restarted and its name stays taken until it is deleted.
+- **Usage limit.** The stage agent recognises the owner's Claude usage limit in the CLI stream: a
+  `rate_limit_event` whose `rate_limit_info.status` is `rejected`, an `assistant` line with `error: "rate_limit"`,
+  or a failing `result` whose text matches `usage limit|session limit|weekly limit|hit your limit`; the reset time
+  comes from any `rate_limit_info.resetsAt` (epoch seconds, epoch milliseconds or ISO-8601; anything else is
+  unknown). These names were read from the Claude Code 2.1.328 binary, not observed in a live limit, so parsing is
+  tolerant. When a release run fails that way, the run is `failed` as usual but its issue goes back to `waiting`
+  ("Interrupted by the Claude usage limit; it is built again"), and the release becomes `paused` with reason
+  `usage_limit`, a note naming the limit and the reset time when known, and `resumeAt` = reset time + 1 minute (now
+  + 30 minutes when unknown or past). A ticker (every 30 s) resumes releases whose `resumeAt` has passed; if the
+  limit is still reached it pauses again the same way. The owner may resume by hand.
+- **Rejected or missing Claude credential.** When the owner's credential is rejected (the existing detection) or
+  missing when a run should start, the issue goes back to `waiting` and the release is `paused` with reason
+  `credentials`, note "Claude rejected the owner's credential; update it in Settings and resume." and no
+  `resumeAt`. (An owner without a GitHub token pauses it the same way, with a note saying so.) If the release is
+  already `paused` or `cancelled` when such a failure arrives, only the issue changes.
+- **Restart.** Interrupted runs are failed as before (§6). Then each `running` release issue is settled from its
+  run: `merged` → `merged`, `needs_human` → `held`, anything else → `waiting` ("Interrupted by a server restart; it is
+  built again"); every `building` release continues, paused releases stay paused, and a due `resumeAt` is honoured.
+  A run that failed in the instant before a restart, before its outcome was recorded, is rebuilt rather than held.
+- **Deleting** a planned release removes the plan and its assignments only; the issues stay open on GitHub. A
+  `building` or `paused` release cannot be deleted (409 `release_active`, "Cancel the release first"); a cancelled
+  one can (owner or admin): the plan and its assignments go, the branch stays on GitHub and its runs keep existing
+  with `releaseId` null.
+- **Live.** Every change, including every state change of a release or of one of its issues, emits a `release`
+  feed frame per affected release (a move: source and target), deletion `release_deleted` (§8). `updatedAt`
+  strictly increases on every change at millisecond resolution.
+- **Fake-GitHub mode.** The local clone has no remote: the release branch is created locally from the clone's
+  `HEAD` when first needed, and merges are not applied to it, so each run starts from the same local release
+  branch tip. Real mode fetches the merged tip from GitHub.
 
 ## 7. Chat agent ↔ factory (MCP)
 
@@ -343,8 +444,11 @@ is rejected with 422 `attachments_not_allowed`; they stay unsent so the owner ca
 `/factory run <issue>`, `/factory status`, `/factory approve [runId]`, `/factory cancel <runId>`,
 `/factory releases`, `/factory release create <name> [description…]`, `/factory release add <name> <issue>…`,
 `/factory release remove <issue>…`, `/factory help`. The reply is appended to the transcript as a `system` event.
-Release commands act in the chat's project as its owner: `releases` lists name, "in preparation", the issue count
-and the issues in order (`#n title`); `add` assigns or moves and says what happened (e.g. `Release "1.4": added
+Release commands act in the chat's project as its owner: `releases` lists each release with its status ("in
+preparation" with the issue count; for started ones "building", "paused" or "cancelled", "k of n merged", the owner
+and the branch, and a paused release's note) and the issues in order (`#n title`, with ` — <state>` when not
+`waiting`, plus the note for held and skipped issues); starting, pausing, resuming, cancelling and retrying are
+web-only in this step; `add` assigns or moves and says what happened (e.g. `Release "1.4": added
 #5, #6 (now 4 issues).`, plus issues moved from another release); `remove` takes issues out of whatever release
 they are in. Issue tokens accept `5`, `#5` and `#5,`; an unknown release name gets a reply naming the existing
 ones; a missing or invalid argument gets a one-line usage reply. Renaming, deleting and reordering are web-only.
@@ -381,12 +485,19 @@ type Issue = { number: number; title: string; state: 'open' | 'closed'; kind: Is
   createdAt: string; updatedAt: string; htmlUrl: string; body?: string; activeRunId: string | null;
   release: { id: string; name: string } | null };  // the release it is planned in (§6 "Releases"); always present
 
-type ReleaseIssue = { number: number; title: string; kind: IssueKind };   // title/kind as when it was assigned
+type ReleaseIssue = { number: number; title: string; kind: IssueKind;   // title/kind as when it was assigned
+  state: 'waiting' | 'running' | 'merged' | 'held' | 'skipped';
+  runId: string | null;                     // the issue's latest release run
+  note: string | null };                    // why it is held or skipped, or that it will be built again
 type Release = { id: string; repo: string; name: string; description: string;
-  status: 'planning';                       // shown as "in preparation"; later steps add more states
+  status: 'planning' | 'building' | 'paused' | 'cancelled';   // planning is shown as "in preparation"
   createdBy: { username: string; displayName: string };
   createdAt: string; updatedAt: string;     // updatedAt strictly increases on every change
-  issues: ReleaseIssue[] };                 // in build order
+  issues: ReleaseIssue[];                   // in build order
+  owner: { username: string; displayName: string } | null;   // who started it
+  branch: string | null;                    // 'release/<name>' once started
+  startedAt: string | null; endedAt: string | null;
+  pause: { reason: 'manual' | 'usage_limit' | 'credentials'; note: string | null; resumeAt: string | null } | null };
 
 type SessionKind = 'chat' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
 type SessionStatus = 'starting' | 'running' | 'idle' | 'done' | 'failed' | 'stopped';
@@ -415,7 +526,9 @@ type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; 
   branch: string | null; prNumber: number | null; prUrl: string | null;
   owner: { username: string; displayName: string }; startedBySessionId: string | null;
   error: string | null; createdAt: string; updatedAt: string; endedAt: string | null;
-  stages: Stage[] };
+  stages: Stage[];
+  releaseId: string | null;  // the release this run builds an issue for (null: a single run, or the release was deleted)
+  baseBranch: string | null }; // the branch it starts from and merges into; null = the default branch
 
 type Attachment = { id: string; name: string;   // name: sanitised (no path, control/bidi characters or leading dots; ≤ 120 chars)
   mediaType: string;                 // decided by sniffing the bytes: image/png|jpeg|gif|webp, application/pdf, application/zip,
@@ -487,10 +600,15 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `GET /api/projects/{repo}/releases` | → `Release[]` | newest first (`createdAt` desc), each with its issues in order |
 | `POST /api/projects/{repo}/releases` | `{ name, description? }` → 201 `Release` | 400 invalid name or description; 409 `release_name_taken`. Starts nothing |
 | `GET /api/releases/{id}` | → `Release` | 404 unknown or invisible |
-| `PUT /api/releases/{id}` | `{ name, description }` → `Release` | rename or edit; same validation as create |
-| `DELETE /api/releases/{id}` | → 204 | removes the plan and its assignments; the issues are untouched on GitHub |
-| `POST /api/projects/{repo}/releases/assign` | `{ issueNumbers: number[], releaseId: string \| null }` → `Release[]` | assigns or moves the issues to that release of `{repo}` (404 otherwise), or takes them out with `releaseId: null` (numbers in no release are ignored, no GitHub calls). 1–100 positive numbers, duplicates collapsed (400 otherwise; an invalid `releaseId` is 400). Every issue is fetched with the caller's token: unknown → 404 "Issue #n not found", closed → 409 `issue_closed`; all-or-nothing. Answers all releases of the project after the change |
-| `PUT /api/releases/{id}/issues/order` | `{ issueNumbers: number[] }` → `Release` | the new complete order; anything but exactly the current issues → 409 `release_issues_changed`, nothing changes |
+| `PUT /api/releases/{id}` | `{ name, description }` → `Release` | rename or edit; same validation as create. Started: owner or admin, and a different name → 409 `release_name_locked` |
+| `DELETE /api/releases/{id}` | → 204 | removes the plan and its assignments; the issues are untouched on GitHub. `building`/`paused` → 409 `release_active`; `cancelled`: owner or admin, the branch stays and its runs keep existing with `releaseId` null |
+| `POST /api/releases/{id}/start` | → `Release` | the caller becomes the owner; creates `release/<name>` and builds (§6 "Releases"). 409 `release_not_planning`, 422 `claude_credential_required`, 409 `release_empty`, 409 `release_already_building`, 409 `release_branch_exists`, 422 `github_push_denied` |
+| `POST /api/releases/{id}/pause` | → `Release` | owner or admin; `building` → `paused` (else 409 `release_not_building`); the running issue finishes |
+| `POST /api/releases/{id}/resume` | → `Release` | owner only; `paused` → `building` (else 409 `release_not_paused`); 422 `claude_credential_required` |
+| `POST /api/releases/{id}/cancel` | → `Release` | owner or admin; `building`/`paused` → `cancelled` (else 409 `release_not_building`); cancels the release's active runs |
+| `POST /api/releases/{id}/issues/{number}/retry` | → `Release` | owner only; release `building`/`paused` (else 409 `release_not_building`), issue `held`/`skipped` (else 409 `release_issue_not_held`); it is built again |
+| `POST /api/projects/{repo}/releases/assign` | `{ issueNumbers: number[], releaseId: string \| null }` → `Release[]` | assigns or moves the issues to that release of `{repo}` (404 otherwise), or takes them out with `releaseId: null` (numbers in no release are ignored, no GitHub calls). 1–100 positive numbers, duplicates collapsed (400 otherwise; an invalid `releaseId` is 400). Every issue is fetched with the caller's token: unknown → 404 "Issue #n not found", closed → 409 `issue_closed`; all-or-nothing. Target `building`/`paused`: owner only, appended as `waiting`; target `cancelled`: 409 `release_closed`. An issue leaving a `building`/`paused` release: owner or admin, and only `waiting`, `held` or `skipped` (else 409 `release_issue_started`); leaving a `cancelled` one: owner or admin. A still active run of an issue that leaves is cancelled. Answers all releases of the project after the change |
+| `PUT /api/releases/{id}/issues/order` | `{ issueNumbers: number[] }` → `Release` | the new complete order; anything but exactly the current issues → 409 `release_issues_changed`, nothing changes. `building`/`paused`: owner only, and every issue that is not `waiting` keeps its index (409 `release_issue_started`); `cancelled`: 409 `release_closed` |
 | `GET /api/projects/{repo}/runs` | → `Run[]` | newest first |
 | `POST /api/projects/{repo}/runs` | `{ issueNumber }` → `Run` | needs Claude credential; 409 if the issue has an active run |
 | `GET /api/runs?active=true&status=<s>` | → `Run[]` | across visible repos, newest first (max 200). `active=true`: not finished, i.e. `queued`, `spec`, `building`, `reviewing`, `approving` or `needs_human`. `status`: only these statuses, repeatable and/or comma list (`?status=needs_human`); unknown status → 400. Both given: both apply |
@@ -535,7 +653,11 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   `attachments_not_allowed`; not the run's owner → 403 `forbidden`.
 - Releases: duplicate name → 409 `release_name_taken`; assigning a closed issue → 409 `issue_closed`; a stale
   order → 409 `release_issues_changed`. Every release route answers 404 when the caller cannot see the project,
-  also when addressed by release id.
+  also when addressed by release id; then 403 `forbidden` for the owner/admin rules of started releases (§6
+  "Releases"). Building: `release_not_planning`, `release_empty`, `release_already_building`,
+  `release_branch_exists`, `release_not_building`, `release_not_paused`, `release_issue_not_held`,
+  `release_issue_started`, `release_closed`, `release_active`, `release_name_locked` (409);
+  `github_push_denied`, `claude_credential_required` (422).
 - "Needs Claude credential" → 422 `claude_credential_required`; too many agents → 409
   `too_many_agents`; issue already has an active run → 409 `active_run_exists`; missing CSRF header
   → 403 `csrf`; foreign `Origin` → 403 `bad_origin`.
@@ -585,7 +707,8 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   `{ type: 'session_closed', repo: string, sessionId: string }` announces a closed (deleted) chat, with
   the same visibility filter; clients drop it from their lists and never show it again.
   `{ type: 'release', repo: string, release: Release }` is sent after every change to a release (created, edited,
-  issues added, removed, moved in or out, reordered), once per affected release — a move sends one for the source
+  issues added, removed, moved in or out, reordered, started, paused, resumed, cancelled, and every state change of
+  one of its issues), once per affected release — a move sends one for the source
   and one for the target. `{ type: 'release_deleted', repo: string, releaseId: string }` announces a deleted
   release. Both pass the same visibility filter; clients order versions by `updatedAt` and reload their release
   lists after a reconnect.
@@ -734,7 +857,7 @@ a compromised GitHub release; the activity answer is advisory (it decides when, 
 
 Routes: `/login`, `/` (projects), `/p/:repo` (issues · CLI chat · agents), `/p/:repo/runs/:runId`
 (pipeline diagram with live stages; selecting a stage shows that agent's transcript),
-`/p/:repo/releases/:releaseId` (a release's plan, below),
+`/p/:repo/releases/:releaseId` (a release's plan and build, below),
 `/agents` (everything running), `/settings` (own credentials, and "Models & cost": the user's own model per
 role and fix rounds, with presets — *Default* clears every choice, *Economy* picks Sonnet for chat and spec,
 Haiku for the four reviewers and one fix round), `/admin` ("Factory settings": the default models and the
@@ -775,8 +898,9 @@ it keep running). The closed chat disappears from the picker and all lists at on
 is cleared and the page falls back to another chat or the empty state. Others watching it via `?session=` see
 "This chat was closed" with a Dismiss button instead of an error.
 
-**Releases.** The activity pane has a "Releases" section above "Runs": one row per release (name, the pill
-"in preparation", "N issues") linking to its page, and "+ New" (accessible name "New release") opening the dialog
+**Releases.** The activity pane has a "Releases" section above "Runs": one row per release (name, the status pill
+— "in preparation", "building", "paused" or "cancelled" — and "N issues", or for started releases "k of n merged"
+plus "· h held" when h > 0) linking to its page, and "+ New" (accessible name "New release") opening the dialog
 "New release in <repo>" (Name with the naming rule, optional Description). Once the project has at least one
 release, the issues panel adds: a "Release" filter (All issues · No release · each release) combined with the kind
 and state filters; the release name as a tag on assigned issues, linking to the release page; on open issues a
@@ -785,11 +909,34 @@ in the panel's alert line) and a "Select #n" checkbox — with a selection, a ba
 selected to", "Assign" and "Clear" (changing the state filter clears the selection). Badges and filter come from
 the live release list (fetched once per project page and overlaid with feed frames and the client's own answers),
 so assignments made by others, `/factory` or the chat agent appear without a reload; a deleted release drops out
-of the filter. The release page (a normal scrolling page) shows the name, pill, description (plain text, line
+of the filter. Cancelled releases are not offered as targets in the per-issue and bulk selects (an issue in one still
+shows its tag); server refusals (403/409) show in the alert line and the control returns to the server's value.
+The release page (a normal scrolling page) shows the name, pill, description (plain text, line
 breaks kept), creator, the note that nothing is built until the release is started, "Edit" (name, description)
 and "Delete" (confirmation; the issues stay open and unassigned; then back to the project). Its issues are an
 ordered list with "Move #n up", "Move #n down" and "Remove #n from release" buttons (no drag and drop), and an
 "Add an open issue" select listing open issues not in this release (those in another release are marked
 "(in <name>)" and moved). It updates live; if someone else deletes the release, the page says so.
+
+For building, the release page also shows (owner = `me.username === release.owner.username`,
+admin = `me.isAdmin`): for started releases "started by <owner> · <time ago>", the branch in monospace linking to
+`<project.htmlUrl>/tree/release/<name>`, and the progress "k of n merged" (plus "· h held", "· s skipped"); the
+note "This release is a plan…" only while planning. A plain-text status line (`role="status"`): "Building #n
+<title>." · "Nothing left to build." (plus " h held issue(s) need attention.") · the pause note (plus " #n is
+finishing; no further issue starts." while one runs; for a usage limit "Resumes automatically <time>.") ·
+"Cancelled <time ago>. What was merged stays on release/<name>.". Only the buttons the user may use are rendered:
+planning "▶ Start release" (disabled with the hint "Add an issue first" when empty), Edit, Delete; building
+"Pause", "Cancel release", Edit; paused "Resume" (owner), "Cancel release", Edit; cancelled Delete (owner or
+admin). In a started release Edit shows the name disabled ("The name is fixed once the release is started"). Users
+who may change nothing see "Only <owner>, who started this release, and admins can change it." The dialog "Start
+release?" explains the branch, the credentials used and that merged issues stay open (Cancel has focus; errors in
+`role="alert"`; "Starting…" while the request runs); "Cancel release?" offers "Keep building" (focused) and
+"Cancel release". Each issue shows a state badge with its text, a "run" link to its latest release run, and the
+note for held and skipped issues; "Retry #n" (owner, held or skipped); in a started release moving is owner-only
+among `waiting` issues and removing is for the owner or admins on `waiting`, `held` and `skipped` issues (any issue
+when cancelled); "Add an open issue" shows while planning and, for the owner, while building or paused.
+
+On the run page of a release run the merge node is titled "merge to release" and the header shows the base branch
+linking to the release page (plain text when the release was deleted); single runs still say "merge to main".
 
 Artwork is served from `web/public/art/` (see `art/README.md`).
