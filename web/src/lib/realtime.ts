@@ -1,5 +1,6 @@
 import { createContext, createElement, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { api, type AgentSession, type Channel, type FactoryEvent, type Issue, type Run } from '../api';
+import { useAsync } from './async';
+import { api, type AgentSession, type Channel, type FactoryEvent, type Issue, type Release, type Run } from '../api';
 
 /** `closed`: the server ended the channel for good (e.g. the chat was closed); it is not reopened. */
 export type ConnState = 'connecting' | 'live' | 'reconnecting' | 'closed';
@@ -154,6 +155,18 @@ type FeedState = {
   closedSessions: Set<string>;
   /** Records a chat as closed and drops it from the live sessions. Stable identity. */
   markSessionClosed: (id: string) => void;
+  /** Latest known version of each release (from the feed and from this client's own changes). */
+  releases: Map<string, Release>;
+  /** Ids of releases deleted while this app was open (tombstones: they never reappear). */
+  deletedReleases: Set<string>;
+  /** Records releases this client received from an API answer, so every view shows them at once. Stable identity. */
+  noteReleases: (list: Release[]) => void;
+  /** Records a release as deleted. Stable identity. */
+  markReleaseDeleted: (id: string) => void;
+  /** A counter that grows with every release version recorded; read it before fetching a release list. Stable identity. */
+  releaseMark: () => number;
+  /** When each release's latest version was recorded, as a [releaseMark] value. */
+  releaseSeen: Map<string, number>;
 };
 
 const FeedContext = createContext<FeedState>({
@@ -165,10 +178,24 @@ const FeedContext = createContext<FeedState>({
   subscribeIssues: () => () => {},
   closedSessions: new Set(),
   markSessionClosed: () => {},
+  releases: new Map(),
+  deletedReleases: new Set(),
+  noteReleases: () => {},
+  markReleaseDeleted: () => {},
+  releaseMark: () => 0,
+  releaseSeen: new Map(),
 });
 
 export function FeedProvider({ enabled, children }: { enabled: boolean; children: ReactNode }) {
-  const store = useRef({ sessions: new Map<string, AgentSession>(), runs: new Map<string, Run>(), closed: new Set<string>() });
+  const store = useRef({
+    sessions: new Map<string, AgentSession>(),
+    runs: new Map<string, Run>(),
+    closed: new Set<string>(),
+    releases: new Map<string, Release>(),
+    deletedReleases: new Set<string>(),
+    releaseSeen: new Map<string, number>(),
+    releaseSeq: 0,
+  });
   // Issue frames are events, not state: issues can change on GitHub without a frame, so a stored copy would go stale.
   const issueListeners = useRef(new Set<IssueListener>());
   const subscribeIssues = useCallback((fn: IssueListener) => {
@@ -195,6 +222,27 @@ export function FeedProvider({ enabled, children }: { enabled: boolean; children
     // Not batched: lists and the open chat should react at once.
     setVersion((v) => v + 1);
   }, []);
+  // Release changes are rare and user-driven: apply them at once rather than batched.
+  const noteReleases = useCallback((list: Release[]) => {
+    let changed = false;
+    for (const r of list) {
+      if (store.current.deletedReleases.has(r.id)) continue;
+      const known = store.current.releases.get(r.id);
+      if (known && known.updatedAt >= r.updatedAt) continue;
+      store.current.releases.set(r.id, r);
+      store.current.releaseSeen.set(r.id, ++store.current.releaseSeq);
+      changed = true;
+    }
+    if (changed) setVersion((v) => v + 1);
+  }, []);
+  const markReleaseDeleted = useCallback((id: string) => {
+    if (store.current.deletedReleases.has(id)) return;
+    store.current.deletedReleases.add(id);
+    store.current.releases.delete(id);
+    store.current.releaseSeen.delete(id);
+    setVersion((v) => v + 1);
+  }, []);
+  const releaseMark = useCallback(() => store.current.releaseSeq, []);
   const conn = useReconnecting(
     (h) =>
       api.openFeed({
@@ -211,6 +259,14 @@ export function FeedProvider({ enabled, children }: { enabled: boolean; children
           }
           if (f.type === 'session_closed') {
             markSessionClosed(f.sessionId);
+            return;
+          }
+          if (f.type === 'release') {
+            noteReleases([f.release]);
+            return;
+          }
+          if (f.type === 'release_deleted') {
+            markReleaseDeleted(f.releaseId);
             return;
           }
           if (f.type === 'session') {
@@ -232,8 +288,14 @@ export function FeedProvider({ enabled, children }: { enabled: boolean; children
       subscribeIssues,
       closedSessions: store.current.closed,
       markSessionClosed,
+      releases: store.current.releases,
+      deletedReleases: store.current.deletedReleases,
+      noteReleases,
+      markReleaseDeleted,
+      releaseMark,
+      releaseSeen: store.current.releaseSeen,
     }),
-    [version, conn, reconnects, subscribeIssues, markSessionClosed],
+    [version, conn, reconnects, subscribeIssues, markSessionClosed, noteReleases, markReleaseDeleted, releaseMark],
   );
   return createElement(FeedContext.Provider, { value }, children);
 }
@@ -298,4 +360,43 @@ export function useLiveSession(s: AgentSession | undefined): AgentSession | unde
   const feed = useFeed();
   if (!s) return s;
   return newer(s, feed.sessions.get(s.id));
+}
+
+/**
+ * The releases of `repo`: the fetched list overlaid with newer versions from the feed (or this client's own changes),
+ * plus releases that appeared later, minus deleted ones. Newest first. `since` is the [FeedState.releaseMark] read
+ * before `base` was fetched: a release known before then but missing from `base` was deleted meanwhile (e.g. while
+ * the feed was down), so it is not added back.
+ */
+export function useLiveReleases(base: Release[] | undefined, repo: string, since = -1): Release[] {
+  const feed = useFeed();
+  return useMemo(() => {
+    const map = new Map((base ?? []).filter((r) => !feed.deletedReleases.has(r.id)).map((r) => [r.id, r]));
+    for (const [id, r] of feed.releases) {
+      if (r.repo !== repo || feed.deletedReleases.has(id)) continue;
+      const known = map.get(id);
+      if (known) map.set(id, newer(known, r));
+      else if ((feed.releaseSeen.get(id) ?? 0) > since) map.set(id, r);
+    }
+    return [...map.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [base, repo, feed.version]);
+}
+
+/** The newest known version of one release, and whether it was deleted while this app was open. */
+export function useLiveRelease(release: Release | undefined): { release: Release | undefined; deleted: boolean } {
+  const feed = useFeed();
+  if (!release) return { release, deleted: false };
+  return { release: newer(release, feed.releases.get(release.id)), deleted: feed.deletedReleases.has(release.id) };
+}
+
+/** Loads the releases of `repo` (again after a feed reconnect) and keeps them live. */
+export function useProjectReleases(repo: string) {
+  const feed = useFeed();
+  const q = useAsync(async () => {
+    const since = feed.releaseMark();
+    return { list: await api.releases(repo), since };
+  }, [repo, feed.reconnects]);
+  const releases = useLiveReleases(q.data?.list, repo, q.data?.since ?? Number.MAX_SAFE_INTEGER);
+  return { releases, loading: !q.data && q.loading, error: q.error, reload: q.reload };
 }

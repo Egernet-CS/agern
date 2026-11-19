@@ -1,13 +1,13 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, ApiError, isRunWorking, isSessionActive, type AgentSession, type Issue, type IssueKind, type Run } from '../api';
+import { api, ApiError, isRunWorking, isSessionActive, type AgentSession, type Issue, type IssueKind, type Release, type Run } from '../api';
 import { ChatView } from '../components/chat/ChatView';
 import { REVIEWERS, roundName } from '../components/pipeline/model';
-import { Dialog, Empty, ErrorBox, KindBadge, Loading, Notice, RoleBadge, RunStatusPill, SessionStatusPill } from '../components/ui/ui';
+import { Dialog, Empty, ErrorBox, KindBadge, Loading, Notice, ReleaseStatusPill, RoleBadge, RunStatusPill, SessionStatusPill } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
 import { modelLabel, timeAgo } from '../lib/format';
-import { useFeed, useFeedReconnects, useIssueFeed, useLiveRuns, useLiveSessions } from '../lib/realtime';
+import { useFeed, useFeedReconnects, useIssueFeed, useLiveRuns, useLiveSessions, useProjectReleases } from '../lib/realtime';
 import { useNow } from '../lib/useNow';
 
 type Tab = 'chat' | 'issues' | 'activity';
@@ -31,6 +31,7 @@ export function ProjectPage() {
   const runsBase = useAsync(() => api.projectRuns(repo), [repo]);
   const sessions = useLiveSessions(sessionsBase.data, (s) => s.repo === repo);
   const runs = useLiveRuns(runsBase.data, (r) => r.repo === repo);
+  const releases = useProjectReleases(repo);
   const { closedSessions, markSessionClosed } = useFeed();
   const [closing, setClosing] = useState<AgentSession | null>(null);
   // Chats this user closed (set before the request): they never get the "was closed" notice for them.
@@ -110,7 +111,7 @@ export function ProjectPage() {
 
       <div className="project-grid3">
         <aside className="panel panel--issues" aria-label="Issues">
-          <IssuesPanel repo={repo} />
+          <IssuesPanel repo={repo} releases={releases.releases} />
         </aside>
         <section className="panel panel--chat" aria-label="Chat">
           <ChatPanel
@@ -130,6 +131,7 @@ export function ProjectPage() {
             runs={runs}
             sessions={sessions}
             loading={!runsBase.data || !sessionsBase.data}
+            releases={releases}
             onSelectChat={selectSession}
             onCloseChat={setClosing}
             currentId={closedNotice ? null : current?.id ?? null}
@@ -320,16 +322,31 @@ const KINDS: ('all' | IssueKind)[] = ['all', 'feature', 'bug', 'task'];
 /** Prepends `i` unless an issue with that number is already listed (dialog insert and feed frame race). */
 const addIssue = (list: Issue[], i: Issue) => (list.some((x) => x.number === i.number) ? list : [i, ...list]);
 
-function IssuesPanel({ repo }: { repo: string }) {
+/** Release filter: every issue, issues in no release, or one release's id. */
+type ReleaseFilter = 'all' | 'none' | string;
+
+/** Option value for "take the issues out of their release" in the bulk bar (never a release id). */
+const NO_RELEASE = '__none__';
+
+function IssuesPanel({ repo, releases }: { repo: string; releases: Release[] }) {
   const me = useMe();
   const nav = useNavigate();
-  const [state, setState] = useState<'open' | 'closed'>('open');
+  const { noteReleases } = useFeed();
+  const [state, setStateRaw] = useState<'open' | 'closed'>('open');
   const [kind, setKind] = useState<'all' | IssueKind>('all');
+  const [releaseFilter, setReleaseFilter] = useState<ReleaseFilter>('all');
   const [creating, setCreating] = useState(false);
   const [starting, setStarting] = useState<number | null>(null);
+  const [assigning, setAssigning] = useState<Set<number>>(new Set());
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [bulkTarget, setBulkTarget] = useState('');
   const [err, setErr] = useState<string | null>(null);
   const reconnects = useFeedReconnects();
   const issues = useAsync(() => api.issues(repo, state), [repo, state, reconnects]);
+  const setState = (s: 'open' | 'closed') => {
+    setStateRaw(s);
+    setSelected(new Set());
+  };
 
   // Issues created through Agern arrive on the feed. Frames that arrive mid-load are held back and merged once the
   // load has delivered, so the fresh list does not overwrite them.
@@ -343,6 +360,8 @@ function IssuesPanel({ repo }: { repo: string }) {
   });
   useEffect(() => {
     pending.current = [];
+    setSelected(new Set());
+    setReleaseFilter('all');
   }, [repo]);
   useEffect(() => {
     if (issues.loading || !pending.current.length) return;
@@ -351,7 +370,20 @@ function IssuesPanel({ repo }: { repo: string }) {
     batch.forEach(merge);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [issues.data, issues.loading]);
-  const list = (issues.data ?? []).filter((i) => kind === 'all' || i.kind === kind);
+
+  // Assignments come from the live release list, so changes made elsewhere show without a reload.
+  const releaseOf = useMemo(() => {
+    const m = new Map<number, Release>();
+    for (const r of releases) for (const i of r.issues) m.set(i.number, r);
+    return m;
+  }, [releases]);
+  const hasReleases = releases.length > 0;
+  // A deleted release falls back to all issues.
+  const filter: ReleaseFilter =
+    releaseFilter === 'all' || releaseFilter === 'none' || releases.some((r) => r.id === releaseFilter) ? releaseFilter : 'all';
+  const inFilter = (i: Issue) =>
+    !hasReleases || filter === 'all' || (filter === 'none' ? !releaseOf.has(i.number) : releaseOf.get(i.number)?.id === filter);
+  const list = (issues.data ?? []).filter((i) => (kind === 'all' || i.kind === kind) && inFilter(i));
   const counts = useMemo(() => {
     const c = { all: 0, feature: 0, bug: 0, task: 0 } as Record<string, number>;
     for (const i of issues.data ?? []) {
@@ -360,6 +392,9 @@ function IssuesPanel({ repo }: { repo: string }) {
     }
     return c;
   }, [issues.data]);
+  // Only open issues that are still listed count as selected.
+  const openNumbers = new Set((issues.data ?? []).filter((i) => i.state === 'open').map((i) => i.number));
+  const selection = [...selected].filter((n) => openNumbers.has(n));
 
   const start = async (i: Issue) => {
     setStarting(i.number);
@@ -372,6 +407,34 @@ function IssuesPanel({ repo }: { repo: string }) {
       setStarting(null);
       issues.reload();
     }
+  };
+
+  /** Assigns the issues to a release (null: takes them out); true on success. */
+  const assign = async (numbers: number[], releaseId: string | null): Promise<boolean> => {
+    setErr(null);
+    setAssigning((prev) => new Set([...prev, ...numbers]));
+    try {
+      noteReleases(await api.assignIssues(repo, numbers, releaseId));
+      return true;
+    } catch (e) {
+      setErr((e as Error).message);
+      return false;
+    } finally {
+      setAssigning((prev) => new Set([...prev].filter((n) => !numbers.includes(n))));
+    }
+  };
+
+  const toggle = (n: number, on: boolean) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(n);
+      else next.delete(n);
+      return next;
+    });
+
+  const assignSelected = async () => {
+    if (!selection.length || !bulkTarget) return;
+    if (await assign(selection, bulkTarget === NO_RELEASE ? null : bulkTarget)) setSelected(new Set());
   };
 
   return (
@@ -393,41 +456,110 @@ function IssuesPanel({ repo }: { repo: string }) {
             <button key={s} role="radio" aria-checked={state === s} className={state === s ? 'is-on' : ''} onClick={() => setState(s)}>{s}</button>
           ))}
         </div>
+        {hasReleases && (
+          <span className="release-filter">
+            <select aria-label="Release" value={filter} onChange={(e) => setReleaseFilter(e.target.value)}>
+              <option value="all">All issues</option>
+              <option value="none">No release</option>
+              {releases.map((r) => (
+                <option key={r.id} value={r.id}>{r.name}</option>
+              ))}
+            </select>
+          </span>
+        )}
       </div>
+      {hasReleases && selection.length > 0 && (
+        <div className="bulk-bar" role="group" aria-label="Selected issues">
+          <span className="bulk-n">{selection.length} selected</span>
+          <span className="bulk-target">
+            <select aria-label="Assign selected to" value={bulkTarget} onChange={(e) => setBulkTarget(e.target.value)}>
+              <option value="" disabled>Assign to…</option>
+              {releases.map((r) => (
+                <option key={r.id} value={r.id}>{r.name}</option>
+              ))}
+              <option value={NO_RELEASE}>No release</option>
+            </select>
+          </span>
+          <button
+            type="button"
+            className="btn btn--sm btn--primary"
+            onClick={() => void assignSelected()}
+            disabled={!bulkTarget || selection.some((n) => assigning.has(n))}
+          >
+            Assign
+          </button>
+          <button type="button" className="btn btn--sm btn--ghost" onClick={() => setSelected(new Set())}>
+            Clear
+          </button>
+        </div>
+      )}
       {err && <p className="form-error" role="alert">{err}</p>}
       {issues.loading && !issues.data && <Loading />}
       {issues.error && <ErrorBox error={issues.error} retry={issues.reload} />}
-      {issues.data && list.length === 0 && <p className="muted pad">No {state} {kind === 'all' ? 'issues' : `${kind}s`}.</p>}
+      {issues.data && list.length === 0 && (
+        <p className="muted pad">
+          No {state} {kind === 'all' ? 'issues' : `${kind}s`}
+          {hasReleases && filter !== 'all' ? (filter === 'none' ? ' without a release' : ' in this release') : ''}.
+        </p>
+      )}
       <ul className="issue-list">
-        {list.map((i) => (
-          <li key={i.number} className="issue">
-            <div className="issue-main">
-              <KindBadge kind={i.kind} />
-              <a href={i.htmlUrl} target="_blank" rel="noreferrer" className="issue-title">
-                <span className="issue-num">#{i.number}</span> {i.title}
-              </a>
-            </div>
-            <div className="issue-meta">
-              <span>{i.author}</span>
-              <span>· {timeAgo(i.updatedAt)}</span>
-              {i.comments > 0 && <span>· {i.comments} comment{i.comments === 1 ? "" : "s"}</span>}
-              <span className="issue-action">
-                {i.activeRunId ? (
-                  <Link to={`/p/${repo}/runs/${i.activeRunId}`} className="run-link"><span className="live-dot" aria-hidden /> run in progress</Link>
-                ) : i.state === 'open' ? (
-                  <button
-                    className="btn btn--sm btn--ghost btn--run"
-                    onClick={() => void start(i)}
-                    disabled={!me.hasClaudeCredential || starting !== null}
-                    title={me.hasClaudeCredential ? 'Hand this issue to the pipeline' : 'Needs your Claude credential (Settings)'}
-                  >
-                    {starting === i.number ? 'Starting…' : '▶ Start run'}
-                  </button>
-                ) : null}
-              </span>
-            </div>
-          </li>
-        ))}
+        {list.map((i) => {
+          const rel = releaseOf.get(i.number);
+          const pickable = hasReleases && i.state === 'open';
+          return (
+            <li key={i.number} className={`issue ${pickable && selected.has(i.number) ? 'is-selected' : ''}`}>
+              <div className="issue-main">
+                {pickable && (
+                  <input
+                    type="checkbox"
+                    className="issue-check"
+                    aria-label={`Select #${i.number}`}
+                    checked={selected.has(i.number)}
+                    onChange={(e) => toggle(i.number, e.target.checked)}
+                  />
+                )}
+                <KindBadge kind={i.kind} />
+                <a href={i.htmlUrl} target="_blank" rel="noreferrer" className="issue-title">
+                  <span className="issue-num">#{i.number}</span> {i.title}
+                </a>
+              </div>
+              <div className="issue-meta">
+                {rel && (
+                  <Link to={`/p/${repo}/releases/${rel.id}`} className="tag release-tag" title={`Planned in release ${rel.name}`}>
+                    {rel.name}
+                  </Link>
+                )}
+                <span>{i.author}</span>
+                <span>· {timeAgo(i.updatedAt)}</span>
+                {i.comments > 0 && <span>· {i.comments} comment{i.comments === 1 ? "" : "s"}</span>}
+                <span className="issue-action">
+                  {pickable && (
+                    <span className="release-pick">
+                      <select aria-label={`Release for #${i.number}`} value={rel?.id ?? ''} disabled={assigning.has(i.number)} onChange={(e) => void assign([i.number], e.target.value || null)}>
+                        <option value="">No release</option>
+                        {releases.map((r) => (
+                          <option key={r.id} value={r.id}>{r.name}</option>
+                        ))}
+                      </select>
+                    </span>
+                  )}
+                  {i.activeRunId ? (
+                    <Link to={`/p/${repo}/runs/${i.activeRunId}`} className="run-link"><span className="live-dot" aria-hidden /> run in progress</Link>
+                  ) : i.state === 'open' ? (
+                    <button
+                      className="btn btn--sm btn--ghost btn--run"
+                      onClick={() => void start(i)}
+                      disabled={!me.hasClaudeCredential || starting !== null}
+                      title={me.hasClaudeCredential ? 'Hand this issue to the pipeline' : 'Needs your Claude credential (Settings)'}
+                    >
+                      {starting === i.number ? 'Starting…' : '▶ Start run'}
+                    </button>
+                  ) : null}
+                </span>
+              </div>
+            </li>
+          );
+        })}
       </ul>
       {!me.hasClaudeCredential && <p className="muted small pad">Starting runs needs your Claude credential. <Link to="/settings#claude">Settings</Link></p>}
       <NewIssueDialog repo={repo} open={creating} onClose={() => setCreating(false)} onCreated={(i) => issues.setData((d) => addIssue(d ?? [], i))} />
@@ -485,6 +617,65 @@ function NewIssueDialog({ repo, open, onClose, onCreated }: { repo: string; open
   );
 }
 
+/** Creates a release; the new release shows through the shared live list (once, even though its feed frame follows). */
+function NewReleaseDialog({ repo, open, onClose }: { repo: string; open: boolean; onClose: () => void }) {
+  const { noteReleases } = useFeed();
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => {
+    if (open) setErr(null);
+  }, [open]);
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setErr(null);
+    try {
+      noteReleases([await api.createRelease(repo, { name: name.trim(), description })]);
+      setName('');
+      setDescription('');
+      onClose();
+    } catch (e2) {
+      setErr((e2 as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Dialog open={open} onClose={onClose} title={`New release in ${repo}`}>
+      <form className="form" onSubmit={submit}>
+        <div className="field">
+          <label htmlFor="rn">Name</label>
+          <input id="rn" value={name} onChange={(e) => setName(e.target.value)} required maxLength={50} autoFocus aria-describedby="rn-hint" className="mono" />
+          <p id="rn-hint" className="muted small">
+            Letters, digits, <code>.</code>, <code>_</code>, <code>-</code>; becomes the branch <code>release/&lt;name&gt;</code>
+          </p>
+        </div>
+        <div className="field">
+          <label htmlFor="rd">
+            Description <span className="muted">(optional)</span>
+          </label>
+          <textarea id="rd" rows={4} value={description} onChange={(e) => setDescription(e.target.value)} maxLength={2000} />
+        </div>
+        {err && (
+          <p className="form-error" role="alert">
+            {err}
+          </p>
+        )}
+        <div className="dialog-actions">
+          <button type="button" className="btn btn--ghost" onClick={onClose}>
+            Cancel
+          </button>
+          <button className="btn btn--primary" disabled={busy || !name.trim()}>
+            {busy ? 'Creating…' : 'Create release'}
+          </button>
+        </div>
+      </form>
+    </Dialog>
+  );
+}
+
 // ---------------------------------------------------------------- activity
 
 export function runStageLine(r: Run): string {
@@ -504,6 +695,7 @@ function ActivityPanel({
   runs,
   sessions,
   loading,
+  releases,
   onSelectChat,
   onCloseChat,
   currentId,
@@ -512,6 +704,7 @@ function ActivityPanel({
   runs: Run[];
   sessions: AgentSession[];
   loading: boolean;
+  releases: { releases: Release[]; loading: boolean; error: Error | undefined; reload: () => void };
   onSelectChat: (id: string) => void;
   onCloseChat: (s: AgentSession) => void;
   currentId: string | null;
@@ -521,6 +714,7 @@ function ActivityPanel({
   const active = sessions.filter(isSessionActive);
   const runList = runs.slice(0, 12);
   const chats = sessions.filter((s) => s.kind === 'chat');
+  const [creatingRelease, setCreatingRelease] = useState(false);
   return (
     <>
       <div className="panel-head">
@@ -559,6 +753,35 @@ function ActivityPanel({
           );
         })}
       </ul>
+      <div className="panel-head">
+        <h2>Releases</h2>
+        <button type="button" className="btn btn--sm" aria-label="New release" onClick={() => setCreatingRelease(true)}>
+          + New
+        </button>
+      </div>
+      {releases.error && <ErrorBox error={releases.error} retry={releases.reload} />}
+      {releases.loading && <Loading />}
+      {!releases.loading && !releases.error && releases.releases.length === 0 && (
+        <p className="muted pad">No releases yet. Create one to plan issues ahead.</p>
+      )}
+      <ul className="run-list release-list">
+        {releases.releases.map((r) => (
+          <li key={r.id}>
+            <Link to={`/p/${repo}/releases/${r.id}`} className="run-row release-row">
+              <div className="rr-top">
+                <span className="rr-title">{r.name}</span>
+              </div>
+              <div className="rr-bot">
+                <ReleaseStatusPill status={r.status} />
+                <span className="rr-line">
+                  {r.issues.length} issue{r.issues.length === 1 ? '' : 's'}
+                </span>
+              </div>
+            </Link>
+          </li>
+        ))}
+      </ul>
+      <NewReleaseDialog repo={repo} open={creatingRelease} onClose={() => setCreatingRelease(false)} />
       <div className="panel-head">
         <h2>Runs</h2>
       </div>

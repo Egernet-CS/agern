@@ -10,6 +10,7 @@ import type {
   IssueKind,
   PreferenceOverrides,
   Project,
+  Release,
   Run,
   SessionKind,
   SessionStatus,
@@ -117,6 +118,8 @@ export const db = {
   closedSessions: new Set<string>(),
   feedSubs: new Set<(f: FeedFrame) => void>(),
   runs: new Map<string, Run>(),
+  /** Release plans (docs/ARCHITECTURE.md §6 "Releases"). */
+  releases: new Map<string, Release>(),
   players: new Map<string, Player>(),
   settings: {
     agentsMayInstallSoftware: false,
@@ -377,7 +380,28 @@ export function chatInput(s: AgentSession, text: string, by: User, attachments: 
       if (db.closedSessions.has(s.id)) return;
       try {
         if (!cmd || cmd === 'help') {
-          systemReply(s, ['/factory run <issue>      start a pipeline run for an issue', '/factory status           list runs in this project', '/factory approve [runId]  approve a run waiting for a human', '/factory cancel <runId>   cancel a run', '/factory help             this help'].join('\n'));
+          systemReply(s, ['/factory run <issue>      start a pipeline run for an issue', '/factory status           list runs in this project', '/factory approve [runId]  approve a run waiting for a human', '/factory cancel <runId>   cancel a run', '/factory releases         list the releases planned in this project', '/factory release create <name> [description]', '/factory release add <name> <issue>…', '/factory release remove <issue>…', '/factory help             this help'].join('\n'));
+        } else if (cmd === 'releases') {
+          const list = releasesOf(s.repo);
+          systemReply(s, list.length ? list.map((r) => [`• ${r.name} — in preparation, ${r.issues.length} issue${r.issues.length === 1 ? '' : 's'}`, ...r.issues.map((i) => `    #${i.number} ${i.title}`)].join('\n')).join('\n\n') : `No releases in ${s.repo} yet.`);
+        } else if (cmd === 'release') {
+          const [, , sub, ...rest] = text.trim().split(/\s+/);
+          const nums = (tokens: string[]) => tokens.flatMap((t) => t.split(',')).filter(Boolean).map((t) => Number(t.replace('#', '')));
+          const find = (name: string) => releasesOf(s.repo).find((r) => r.name.toLowerCase() === name.toLowerCase() || r.id === name);
+          if (sub === 'create' && rest[0]) {
+            const r = createRelease(s.repo, { name: rest[0], description: rest.slice(1).join(' ') }, by);
+            systemReply(s, `Created release "${r.name}".`);
+          } else if (sub === 'add' && rest.length > 1) {
+            const r = find(rest[0]);
+            if (!r) throw new Error(`No release "${rest[0]}" in ${s.repo}. Releases: ${releasesOf(s.repo).map((x) => x.name).join(', ') || 'none'}.`);
+            const n = nums(rest.slice(1));
+            assignIssues(s.repo, n, r.id);
+            systemReply(s, `Release "${r.name}": added ${n.map((x) => `#${x}`).join(', ')} (now ${r.issues.length} issue${r.issues.length === 1 ? '' : 's'}).`);
+          } else if (sub === 'remove' && rest.length) {
+            const n = nums(rest);
+            assignIssues(s.repo, n, null);
+            systemReply(s, `Removed ${n.map((x) => `#${x}`).join(', ')} from their release.`);
+          } else systemReply(s, 'Usage: /factory release create <name> [description] | add <name> <issue>… | remove <issue>…', 'warn');
         } else if (cmd === 'status') {
           const runs = [...db.runs.values()].filter((r) => r.repo === s.repo).slice(0, 6);
           systemReply(s, runs.length ? runs.map((r) => `${r.id.slice(0, 8)}  #${r.issueNumber}  ${r.status.padEnd(11)} ${r.issueTitle}`).join('\n') : 'No runs in this project.');
@@ -721,6 +745,106 @@ export function cancelRun(r: Run) {
   setRunStatus(r, 'cancelled', iso(Date.now()));
 }
 
+// ---------------------------------------------------------------- releases (same rules and error codes as the server)
+
+const RELEASE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,49}$/;
+const RELEASE_NAME_RULE =
+  "A release name is 1 to 50 letters, digits, '.', '_' or '-', starts with a letter or digit, and must not contain '..' or end with '.' or '.lock'.";
+
+/** Strictly increasing `updatedAt`, like the server's touch. */
+function touchRelease(r: Release) {
+  const now = Date.now();
+  r.updatedAt = iso(Math.max(now, Date.parse(r.updatedAt) + 1));
+  feed({ type: 'release', repo: r.repo, release: r });
+}
+
+function validRelease(repo: string, rawName: string, rawDescription: string, self?: string) {
+  const name = rawName.trim();
+  if (!RELEASE_NAME.test(name) || name.includes('..') || name.endsWith('.') || name.endsWith('.lock')) throw new MockError(400, 'bad_request', RELEASE_NAME_RULE);
+  const description = rawDescription.trim();
+  if (description.length > 2000) throw new MockError(400, 'bad_request', 'The description is too long (at most 2000 characters)');
+  const taken = [...db.releases.values()].some((r) => r.repo === repo && r.id !== self && r.name.toLowerCase() === name.toLowerCase());
+  if (taken) throw new MockError(409, 'release_name_taken', `A release named "${name}" already exists in this project`);
+  return { name, description };
+}
+
+export const releasesOf = (repo: string) =>
+  [...db.releases.values()].filter((r) => r.repo === repo).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id));
+
+export function releaseOfIssue(repo: string, n: number): { id: string; name: string } | null {
+  const r = releasesOf(repo).find((x) => x.issues.some((i) => i.number === n));
+  return r ? { id: r.id, name: r.name } : null;
+}
+
+export function getRelease(id: string): Release {
+  const r = db.releases.get(id);
+  if (!r) throw new MockError(404, 'not_found', 'Release not found');
+  return r;
+}
+
+export function createRelease(repo: string, body: { name: string; description: string }, by: User, createdMs = Date.now()): Release {
+  const { name, description } = validRelease(repo, body.name, body.description ?? '');
+  const r: Release = { id: uid(), repo, name, description, status: 'planning', createdBy: ownerOf(by), createdAt: iso(createdMs), updatedAt: iso(createdMs), issues: [] };
+  db.releases.set(r.id, r);
+  feed({ type: 'release', repo, release: r });
+  return r;
+}
+
+export function updateRelease(r: Release, body: { name: string; description: string }) {
+  Object.assign(r, validRelease(r.repo, body.name, body.description ?? '', r.id));
+  touchRelease(r);
+  return r;
+}
+
+export function deleteRelease(r: Release) {
+  db.releases.delete(r.id);
+  feed({ type: 'release_deleted', repo: r.repo, releaseId: r.id });
+}
+
+/** Assigns (moving from other releases) or, with `releaseId` null, unassigns. All-or-nothing. */
+export function assignIssues(repo: string, numbers: number[], releaseId: string | null) {
+  if (!numbers.length || numbers.length > 100 || numbers.some((n) => !Number.isInteger(n) || n <= 0)) throw new MockError(400, 'bad_request', 'Give 1 to 100 issue numbers');
+  const nums = [...new Set(numbers)];
+  const changed = new Set<Release>();
+  const leave = (n: number) => {
+    for (const r of releasesOf(repo)) {
+      if (r.issues.some((i) => i.number === n)) {
+        r.issues = r.issues.filter((i) => i.number !== n);
+        changed.add(r);
+      }
+    }
+  };
+  if (releaseId === null) {
+    nums.forEach(leave);
+  } else {
+    const target = db.releases.get(releaseId);
+    if (!target || target.repo !== repo) throw new MockError(404, 'not_found', 'Release not found');
+    const issues = nums.map((n) => {
+      const i = db.issues[repo]?.find((x) => x.number === n);
+      if (!i) throw new MockError(404, 'not_found', `Issue #${n} not found`);
+      if (i.state !== 'open') throw new MockError(409, 'issue_closed', `Issue #${n} is closed; only open issues can be planned in a release`);
+      return i;
+    });
+    for (const i of issues) {
+      if (target.issues.some((x) => x.number === i.number)) continue;
+      leave(i.number);
+      target.issues.push({ number: i.number, title: i.title, kind: i.kind });
+      changed.add(target);
+    }
+  }
+  changed.forEach(touchRelease);
+  return releasesOf(repo);
+}
+
+export function reorderRelease(r: Release, numbers: number[]) {
+  const current = r.issues.map((i) => i.number);
+  const same = numbers.length === current.length && new Set(numbers).size === numbers.length && numbers.every((n) => current.includes(n));
+  if (!same) throw new MockError(409, 'release_issues_changed', "The release's issues changed in the meantime; reload and try again.");
+  r.issues = numbers.map((n) => r.issues.find((i) => i.number === n)!);
+  touchRelease(r);
+  return r;
+}
+
 // ---------------------------------------------------------------- seed
 
 const LABEL = { bug: { name: 'bug', color: 'd73a4a' }, feature: { name: 'enhancement', color: 'a2eeef' }, task: { name: 'chore', color: 'c5def5' } };
@@ -739,6 +863,7 @@ function issue(repo: string, number: number, kind: IssueKind, title: string, aut
     htmlUrl: `https://github.com/${ORG}/${repo}/issues/${number}`,
     body: `### Context\n\nReported by @${author}.\n\n### Acceptance\n\n- [ ] Works on desktop and mobile\n- [ ] Covered by tests`,
     activeRunId: null,
+    release: null,
     ...extra,
   };
 }
@@ -793,6 +918,14 @@ function seed() {
   ];
   db.issues['data-pipeline'] = [issue('data-pipeline', 3, 'bug', 'Duplicate orders on DST change', 'carl', 10)];
   db.issues.infra = [];
+
+  // Release plans: one with issues, one empty.
+  const spring = createRelease('web-shop', { name: '1.4', description: 'Checkout polish before the spring campaign.\nShip together.' }, alice, Date.now() - 2 * 86400_000);
+  spring.issues = [51, 55, 57].map((n) => {
+    const i = db.issues['web-shop'].find((x) => x.number === n)!;
+    return { number: n, title: i.title, kind: i.kind };
+  });
+  createRelease('web-shop', { name: 'chat-cleanup', description: '' }, bob, Date.now() - 86400_000);
 
   // Historical runs (instant).
   const never = () => false;

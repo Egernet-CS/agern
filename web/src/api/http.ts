@@ -121,6 +121,14 @@ export const httpApi: Api = {
   issue: (repo, n) => get(`/api/projects/${enc(repo)}/issues/${n}`),
   createIssue: (repo, body) => post(`/api/projects/${enc(repo)}/issues`, body),
 
+  releases: (repo) => get(`/api/projects/${enc(repo)}/releases`),
+  release: (id) => get(`/api/releases/${enc(id)}`),
+  createRelease: (repo, body) => post(`/api/projects/${enc(repo)}/releases`, body),
+  updateRelease: (id, body) => put(`/api/releases/${enc(id)}`, body),
+  deleteRelease: (id) => del(`/api/releases/${enc(id)}`),
+  assignIssues: (repo, issueNumbers, releaseId) => post(`/api/projects/${enc(repo)}/releases/assign`, { issueNumbers, releaseId }),
+  reorderRelease: (id, issueNumbers) => put(`/api/releases/${enc(id)}/issues/order`, { issueNumbers }),
+
   projectRuns: (repo) => get(`/api/projects/${enc(repo)}/runs`),
   startRun: (repo, issueNumber) => post(`/api/projects/${enc(repo)}/runs`, { issueNumber }),
   runs: (filter = {}) => {

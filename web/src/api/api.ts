@@ -12,6 +12,7 @@ import type {
   LoginStep,
   IssueKind,
   Project,
+  Release,
   Run,
   RunStatus,
   Settings,
@@ -53,6 +54,22 @@ export interface Api {
   issues(repo: string, state?: 'open' | 'closed' | 'all'): Promise<Issue[]>;
   issue(repo: string, number: number): Promise<Issue>;
   createIssue(repo: string, body: { title: string; body: string; kind: IssueKind }): Promise<Issue>;
+
+  /** Newest first, each with its issues in order. */
+  releases(repo: string): Promise<Release[]>;
+  release(id: string): Promise<Release>;
+  /** 400 invalid name or description, 409 `release_name_taken`. */
+  createRelease(repo: string, body: { name: string; description: string }): Promise<Release>;
+  updateRelease(id: string, body: { name: string; description: string }): Promise<Release>;
+  /** Removes the plan only; the issues are untouched. */
+  deleteRelease(id: string): Promise<void>;
+  /**
+   * Puts open issues into a release (moving them from another), or takes them out with `releaseId` null. All-or-nothing:
+   * 409 `issue_closed`, 404 for an unknown issue. Answers all releases of the project after the change.
+   */
+  assignIssues(repo: string, issueNumbers: number[], releaseId: string | null): Promise<Release[]>;
+  /** The new complete order; 409 `release_issues_changed` when it is not exactly the release's current issues. */
+  reorderRelease(id: string, issueNumbers: number[]): Promise<Release>;
 
   projectRuns(repo: string): Promise<Run[]>;
   startRun(repo: string, issueNumber: number): Promise<Run>;

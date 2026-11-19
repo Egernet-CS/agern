@@ -56,6 +56,29 @@ export type Issue = {
   htmlUrl: string;
   body?: string;
   activeRunId: string | null;
+  /** The release the issue is planned in; null when it is in none. */
+  release: { id: string; name: string } | null;
+};
+
+/** Step 1 of releases only plans; later steps add the building and releasing states. */
+export type ReleaseStatus = 'planning';
+
+/** An issue as planned in a release: title and kind as they were when it was assigned. */
+export type ReleaseIssue = { number: number; title: string; kind: IssueKind };
+
+/** A named plan of issues for one project (docs/ARCHITECTURE.md §6 "Releases"). */
+export type Release = {
+  id: string;
+  repo: string;
+  name: string;
+  description: string;
+  status: ReleaseStatus;
+  createdBy: Owner;
+  createdAt: string;
+  /** Strictly increases on every change. */
+  updatedAt: string;
+  /** In build order. */
+  issues: ReleaseIssue[];
 };
 
 export type SessionKind = 'chat' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
@@ -234,7 +257,10 @@ export type FeedFrame =
   /** An issue created through Agern, in list shape (no body). Event only: not replayed, not sent for changes made on GitHub. */
   | { type: 'issue'; repo: string; issue: Issue }
   /** A chat was closed (deleted) by its owner or an admin. */
-  | { type: 'session_closed'; repo: string; sessionId: string };
+  | { type: 'session_closed'; repo: string; sessionId: string }
+  /** A release after any change (created, edited, issues added, removed, moved or reordered). */
+  | { type: 'release'; repo: string; release: Release }
+  | { type: 'release_deleted'; repo: string; releaseId: string };
 
 /** Agents are working on these runs. */
 export const WORKING_RUN_STATUSES: RunStatus[] = ['queued', 'spec', 'building', 'reviewing', 'approving'];
