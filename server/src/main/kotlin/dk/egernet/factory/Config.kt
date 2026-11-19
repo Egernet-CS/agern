@@ -93,6 +93,8 @@ data class Config(
             val devUsers = if ("dev" in auth) parseDevUsers(get("FACTORY_DEV_USERS")) else emptyMap()
             val fakeGithub = get("FACTORY_DEV_FAKE_GITHUB")?.lowercase() in setOf("1", "true", "yes")
             if (fakeGithub) require("dev" in auth) { "FACTORY_DEV_FAKE_GITHUB requires 'dev' in FACTORY_AUTH" }
+            val sandbox = SandboxConfig.fromEnv(::get)
+            if (sandbox.mode == "fake") require(fakeGithub) { "FACTORY_SANDBOX=fake is a development mode and requires FACTORY_DEV_FAKE_GITHUB" }
 
             return Config(
                 port = get("FACTORY_PORT")?.toInt() ?: 8080,
@@ -135,7 +137,7 @@ data class Config(
                 attachmentMaxCount = (get("FACTORY_ATTACHMENT_MAX_COUNT")?.toIntOrNull() ?: get("FACTORY_ATTACHMENT_MAX_COUNT")?.let {
                     throw IllegalArgumentException("FACTORY_ATTACHMENT_MAX_COUNT must be a whole number")
                 } ?: 10).also { require(it in 1..20) { "FACTORY_ATTACHMENT_MAX_COUNT must be between 1 and 20" } },
-                sandbox = SandboxConfig.fromEnv(::get),
+                sandbox = sandbox,
             ).also {
                 require(it.attachmentMaxMessageBytes >= it.attachmentMaxBytes) {
                     "FACTORY_ATTACHMENT_MAX_MESSAGE_MB must be at least FACTORY_ATTACHMENT_MAX_MB"
@@ -185,7 +187,10 @@ data class LdapConfig(
 
 /** Sandbox settings (docs/ARCHITECTURE.md §3, §5 "Sandboxes"). */
 data class SandboxConfig(
-    /** `off` (default) or `podman` (rootless Podman through its CLI). */
+    /**
+     * `off` (default), `podman` (rootless Podman through its CLI) or `fake` (an in-memory runtime that only pretends to run
+     * commands; development and end-to-end tests, only together with FACTORY_DEV_FAKE_GITHUB).
+     */
     val mode: String = "off",
     /** FACTORY_SANDBOX_PODMAN: the podman binary. */
     val podmanBin: String = "podman",
@@ -214,7 +219,7 @@ data class SandboxConfig(
 
         fun fromEnv(get: (String) -> String?): SandboxConfig {
             val mode = (get("FACTORY_SANDBOX") ?: "off").lowercase()
-            require(mode in setOf("off", "podman")) { "FACTORY_SANDBOX must be 'off' or 'podman'" }
+            require(mode in setOf("off", "podman", "fake")) { "FACTORY_SANDBOX must be 'off' or 'podman' ('fake' in development)" }
             val registries = get("FACTORY_SANDBOX_REGISTRIES")?.split(',')?.map { it.trim().lowercase() }?.filter { it.isNotEmpty() }
                 ?: DEFAULT_REGISTRIES
             for (r in registries) require(REGISTRY_RE.matches(r)) { "FACTORY_SANDBOX_REGISTRIES: '$r' is not a registry host name" }

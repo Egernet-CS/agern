@@ -30,6 +30,9 @@ sealed class FeedItem(val repo: String) {
 
     /** A release that was deleted. */
     class ReleaseDeleted(repo: String, val releaseId: String) : FeedItem(repo)
+
+    /** A project's sandbox approval after an admin approved or revoked it (null: revoked). */
+    class SandboxApproval(repo: String, val approval: dk.egernet.factory.SandboxApprovalDto?) : FeedItem(repo)
 }
 
 /** In-process fan-out of live events. Persisted state is in PostgreSQL; this only carries notifications. */

@@ -10,6 +10,11 @@ import dk.egernet.factory.SandboxDefinitionDto
 import dk.egernet.factory.SandboxLimitsDto
 import dk.egernet.factory.SandboxServiceDto
 import dk.egernet.factory.SandboxStatusDto
+import dk.egernet.factory.PendingSandboxDto
+import dk.egernet.factory.RunningSandboxDto
+import dk.egernet.factory.SandboxOverviewDto
+import dk.egernet.factory.SandboxServerLimitsDto
+import dk.egernet.factory.agent.FeedItem
 import dk.egernet.factory.conflict
 import dk.egernet.factory.db.RunStore
 import dk.egernet.factory.db.SandboxApprovalStore
@@ -39,6 +44,8 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.time.Instant
 
 /** What a tool call answers: JSON or a message for the agent, and whether it is an error. */
 data class SandboxAnswer(val isError: Boolean, val text: String)
@@ -61,6 +68,13 @@ class SandboxManager(
     private val git: GitOps,
     /** Appends a `system` event (payload as given) to an agent session's transcript. */
     private val publishSystem: (UUID, JsonObject) -> Unit,
+    /** Announces approval changes on the live feed (`sandbox_approval`). */
+    private val emitFeed: (FeedItem) -> Unit = {},
+    /**
+     * Development only (FACTORY_DEV_FAKE_GITHUB, whose workspaces are local `git init` repositories): where a run reads
+     * its definition instead of the base commit, by repository. Null: from git, as in production.
+     */
+    private val devDefinitionSource: ((String) -> String?)? = null,
 ) {
     private val log = LoggerFactory.getLogger(SandboxManager::class.java)
     private val sc: SandboxConfig get() = cfg.sandbox
@@ -76,11 +90,17 @@ class SandboxManager(
     }
 
     private class RunSandbox(val runId: UUID, val repo: String, val worktree: Path, val plan: Plan, val info: RunSandboxDto) {
-        /** Serialises creation and commands: one command at a time per run. Release never takes it. */
+        /** Serialises creation and commands: one command at a time per run. Release and stop never take it. */
         val lock = Mutex()
         val slotHeld = AtomicBoolean(false)
         @Volatile var created = false
         @Volatile var released = false
+        /** When the current containers were created (null while there are none). */
+        @Volatile var createdAt: Instant? = null
+        /** The builder session that used the sandbox last (where an admin's stop is reported). */
+        @Volatile var sessionId: UUID? = null
+        /** Bumped by every admin stop, so a creation or command in flight notices its containers are gone. */
+        val generation = AtomicInteger()
     }
 
     private fun names(rs: RunSandbox): List<String> {
@@ -100,7 +120,9 @@ class SandboxManager(
             return record(runId, RunSandboxDto("disabled", "Sandboxes are switched off on this server (FACTORY_SANDBOX=off).", null, null), null, repo, worktree)
         }
         val content = try {
-            withContext(Dispatchers.IO) { git.readFile(worktree, baseRef, SANDBOX_FILE, home, SandboxDefinitions.MAX_BYTES) }
+            withContext(Dispatchers.IO) {
+                devDefinitionSource?.invoke(repo) ?: git.readFile(worktree, baseRef, SANDBOX_FILE, home, SandboxDefinitions.MAX_BYTES)
+            }
         } catch (e: Exception) {
             return record(runId, RunSandboxDto("invalid", "Could not read $SANDBOX_FILE from $baseRef: ${e.message}", null, null), null, repo, worktree)
         }
@@ -206,13 +228,17 @@ class SandboxManager(
         val timeoutMs = minOf(timeoutSeconds?.let { it * 1000 } ?: cap, cap)
         return rs.lock.withLock {
             if (rs.released) return@withLock SandboxAnswer(true, "The run's sandbox has been removed.")
+            rs.sessionId = sessionId
             if (!rs.created) create(rs, plan, sessionId)?.let { return@withLock SandboxAnswer(true, it) }
+            val generation = rs.generation.get()
             val r = try {
                 withContext(Dispatchers.IO) { runtime!!.exec(containerName(runId), listOf("sh", "-lc", command), WORKDIR, timeoutMs) }
             } catch (e: Exception) {
+                if (rs.generation.get() != generation) return@withLock SandboxAnswer(true, STOPPED_WHILE_RUNNING)
                 return@withLock SandboxAnswer(true, "The sandbox command could not be run: ${e.message}")
             }
             if (rs.released) return@withLock SandboxAnswer(true, "The run's sandbox was removed while the command ran (the run ended).")
+            if (rs.generation.get() != generation) return@withLock SandboxAnswer(true, STOPPED_WHILE_RUNNING)
             if (r.timedOut) {
                 // Kill whatever the command left running; files (and what setup installed) are kept.
                 runCatching { withContext(Dispatchers.IO) { runtime!!.restartContainer(containerName(runId)) } }
@@ -239,6 +265,7 @@ class SandboxManager(
                 "Nothing was run. Try again in a few minutes; meanwhile continue with work that needs no build."
         }
         rs.slotHeld.set(true)
+        val generation = rs.generation.get()
         val def = plan.definition
         val started = System.currentTimeMillis()
         publishSystem(sessionId, systemPayload("info", "Creating the sandbox: image ${def.image}" +
@@ -251,9 +278,14 @@ class SandboxManager(
                 rt.startContainer(mainSpec(rs.runId, rs.repo, rs.worktree, def))
             }
             rs.created = true
+            rs.createdAt = Instant.now()
             if (rs.released) {
                 teardown(rs)
                 return "The run ended while its sandbox was being created."
+            }
+            if (rs.generation.get() != generation) {
+                teardown(rs)
+                return "An admin stopped this run's sandbox while it was being created. Nothing was run; the next command creates it again."
             }
             if (def.setup != null) {
                 val r = withContext(Dispatchers.IO) { rt.exec(containerName(rs.runId), listOf("sh", "-lc", def.setup), WORKDIR, execCapMs) }
@@ -308,7 +340,70 @@ class SandboxManager(
             runCatching { rt.removeNetwork(networkName(rs.runId)) }.onFailure { log.warn("Removing the network of run {} failed: {}", rs.runId, it.message) }
         }
         rs.created = false
+        rs.createdAt = null
         if (rs.slotHeld.getAndSet(false)) slots.release()
+    }
+
+    // ------------------------------------------------------------------ admin (docs/ARCHITECTURE.md §8)
+
+    /**
+     * Admin: removes run [runId]'s sandbox now (containers and network; cache volumes stay) and frees its slot. The run
+     * itself continues: the builder's next `factory_sandbox_exec` creates a fresh sandbox (setup runs again), a command
+     * running at that moment ends with an error saying so. 404 when the run has no sandbox right now.
+     */
+    suspend fun stop(admin: UserRecord, runId: UUID) {
+        if (!admin.isAdmin) throw forbidden("Only an admin can stop a sandbox")
+        val rs = sandboxes[runId]?.takeIf { !it.released && (it.created || it.slotHeld.get()) }
+            ?: throw notFound("Run $runId has no sandbox right now")
+        rs.generation.incrementAndGet()
+        withContext(NonCancellable + Dispatchers.IO) { teardown(rs) }
+        log.info("Sandbox of run {} stopped by {}", runId, admin.username)
+        rs.sessionId?.let {
+            publishSystem(it, systemPayload("warn", "An admin (${admin.username}) stopped this run's sandbox: its containers and network were removed " +
+                "(cache volumes are kept). The run continues; the next sandbox command creates a new sandbox and runs the setup script again."))
+        }
+    }
+
+    /** Admin: the runtime, its limits and the sandboxes that exist right now (oldest first). */
+    suspend fun overview(admin: UserRecord): SandboxOverviewDto = withContext(Dispatchers.IO) {
+        val list = sandboxes.values.filter { it.created && !it.released }.mapNotNull { rs ->
+            val def = (rs.plan as? Plan.Available) ?: return@mapNotNull null
+            val run = runs.get(rs.runId) ?: return@mapNotNull null
+            val at = rs.createdAt ?: return@mapNotNull null
+            val visible = access.canSee(admin, rs.repo)
+            RunningSandboxDto(
+                runId = rs.runId.toString(), repo = rs.repo, visible = visible, issueNumber = run.issueNumber,
+                issueTitle = if (visible) run.issueTitle else null, runStatus = run.status,
+                owner = OwnerDto(run.ownerUsername, run.ownerDisplayName), image = def.definition.image,
+                services = def.definition.services.map { it.name }, sha256 = def.sha256, createdAt = at.iso(),
+                cpus = def.definition.cpus, memory = SandboxConfig.formatMemory(def.definition.memoryBytes),
+            )
+        }.sortedBy { it.createdAt }
+        SandboxOverviewDto(
+            enabled = enabled, runtime = if (enabled) sc.mode else "off", inUse = inUse(),
+            limits = SandboxServerLimitsDto(sc.maxCpus, SandboxConfig.formatMemory(sc.maxMemoryBytes), sc.maxConcurrent, sc.execTimeoutMs / 60_000, sc.registries),
+            sandboxes = list,
+        )
+    }
+
+    /**
+     * Admin: the projects the admin can see whose `.agern/sandbox.yml` on the default branch is valid but not approved in
+     * this exact version (one GitHub read per project; a project that cannot be read is left out).
+     */
+    suspend fun pending(admin: UserRecord): List<PendingSandboxDto> = withContext(Dispatchers.IO) {
+        val client = access.client(admin) ?: return@withContext emptyList()
+        val repos = try {
+            client.listOrgRepos(cfg.githubOrg).filter { !it.archived }
+        } catch (e: GitHubException) {
+            throw dk.egernet.factory.ApiException(io.ktor.http.HttpStatusCode.BadGateway, "github_error", e.message ?: "GitHub error")
+        }
+        access.remember(admin, repos)
+        repos.mapNotNull { r ->
+            val content = runCatching { client.getFile(cfg.githubOrg, r.name, SANDBOX_FILE, r.defaultBranch) }.getOrNull() ?: return@mapNotNull null
+            val p = SandboxDefinitions.parse(content, sc) as? ParsedDefinition.Valid ?: return@mapNotNull null
+            val approved = approvals.get(r.name)?.sha256
+            if (approved == p.sha256) null else PendingSandboxDto(r.name, p.sha256, p.definition.image, approved)
+        }.sortedBy { it.repo }
     }
 
     /**
@@ -381,14 +476,18 @@ class SandboxManager(
         if (current.state == "invalid") throw unprocessable("The definition is invalid: " + current.errors.joinToString("; "), "sandbox_definition_invalid")
         withContext(Dispatchers.IO) { approvals.approve(repo, current.sha256, current.content, user.id) }
         log.info("Sandbox definition {} of {} approved by {}", current.sha256, repo, user.username)
-        return status(user, repo)
+        return status(user, repo).also { emitFeed(FeedItem.SandboxApproval(repo, it.approval)) }
     }
 
     /** Admin only: removes the repository's approval. Runs that already started keep the decision they made. */
     suspend fun revoke(user: UserRecord, repo: String): SandboxStatusDto {
         withContext(Dispatchers.IO) { access.requireVisible(user, repo) }
         if (!user.isAdmin) throw forbidden("Only an admin can revoke a sandbox approval")
-        if (withContext(Dispatchers.IO) { approvals.revoke(repo) }) log.info("Sandbox approval of {} revoked by {}", repo, user.username)
+        val removed = withContext(Dispatchers.IO) { approvals.revoke(repo) }
+        if (removed) {
+            log.info("Sandbox approval of {} revoked by {}", repo, user.username)
+            emitFeed(FeedItem.SandboxApproval(repo, null))
+        }
         return status(user, repo)
     }
 
@@ -429,6 +528,8 @@ class SandboxManager(
         )
 
         const val WORKDIR = "/workspace"
+        private const val STOPPED_WHILE_RUNNING = "An admin stopped this run's sandbox while the command ran, so it was killed. " +
+            "The next command creates a new sandbox (the setup script runs again)."
         /** How much of a command's output the agent gets back (the end of it). */
         const val OUTPUT_TAIL_CHARS = 20_000
         val TOOLS = setOf("factory_sandbox_info", "factory_sandbox_exec")

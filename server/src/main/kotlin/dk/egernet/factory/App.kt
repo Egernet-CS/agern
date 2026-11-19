@@ -60,7 +60,11 @@ class Services(
     val auth: AuthService = AuthService.fromConfig(cfg),
     val loginThrottle: dk.egernet.factory.auth.LoginThrottle = dk.egernet.factory.auth.LoginThrottle(),
     /** The container runtime for sandboxes; null (sandboxes off) unless FACTORY_SANDBOX names one. */
-    val sandboxRuntime: SandboxRuntime? = if (cfg.sandbox.mode == "podman") PodmanRuntime(cfg.sandbox) else null,
+    val sandboxRuntime: SandboxRuntime? = when (cfg.sandbox.mode) {
+        "podman" -> PodmanRuntime(cfg.sandbox)
+        "fake" -> dk.egernet.factory.sandbox.DevFakeSandboxRuntime()
+        else -> null
+    },
 ) {
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     val box = SecretBox(cfg.masterKey)
@@ -83,7 +87,13 @@ class Services(
     val agents = AgentManager(cfg, sessions, events, access, launcher, bus, mcpRegistry, settings, prompts, workspaces, scope, attachments, preferences)
     val sandboxes = SandboxManager(
         cfg, sandboxRuntime, SandboxApprovalStore(db), runs, access, git,
-    ) { sessionId, payload -> agents.publish(sessionId, "system", payload) }
+        publishSystem = { sessionId, payload -> agents.publish(sessionId, "system", payload) },
+        emitFeed = { bus.emitFeed(it) },
+        // The fake GitHub's workspaces are local `git init` repositories without the file: runs read the fake's copy.
+        devDefinitionSource = (github as? FakeGitHub)?.takeIf { cfg.fakeGithub }?.let { fake ->
+            { repo -> fake.fileOf(repo, dk.egernet.factory.sandbox.SANDBOX_FILE) }
+        },
+    )
     val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes)
     val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
     val releases = ReleaseService(cfg, access, releaseStore, bus)
@@ -126,7 +136,7 @@ class Services(
             else cfg.githubApiUrl.substringBefore("/api/").trimEnd('/') + "/"
             val github: GitHub = if (cfg.fakeGithub) {
                 LoggerFactory.getLogger("dk.egernet.factory").warn("!!!!!!!! FACTORY_DEV_FAKE_GITHUB: using an in-memory fake GitHub. Tokens 'fake-<login>' are accepted. !!!!!!!!")
-                FakeGitHub.seeded(cfg.githubOrg)
+                FakeGitHub.seeded(cfg.githubOrg).apply { filesDir = cfg.dataDir.resolve("fake-github") }
             } else {
                 HttpGitHub(cfg.githubApiUrl, gitHost.trimEnd('/'))
             }
