@@ -128,6 +128,11 @@ export const httpApi: Api = {
   deleteRelease: (id) => del(`/api/releases/${enc(id)}`),
   assignIssues: (repo, issueNumbers, releaseId) => post(`/api/projects/${enc(repo)}/releases/assign`, { issueNumbers, releaseId }),
   reorderRelease: (id, issueNumbers) => put(`/api/releases/${enc(id)}/issues/order`, { issueNumbers }),
+  startRelease: (id) => post(`/api/releases/${enc(id)}/start`),
+  pauseRelease: (id) => post(`/api/releases/${enc(id)}/pause`),
+  resumeRelease: (id) => post(`/api/releases/${enc(id)}/resume`),
+  cancelRelease: (id) => post(`/api/releases/${enc(id)}/cancel`),
+  retryReleaseIssue: (id, issueNumber) => post(`/api/releases/${enc(id)}/issues/${issueNumber}/retry`),
 
   projectRuns: (repo) => get(`/api/projects/${enc(repo)}/runs`),
   startRun: (repo, issueNumber) => post(`/api/projects/${enc(repo)}/runs`, { issueNumber }),
