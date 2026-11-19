@@ -234,7 +234,7 @@ class SandboxManager(
             if (!rs.created) create(rs, plan, sessionId)?.let { return@withLock SandboxAnswer(true, it) }
             val generation = rs.generation.get()
             val r = try {
-                withContext(Dispatchers.IO) { runtime!!.exec(containerName(runId), listOf("sh", "-lc", command), WORKDIR, timeoutMs) }
+                withContext(Dispatchers.IO) { runtime!!.exec(containerName(runId), shellCommand(command), WORKDIR, timeoutMs) }
             } catch (e: Exception) {
                 if (rs.generation.get() != generation) return@withLock SandboxAnswer(true, STOPPED_WHILE_RUNNING)
                 return@withLock SandboxAnswer(true, "The sandbox command could not be run: ${e.message}")
@@ -290,7 +290,7 @@ class SandboxManager(
                 return "An admin stopped this run's sandbox while it was being created. Nothing was run; the next command creates it again."
             }
             if (def.setup != null) {
-                val r = withContext(Dispatchers.IO) { rt.exec(containerName(rs.runId), listOf("sh", "-lc", def.setup), WORKDIR, execCapMs) }
+                val r = withContext(Dispatchers.IO) { rt.exec(containerName(rs.runId), shellCommand(def.setup), WORKDIR, execCapMs) }
                 logEvent(sessionId, "setup", def.setup, r, execCapMs)
                 if (r.timedOut || r.exitCode != 0) {
                     teardown(rs)
@@ -529,6 +529,15 @@ class SandboxManager(
             labels = labels(runId, repo, "service").also { it["agern.service"] = svc.name },
             network = networkName(runId), networkAlias = svc.name, env = svc.env, cpus = def.cpus, memoryBytes = def.memoryBytes,
         )
+
+        /**
+         * `sh -lc <command>`, after the shell raised its `oom_score_adj` to 1000 (always allowed, unprivileged). When a
+         * command exceeds the memory limit the kernel then kills the command's processes, never the sandbox's keep-alive
+         * process (PID 1) — without this it does, if the command's memory is not freed before the next OOM (seen with
+         * real Podman: the whole sandbox exited with 137). The command stays the last argument.
+         */
+        fun shellCommand(command: String) =
+            listOf("sh", "-c", "{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; exec sh -lc \"\$1\"", "sh", command)
 
         const val WORKDIR = "/workspace"
         private const val STOPPED_WHILE_RUNNING = "An admin stopped this run's sandbox while the command ran, so it was killed. " +

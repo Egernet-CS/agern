@@ -84,6 +84,13 @@ class PodmanRuntimeTest {
     }
 
     @Test
+    fun `commands raise their oom_score_adj, then run with sh -lc`() {
+        val cmd = SandboxManager.shellCommand("./gradlew test")
+        assertEquals(listOf("sh", "-c", "{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; exec sh -lc \"\$1\"", "sh", "./gradlew test"), cmd)
+        assertEquals("./gradlew test", cmd.last())
+    }
+
+    @Test
     fun `a cgroup parent when configured`() {
         val withParent = remote.copy(cgroupParent = "/system.slice/agern-sandbox.service/containers")
         val args = PodmanRuntime.runArgs(withParent, manager.serviceSpec(runId, "demo-app", def.services[0], def))

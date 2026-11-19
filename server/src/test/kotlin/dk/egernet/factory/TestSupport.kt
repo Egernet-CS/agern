@@ -275,7 +275,7 @@ class FakeSandboxRuntime : dk.egernet.factory.sandbox.SandboxRuntime {
         containers[spec.name] = spec.labels.getValue("agern.run")
     }
     override fun exec(container: String, command: List<String>, workdir: String, timeoutMs: Long): dk.egernet.factory.sandbox.ExecResult {
-        val line = command.drop(2).joinToString(" ")
+        val line = command.last() // SandboxManager.shellCommand: the command is the last argument
         calls += "exec $container $line"
         if (!containers.containsKey(container)) throw dk.egernet.factory.sandbox.SandboxRuntimeException("no such container $container")
         execs += Triple(container, line, timeoutMs)

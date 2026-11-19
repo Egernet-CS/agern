@@ -89,7 +89,7 @@ class PodmanIntegrationTest {
     }
 
     private fun sh(container: String, command: String, timeoutMs: Long = 120_000): ExecResult =
-        rt.exec(container, listOf("sh", "-lc", command), SandboxManager.WORKDIR, timeoutMs)
+        rt.exec(container, SandboxManager.shellCommand(command), SandboxManager.WORKDIR, timeoutMs)
 
     private fun ok(container: String, command: String): String {
         val r = sh(container, command)
@@ -155,6 +155,7 @@ class PodmanIntegrationTest {
         assertEquals("4096", ok(a, "cat /sys/fs/cgroup/pids.max"), "pids.max")
         // ... and enforced: a process that allocates more than the limit is killed, the sandbox survives.
         val before = ok(a, "echo pid1 \$(cat /proc/1/oom_score_adj) self \$(cat /proc/self/oom_score_adj) group \$(cat /sys/fs/cgroup/memory.oom.group 2>/dev/null)")
+        assertTrue(before.contains(" self 1000 "), "commands must raise their oom_score_adj above the keep-alive process: $before")
         println("before the memory hog: $before")
         val hog = sh(a, "x=\$(head -c 400000000 /dev/zero | tr '\\0' a); echo survived \${#x}", timeoutMs = 120_000)
         val state = podman("inspect", "--format", "{{.State.Status}} exit={{.State.ExitCode}} oomkilled={{.State.OOMKilled}}", a).output.trim()

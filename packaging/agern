@@ -1311,13 +1311,18 @@ sandbox_selftest() {
         done
         if [ "$out" = pong ]; then ok "the sidecar is reachable by name (DNS on the run's network)"
         else bad "sidecar 'peer' not reachable by name after 10 tries: $out"; sandbox_dns_diagnostics "$tag"; fi
+        # As the server runs commands (SandboxManager.shellCommand): oom_score_adj raised first, so the kernel
+        # kills the command and not the sandbox's keep-alive process.
         # shellcheck disable=SC2016 # expanded in the container
-        out=$(spodman exec "$tag" sh -lc 'x=$(head -c 200000000 /dev/zero | tr "\0" a); echo survived' 2>&1) && rc=0 || rc=$?
+        out=$(spodman exec "$tag" sh -c '{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; exec sh -lc "$1"' sh \
+            'x=$(head -c 200000000 /dev/zero | tr "\0" a); echo survived' 2>&1) && rc=0 || rc=$?
         if [ "$rc" != 0 ] && ! printf '%s' "$out" | grep -q survived; then
             ok "a process allocating 200 MB in a 64 MB sandbox is killed (exit $rc)"
         else
             bad "the memory limit is not enforced (exit $rc: $out)"
         fi
+        out=$(spodman inspect --format '{{.State.Status}}' "$tag" 2>&1) || true
+        [ "$out" = running ] && ok "the sandbox itself survived the killed process" || bad "the sandbox did not survive the killed process (state: $out)"
         rc=0
     fi
     spodman rm --force --ignore --volumes "$tag" "$tag-peer" >/dev/null 2>&1 || true

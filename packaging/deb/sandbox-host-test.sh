@@ -106,7 +106,7 @@ if [ "$ENABLED" = 0 ]; then
 fi
 grep -q '  FAIL' "$WORK/enable.log" && fail "the self-test reported a problem" || pass "self-test without problems"
 for s in "rootless Podman" "cgroups v2" "network backend netavark" "limits applied in the container's cgroup" \
-    "belongs to agern on the host" "reachable by name" "is killed"; do
+    "belongs to agern on the host" "reachable by name" "is killed" "survived the killed process"; do
     grep -q "ok    .*$s" "$WORK/enable.log" && pass "self-test: $s" || fail "self-test: $s"
 done
 check "FACTORY_SANDBOX=podman" grep -qx 'FACTORY_SANDBOX=podman' /etc/agern/agern.env

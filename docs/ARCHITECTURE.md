@@ -310,7 +310,7 @@ run --detach --name agern-run-<id> --label agern.run=<id> --label agern.repo=<re
     --workdir /workspace --entrypoint sh [--env K=V …]
     --mount type=bind,source=<worktree>,target=/workspace [--mount type=volume,source=<volume>,target=<path> …]
     <image> -c "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"
-exec --workdir /workspace agern-run-<id> sh -lc <command>          # setup and every command
+exec --workdir /workspace agern-run-<id> sh -c '{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; exec sh -lc "$1"' sh <command>   # setup and every command
 restart --time 0 agern-run-<id>                                    # after a command timed out
 rm --force --ignore --volumes agern-run-<id> [agern-run-<id>-<svc> …]   # anonymous volumes (an image's VOLUME) too
 network rm --force agern-run-<id>
@@ -323,7 +323,10 @@ The podman process gets an environment built from an allow-list (`PATH`, `HOME`,
 `XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `DBUS_SESSION_BUS_ADDRESS`, `TMPDIR`), never the
 server's secrets.
 
-**Commands.** `factory_sandbox_exec` runs `sh -lc <command>` in `/workspace`, one command at a time per run
+**Commands.** `factory_sandbox_exec` runs `sh -lc <command>` in `/workspace` (first raising its own
+`oom_score_adj` to 1000, so that a command over the memory limit is what the kernel kills — never the
+sandbox's keep-alive process, which real Podman showed can otherwise happen when the command's memory is
+not freed before a second OOM, ending the whole sandbox), one command at a time per run
 (concurrent calls wait). Its time limit is `timeoutSeconds` if given, never more than
 `FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES` and the stage time limit. A command that runs out of time is
 stopped and the sandbox container restarted (`restart --time 0`: every process in it is killed, files are
