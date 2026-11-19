@@ -85,8 +85,18 @@ data class IssueDto(
 
 @Serializable data class IssueReleaseDto(val id: String, val name: String)
 
-/** An issue as planned in a release: title and kind as they were when it was assigned. */
-@Serializable data class ReleaseIssueDto(val number: Int, val title: String, val kind: String)
+/**
+ * An issue as planned in a release: title and kind as they were when it was assigned, and its build state
+ * ([ReleaseIssueState]) with the issue's latest release run and why it is held or skipped.
+ */
+@Serializable
+data class ReleaseIssueDto(
+    val number: Int, val title: String, val kind: String,
+    val state: String = ReleaseIssueState.WAITING, val runId: String? = null, val note: String? = null,
+)
+
+/** Why a release is paused; [resumeAt] is set only for an automatic resume after a usage limit. */
+@Serializable data class ReleasePauseDto(val reason: String, val note: String?, val resumeAt: String?)
 
 @Serializable
 data class ReleaseDto(
@@ -94,6 +104,14 @@ data class ReleaseDto(
     val createdBy: OwnerDto, val createdAt: String, val updatedAt: String,
     /** In build order. */
     val issues: List<ReleaseIssueDto>,
+    /** Who started the release; null while it is planned. */
+    val owner: OwnerDto? = null,
+    /** `release/<name>` once started. */
+    val branch: String? = null,
+    val startedAt: String? = null,
+    val endedAt: String? = null,
+    /** Set while the release is `paused`. */
+    val pause: ReleasePauseDto? = null,
 )
 
 @Serializable data class OwnerDto(val username: String, val displayName: String)
@@ -124,6 +142,10 @@ data class RunDto(
     val status: String, val round: Int, val maxRounds: Int, val branch: String?, val prNumber: Int?,
     val prUrl: String?, val owner: OwnerDto, val startedBySessionId: String?, val error: String?,
     val createdAt: String, val updatedAt: String, val endedAt: String?, val stages: List<StageDto>,
+    /** The release this run builds an issue for; null for a single run (or when the release was deleted). */
+    val releaseId: String? = null,
+    /** The branch the run starts from and merges into; null = the repository's default branch. */
+    val baseBranch: String? = null,
 )
 
 @Serializable
@@ -227,9 +249,24 @@ object RunStatus {
     val ALL = ACTIVE + TERMINAL
 }
 
-/** Release states. Step 1 of releases only plans; later steps add the building and releasing states. */
+/** Release states (docs/ARCHITECTURE.md §6 "Releases"). Later steps add `scheduled`, `ready` and `released`. */
 object ReleaseStatus {
-    const val PLANNING = "planning"
+    const val PLANNING = "planning"; const val BUILDING = "building"; const val PAUSED = "paused"; const val CANCELLED = "cancelled"
+    /** Started: has an owner and a branch. */
+    val STARTED = setOf(BUILDING, PAUSED, CANCELLED)
+    /** Holds the project's one building slot. */
+    val ACTIVE = setOf(BUILDING, PAUSED)
+}
+
+/** The state of an issue within a release. */
+object ReleaseIssueState {
+    const val WAITING = "waiting"; const val RUNNING = "running"; const val MERGED = "merged"
+    const val HELD = "held"; const val SKIPPED = "skipped"
+}
+
+/** Why a release is paused. */
+object PauseReason {
+    const val MANUAL = "manual"; const val USAGE_LIMIT = "usage_limit"; const val CREDENTIALS = "credentials"
 }
 
 object SessionStatus {

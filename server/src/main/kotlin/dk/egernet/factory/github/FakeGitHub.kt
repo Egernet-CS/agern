@@ -18,6 +18,12 @@ class FakeGitHub(private val org: String) : GitHub {
     val pulls = mutableMapOf<String, MutableList<GhPull>>()
     /** Lets tests make merges fail. */
     @Volatile var failMerge = false
+    /** Lets tests make branch creation fail as for a token without push access (403). */
+    @Volatile var failCreateBranch = false
+    /** Pull request bodies by number. */
+    val pullBodies = java.util.concurrent.ConcurrentHashMap<Int, String>()
+    /** Branches per repo besides `main`, which always exists. */
+    val branches = mutableMapOf<String, MutableSet<String>>()
 
     override val isFake = true
     override fun cloneUrl(org: String, repo: String) = "fake://$org/$repo"
@@ -140,6 +146,7 @@ class FakeGitHub(private val org: String) : GitHub {
                 val n = 1000 + pulls.values.sumOf { it.size } + 1
                 val pr = GhPull(n, "https://github.com/$org/$repo/pull/$n")
                 pulls.getOrPut("$repo:$head") { mutableListOf() } += pr
+                pullBodies[n] = body
                 actions += "pr $repo $head -> $base #$n"
                 pr
             }
@@ -149,6 +156,20 @@ class FakeGitHub(private val org: String) : GitHub {
             if (failMerge) throw GitHubException(405, "Pull Request is not mergeable")
             pulls.values.forEach { l -> l.replaceAll { if (it.number == number) it.copy(state = "merged") else it } }
             actions += "merge $repo #$number"
+            Unit
+        }
+
+        override fun branchSha(org: String, repo: String, branch: String): String? = synchronized(this@FakeGitHub) {
+            repo(org, repo)
+            if (branch == "main" || branch in branches[repo].orEmpty()) "sha-$branch" else null
+        }
+
+        override fun createBranch(org: String, repo: String, branch: String, sha: String) = synchronized(this@FakeGitHub) {
+            repo(org, repo)
+            if (failCreateBranch) throw GitHubException(403, "Resource not accessible by personal access token")
+            if (branch == "main" || branch in branches[repo].orEmpty()) throw GitHubException(422, "Reference already exists")
+            branches.getOrPut(repo) { mutableSetOf() } += branch
+            actions += "branch $repo $branch"
             Unit
         }
     }

@@ -461,6 +461,29 @@ private fun Route.releaseRoutes(s: Services) {
         s.releases.delete(u, uuidParam("id"))
         call.respond(HttpStatusCode.NoContent)
     }
+    // Building (docs/ARCHITECTURE.md §6 "Releases"): each answers the release after the change.
+    post("/releases/{id}/start") {
+        val u = call.requireUser(s)
+        call.respond(s.releases.start(u, uuidParam("id")).toDto())
+    }
+    post("/releases/{id}/pause") {
+        val u = call.requireUser(s)
+        call.respond(s.releases.pause(u, uuidParam("id")).toDto())
+    }
+    post("/releases/{id}/resume") {
+        val u = call.requireUser(s)
+        call.respond(s.releases.resume(u, uuidParam("id")).toDto())
+    }
+    post("/releases/{id}/cancel") {
+        val u = call.requireUser(s)
+        call.respond(s.releases.cancel(u, uuidParam("id")).toDto())
+    }
+    post("/releases/{id}/issues/{number}/retry") {
+        val u = call.requireUser(s)
+        val id = uuidParam("id")
+        val number = call.parameters["number"]?.toIntOrNull()?.takeIf { it > 0 } ?: throw badRequest("Issue number must be a positive integer")
+        call.respond(s.releases.retry(u, id, number).toDto())
+    }
     put("/releases/{id}/issues/order") {
         val u = call.requireUser(s)
         val id = uuidParam("id")
