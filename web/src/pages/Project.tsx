@@ -7,10 +7,14 @@ import { Dialog, Empty, ErrorBox, KindBadge, Loading, Notice, RoleBadge, RunStat
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
 import { modelLabel, timeAgo } from '../lib/format';
-import { useFeedReconnects, useIssueFeed, useLiveRuns, useLiveSessions } from '../lib/realtime';
+import { useFeed, useFeedReconnects, useIssueFeed, useLiveRuns, useLiveSessions } from '../lib/realtime';
 import { useNow } from '../lib/useNow';
 
 type Tab = 'chat' | 'issues' | 'activity';
+
+/** The user may close this chat: its owner or an admin (the server enforces the same rule). */
+const closable = (s: AgentSession, me: { username: string; isAdmin: boolean }) => s.kind === 'chat' && (s.owner.username === me.username || me.isAdmin);
+const chatLabel = (s: AgentSession, username: string) => (s.owner.username === username ? 'my chat' : `${s.owner.username}’s chat`);
 
 export function ProjectPage() {
   const { repo = '' } = useParams();
@@ -27,6 +31,10 @@ export function ProjectPage() {
   const runsBase = useAsync(() => api.projectRuns(repo), [repo]);
   const sessions = useLiveSessions(sessionsBase.data, (s) => s.repo === repo);
   const runs = useLiveRuns(runsBase.data, (r) => r.repo === repo);
+  const { closedSessions, markSessionClosed } = useFeed();
+  const [closing, setClosing] = useState<AgentSession | null>(null);
+  // Chats this user closed (set before the request): they never get the "was closed" notice for them.
+  const closedByMe = useRef(new Set<string>());
 
   useEffect(() => {
     document.title = `${repo} · Agern`;
@@ -35,12 +43,28 @@ export function ProjectPage() {
   const chats = sessions.filter((s) => s.kind === 'chat');
   const mine = chats.filter((s) => s.owner.username === me.username);
   const requested = params.get('session');
+  const closedNotice = !!requested && closedSessions.has(requested) && !closedByMe.current.has(requested);
   const current = (requested && sessions.find((s) => s.id === requested)) || mine.find((s) => !['stopped', 'failed', 'done'].includes(s.status)) || mine[0] || null;
 
   const selectSession = (id: string) => {
     params.set('session', id);
     setParams(params, { replace: true });
     setTab('chat');
+  };
+  const clearSession = (id?: string) =>
+    setParams(
+      (prev) => {
+        if (id !== undefined && prev.get('session') !== id) return prev;
+        const next = new URLSearchParams(prev);
+        next.delete('session');
+        return next;
+      },
+      { replace: true },
+    );
+  const onClosed = (id: string) => {
+    markSessionClosed(id);
+    sessionsBase.setData((d) => d?.filter((s) => s.id !== id));
+    clearSession(id);
   };
 
   if (project.error) {
@@ -89,19 +113,56 @@ export function ProjectPage() {
           <IssuesPanel repo={repo} />
         </aside>
         <section className="panel panel--chat" aria-label="Chat">
-          <ChatPanel repo={repo} current={current} chats={chats} onSelect={selectSession} onCreated={(s) => (sessionsBase.setData((d) => [s, ...(d ?? [])]), selectSession(s.id))} />
+          <ChatPanel
+            repo={repo}
+            current={current}
+            chats={chats}
+            closedNotice={closedNotice}
+            onDismissClosed={() => clearSession()}
+            onSelect={selectSession}
+            onCreated={(s) => (sessionsBase.setData((d) => [s, ...(d ?? [])]), selectSession(s.id))}
+            onCloseChat={setClosing}
+          />
         </section>
         <aside className="panel panel--activity" aria-label="Agents and runs">
-          <ActivityPanel repo={repo} runs={runs} sessions={sessions} loading={!runsBase.data || !sessionsBase.data} onSelectChat={selectSession} currentId={current?.id ?? null} />
+          <ActivityPanel
+            repo={repo}
+            runs={runs}
+            sessions={sessions}
+            loading={!runsBase.data || !sessionsBase.data}
+            onSelectChat={selectSession}
+            onCloseChat={setClosing}
+            currentId={closedNotice ? null : current?.id ?? null}
+          />
         </aside>
       </div>
+      <CloseChatDialog chat={closing} onClose={() => setClosing(null)} closedByMe={closedByMe.current} onClosed={onClosed} />
     </div>
   );
 }
 
 // ---------------------------------------------------------------- chat
 
-function ChatPanel({ repo, current, chats, onSelect, onCreated }: { repo: string; current: AgentSession | null; chats: AgentSession[]; onSelect: (id: string) => void; onCreated: (s: AgentSession) => void }) {
+function ChatPanel({
+  repo,
+  current,
+  chats,
+  closedNotice,
+  onDismissClosed,
+  onSelect,
+  onCreated,
+  onCloseChat,
+}: {
+  repo: string;
+  current: AgentSession | null;
+  chats: AgentSession[];
+  /** The chat named by `?session=` was closed by someone else: show that instead of a chat. */
+  closedNotice: boolean;
+  onDismissClosed: () => void;
+  onSelect: (id: string) => void;
+  onCreated: (s: AgentSession) => void;
+  onCloseChat: (s: AgentSession) => void;
+}) {
   const me = useMe();
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -129,21 +190,46 @@ function ChatPanel({ repo, current, chats, onSelect, onCreated }: { repo: string
     <div className="chat-head">
       <label className="chat-pick">
         <span className="sr-only">Chat session</span>
-        <select value={current?.id ?? ''} onChange={(e) => onSelect(e.target.value)} disabled={chats.length === 0}>
-          {!current && <option value="">No chat yet</option>}
+        <select value={closedNotice ? CLOSED_OPTION : current?.id ?? ''} onChange={(e) => onSelect(e.target.value)} disabled={chats.length === 0}>
+          {closedNotice && (
+            <option value={CLOSED_OPTION} disabled>
+              closed chat
+            </option>
+          )}
+          {!current && !closedNotice && <option value="">No chat yet</option>}
           {chats.map((s) => (
             <option key={s.id} value={s.id}>
-              {s.owner.username === me.username ? 'my chat' : `${s.owner.username}’s chat`} · {s.status} · {timeAgo(s.updatedAt)}
+              {chatLabel(s, me.username)} · {s.status} · {timeAgo(s.updatedAt)}
             </option>
           ))}
         </select>
       </label>
       <span className="chat-head-title mono">~/{repo}</span>
+      {current && !closedNotice && closable(current, me) && (
+        <button type="button" className="btn btn--ghost btn--sm btn--danger" onClick={() => onCloseChat(current)} title="Stop the agent and delete this chat">
+          Close chat
+        </button>
+      )}
       <button type="button" className="btn btn--ghost btn--sm" onClick={() => void create()} disabled={!canStart || busy} title={canStart ? 'Start a fresh conversation' : 'Needs your Claude credential'}>
         + New chat
       </button>
     </div>
   );
+
+  if (closedNotice) {
+    return (
+      <div className="chat chat--empty">
+        {header}
+        <div className="chat-start chat-closed" role="status">
+          <h3>This chat was closed</h3>
+          <p className="muted">Its owner or an admin closed it. The transcript has been deleted.</p>
+          <button type="button" className="btn btn--ghost" onClick={onDismissClosed}>
+            Dismiss
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   if (!current) {
     return (
@@ -166,6 +252,65 @@ function ChatPanel({ repo, current, chats, onSelect, onCreated }: { repo: string
     );
   }
   return <ChatView key={current.id} sessionId={current.id} session={current} header={header} disabledReason={canStart ? undefined : noClaude} />;
+}
+
+/** Value of the picker's placeholder while the "was closed" notice shows (never a session id). */
+const CLOSED_OPTION = '__closed__';
+
+/** Confirms closing a chat and calls the API; a 404 counts as success (the chat is already gone). */
+function CloseChatDialog({ chat, onClose, closedByMe, onClosed }: { chat: AgentSession | null; onClose: () => void; closedByMe: Set<string>; onClosed: (id: string) => void }) {
+  const me = useMe();
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => {
+    setErr(null);
+    setBusy(false);
+  }, [chat?.id]);
+
+  const confirm = async () => {
+    if (!chat) return;
+    const id = chat.id;
+    setBusy(true);
+    setErr(null);
+    closedByMe.add(id);
+    try {
+      await api.closeChat(id);
+    } catch (e) {
+      if (!(e instanceof ApiError && e.status === 404)) {
+        closedByMe.delete(id);
+        setErr(e instanceof ApiError ? e.message : 'Could not close the chat.');
+        setBusy(false);
+        return;
+      }
+    }
+    setBusy(false);
+    onClosed(id);
+    onClose();
+  };
+
+  const subject = chat && chat.owner.username !== me.username ? `${chat.owner.username}’s chat` : 'this chat';
+  return (
+    <Dialog open={chat !== null} onClose={onClose} title="Close chat?">
+      <div className="form">
+        <p>
+          This stops the agent and permanently deletes {subject} with its transcript and attachments. Pipeline runs started from it keep running. This cannot be undone.
+        </p>
+        {err && (
+          <p className="form-error" role="alert">
+            {err}
+          </p>
+        )}
+        <div className="dialog-actions">
+          <button type="button" className="btn btn--ghost" onClick={onClose} disabled={busy} autoFocus>
+            Cancel
+          </button>
+          <button type="button" className="btn btn--danger" onClick={() => void confirm()} disabled={busy}>
+            {busy ? 'Closing…' : 'Close chat'}
+          </button>
+        </div>
+      </div>
+    </Dialog>
+  );
 }
 
 // ---------------------------------------------------------------- issues
@@ -354,10 +499,28 @@ export function runStageLine(r: Run): string {
   return r.status.replace('_', ' ');
 }
 
-function ActivityPanel({ repo, runs, sessions, loading, onSelectChat, currentId }: { repo: string; runs: Run[]; sessions: AgentSession[]; loading: boolean; onSelectChat: (id: string) => void; currentId: string | null }) {
+function ActivityPanel({
+  repo,
+  runs,
+  sessions,
+  loading,
+  onSelectChat,
+  onCloseChat,
+  currentId,
+}: {
+  repo: string;
+  runs: Run[];
+  sessions: AgentSession[];
+  loading: boolean;
+  onSelectChat: (id: string) => void;
+  onCloseChat: (s: AgentSession) => void;
+  currentId: string | null;
+}) {
   useNow(5000);
+  const me = useMe();
   const active = sessions.filter(isSessionActive);
   const runList = runs.slice(0, 12);
+  const chats = sessions.filter((s) => s.kind === 'chat');
   return (
     <>
       <div className="panel-head">
@@ -416,6 +579,33 @@ function ActivityPanel({ repo, runs, sessions, loading, onSelectChat, currentId 
             </Link>
           </li>
         ))}
+      </ul>
+      <div className="panel-head">
+        <h2>Chats</h2>
+        <span className="muted small">{chats.length}</span>
+      </div>
+      {!loading && chats.length === 0 && <p className="muted pad">No chats in {repo} yet.</p>}
+      <ul className="chat-list">
+        {chats.map((s) => {
+          const title = s.title ?? 'New chat';
+          return (
+            <li key={s.id} data-session-id={s.id} className={`chat-item ${s.id === currentId ? 'is-current' : ''}`}>
+              <button type="button" className="chat-item-btn" onClick={() => onSelectChat(s.id)}>
+                <span className="al-top">
+                  <span className="al-owner">{chatLabel(s, me.username)}</span>
+                  <SessionStatusPill status={s.status} />
+                </span>
+                <span className="ci-title">{title}</span>
+                <span className="al-meta">{timeAgo(s.updatedAt)}</span>
+              </button>
+              {closable(s, me) && (
+                <button type="button" className="btn btn--ghost btn--sm btn--danger chat-item-close" aria-label={`Close chat: ${title}`} onClick={() => onCloseChat(s)}>
+                  Close
+                </button>
+              )}
+            </li>
+          );
+        })}
       </ul>
     </>
   );

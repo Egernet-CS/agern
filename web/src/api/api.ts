@@ -84,6 +84,12 @@ export interface Api {
   config(): Promise<ClientConfig>;
   interrupt(id: string): Promise<void>;
   stopSession(id: string): Promise<AgentSession>;
+  /**
+   * Closes a chat: stops its agent and permanently deletes it (transcript, attachments). Owner or admin; rejects with
+   * ApiError 403 for others, 404 when it is unknown or already closed, 409 `not_a_chat` for pipeline sessions and
+   * 409 `agent_not_stopped` when the process would not stop.
+   */
+  closeChat(id: string): Promise<void>;
 
   settings(): Promise<Settings>;
   putSettings(s: Settings): Promise<Settings>;

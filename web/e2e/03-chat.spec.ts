@@ -99,3 +99,73 @@ test('another user observes the chat live and read-only, and cannot send input',
   await alice.context.close();
   await bob.context.close();
 });
+
+test('closing a chat from its header removes it for the owner; a watcher sees that it was closed', async ({ browser }) => {
+  const aliceChat = readState().aliceChat as string;
+  const alice = await userContext(browser, 'alice');
+  const bob = await userContext(browser, 'bob');
+  await alice.page.goto(`${BASE()}/p/demo-app?session=${aliceChat}`);
+  await alice.page.locator('.chat-head').getByRole('button', { name: '+ New chat' }).click();
+  await expect(alice.page).not.toHaveURL(new RegExp(`session=${aliceChat}`));
+  await expect(alice.page).toHaveURL(/\?session=/);
+  const doomed = new URL(alice.page.url()).searchParams.get('session')!;
+  await send(alice.page, 'hello before closing');
+  await expect(log(alice.page)).toContainText('You said: hello before closing');
+  expect((await (await alice.page.request.get(`${BASE()}/api/sessions/${doomed}`)).json()).live).toBe(true);
+
+  // Bob may watch, but neither the header nor the list offers him a close action.
+  await bob.page.goto(`${BASE()}/p/demo-app?session=${doomed}`);
+  await expect(log(bob.page)).toContainText('You said: hello before closing');
+  await expect(bob.page.locator('.chat-head').getByRole('button', { name: 'Close chat' })).toHaveCount(0);
+  const bobRow = bob.page.locator(`.chat-list li[data-session-id="${doomed}"]`);
+  await expect(bobRow).toBeVisible();
+  await expect(bobRow.getByRole('button', { name: /^Close chat:/ })).toHaveCount(0);
+
+  // Cancel does nothing; confirming closes it.
+  await alice.page.locator('.chat-head').getByRole('button', { name: 'Close chat' }).click();
+  const dialog = alice.page.locator('dialog[open]');
+  await expect(dialog).toContainText('permanently deletes this chat with its transcript and attachments');
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+  await expect(alice.page.locator('dialog[open]')).toHaveCount(0);
+  await expect(alice.page).toHaveURL(new RegExp(`session=${doomed}`));
+  await alice.page.locator('.chat-head').getByRole('button', { name: 'Close chat' }).click();
+  await alice.page.locator('dialog[open]').getByRole('button', { name: 'Close chat' }).click();
+
+  await expect(alice.page.locator('dialog[open]')).toHaveCount(0);
+  await expect(alice.page).not.toHaveURL(/session=/);
+  await expect(alice.page.locator(`.chat-list li[data-session-id="${doomed}"]`)).toHaveCount(0);
+  await expect(alice.page.locator(`.chat-pick option[value="${doomed}"]`)).toHaveCount(0);
+  await expect(alice.page.locator('.chat-pick select')).toHaveValue(aliceChat);
+  await expect(alice.page.getByText('This chat was closed')).toHaveCount(0);
+  expect((await alice.page.request.get(`${BASE()}/api/sessions/${doomed}`)).status()).toBe(404);
+
+  // Bob is told, without an error, and can dismiss it.
+  const notice = bob.page.getByRole('status').filter({ hasText: 'This chat was closed' });
+  await expect(notice).toBeVisible();
+  await expect(notice).toContainText('The transcript has been deleted.');
+  await expect(bob.page.locator(`.chat-list li[data-session-id="${doomed}"]`)).toHaveCount(0);
+  await notice.getByRole('button', { name: 'Dismiss' }).click();
+  await expect(bob.page.getByText('This chat was closed')).toHaveCount(0);
+  await expect(bob.page).not.toHaveURL(/session=/);
+
+  // The server refuses Bob closing Alice's chat.
+  expect((await bob.page.request.delete(`${BASE()}/api/sessions/${aliceChat}`, { headers: mutate })).status()).toBe(403);
+
+  await alice.context.close();
+  await bob.context.close();
+});
+
+test('a chat can be closed from the chat list', async ({ page }) => {
+  await login(page, 'alice');
+  await page.goto(`${BASE()}/p/demo-app`);
+  await page.locator('.chat-head').getByRole('button', { name: '+ New chat' }).click();
+  await expect(page).toHaveURL(/\?session=/);
+  const id = new URL(page.url()).searchParams.get('session')!;
+  const row = page.locator(`.chat-list li[data-session-id="${id}"]`);
+  await expect(row).toBeVisible();
+  await row.getByRole('button', { name: /^Close chat:/ }).click();
+  await page.locator('dialog[open]').getByRole('button', { name: 'Close chat' }).click();
+  await expect(row).toHaveCount(0);
+  await expect(page.locator('dialog[open]')).toHaveCount(0);
+  expect((await page.request.get(`${BASE()}/api/sessions/${id}`)).status()).toBe(404);
+});

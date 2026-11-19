@@ -111,6 +111,10 @@ export const db = {
   sessions: new Map<string, AgentSession>(),
   events: new Map<string, FactoryEvent[]>(),
   sessionSubs: new Map<string, Set<(e: FactoryEvent) => void>>(),
+  /** Close handlers of open session sockets (the server closes them when the chat is closed). */
+  sessionClosers: new Map<string, Set<(info: { code: number; reason: string }) => void>>(),
+  /** Ids of closed (deleted) chats: late timers for them do nothing. */
+  closedSessions: new Set<string>(),
   feedSubs: new Set<(f: FeedFrame) => void>(),
   runs: new Map<string, Run>(),
   players: new Map<string, Player>(),
@@ -144,6 +148,7 @@ function feed(frame: FeedFrame) {
   for (const s of db.feedSubs) s(structuredClone(frame));
 }
 export function touchSession(s: AgentSession, ts = iso(Date.now())) {
+  if (db.closedSessions.has(s.id)) return;
   s.updatedAt = ts;
   feed({ type: 'session', session: s });
 }
@@ -159,6 +164,7 @@ export function announceIssue(repo: string, issue: Issue) {
 }
 
 function emit(sessionId: string, type: FactoryEvent['type'], payload: unknown, ts: string, live = false) {
+  if (db.closedSessions.has(sessionId)) return;
   const list = db.events.get(sessionId) ?? [];
   db.events.set(sessionId, list);
   const ev: FactoryEvent = { seq: live ? -1 : list.length + 1, sessionId, ts, type, payload };
@@ -368,6 +374,7 @@ export function chatInput(s: AgentSession, text: string, by: User, attachments: 
     emit(s.id, 'user', { text, username: by.username }, ts);
     const [, cmd, arg] = text.trim().split(/\s+/);
     setTimeout(() => {
+      if (db.closedSessions.has(s.id)) return;
       try {
         if (!cmd || cmd === 'help') {
           systemReply(s, ['/factory run <issue>      start a pipeline run for an issue', '/factory status           list runs in this project', '/factory approve [runId]  approve a run waiting for a human', '/factory cancel <runId>   cancel a run', '/factory help             this help'].join('\n'));
@@ -468,6 +475,25 @@ export function stopSession(s: AgentSession) {
   db.players.get(s.id)?.cancel();
   db.players.delete(s.id);
   setStatus(s, 'stopped', iso(Date.now()));
+}
+
+/**
+ * Like the backend's `DELETE /api/sessions/{id}`: stops the chat's agent and deletes the chat with its events; runs it
+ * started lose the link. Its sockets are closed with 4404 and the feed announces `session_closed`.
+ */
+export function closeChat(s: AgentSession) {
+  db.players.get(s.id)?.cancel();
+  db.players.delete(s.id);
+  queued.delete(s.id);
+  db.closedSessions.add(s.id);
+  db.sessions.delete(s.id);
+  db.events.delete(s.id);
+  for (const r of db.runs.values()) if (r.startedBySessionId === s.id) r.startedBySessionId = null;
+  const closers = [...(db.sessionClosers.get(s.id) ?? [])];
+  db.sessionSubs.delete(s.id);
+  db.sessionClosers.delete(s.id);
+  for (const close of closers) close({ code: 4404, reason: 'session closed' });
+  feed({ type: 'session_closed', repo: s.repo, sessionId: s.id });
 }
 
 // ---------------------------------------------------------------- runs

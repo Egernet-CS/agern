@@ -1,13 +1,25 @@
 import { createContext, createElement, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api, type AgentSession, type Channel, type FactoryEvent, type Issue, type Run } from '../api';
 
-export type ConnState = 'connecting' | 'live' | 'reconnecting';
+/** `closed`: the server ended the channel for good (e.g. the chat was closed); it is not reopened. */
+export type ConnState = 'connecting' | 'live' | 'reconnecting' | 'closed';
 
-/** Opens a channel and reopens it with backoff when it drops. `open` is re-read on every attempt. */
-function useReconnecting(open: (h: { onOpen: () => void; onClose: () => void }) => Channel | null, key: string | null): ConnState {
+type CloseInfo = { code: number; reason: string };
+
+/**
+ * Opens a channel and reopens it with backoff when it drops. `open` is re-read on every attempt. When `isFinal`
+ * returns true for a close, the channel is not reopened and the state becomes `closed`.
+ */
+function useReconnecting(
+  open: (h: { onOpen: () => void; onClose: (info?: CloseInfo) => void }) => Channel | null,
+  key: string | null,
+  isFinal?: (info: CloseInfo) => boolean,
+): ConnState {
   const [state, setState] = useState<ConnState>('connecting');
   const openRef = useRef(open);
   openRef.current = open;
+  const finalRef = useRef(isFinal);
+  finalRef.current = isFinal;
   useEffect(() => {
     if (key === null) return;
     let ch: Channel | null = null;
@@ -20,8 +32,12 @@ function useReconnecting(open: (h: { onOpen: () => void; onClose: () => void }) 
           attempt = 0;
           setState('live');
         },
-        onClose: () => {
+        onClose: (info) => {
           if (disposed) return;
+          if (info && finalRef.current?.(info)) {
+            setState('closed');
+            return;
+          }
           setState('reconnecting');
           const delay = Math.min(10_000, 500 * 2 ** attempt++);
           timer = setTimeout(connect, delay);
@@ -47,8 +63,15 @@ export type SessionStream = {
   lastSeq: number;
 };
 
-/** Persisted events + live partials for one session. Reconnects with ?after=<lastSeq>. */
+/** WebSocket close codes for a session that does not exist (any more): 4404 closed while watched, 1008 refused at open. */
+const SESSION_GONE = new Set([4404, 1008]);
+
+/**
+ * Persisted events + live partials for one session. Reconnects with ?after=<lastSeq>, except when the server says the
+ * session is gone: then the stream stops (`conn: 'closed'`) and the session is marked closed on the feed.
+ */
 export function useSessionStream(sessionId: string | null): SessionStream {
+  const { markSessionClosed } = useFeed();
   const [events, setEvents] = useState<FactoryEvent[]>([]);
   const [partials, setPartials] = useState<unknown[]>([]);
   const lastSeq = useRef(0);
@@ -100,6 +123,11 @@ export function useSessionStream(sessionId: string | null): SessionStream {
           })
         : null,
     sessionId,
+    (info) => {
+      if (!SESSION_GONE.has(info.code)) return false;
+      if (sessionId) markSessionClosed(sessionId);
+      return true;
+    },
   );
 
   useEffect(() => () => {
@@ -122,6 +150,10 @@ type FeedState = {
   reconnects: number;
   /** Registers a listener for `issue` frames; returns the unsubscribe function. Stable identity. */
   subscribeIssues: (fn: IssueListener) => () => void;
+  /** Ids of chats closed while this app was open (tombstones: they never reappear). */
+  closedSessions: Set<string>;
+  /** Records a chat as closed and drops it from the live sessions. Stable identity. */
+  markSessionClosed: (id: string) => void;
 };
 
 const FeedContext = createContext<FeedState>({
@@ -131,10 +163,12 @@ const FeedContext = createContext<FeedState>({
   conn: 'connecting',
   reconnects: 0,
   subscribeIssues: () => () => {},
+  closedSessions: new Set(),
+  markSessionClosed: () => {},
 });
 
 export function FeedProvider({ enabled, children }: { enabled: boolean; children: ReactNode }) {
-  const store = useRef({ sessions: new Map<string, AgentSession>(), runs: new Map<string, Run>() });
+  const store = useRef({ sessions: new Map<string, AgentSession>(), runs: new Map<string, Run>(), closed: new Set<string>() });
   // Issue frames are events, not state: issues can change on GitHub without a frame, so a stored copy would go stale.
   const issueListeners = useRef(new Set<IssueListener>());
   const subscribeIssues = useCallback((fn: IssueListener) => {
@@ -154,6 +188,13 @@ export function FeedProvider({ enabled, children }: { enabled: boolean; children
       setVersion((v) => v + 1);
     }, 100);
   };
+  const markSessionClosed = useCallback((id: string) => {
+    if (store.current.closed.has(id)) return;
+    store.current.closed.add(id);
+    store.current.sessions.delete(id);
+    // Not batched: lists and the open chat should react at once.
+    setVersion((v) => v + 1);
+  }, []);
   const conn = useReconnecting(
     (h) =>
       api.openFeed({
@@ -168,16 +209,31 @@ export function FeedProvider({ enabled, children }: { enabled: boolean; children
             for (const fn of issueListeners.current) fn(f.repo, f.issue);
             return;
           }
-          if (f.type === 'session') store.current.sessions.set(f.session.id, f.session);
-          else if (f.type === 'run') store.current.runs.set(f.run.id, f.run);
+          if (f.type === 'session_closed') {
+            markSessionClosed(f.sessionId);
+            return;
+          }
+          if (f.type === 'session') {
+            if (store.current.closed.has(f.session.id)) return;
+            store.current.sessions.set(f.session.id, f.session);
+          } else if (f.type === 'run') store.current.runs.set(f.run.id, f.run);
           bump();
         },
       }),
     enabled ? 'feed' : null,
   );
   const value = useMemo(
-    () => ({ sessions: store.current.sessions, runs: store.current.runs, version, conn, reconnects, subscribeIssues }),
-    [version, conn, reconnects, subscribeIssues],
+    () => ({
+      sessions: store.current.sessions,
+      runs: store.current.runs,
+      version,
+      conn,
+      reconnects,
+      subscribeIssues,
+      closedSessions: store.current.closed,
+      markSessionClosed,
+    }),
+    [version, conn, reconnects, subscribeIssues, markSessionClosed],
   );
   return createElement(FeedContext.Provider, { value }, children);
 }
@@ -221,8 +277,9 @@ export function useLiveRuns(base: Run[] | undefined, include?: (r: Run) => boole
 export function useLiveSessions(base: AgentSession[] | undefined, include?: (s: AgentSession) => boolean): AgentSession[] {
   const feed = useFeed();
   return useMemo(() => {
-    const map = new Map((base ?? []).map((s) => [s.id, s]));
+    const map = new Map((base ?? []).filter((s) => !feed.closedSessions.has(s.id)).map((s) => [s.id, s]));
     for (const [id, s] of feed.sessions) {
+      if (feed.closedSessions.has(id)) continue;
       if (map.has(id)) map.set(id, newer(map.get(id)!, s));
       else if (include?.(s)) map.set(id, s);
     }
