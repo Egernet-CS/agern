@@ -60,6 +60,19 @@ export type Issue = {
 
 export type SessionKind = 'chat' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
 export type StageRole = Exclude<SessionKind, 'chat'>;
+
+/** Roles whose running agent accepts messages from the run's owner (docs/ARCHITECTURE.md §6). */
+export const STEERABLE_ROLES: StageRole[] = ['spec-writer', 'builder'];
+
+/** Answer to a message for a running pipeline agent. Always `queued`; a `system` event with `messageId` confirms pickup. */
+export type AgentMessage = {
+  status: 'queued';
+  messageId: string;
+  sessionId: string;
+  runId: string | null;
+  role: StageRole;
+  note: string;
+};
 export type SessionStatus = 'starting' | 'running' | 'idle' | 'done' | 'failed' | 'stopped';
 
 export type Owner = { username: string; displayName: string };

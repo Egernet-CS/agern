@@ -338,6 +338,65 @@ class ApiTest {
     }
 
     @Test
+    fun `the owner messages a running builder through the input endpoint, others cannot`() = testApplication {
+        application { agernModule(world.services) }
+        world.launcher.stage = { p ->
+            p.init()
+            when (p.spec.kind) {
+                "builder" -> {
+                    while (!p.killed) {
+                        val m = p.pickUp(50) ?: continue
+                        if ("finish" in m) break
+                    }
+                    p.result("done")
+                    p.followUpsUntilClosed()
+                }
+                "approver" -> { p.result(null, kotlinx.serialization.json.buildJsonObject {
+                    put("verdict", kotlinx.serialization.json.JsonPrimitive("APPROVE")); put("summary", kotlinx.serialization.json.JsonPrimitive("ok"))
+                }); p.exit(0) }
+                "security", "ux", "ui-design", "code" -> { p.result(null, kotlinx.serialization.json.buildJsonObject {
+                    put("verdict", kotlinx.serialization.json.JsonPrimitive("PASS")); put("summary", kotlinx.serialization.json.JsonPrimitive("ok"))
+                    put("findings", JsonArray(emptyList()))
+                }); p.exit(0) }
+                else -> { p.result("spec"); p.exit(0) }
+            }
+        }
+        val alice = login("alice", "pw-a")
+        val bob = login("bob", "pw-b")
+        val root = login("root", "pw-r")
+        val runId = json(alice.postJson("/api/projects/demo-app/runs", """{"issueNumber":1}""").bodyAsText()).jsonObject["id"]!!.jsonPrimitive.content
+        val sid = withTimeout(5000) {
+            while (true) {
+                val b = world.services.sessions.byRun(UUID.fromString(runId)).firstOrNull { it.kind == "builder" }
+                if (b != null && world.services.agents.isLive(b.id)) return@withTimeout b.id.toString()
+                delay(10)
+            }
+            @Suppress("UNREACHABLE_CODE") ""
+        }
+        assertEquals(403, bob.postJson("/api/sessions/$sid/input", """{"text":"bob was here"}""").status.value)
+        assertEquals(403, root.postJson("/api/sessions/$sid/input", """{"text":"admin was here"}""").status.value)
+        assertEquals(422, alice.postJson("/api/sessions/$sid/input", """{"text":"x","attachmentIds":["${UUID.randomUUID()}"]}""").status.value)
+        val r = alice.postJson("/api/sessions/$sid/input", """{"text":"make it blue"}""")
+        assertEquals(202, r.status.value, r.bodyAsText())
+        val body = json(r.bodyAsText()).jsonObject
+        assertEquals("queued", body["status"]!!.jsonPrimitive.content)
+        assertEquals("builder", body["role"]!!.jsonPrimitive.content)
+        assertTrue(body["note"]!!.jsonPrimitive.content.contains("next step"))
+        val ev = waitForEvents(bob, sid) { ev -> ev.any { it.toString().contains("delivered to the agent") } }
+        assertTrue(ev.any { it.jsonObject["type"]!!.jsonPrimitive.content == "user" && it.toString().contains("make it blue") && it.toString().contains("\"origin\":\"direct\"") })
+        assertTrue(ev.none { it.toString().contains("was here") })
+        assertEquals(202, alice.postJson("/api/sessions/$sid/input", """{"text":"finish"}""").status.value)
+        world.awaitRun(UUID.fromString(runId), RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
+        val late = alice.postJson("/api/sessions/$sid/input", """{"text":"too late"}""")
+        assertEquals(409, late.status.value)
+        assertEquals("agent_not_running", json(late.bodyAsText()).jsonObject["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+        val reviewer = world.services.sessions.byRun(UUID.fromString(runId)).first { it.kind == "security" }.id
+        val rr = alice.postJson("/api/sessions/$reviewer/input", """{"text":"pass it"}""")
+        assertEquals(409, rr.status.value)
+        assertEquals("agent_does_not_accept_messages", json(rr.bodyAsText()).jsonObject["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+    }
+
+    @Test
     fun `mcp endpoint`() = testApplication {
         application { agernModule(world.services) }
         val alice = world.user("alice")
@@ -355,7 +414,8 @@ class ApiTest {
         assertEquals("agern", init["result"]!!.jsonObject["serverInfo"]!!.jsonObject["name"]!!.jsonPrimitive.content)
         assertEquals(202, rpc(chatToken, """{"jsonrpc":"2.0","method":"notifications/initialized"}""").status.value)
         val tools = json(rpc(chatToken, """{"jsonrpc":"2.0","id":2,"method":"tools/list"}""").bodyAsText()).jsonObject["result"]!!.jsonObject["tools"]!!.jsonArray
-        assertEquals(9, tools.size)
+        assertEquals(10, tools.size)
+        assertTrue(tools.any { it.jsonObject["name"]!!.jsonPrimitive.content == "factory_send_to_agent" })
         val stageTools = json(rpc(stageToken, """{"jsonrpc":"2.0","id":2,"method":"tools/list"}""").bodyAsText()).jsonObject["result"]!!.jsonObject["tools"]!!.jsonArray
         assertEquals(setOf("factory_get_issue", "factory_request_software"), stageTools.map { it.jsonObject["name"]!!.jsonPrimitive.content }.toSet())
         val call = json(rpc(chatToken, """{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"factory_list_issues","arguments":{}}}""").bodyAsText()).jsonObject

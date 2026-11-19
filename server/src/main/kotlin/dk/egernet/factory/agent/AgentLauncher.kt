@@ -35,9 +35,15 @@ data class LaunchSpec(
     val identity: AgentIdentity,
     /** Chat: `--input-format stream-json --include-partial-messages`, process stays alive between turns. */
     val interactive: Boolean,
+    /**
+     * Pipeline stage that accepts messages from its owner while it works (spec-writer, builder):
+     * `--input-format stream-json --replay-user-messages`. The task prompt is NOT written by the launcher; the
+     * caller sends it as the first stream-json user message and closes stdin when the stage is finished.
+     */
+    val steerable: Boolean = false,
     val resumeClaudeSessionId: String? = null,
     val appendSystemPrompt: String? = null,
-    /** One-shot prompt, written to stdin which is then closed. Null for interactive sessions. */
+    /** Task prompt of a pipeline stage. One-shot stages: written to stdin as text, which is then closed. Null for chats. */
     val prompt: String? = null,
     val jsonSchema: String? = null,
     val disallowedTools: List<String> = emptyList(),
@@ -77,6 +83,7 @@ object AgentCommand {
             "--mcp-config", mcpConfigPath,
         )
         if (spec.interactive) a += listOf("--input-format", "stream-json", "--include-partial-messages")
+        else if (spec.steerable) a += listOf("--input-format", "stream-json", "--replay-user-messages")
         spec.resumeClaudeSessionId?.let { a += listOf("--resume", it) }
         spec.appendSystemPrompt?.let { a += listOf("--append-system-prompt", it) }
         spec.jsonSchema?.let { a += listOf("--json-schema", it) }
@@ -151,7 +158,7 @@ class LocalProcessLauncher(private val claudeBin: String, private val agentPath:
             Files.deleteIfExists(mcpFile)
             throw e
         }
-        return LocalAgentProcess(proc, spec.prompt, mcpFile)
+        return LocalAgentProcess(proc, spec.prompt.takeUnless { spec.interactive || spec.steerable }, mcpFile)
     }
 }
 

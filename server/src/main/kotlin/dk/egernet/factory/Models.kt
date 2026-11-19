@@ -124,6 +124,8 @@ data class SettingsDto(
 
 val PIPELINE_ROLES = listOf("spec-writer", "builder", "security", "ux", "ui-design", "code", "approver")
 val REVIEWER_ROLES = listOf("security", "ux", "ui-design", "code")
+/** Pipeline roles whose running agent accepts messages from the run's owner (docs/ARCHITECTURE.md §6 "Messages"). */
+val STEERABLE_ROLES = setOf("spec-writer", "builder")
 val DEFAULT_PIPELINE_MODELS = mapOf(
     "spec-writer" to "opus", "builder" to "opus", "security" to "opus",
     "ux" to "sonnet", "ui-design" to "sonnet", "code" to "sonnet", "approver" to "opus",
@@ -174,6 +176,17 @@ data class AttachmentDto(
 )
 
 @Serializable data class AttachmentLimitsDto(val maxFileBytes: Long, val maxMessageBytes: Long, val maxCount: Int, val imageTypes: List<String>)
+/** Answer to a message for a running pipeline agent (`POST /api/sessions/{id}/input`, `factory_send_to_agent`). */
+@Serializable data class AgentMessageDto(
+    /** Always `queued`: the CLI picks it up at the agent's next step; a `system` event with this id confirms delivery. */
+    val status: String,
+    val messageId: String,
+    val sessionId: String,
+    val runId: String?,
+    val role: String,
+    val note: String,
+)
+
 @Serializable data class ClientConfigDto(val attachments: AttachmentLimitsDto)
 
 @Serializable data class FeedFrame(val type: String, val session: AgentSessionDto? = null, val run: RunDto? = null)

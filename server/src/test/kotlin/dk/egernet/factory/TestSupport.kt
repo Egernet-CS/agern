@@ -49,6 +49,11 @@ class FakeProcess(val spec: LaunchSpec, private val onInput: (FakeProcess, Strin
     private val ch = Channel<String>(Channel.UNLIMITED)
     private val exit = CompletableDeferred<Int>()
     @Volatile var killed = false
+    /** Every line written to stdin, in order. */
+    val written = CopyOnWriteArrayList<String>()
+    /** Lines written to stdin and not yet picked up (see [pickUp]). */
+    val inputs = java.util.concurrent.LinkedBlockingQueue<String>()
+    @Volatile var inputClosed = false
 
     fun emit(obj: JsonObject) { ch.trySend(obj.toString()) }
     fun exit(code: Int) {
@@ -74,9 +79,41 @@ class FakeProcess(val spec: LaunchSpec, private val onInput: (FakeProcess, Strin
         if (structured != null) put("structured_output", structured)
     })
 
+    /**
+     * Like the real CLI with `--replay-user-messages`: takes the next stdin message (waiting up to [timeoutMs]),
+     * echoes it with `isReplay: true` and returns its text; null when none arrived or stdin was closed.
+     */
+    fun pickUp(timeoutMs: Long = 10_000): String? {
+        val line = inputs.poll(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS) ?: return null
+        val msg = AppJson.parseToJsonElement(line).jsonObject["message"]!!.jsonObject
+        emit(buildJsonObject { put("type", "user"); put("message", msg); put("isReplay", true); put("session_id", "fake") })
+        return msg["content"]!!.jsonPrimitive.content
+    }
+
+    /** After the first result: answers later messages as further turns until stdin is closed, then exits 0. */
+    fun followUpsUntilClosed(reply: (String) -> String = { "follow-up: $it" }) {
+        while (!killed) {
+            if (inputs.isEmpty() && inputClosed) {
+                exit(0)
+                return
+            }
+            val m = pickUp(20) ?: continue
+            assistantText(reply(m))
+            result(reply(m))
+        }
+    }
+
     override val lines: ReceiveChannel<String> get() = ch
-    override fun send(line: String) = onInput(this, line)
-    override fun closeInput() { if (spec.interactive) exit(0) }
+    override fun send(line: String) {
+        if (inputClosed) throw java.io.IOException("stdin is closed")
+        written += line
+        inputs += line
+        onInput(this, line)
+    }
+    override fun closeInput() {
+        inputClosed = true
+        if (spec.interactive) exit(0)
+    }
     override fun kill() {
         killed = true
         if (!exit.isCompleted) exit(143)
@@ -111,7 +148,11 @@ class FakeLauncher(var stage: (FakeProcess) -> Unit = { it.init(); it.result("ok
             }
         } else FakeProcess(spec)
         launched += p
-        if (!spec.interactive) thread(isDaemon = true) { stage(p) }
+        // A steerable stage (spec-writer, builder) gets its task as the first stdin message: pick it up like the CLI does.
+        if (!spec.interactive) thread(isDaemon = true) {
+            if (spec.steerable) p.pickUp()
+            stage(p)
+        }
         return p
     }
 

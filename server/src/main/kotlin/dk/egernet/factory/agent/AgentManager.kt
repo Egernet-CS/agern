@@ -1,7 +1,9 @@
 package dk.egernet.factory.agent
 
 import dk.egernet.factory.AppJson
+import dk.egernet.factory.AgentMessageDto
 import dk.egernet.factory.AttachmentDto
+import dk.egernet.factory.STEERABLE_ROLES
 import kotlinx.serialization.builtins.ListSerializer
 import dk.egernet.factory.Config
 import dk.egernet.factory.EventDto
@@ -127,6 +129,15 @@ class AgentManager(
         @Volatile var authFailed = false
         /** Chat inputs (stream-json `message.content`) written to this process and not yet answered by a `result`. */
         val pending = java.util.Collections.synchronizedList(mutableListOf<JsonElement>())
+
+        // ---- steerable pipeline stages (spec-writer, builder): stdin stays open while the agent works
+        @Volatile var steerable = false
+        /** Guards [inputClosed], [awaiting] and every write to stdin, so a message is either written before stdin closes or rejected. */
+        val inputLock = Any()
+        var inputClosed = false
+        /** Messages written to stdin that the CLI has not replayed (picked up) yet, oldest first. A null id is the task prompt. */
+        val awaiting = ArrayDeque<Pair<String?, String>>()
+        var replaysSeen = 0
     }
 
     private val live = ConcurrentHashMap<UUID, Live>()
@@ -251,15 +262,18 @@ class AgentManager(
         }
     }
 
+    /** One stream-json user message for the CLI's stdin. */
+    private fun userLine(content: JsonElement): String = buildJsonObject {
+        put("type", "user")
+        putJsonObject("message") { put("role", "user"); put("content", content) }
+    }.toString()
+
     private suspend fun deliver(l: Live, content: JsonElement) {
         l.turnActive = true
         l.lastUse = System.currentTimeMillis()
         l.pending += content
-        val msg = buildJsonObject {
-            put("type", "user")
-            putJsonObject("message") { put("role", "user"); put("content", content) }
-        }
-        withContext(Dispatchers.IO) { l.proc.send(msg.toString()) }
+        val msg = userLine(content)
+        withContext(Dispatchers.IO) { l.proc.send(msg) }
         if (sessions.get(l.sessionId)?.status != SessionStatus.RUNNING) setStatus(l.sessionId, SessionStatus.RUNNING)
     }
 
@@ -388,6 +402,87 @@ class AgentManager(
         systemEvent(s.id, "info", "Interrupted by ${user.username}")
     }
 
+    /**
+     * A message from the run's owner to a running spec-writer or builder (docs/ARCHITECTURE.md §6 "Messages to running
+     * agents"). It is written to the agent's stdin at once and picked up by the CLI at its next step (after the current
+     * tool call, or as a further turn when the agent was finishing); the `system` event carrying `messageId` confirms the
+     * pickup. Race-free with the end of the stage: stdin is only closed under the same lock, and only when no written
+     * message is still waiting, so an accepted message is never dropped silently.
+     * [viaChatSession]: the owner's chat session whose agent forwarded it (MCP), or null when sent directly.
+     */
+    fun sendToStageAgent(user: UserRecord, s: SessionRecord, text: String, viaChatSession: UUID? = null): AgentMessageDto {
+        if (s.kind == "chat") throw conflict("Chat sessions take input, not agent messages")
+        if (s.ownerId != user.id) throw forbidden("Only the owner of this run can send messages to its agents")
+        if (s.kind !in STEERABLE_ROLES) {
+            throw conflict(
+                "The ${s.kind} agent does not accept messages: reviewers and the approver answer in a fixed verdict format. " +
+                    "Only a running spec-writer or builder can be messaged.",
+                "agent_does_not_accept_messages",
+            )
+        }
+        if (text.isBlank()) throw dk.egernet.factory.badRequest("text must not be empty")
+        if (text.length > 100_000) throw dk.egernet.factory.badRequest("text is too long")
+        fun notRunning(): Exception {
+            val st = sessions.get(s.id)?.status ?: s.status
+            val why = if (st == SessionStatus.STARTING || st == SessionStatus.RUNNING) "has not started yet" else "is no longer running (it is $st)"
+            return conflict(
+                "The ${s.kind} agent $why, so the message cannot be delivered. To change finished work, start a new run " +
+                    "(or describe the change on the issue) instead.",
+                "agent_not_running",
+            )
+        }
+        val l = live[s.id]?.takeIf { it.steerable } ?: throw notRunning()
+        val messageId = UUID.randomUUID().toString()
+        // The agent sees who wrote it; the transcript shows the owner's text as written.
+        val forAgent = "Message from the run owner (${user.username}) while you work — take it into account:\n\n$text"
+        synchronized(l.inputLock) {
+            if (l.inputClosed) throw notRunning()
+            try {
+                l.proc.send(userLine(JsonPrimitive(forAgent)))
+            } catch (e: Exception) {
+                throw notRunning()
+            }
+            l.awaiting.addLast(messageId to user.username)
+            publish(s.id, "user", buildJsonObject {
+                put("text", text); put("username", user.username); put("messageId", messageId)
+                put("origin", if (viaChatSession == null) "direct" else "chat")
+                viaChatSession?.let { put("viaSessionId", it.toString()) }
+            })
+        }
+        log.info("Message {} queued for {} session {} (via {})", messageId, s.kind, s.id, viaChatSession ?: "direct")
+        return AgentMessageDto(
+            status = "queued", messageId = messageId, sessionId = s.id.toString(), runId = s.runId?.toString(), role = s.kind,
+            note = "Queued — delivered at the agent's next step (after its current tool call, or as a further turn if it is finishing).",
+        )
+    }
+
+    /** The CLI replayed a stdin message: it has been picked up. */
+    private fun onReplay(l: Live) {
+        synchronized(l.inputLock) {
+            l.replaysSeen++
+            val (id, username) = l.awaiting.removeFirstOrNull() ?: return
+            if (id != null) {
+                publish(l.sessionId, "system", buildJsonObject {
+                    put("level", "info"); put("text", "Message from $username delivered to the agent."); put("messageId", id)
+                })
+            }
+        }
+    }
+
+    /** Stage ended: refuse further messages and say which accepted ones the agent never picked up. */
+    private fun closeSteering(l: Live?) {
+        if (l == null || !l.steerable) return
+        val left = synchronized(l.inputLock) {
+            l.inputClosed = true
+            l.awaiting.filter { it.first != null }.also { l.awaiting.clear() }
+        }
+        for ((id, username) in left) {
+            publish(l.sessionId, "system", buildJsonObject {
+                put("level", "warn"); put("text", "Message from $username was not delivered: the agent stopped before picking it up."); put("messageId", id)
+            })
+        }
+    }
+
     /** Owner or admin. Kills the process; a stopped chat can be resumed by sending input again. */
     suspend fun stop(user: UserRecord, s: SessionRecord): SessionRecord {
         if (s.ownerId != user.id && !user.isAdmin) throw forbidden("Only the owner or an admin can stop this session")
@@ -442,16 +537,25 @@ class AgentManager(
             val tools = if (mayInstall) McpRegistry.STAGE_TOOLS - "factory_request_software" else McpRegistry.STAGE_TOOLS
             token = mcp.issue(McpGrant(s.id, req.owner.id, req.repo, req.runId, tools))
             val identity = AgentIdentity(req.owner.username, req.owner.displayName, req.owner.githubLogin, access.githubToken(req.owner), cred)
+            val steerable = req.role in STEERABLE_ROLES
             val spec = LaunchSpec(
                 sessionId = s.id, kind = req.role, model = req.model, workDir = req.workDir, home = workspaces.home(req.owner.username),
-                identity = identity, interactive = false, resumeClaudeSessionId = req.resumeClaudeSessionId,
+                identity = identity, interactive = false, steerable = steerable, resumeClaudeSessionId = req.resumeClaudeSessionId,
                 appendSystemPrompt = req.systemPrompt, prompt = req.prompt, jsonSchema = req.jsonSchema,
                 disallowedTools = req.disallowedTools, mcpConfigJson = mcpConfig(token),
             )
             publish(s.id, "user", buildJsonObject { put("text", req.prompt); put("username", req.owner.username) })
             val proc = withContext(Dispatchers.IO) { launcher.launch(spec) }
             val lv = Live(s.id, req.owner.id, req.repo, req.role, proc, token, false, 0.0, 0, req.resumeClaudeSessionId)
+            lv.steerable = steerable
             l = lv
+            if (steerable) {
+                // The task prompt is the first stream-json message; stdin stays open for the owner's messages.
+                synchronized(lv.inputLock) {
+                    proc.send(userLine(JsonPrimitive(req.prompt)))
+                    lv.awaiting.addLast(null to req.owner.username)
+                }
+            }
             live[s.id] = lv
             setStatus(s.id, SessionStatus.RUNNING)
             val code = withTimeoutOrNull(cfg.stageTimeoutMs) {
@@ -482,6 +586,7 @@ class AgentManager(
         } catch (e: CancellationException) {
             withContext(NonCancellable) {
                 l?.let { it.stopReason = "stopped"; it.proc.kill() }
+                closeSteering(l)
                 systemEvent(s.id, "warn", "Agent stopped because the run was cancelled")
                 setStatus(s.id, SessionStatus.STOPPED, ended = true)
             }
@@ -498,6 +603,7 @@ class AgentManager(
     }
 
     private fun finishStage(s: SessionRecord, l: Live?, error: String?): StageAgentResult {
+        closeSteering(l)
         if (error != null) systemEvent(s.id, "error", error)
         val status = if (l?.stopReason == "stopped") SessionStatus.STOPPED else if (error == null) SessionStatus.DONE else SessionStatus.FAILED
         setStatus(s.id, status, ended = true)
@@ -539,6 +645,12 @@ class AgentManager(
                 return
             }
             "control_response", "control_request", "keep_alive" -> return
+            // `--replay-user-messages` echoes each stdin message when the CLI picks it up; the factory's own `user`
+            // event already shows it, so the echo only confirms delivery.
+            "user" -> if (l.steerable && obj["isReplay"]?.jsonPrimitive?.booleanOrNull == true) {
+                onReplay(l)
+                return
+            }
         }
         publish(l.sessionId, "claude", obj)
         when (obj["type"]?.jsonPrimitive?.contentOrNull) {
@@ -572,8 +684,20 @@ class AgentManager(
                     if (l.stopReason == null) setStatus(l.sessionId, SessionStatus.IDLE) else publishFeed(l.sessionId)
                 } else {
                     publishFeed(l.sessionId)
-                    // A one-shot agent should exit by itself after its result; make sure it does.
-                    scope.launch {
+                    // A steerable stage ends when a turn ends and no message is waiting: then stdin is closed. A message
+                    // written before this point but not yet picked up makes the CLI run a further turn; its result
+                    // decides again. (A CLI that never replays falls back to closing at the first result.)
+                    val finished = !l.steerable || synchronized(l.inputLock) {
+                        if (l.awaiting.isEmpty() || l.replaysSeen == 0) {
+                            l.inputClosed = true
+                            l.proc.closeInput()
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    // An agent should exit by itself after its final result; make sure it does.
+                    if (finished) scope.launch {
                         delay(30_000)
                         if (!l.exited.isCompleted && live[l.sessionId] === l) l.proc.kill()
                     }

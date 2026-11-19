@@ -1,4 +1,5 @@
 import type {
+  AgentMessage,
   AgentSession,
   Attachment,
   ClientConfig,
@@ -68,6 +69,11 @@ export interface Api {
   events(id: string, after?: number, limit?: number): Promise<FactoryEvent[]>;
   /** `attachmentIds`: unsent uploads of this session, in order. */
   sendInput(id: string, text: string, attachmentIds?: string[]): Promise<void>;
+  /**
+   * Owner only: a text message for a running spec-writer or builder (same endpoint as chat input). Rejects with ApiError
+   * 409 `agent_not_running` / `agent_does_not_accept_messages`, 403 for anyone else.
+   */
+  sendToAgent(sessionId: string, text: string): Promise<AgentMessage>;
   /** Owner only. Rejects with ApiError (413 attachment_too_large / attachments_too_large, 409 too_many_attachments, …). */
   uploadAttachment(sessionId: string, file: File, opts?: { onProgress?: (loaded: number, total: number) => void; signal?: AbortSignal }): Promise<Attachment>;
   /** Removes an unsent upload. */

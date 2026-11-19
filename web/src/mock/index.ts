@@ -10,6 +10,7 @@ import {
   createChat,
   db,
   interrupt,
+  messageAgent,
   MockError,
   ORG,
   startRun,
@@ -308,7 +309,12 @@ export const mockApi: Api = {
     ok(() => {
       const s = session(id);
       if (s.owner.username !== me().username) throw new MockError(403, 'forbidden', 'Only the owner can send input.');
-      if (s.kind !== 'chat') throw new MockError(409, 'conflict', 'Only chat sessions accept input');
+      if (s.kind !== 'chat') {
+        // Like the backend: the same endpoint carries messages to a running spec-writer / builder (text only).
+        if (attachmentIds.length) throw new MockError(422, 'attachments_not_allowed', 'Messages to pipeline agents are text only');
+        messageAgent(s, text, me());
+        return;
+      }
       if (!text.trim() && attachmentIds.length === 0) throw new MockError(400, 'bad_request', 'text must not be empty');
       if (text.trim().startsWith('/factory') && attachmentIds.length) {
         throw new MockError(422, 'attachments_not_allowed', '/factory commands do not take attachments. Remove them, or send them in a normal message.');
@@ -321,6 +327,7 @@ export const mockApi: Api = {
       list.forEach((a) => (a!.sent = true));
       chatInput(s, text, me(), list.map((a) => a!.meta));
     }),
+  sendToAgent: (id, text) => ok(() => messageAgent(session(id), text, me())),
   async uploadAttachment(sessionId, file, opts) {
     const s = session(sessionId);
     if (s.owner.username !== me().username) throw new ApiError(403, 'forbidden', 'Only the owner of this session can attach files');
