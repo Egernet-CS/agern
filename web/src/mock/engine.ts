@@ -567,7 +567,9 @@ function runStage(r: Run, role: StageRole, round: number, plan: Plan, startMs: n
   } else if (role === 'approver') {
     verdict = plan.approver;
     steps = approverScript(plan.approver, `${r.issueTitle} (#${r.issueNumber})`);
-    summary = plan.approver === 'APPROVE' ? 'All reviewers pass; merging.' : 'New payment-provider dependency not covered by the spec. A human should confirm.';
+    summary = plan.approver === 'APPROVE'
+      ? 'All reviewers pass; merging.\n\n- **Security:** cart ownership is checked in `CartRoutes.kt`.\n- **Code:** quantity handling now lives in `mergeQuantities()`.\n- **Tests:** `./gradlew build` is green.'
+      : 'New payment-provider dependency not covered by the spec. A human should confirm.';
   } else {
     const ch = round === 0 ? plan.changes[role] : undefined;
     verdict = ch ? 'CHANGES' : 'PASS';
@@ -687,7 +689,7 @@ export function startRun(repo: string, issueNumber: number, owner: User, started
   const r = makeRun(repo, issue, owner, createdMs, startedBy);
   touchRun(r, iso(createdMs));
   const full: Plan = {
-    changes: { code: ['Merge logic duplicates quantity handling from CheckoutService; extract a shared helper.'], security: ['Cart routes accept any cart id; ownership is not checked (IDOR).', 'Log line prints the full cart including email.'] },
+    changes: { code: ['Merge logic duplicates quantity handling from `CheckoutService`; extract a **shared helper**.'], security: ['Cart routes accept any cart id; ownership is not checked (**IDOR**).', 'Log line prints the full cart including email.'] },
     approver: 'APPROVE',
     liveFrom: () => true,
     ...plan,
