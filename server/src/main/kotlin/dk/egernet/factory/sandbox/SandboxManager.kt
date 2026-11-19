@@ -224,7 +224,7 @@ class SandboxManager(
                 rs.released -> "The run's sandbox has been removed (the build/review part of the run is over)."
                 else -> rs.info.reason
             })
-            if (plan is Plan.Available && rs != null) {
+            if (plan is Plan.Available) {
                 val def = plan.definition
                 put("image", def.image)
                 put("created", rs.boxes.containsKey(DEFAULT))
