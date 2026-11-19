@@ -142,10 +142,13 @@ Launch rules:
   --permission-mode bypassPermissions --strict-mcp-config --mcp-config <file> …`. The MCP config
   (which contains the per-process bearer token) is written to a `0600` file under the owner's
   `HOME/.agern/` and deleted when the process exits, so the token is not in the argument list.
-  The role prompt is passed with `--append-system-prompt`. Pipeline agents read their task prompt
-  from stdin (text input, stdin closed afterwards); reviewers and the approver add `--json-schema`
-  and `--disallowedTools Edit,Write,NotebookEdit` (the spec-writer is read-only too). The verdict is
-  read from the `result` event's `structured_output`.
+  The role prompt is passed with `--append-system-prompt`. Reviewers and the approver read their task
+  prompt from stdin (text input, stdin closed afterwards) and add `--json-schema` and
+  `--disallowedTools Edit,Write,NotebookEdit` (the spec-writer is read-only too); the verdict is read from
+  the `result` event's `structured_output`. The spec-writer and the builder (fix rounds included) are
+  *steerable*: they add `--input-format stream-json --replay-user-messages`, get their task prompt as the
+  first stream-json user message and keep stdin open while they work, so their owner can send messages
+  (§6 "Messages to running agents").
 - Chat input is written to stdin as `{"type":"user","message":{"role":"user","content":<text>}}`.
   A message with attachments has an array as `content` instead: one `image` block
   (`{"type":"image","source":{"type":"base64","media_type":…,"data":…}}`) per image that goes inline,
@@ -237,6 +240,35 @@ issue → spec-writer (opus) → builder (opus) ─┬→ security  (opus)   ┐
   `0..maxFixRounds` (422 `max_fix_rounds_out_of_range` otherwise). If an admin later lowers the bound below a
   stored preference, the effective value is clamped to it (and reported as `clamped`). `0` means no fix rounds:
   any `CHANGES` after the first review sends the run straight to `needs_human` (approver `skipped`).
+- **Messages to running agents.** The run's owner — directly on the run page, or through their own chat
+  agent (`factory_send_to_agent`, §7) — can send a text message to a *running* spec-writer or builder
+  (fix rounds included). Nobody else can, admins included (they may stop, never drive). Reviewers and the
+  approver never accept messages (409 `agent_does_not_accept_messages`): they answer in a fixed verdict
+  format that an outside message must not bias. A message to an agent that is not running — not started
+  yet, finished, failed or stopped — is rejected with 409 `agent_not_running` and a hint to start a new run;
+  nothing is dropped silently. Messages are not posted on GitHub.
+  - *Delivery.* The message is written to the agent's stdin at once as
+    `{"type":"user","message":{"role":"user","content":"Message from the run owner (<username>) while you work — take it into account:\n\n<text>"}}`
+    and the API answers `queued`. Verified against Claude Code 2.1.328 (`-p --input-format stream-json
+    --output-format stream-json --verbose`, haiku, a task of three sequential `sleep 4` Bash calls): a message
+    written while a tool call ran was picked up right after that tool result, inside the same turn — the
+    model's next step already followed it, and the turn ended with one `result`. A message written while the
+    model was writing its final answer (no further tool call) was not folded in: the turn finished, and the
+    message then ran as a further turn with its own `result`. So a message is delivered at the agent's
+    **next step**: after its current tool call, or as a further turn if it was finishing. With
+    `--replay-user-messages` the CLI echoes each stdin message (`"isReplay": true`) at the moment it picks it
+    up (also the task prompt, and with `--resume` only the new messages); the server uses the echo as the
+    delivery receipt — it appends a `system` info event carrying the message's `messageId` — and does not
+    persist the echo itself.
+  - *End of the stage.* A `result` ends the stage only when no written message is still waiting for its echo:
+    then the server closes stdin and the stage finishes as before (the agent exits by itself; it is killed
+    30 s later if not). Otherwise the CLI runs a further turn for the waiting message(s), and the *last*
+    `result` is the stage's result. Writes to stdin, the "waiting" bookkeeping and closing stdin happen under
+    one lock per agent, so a message the API accepted was written before stdin closed and will be answered,
+    or the caller got the rejection. If the agent stops before picking up an accepted message (crash, time
+    limit, cancel), a `system` warn event with that `messageId` says it was not delivered. (A CLI that never
+    echoes falls back to closing stdin at the first `result`.)
+  - The stage time limit is unchanged and not extended by messages; cancel works as before.
 - Orchestration is a deterministic state machine in the server, not something an LLM decides. On
   server restart, unfinished runs are marked `failed` with a clear reason (v1).
 
@@ -255,8 +287,15 @@ to the owner and the repo, and dies with the process.
 
 Tools: `factory_list_issues`, `factory_get_issue`, `factory_create_issue`, `factory_start_run`,
 `factory_list_runs`, `factory_get_run`, `factory_approve_run`, `factory_cancel_run`,
-`factory_request_software`. Pipeline-stage agents get only `factory_get_issue` and
-`factory_request_software`.
+`factory_send_to_agent`, `factory_request_software`. Pipeline-stage agents get only `factory_get_issue`
+and `factory_request_software`.
+
+`factory_send_to_agent` `{ runId?, role?, sessionId?, message }` passes the person's message to a running
+spec-writer or builder of a run in this project (§6 "Messages to running agents"): by `runId` + `role`
+(`spec-writer` | `builder`; without `role`, the run's running one of the two) or by the agent's `sessionId`.
+The chat's owner must own the run; the same checks and refusals as the HTTP endpoint apply and come back as
+tool errors. The transcript entry records `origin: 'chat'` and the chat's session id. The answer says the
+message is queued for the agent's next step, never that it was already applied.
 
 Chat input starting with `/factory` is handled by the server and not sent to Claude (with attachments it
 is rejected with 422 `attachments_not_allowed`; they stay unsent so the owner can send them in a normal message):
@@ -336,8 +375,15 @@ type ClientConfig = { attachments: { maxFileBytes: number; maxMessageBytes: numb
 type Event = { seq: number; sessionId: string; ts: string;
   type: 'user' | 'claude' | 'system' | 'status'; payload: unknown };
 //  user:   { text: string, username: string, attachments?: Attachment[] }   // attachments only when there are some
+//          A message to a running pipeline agent (§6) adds: messageId: string, origin: 'direct' | 'chat',
+//          viaSessionId?: string   // the forwarding chat session when origin is 'chat'
 //  claude: one raw stream-json object from the CLI ({type:'system'|'assistant'|'user'|'result'|'stream_event', …})
-//  system: { level: 'info' | 'warn' | 'error', text: string }
+//  system: { level: 'info' | 'warn' | 'error', text: string, messageId?: string }
+//          messageId: the agent picked that message up (info) or stopped before it did (warn)
+
+type AgentMessage = { status: 'queued';          // always: picked up at the agent's next step (§6)
+  messageId: string; sessionId: string; runId: string | null;
+  role: 'spec-writer' | 'builder'; note: string }; // note: human-readable, e.g. "Queued — delivered at the agent's next step …"
 //  status: { status: SessionStatus }
 
 type Settings = { agentsMayInstallSoftware: boolean;
@@ -395,7 +441,7 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `GET /api/sessions/{id}` | → `AgentSession` | |
 | `GET /api/sessions/{id}/events?after=<seq>&limit=<n>` | → `Event[]` | ascending |
 | `GET /api/config` | → `ClientConfig` | limits the frontend checks before uploading |
-| `POST /api/sessions/{id}/input` | `{ text, attachmentIds? }` → 202 | owner only, chat only; accepted mid-turn too (delivered after the current turn); a `stopped` or process-less chat resumes. `text` may be empty when `attachmentIds` is not. The attachments are bound to this message when it is accepted, so a message queued mid-turn keeps its own |
+| `POST /api/sessions/{id}/input` | `{ text, attachmentIds? }` → 202 | owner only. **Chat:** accepted mid-turn too (delivered after the current turn); a `stopped` or process-less chat resumes. `text` may be empty when `attachmentIds` is not. The attachments are bound to this message when it is accepted, so a message queued mid-turn keeps its own. Answer `{ status: 'accepted' }`. **Pipeline agent:** a text message for a running spec-writer or builder (§6 "Messages to running agents") → 202 `AgentMessage`; 403 for everyone but the run's owner (admins too), 409 `agent_does_not_accept_messages` (reviewers, approver), 409 `agent_not_running`, 422 `attachments_not_allowed` |
 | `POST /api/sessions/{id}/attachments?name=<file name>` | raw bytes → 201 `Attachment` | owner only, chat only; see "Attachments" below |
 | `GET /api/sessions/{id}/attachments/{aid}?preview=1` | → bytes | anyone who may see the session once it is sent; before that only its uploader. `preview=1`: the downscaled copy if there is one |
 | `DELETE /api/sessions/{id}/attachments/{aid}` | → 204 | owner only; unsent only (409 `attachment_sent`) |
@@ -421,6 +467,9 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   | TOTP / enrol | 401 | `unauthorized` | no pending session (never logged in, or it expired after 10 minutes): start again |
   | TOTP | 422 | `not_enrolled` | the account has no confirmed TOTP secret |
   | enrol | 422 | `no_enrolment` | no enrolment in progress: start again |
+- Messages to pipeline agents: reviewer/approver → 409 `agent_does_not_accept_messages`; agent not running
+  (pending, finished, failed, stopped) → 409 `agent_not_running`; with attachments → 422
+  `attachments_not_allowed`; not the run's owner → 403 `forbidden`.
 - "Needs Claude credential" → 422 `claude_credential_required`; too many agents → 409
   `too_many_agents`; issue already has an active run → 409 `active_run_exists`; missing CSRF header
   → 403 `csrf`; foreign `Origin` → 403 `bad_origin`.
@@ -605,6 +654,13 @@ default and maximum fix rounds; installing software stays admin-only).
 The chat renders the Claude stream the way the terminal does: prompt line, streamed assistant
 text, tool calls as `⏺ Tool(args)` with collapsible results, thinking, cost/turn footer. Sessions
 owned by someone else are shown read-only with an "observing <user>" banner.
+
+On the run page the owner of a run gets a text-only composer (the chat prompt without `/factory` commands,
+attachments or interrupt; it can send while the agent works) under the transcript of a selected spec-writer or
+builder while that agent is `running`, with a note that messages are queued for the agent's next step and are
+not posted on GitHub. Everyone else, and every other stage, stays read-only. In the transcript a forwarded
+message shows its sender and origin ("alice · direct" or "alice · via chat <id>") and its state: "queued —
+delivered at the agent's next step", then "delivered" (or "not delivered" if the agent stopped first).
 
 The owner attaches files by pasting (a pasted screenshot is named `screenshot-<date>-<time>.png`),
 dropping them anywhere on the chat pane (which shows a drop target) or with the `+` button. Each becomes a

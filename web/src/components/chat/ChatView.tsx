@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type ReactNode } from 'react';
-import { api, ApiError, type AgentSession, type Attachment } from '../../api';
+import { api, ApiError, STEERABLE_ROLES, type AgentSession, type Attachment, type StageRole } from '../../api';
 import { useMe } from '../../lib/auth';
 import { cost, duration, modelLabel } from '../../lib/format';
 import { useSessionStream } from '../../lib/realtime';
@@ -35,7 +35,10 @@ export type ChatViewProps = {
   session: AgentSession | undefined;
   /** Shown instead of the prompt when the owner cannot send (e.g. no Claude credential). */
   disabledReason?: ReactNode;
-  /** Pipeline stage transcripts: never interactive, no observing banner if it is mine. */
+  /**
+   * Pipeline stage transcripts: no chat input, no observing banner if it is mine. The owner may message a running
+   * spec-writer or builder through a text-only composer.
+   */
   embedded?: boolean;
   header?: ReactNode;
 };
@@ -57,6 +60,9 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
   const [sending, setSending] = useState<{ text: string; attachments: Attachment[] } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const canCompose = canDrive && !ended && !disabledReason;
+  // Messages to a working pipeline agent: its owner only, spec-writer / builder only, only while it runs.
+  const stageRole = !isChat && session ? (session.kind as StageRole) : null;
+  const canSteer = isOwner && !!stageRole && STEERABLE_ROLES.includes(stageRole) && status === 'running' && session?.live !== false;
   const att = useAttachmentDrafts(sessionId, canCompose);
 
   // --- scrolling: stick to the bottom while the agent streams, unless the reader scrolled up
@@ -127,6 +133,23 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
       return true;
     },
     [sessionId, att],
+  );
+
+  const steer = useCallback(
+    async (text: string) => {
+      setError(null);
+      setSending({ text, attachments: [] });
+      stick.current = true;
+      try {
+        await api.sendToAgent(sessionId, text);
+      } catch (e) {
+        setSending(null);
+        setError(e instanceof ApiError ? e.message : 'Could not send.');
+        return false;
+      }
+      return true;
+    },
+    [sessionId],
   );
 
   // --- drag and drop anywhere on the chat pane (owner only)
@@ -259,6 +282,23 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
           blocked={att.uploading ? 'Waiting for uploads to finish…' : att.failed ? 'Remove the attachments that failed before sending.' : null}
         />
       )}
+      {canSteer && stageRole && (
+        <>
+          <div className="chat-steer-note muted" role="note">
+            Message this {stageRole} while it works: your message is queued and picked up at its next step (after its current tool
+            call). It is not posted on GitHub.
+          </div>
+          <Prompt
+            onSubmit={steer}
+            working={working}
+            sendWhileWorking
+            commands={false}
+            label={`Message the ${stageRole}`}
+            placeholder={`Tell the ${stageRole} something — queued for its next step`}
+            history={history}
+          />
+        </>
+      )}
       {canDrive && !ended && disabledReason && <div className="chat-disabled">{disabledReason}</div>}
       {canDrive && ended && <div className="chat-disabled">This session has {status}.</div>}
       <footer className="chat-footer">
@@ -271,6 +311,7 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
         {canDrive && !ended && !disabledReason && (
           <span className="cf-hints" aria-hidden>⏎ send · ⇧⏎ newline · esc interrupt · / commands · paste or drop files</span>
         )}
+        {canSteer && <span className="cf-hints" aria-hidden>⏎ send · ⇧⏎ newline · delivered at the agent’s next step</span>}
       </footer>
     </section>
   );

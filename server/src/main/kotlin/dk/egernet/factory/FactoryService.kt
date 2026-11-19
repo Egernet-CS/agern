@@ -4,6 +4,7 @@ import dk.egernet.factory.agent.AgentManager
 import dk.egernet.factory.db.RunRecord
 import dk.egernet.factory.db.RunStore
 import dk.egernet.factory.db.SessionRecord
+import dk.egernet.factory.db.SessionStore
 import dk.egernet.factory.db.SoftwareRequestStore
 import dk.egernet.factory.db.UserRecord
 import dk.egernet.factory.github.Access
@@ -26,6 +27,7 @@ class FactoryService(
     private val orchestrator: Orchestrator,
     private val agents: AgentManager,
     private val softwareRequests: SoftwareRequestStore,
+    private val sessions: SessionStore,
 ) {
     private val org get() = cfg.githubOrg
 
@@ -141,6 +143,52 @@ class FactoryService(
         return runs.toDto(orchestrator.cancel(user, runId))
     }
 
+    /**
+     * A message for a running pipeline agent, addressed by run + role (role omitted: the run's running spec-writer or
+     * builder) or by its session id. Visibility (404), then ownership (403, admins included), then role and liveness (409)
+     * are checked; [repo] (an MCP grant's repository) restricts the target to that project. [viaChatSession] is the
+     * forwarding chat session, if any.
+     */
+    suspend fun sendToAgent(
+        user: UserRecord, runId: UUID?, role: String?, sessionId: UUID?, text: String, viaChatSession: UUID?, repo: String? = null,
+    ): AgentMessageDto {
+        val target: SessionRecord = when {
+            sessionId != null -> {
+                val rec = sessions.get(sessionId)?.takeIf { it.repo == (repo ?: it.repo) && it.kind != "chat" }
+                    ?: throw notFound("Agent session not found")
+                if (!withContext(Dispatchers.IO) { access.canSee(user, rec.repo) }) throw notFound("Agent session not found")
+                rec
+            }
+            runId != null -> {
+                val run = visibleRun(user, runId)
+                if (repo != null && run.repo != repo) throw notFound("Run not found in this project")
+                if (run.ownerId != user.id) throw forbidden("Only the owner of this run can send messages to its agents")
+                if (role != null && role !in PIPELINE_ROLES) throw badRequest("Unknown role '$role'")
+                val stages = runs.stages(run.id)
+                val stage = if (role != null) {
+                    stages.filter { it.role == role }.maxByOrNull { it.round }
+                } else {
+                    stages.lastOrNull { it.status == "running" && it.role in STEERABLE_ROLES }
+                }
+                if (role != null && role !in STEERABLE_ROLES) {
+                    throw conflict(
+                        "The $role agent does not accept messages: reviewers and the approver answer in a fixed verdict format. " +
+                            "Only a running spec-writer or builder can be messaged.",
+                        "agent_does_not_accept_messages",
+                    )
+                }
+                val sid = stage?.sessionId ?: throw conflict(
+                    "No ${role ?: "spec-writer or builder"} agent is running in run ${run.id} (run status ${run.status}). " +
+                        "Messages can only be delivered to a running agent; to change finished work, start a new run.",
+                    "agent_not_running",
+                )
+                sessions.get(sid) ?: throw notFound("Agent session not found")
+            }
+            else -> throw badRequest("Give runId (and optionally role) or sessionId")
+        }
+        return agents.sendToStageAgent(user, target, text, viaChatSession)
+    }
+
     fun requestSoftware(user: UserRecord, repo: String, sessionId: UUID?, name: String, reason: String): SoftwareRequestDto {
         if (name.isBlank() || name.length > 200) throw badRequest("name is required (max 200 chars)")
         return softwareRequests.create(name.trim(), reason.take(4000), repo, user.username, sessionId)
@@ -203,6 +251,8 @@ class FactoryService(
             |  /factory approve [runId]   merge a run that waits for a human (owner only)
             |  /factory cancel <runId>    cancel a run (owner or admin)
             |  /factory help              this help
+            |To steer a running spec-writer or builder, select it on the run page and type below its transcript,
+            |or ask the chat agent to pass a message on (it uses the factory_send_to_agent tool).
         """.trimMargin()
     }
 }

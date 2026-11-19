@@ -32,7 +32,7 @@ class McpRegistry {
     companion object {
         val CHAT_TOOLS = setOf(
             "factory_list_issues", "factory_get_issue", "factory_create_issue", "factory_start_run", "factory_list_runs",
-            "factory_get_run", "factory_approve_run", "factory_cancel_run", "factory_request_software",
+            "factory_get_run", "factory_approve_run", "factory_cancel_run", "factory_send_to_agent", "factory_request_software",
         )
         val STAGE_TOOLS = setOf("factory_get_issue", "factory_request_software")
     }

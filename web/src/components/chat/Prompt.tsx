@@ -10,8 +10,15 @@ export const FACTORY_COMMANDS = [
 
 type Props = {
   onSubmit: (text: string) => Promise<boolean>;
-  onInterrupt: () => void;
+  /** Absent: no interrupt (messages to pipeline agents). */
+  onInterrupt?: () => void;
   working: boolean;
+  /** Sending is allowed while the agent works (messages to a pipeline agent are queued for its next step). */
+  sendWhileWorking?: boolean;
+  /** `/factory …` command suggestions (chat only). */
+  commands?: boolean;
+  placeholder?: string;
+  label?: string;
   history: string[];
   /** Chips of the attachments being composed, shown above the input. */
   attachments?: ReactNode;
@@ -23,7 +30,20 @@ type Props = {
   blocked?: string | null;
 };
 
-export function Prompt({ onSubmit, onInterrupt, working, history, attachments, onFiles, hasAttachments = false, blocked = null }: Props) {
+export function Prompt({
+  onSubmit,
+  onInterrupt,
+  working,
+  sendWhileWorking = false,
+  commands = true,
+  placeholder,
+  label = 'Message the agent',
+  history,
+  attachments,
+  onFiles,
+  hasAttachments = false,
+  blocked = null,
+}: Props) {
   const [value, setValue] = useState('');
   const [sel, setSel] = useState(0);
   const [dismissed, setDismissed] = useState(false);
@@ -33,10 +53,10 @@ export function Prompt({ onSubmit, onInterrupt, working, history, attachments, o
   const listId = useId();
 
   const suggestions = useMemo(() => {
-    if (dismissed || !value.startsWith('/') || value.includes('\n')) return [];
+    if (!commands || dismissed || !value.startsWith('/') || value.includes('\n')) return [];
     const v = value.toLowerCase();
     return FACTORY_COMMANDS.filter((c) => c.cmd.startsWith(v));
-  }, [value, dismissed]);
+  }, [value, dismissed, commands]);
   const open = suggestions.length > 0;
 
   useEffect(() => setSel(0), [suggestions.length]);
@@ -64,7 +84,7 @@ export function Prompt({ onSubmit, onInterrupt, working, history, attachments, o
   const canSend = (value.trim().length > 0 || hasAttachments) && !blocked;
   const submit = async () => {
     const text = value.trim();
-    if ((!text && !hasAttachments) || working || blocked) return;
+    if ((!text && !hasAttachments) || (working && !sendWhileWorking) || blocked) return;
     setValue('');
     setHistIdx(null);
     setDismissed(false);
@@ -113,7 +133,7 @@ export function Prompt({ onSubmit, onInterrupt, working, history, attachments, o
       void submit();
       return;
     }
-    if (e.key === 'Escape' && working) {
+    if (e.key === 'Escape' && working && onInterrupt) {
       e.preventDefault();
       onInterrupt();
       return;
@@ -170,8 +190,8 @@ export function Prompt({ onSubmit, onInterrupt, working, history, attachments, o
           rows={1}
           value={value}
           spellCheck={false}
-          placeholder={working ? 'Working — esc to interrupt' : 'Ask the agent, or /factory …'}
-          aria-label="Message the agent"
+          placeholder={placeholder ?? (working ? 'Working — esc to interrupt' : 'Ask the agent, or /factory …')}
+          aria-label={label}
           aria-autocomplete="list"
           aria-controls={open ? listId : undefined}
           aria-activedescendant={open ? `${listId}-${sel}` : undefined}
@@ -203,7 +223,7 @@ export function Prompt({ onSubmit, onInterrupt, working, history, attachments, o
             </button>
           </>
         )}
-        {working ? (
+        {working && onInterrupt ? (
           <button type="button" className="prompt-btn prompt-btn--stop" onClick={onInterrupt} aria-label="Interrupt (Esc)">
             ■
           </button>

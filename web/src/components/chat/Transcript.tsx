@@ -86,7 +86,14 @@ const TranscriptItem = memo(function TranscriptItem({ item, me, sessionId }: { i
             {item.text && <div className="t-user-text">{item.text}</div>}
             <MessageAttachments sessionId={sessionId} list={item.attachments} />
           </div>
-          {item.username && item.username !== me && <span className="t-user-name">{item.username}</span>}
+          {item.forwarded ? (
+            <span className={`t-user-fwd t-user-fwd--${item.forwarded.delivery}`}>
+              {item.username} · {item.forwarded.origin === 'chat' ? <>via chat <code>{item.forwarded.viaSessionId?.slice(0, 8) ?? '?'}</code></> : 'direct'} ·{' '}
+              {item.forwarded.delivery === 'queued' ? 'queued — delivered at the agent’s next step' : item.forwarded.delivery === 'delivered' ? 'delivered' : 'not delivered (the agent stopped first)'}
+            </span>
+          ) : (
+            item.username && item.username !== me && <span className="t-user-name">{item.username}</span>
+          )}
         </div>
       );
     }

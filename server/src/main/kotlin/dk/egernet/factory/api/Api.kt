@@ -466,6 +466,12 @@ private fun Route.sessionRoutes(s: Services) {
         val rec = visibleSession(s, u, uuidParam("id"))
         val req = call.receive<InputReq>()
         val ids = req.attachmentIds.map { runCatching { UUID.fromString(it) }.getOrNull() ?: throw badRequest("Invalid attachment id") }
+        if (rec.kind != "chat") {
+            // A message for a running pipeline agent (spec-writer / builder), from its owner directly.
+            if (rec.ownerId == u.id && ids.isNotEmpty()) throw unprocessable("Messages to pipeline agents are text only", "attachments_not_allowed")
+            call.respond(HttpStatusCode.Accepted, s.agents.sendToStageAgent(u, rec, req.text))
+            return@post
+        }
         s.agents.sendInput(u, rec, req.text, ids)
         call.respond(HttpStatusCode.Accepted, mapOf("status" to "accepted"))
     }
