@@ -352,7 +352,7 @@ export function ReleasePage() {
             <code>{release.branch ?? `release/${release.name}`}</code>.
           </p>
           <div className="dialog-actions">
-            <button type="button" className="btn btn--ghost" onClick={() => setConfirmCancel(false)} autoFocus>
+            <button type="button" className="btn btn--ghost" onClick={() => setConfirmCancel(false)} data-autofocus>
               Keep building
             </button>
             <button type="button" className="btn btn--danger" onClick={() => void doCancel()} disabled={busy}>
@@ -467,7 +467,7 @@ function StartReleaseDialog({
           </p>
         )}
         <div className="dialog-actions">
-          <button type="button" className="btn btn--ghost" onClick={onClose} autoFocus>
+          <button type="button" className="btn btn--ghost" onClick={onClose} data-autofocus>
             Cancel
           </button>
           <button type="button" className="btn btn--primary" onClick={() => void start()} disabled={busy}>

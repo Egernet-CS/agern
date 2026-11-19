@@ -159,7 +159,11 @@ export function Dialog({ open, onClose, title, children, wide }: { open: boolean
   useEffect(() => {
     const d = ref.current;
     if (!d) return;
-    if (open && !d.open) d.showModal();
+    if (open && !d.open) {
+      d.showModal();
+      // showModal focuses the first focusable element (✕); a child marked data-autofocus gets the focus instead.
+      d.querySelector<HTMLElement>('[data-autofocus]')?.focus();
+    }
     if (!open && d.open) d.close();
   }, [open]);
   return (
