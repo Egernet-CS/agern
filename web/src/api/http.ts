@@ -129,6 +129,10 @@ export const httpApi: Api = {
   assignIssues: (repo, issueNumbers, releaseId) => post(`/api/projects/${enc(repo)}/releases/assign`, { issueNumbers, releaseId }),
   reorderRelease: (id, issueNumbers) => put(`/api/releases/${enc(id)}/issues/order`, { issueNumbers }),
 
+  sandboxStatus: (repo) => get(`/api/projects/${enc(repo)}/sandbox`),
+  approveSandbox: (repo, sha256) => post(`/api/projects/${enc(repo)}/sandbox/approval`, { sha256 }),
+  revokeSandboxApproval: (repo) => del(`/api/projects/${enc(repo)}/sandbox/approval`),
+
   projectRuns: (repo) => get(`/api/projects/${enc(repo)}/runs`),
   startRun: (repo, issueNumber) => post(`/api/projects/${enc(repo)}/runs`, { issueNumber }),
   runs: (filter = {}) => {

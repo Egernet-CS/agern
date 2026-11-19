@@ -12,6 +12,10 @@ import type {
   Project,
   Release,
   Run,
+  RunSandbox,
+  SandboxApproval,
+  SandboxDefinition,
+  SandboxStatus,
   SessionKind,
   SessionStatus,
   Settings,
@@ -120,6 +124,10 @@ export const db = {
   runs: new Map<string, Run>(),
   /** Release plans (docs/ARCHITECTURE.md §6 "Releases"). */
   releases: new Map<string, Release>(),
+  /** `.agern/sandbox.yml` on each project's default branch (precomputed hash and validation; the mock parses no YAML). */
+  sandboxFiles: new Map<string, MockSandboxFile>(),
+  /** Admin approvals by content hash, one per project. */
+  sandboxApprovals: new Map<string, SandboxApproval>(),
   players: new Map<string, Player>(),
   settings: {
     agentsMayInstallSoftware: false,
@@ -672,6 +680,63 @@ function pipeline(r: Run, plan: Plan, owner: User, startMs: number) {
   spec();
 }
 
+// ---------------------------------------------------------------- sandboxes (docs/ARCHITECTURE.md §5 "Sandboxes")
+
+export type MockSandboxFile = { content: string; sha256: string; definition: SandboxDefinition | null; errors: string[] };
+
+export function sandboxStatus(repo: string, branch = 'main'): SandboxStatus {
+  const f = db.sandboxFiles.get(repo);
+  const approval = db.sandboxApprovals.get(repo) ?? null;
+  const base = { repo, enabled: true, path: '.agern/sandbox.yml', branch, approval };
+  if (!f) return { ...base, state: 'none', sha256: null, content: null, errors: [], definition: null };
+  const state = f.definition === null ? 'invalid' : approval?.sha256 === f.sha256 ? 'approved' : 'pending';
+  return { ...base, state, sha256: f.sha256, content: f.content, errors: f.errors, definition: f.definition };
+}
+
+export function approveSandbox(repo: string, sha256: string, by: User): SandboxStatus {
+  if (!by.isAdmin) throw new MockError(403, 'forbidden', 'Only an admin can approve a sandbox definition');
+  const f = db.sandboxFiles.get(repo);
+  if (!f) throw new MockError(404, 'not_found', `${repo} has no .agern/sandbox.yml on main`);
+  if (f.sha256 !== sha256.trim().toLowerCase()) {
+    throw new MockError(409, 'sandbox_definition_changed', `.agern/sandbox.yml on main has changed (it is now ${f.sha256}); review it again`);
+  }
+  if (!f.definition) throw new MockError(422, 'sandbox_definition_invalid', `The definition is invalid: ${f.errors.join('; ')}`);
+  db.sandboxApprovals.set(repo, { sha256: f.sha256, content: f.content, approvedBy: ownerOf(by), approvedAt: iso(Date.now()) });
+  return sandboxStatus(repo);
+}
+
+export function revokeSandboxApproval(repo: string, by: User): SandboxStatus {
+  if (!by.isAdmin) throw new MockError(403, 'forbidden', 'Only an admin can revoke a sandbox approval');
+  db.sandboxApprovals.delete(repo);
+  return sandboxStatus(repo);
+}
+
+/** What a run starting now decides, like the backend's RunSandbox. */
+function runSandboxFor(repo: string): RunSandbox {
+  const st = sandboxStatus(repo);
+  const short = st.sha256?.slice(0, 12);
+  switch (st.state) {
+    case 'none':
+      return { state: 'none', reason: 'The repository has no .agern/sandbox.yml on its default branch (origin/main).', sha256: null, image: null };
+    case 'invalid':
+      return { state: 'invalid', reason: `.agern/sandbox.yml on origin/main is invalid: ${st.errors.join('; ')}`, sha256: st.sha256, image: null };
+    case 'pending':
+      return {
+        state: 'unapproved',
+        reason: `.agern/sandbox.yml (${short}) is not approved: ${st.approval ? `it changed since an admin approved version ${st.approval.sha256.slice(0, 12)}` : 'no version of it has been approved by an admin'}. An admin can approve it in the project's sandbox settings.`,
+        sha256: st.sha256,
+        image: st.definition?.image ?? null,
+      };
+    case 'approved':
+      return {
+        state: 'approved',
+        reason: `Sandbox definition ${short} approved by ${st.approval!.approvedBy.username}; image ${st.definition!.image}. It is created on the builder's first sandbox command.`,
+        sha256: st.sha256,
+        image: st.definition!.image,
+      };
+  }
+}
+
 function makeRun(repo: string, issue: Issue, owner: User, createdMs: number, startedBy: string | null): Run {
   const slug = issue.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 30);
   const r: Run = {
@@ -693,6 +758,7 @@ function makeRun(repo: string, issue: Issue, owner: User, createdMs: number, sta
     updatedAt: iso(createdMs),
     endedAt: null,
     stages: [],
+    sandbox: runSandboxFor(repo),
   };
   for (const role of ['spec-writer', 'builder', ...reviewers, 'approver'] as StageRole[]) pendingStage(r, role, 0);
   db.runs.set(r.id, r);
@@ -890,6 +956,52 @@ function seed() {
     proj('data-pipeline', 'Nightly ETL into the warehouse', 'Python', 2, 60 * 24 * 6),
     proj('infra', 'Terraform for the hosting environment', 'HCL', 0, 60 * 24 * 19),
   ];
+  // Sandbox definitions: web-shop's is approved, billing-service's changed since its approval, design-system's is invalid.
+  const webShopSandbox = 'image: docker.io/library/eclipse-temurin:21-jdk\nsetup: |\n  apt-get update && apt-get install -y nodejs npm\nservices:\n  postgres:\n    image: docker.io/library/postgres:17\n    env: { POSTGRES_PASSWORD: dev }\ncaches: [ /root/.gradle, /root/.npm ]\nresources: { cpus: 2, memory: 4g }\n';
+  db.sandboxFiles.set('web-shop', {
+    content: webShopSandbox,
+    sha256: '3f6c1d0e9a8b7c6d5e4f30211a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d',
+    definition: {
+      image: 'docker.io/library/eclipse-temurin:21-jdk',
+      setup: 'apt-get update && apt-get install -y nodejs npm\n',
+      env: {},
+      services: [{ name: 'postgres', image: 'docker.io/library/postgres:17', env: { POSTGRES_PASSWORD: 'dev' } }],
+      caches: ['/root/.gradle', '/root/.npm'],
+      limits: { cpus: 2, memory: '4g', requestedCpus: 2, requestedMemory: '4g', capped: false },
+    },
+    errors: [],
+  });
+  db.sandboxApprovals.set('web-shop', { sha256: '3f6c1d0e9a8b7c6d5e4f30211a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d', content: webShopSandbox, approvedBy: ownerOf(alice), approvedAt: ago(60 * 24 * 3) });
+  const billingSandbox = 'image: docker.io/library/eclipse-temurin:21-jdk\nresources: { cpus: 8, memory: 16g }\n';
+  db.sandboxFiles.set('billing-service', {
+    content: billingSandbox,
+    sha256: 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+    definition: {
+      image: 'docker.io/library/eclipse-temurin:21-jdk',
+      setup: null,
+      env: {},
+      services: [],
+      caches: [],
+      limits: { cpus: 2, memory: '4g', requestedCpus: 8, requestedMemory: '16g', capped: true },
+    },
+    errors: [],
+  });
+  db.sandboxApprovals.set('billing-service', {
+    sha256: '0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0',
+    content: 'image: docker.io/library/eclipse-temurin:17-jdk\n',
+    approvedBy: ownerOf(alice),
+    approvedAt: ago(60 * 24 * 9),
+  });
+  db.sandboxFiles.set('design-system', {
+    content: 'image: node:22\nprivileged: true\n',
+    sha256: '9e8d7c6b5a4f30211e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a697887',
+    definition: null,
+    errors: [
+      "image: 'node:22' is not fully qualified; name the registry, e.g. docker.io/library/node:22",
+      'privileged: unknown key (allowed here: image, setup, env, services, caches, resources)',
+    ],
+  });
+
   db.issues['web-shop'] = [
     issue('web-shop', 42, 'feature', 'Saved carts for signed-in users', 'alice', 3),
     issue('web-shop', 38, 'feature', 'Gift cards at checkout', 'bob', 8),

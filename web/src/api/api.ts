@@ -15,6 +15,7 @@ import type {
   Release,
   Run,
   RunStatus,
+  SandboxStatus,
   Settings,
   SoftwareRequest,
   User,
@@ -70,6 +71,16 @@ export interface Api {
   assignIssues(repo: string, issueNumbers: number[], releaseId: string | null): Promise<Release[]>;
   /** The new complete order; 409 `release_issues_changed` when it is not exactly the release's current issues. */
   reorderRelease(id: string, issueNumbers: number[]): Promise<Release>;
+
+  /** The project's `.agern/sandbox.yml` on its default branch and its approval (anyone who can see the project). */
+  sandboxStatus(repo: string): Promise<SandboxStatus>;
+  /**
+   * Admin: approves exactly the content with this hash. 409 `sandbox_definition_changed` when the file changed meanwhile,
+   * 422 `sandbox_definition_invalid`, 404 when there is no file, 403 for non-admins.
+   */
+  approveSandbox(repo: string, sha256: string): Promise<SandboxStatus>;
+  /** Admin: removes the project's approval (runs already started keep their decision). */
+  revokeSandboxApproval(repo: string): Promise<SandboxStatus>;
 
   projectRuns(repo: string): Promise<Run[]>;
   startRun(repo: string, issueNumber: number): Promise<Run>;
