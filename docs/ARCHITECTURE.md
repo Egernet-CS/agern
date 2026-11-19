@@ -291,9 +291,9 @@ run its bearer token belongs to, so an agent can never reach another run's sandb
 
 **Lifecycle.** One sandbox per run, created lazily by the builder's first `factory_sandbox_exec` and
 shared by all builder rounds of the run. Creation, in order: a private network `agern-run-<runId>`; one
-container per service, `agern-run-<runId>-<service>`, with the service name as its network alias; the
-services' readiness checks (below); one named volume per cache, `agern-cache-<repo>-<first 12 hex of
-SHA-256(path)>` (kept across runs, per project); the sandbox container `agern-run-<runId>`; with `user`,
+container per service, `agern-run-<runId>-<service>`, with the service name as its network alias; one
+named volume per cache, `agern-cache-<repo>-<first 12 hex of SHA-256(path)>` (kept across runs, per
+project); the sandbox container `agern-run-<runId>`; the services' readiness checks (below); with `user`,
 the account is prepared (below); then the `setup` script (`sh -lc`, as root, time limit as for commands).
 A failed creation, readiness check or setup removes what was created and frees the slot; the tool answers
 with the error (and the setup output's tail), and a later call tries again. Everything carries the labels
