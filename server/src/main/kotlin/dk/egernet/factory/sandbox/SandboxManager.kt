@@ -144,9 +144,6 @@ class SandboxManager(
         return info
     }
 
-    /** The run's decision, for the builder's transcript and prompt; null when sandboxes are off. */
-    fun decision(runId: UUID): RunSandboxDto? = if (!enabled) null else sandboxes[runId]?.info
-
     // ------------------------------------------------------------------ tools
 
     private val execCapMs: Long get() = minOf(sc.execTimeoutMs, cfg.stageTimeoutMs)
@@ -405,7 +402,7 @@ class SandboxManager(
     )
 
     companion object {
-        // ------------------------------------------------------------------ names and specs (deterministic per run)
+        // Names and specs, deterministic per run (so cleanup never depends on in-memory state).
 
         fun containerName(runId: UUID) = "agern-run-$runId"
         fun networkName(runId: UUID) = "agern-run-$runId"
