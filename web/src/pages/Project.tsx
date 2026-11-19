@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { api, ApiError, isRunWorking, isSessionActive, type AgentSession, type Issue, type IssueKind, type Run } from '../api';
 import { ChatView } from '../components/chat/ChatView';
@@ -7,7 +7,7 @@ import { Dialog, Empty, ErrorBox, KindBadge, Loading, Notice, RoleBadge, RunStat
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
 import { modelLabel, timeAgo } from '../lib/format';
-import { useLiveRuns, useLiveSessions } from '../lib/realtime';
+import { useFeedReconnects, useIssueFeed, useLiveRuns, useLiveSessions } from '../lib/realtime';
 import { useNow } from '../lib/useNow';
 
 type Tab = 'chat' | 'issues' | 'activity';
@@ -17,7 +17,12 @@ export function ProjectPage() {
   const me = useMe();
   const [params, setParams] = useSearchParams();
   const [tab, setTab] = useState<Tab>('chat');
-  const project = useAsync(() => api.project(repo), [repo]);
+  const reconnects = useFeedReconnects();
+  const project = useAsync(() => api.project(repo), [repo, reconnects]);
+  // Every creator gets the frame too, so this is the only place the counter moves.
+  useIssueFeed(repo, (i) => {
+    if (i.state === 'open') project.setData((p) => p && { ...p, openIssues: p.openIssues + 1 });
+  });
   const sessionsBase = useAsync(() => api.projectSessions(repo), [repo]);
   const runsBase = useAsync(() => api.projectRuns(repo), [repo]);
   const sessions = useLiveSessions(sessionsBase.data, (s) => s.repo === repo);
@@ -167,6 +172,9 @@ function ChatPanel({ repo, current, chats, onSelect, onCreated }: { repo: string
 
 const KINDS: ('all' | IssueKind)[] = ['all', 'feature', 'bug', 'task'];
 
+/** Prepends `i` unless an issue with that number is already listed (dialog insert and feed frame race). */
+const addIssue = (list: Issue[], i: Issue) => (list.some((x) => x.number === i.number) ? list : [i, ...list]);
+
 function IssuesPanel({ repo }: { repo: string }) {
   const me = useMe();
   const nav = useNavigate();
@@ -175,7 +183,29 @@ function IssuesPanel({ repo }: { repo: string }) {
   const [creating, setCreating] = useState(false);
   const [starting, setStarting] = useState<number | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const issues = useAsync(() => api.issues(repo, state), [repo, state]);
+  const reconnects = useFeedReconnects();
+  const issues = useAsync(() => api.issues(repo, state), [repo, state, reconnects]);
+
+  // Issues created through Agern arrive on the feed. Frames that arrive mid-load are held back and merged once the
+  // load has delivered, so the fresh list does not overwrite them.
+  const pending = useRef<Issue[]>([]);
+  const merge = (i: Issue) => {
+    if (i.state === state) issues.setData((d) => d && addIssue(d, i));
+  };
+  useIssueFeed(repo, (i) => {
+    if (issues.loading) pending.current.push(i);
+    else merge(i);
+  });
+  useEffect(() => {
+    pending.current = [];
+  }, [repo]);
+  useEffect(() => {
+    if (issues.loading || !pending.current.length) return;
+    const batch = pending.current;
+    pending.current = [];
+    batch.forEach(merge);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [issues.data, issues.loading]);
   const list = (issues.data ?? []).filter((i) => kind === 'all' || i.kind === kind);
   const counts = useMemo(() => {
     const c = { all: 0, feature: 0, bug: 0, task: 0 } as Record<string, number>;
@@ -255,7 +285,7 @@ function IssuesPanel({ repo }: { repo: string }) {
         ))}
       </ul>
       {!me.hasClaudeCredential && <p className="muted small pad">Starting runs needs your Claude credential. <Link to="/settings#claude">Settings</Link></p>}
-      <NewIssueDialog repo={repo} open={creating} onClose={() => setCreating(false)} onCreated={(i) => issues.setData((d) => [i, ...(d ?? [])])} />
+      <NewIssueDialog repo={repo} open={creating} onClose={() => setCreating(false)} onCreated={(i) => issues.setData((d) => addIssue(d ?? [], i))} />
     </>
   );
 }

@@ -1,5 +1,5 @@
 import { createContext, createElement, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { api, type AgentSession, type Channel, type FactoryEvent, type Run } from '../api';
+import { api, type AgentSession, type Channel, type FactoryEvent, type Issue, type Run } from '../api';
 
 export type ConnState = 'connecting' | 'live' | 'reconnecting';
 
@@ -111,17 +111,40 @@ export function useSessionStream(sessionId: string | null): SessionStream {
 
 // ---------------------------------------------------------------- global feed
 
+type IssueListener = (repo: string, issue: Issue) => void;
+
 type FeedState = {
   sessions: Map<string, AgentSession>;
   runs: Map<string, Run>;
   version: number;
   conn: ConnState;
+  /** Increments each time the feed is re-established after a drop (not on the first open). The feed has no replay, so lists derived from it should reload when this changes. */
+  reconnects: number;
+  /** Registers a listener for `issue` frames; returns the unsubscribe function. Stable identity. */
+  subscribeIssues: (fn: IssueListener) => () => void;
 };
 
-const FeedContext = createContext<FeedState>({ sessions: new Map(), runs: new Map(), version: 0, conn: 'connecting' });
+const FeedContext = createContext<FeedState>({
+  sessions: new Map(),
+  runs: new Map(),
+  version: 0,
+  conn: 'connecting',
+  reconnects: 0,
+  subscribeIssues: () => () => {},
+});
 
 export function FeedProvider({ enabled, children }: { enabled: boolean; children: ReactNode }) {
   const store = useRef({ sessions: new Map<string, AgentSession>(), runs: new Map<string, Run>() });
+  // Issue frames are events, not state: issues can change on GitHub without a frame, so a stored copy would go stale.
+  const issueListeners = useRef(new Set<IssueListener>());
+  const subscribeIssues = useCallback((fn: IssueListener) => {
+    issueListeners.current.add(fn);
+    return () => {
+      issueListeners.current.delete(fn);
+    };
+  }, []);
+  const opened = useRef(false);
+  const [reconnects, setReconnects] = useState(0);
   const [version, setVersion] = useState(0);
   const raf = useRef<number | null>(null);
   const bump = () => {
@@ -135,7 +158,16 @@ export function FeedProvider({ enabled, children }: { enabled: boolean; children
     (h) =>
       api.openFeed({
         ...h,
+        onOpen: () => {
+          h.onOpen();
+          if (opened.current) setReconnects((n) => n + 1);
+          opened.current = true;
+        },
         onFrame: (f) => {
+          if (f.type === 'issue') {
+            for (const fn of issueListeners.current) fn(f.repo, f.issue);
+            return;
+          }
           if (f.type === 'session') store.current.sessions.set(f.session.id, f.session);
           else if (f.type === 'run') store.current.runs.set(f.run.id, f.run);
           bump();
@@ -144,13 +176,30 @@ export function FeedProvider({ enabled, children }: { enabled: boolean; children
     enabled ? 'feed' : null,
   );
   const value = useMemo(
-    () => ({ sessions: store.current.sessions, runs: store.current.runs, version, conn }),
-    [version, conn],
+    () => ({ sessions: store.current.sessions, runs: store.current.runs, version, conn, reconnects, subscribeIssues }),
+    [version, conn, reconnects, subscribeIssues],
   );
   return createElement(FeedContext.Provider, { value }, children);
 }
 
 export const useFeed = () => useContext(FeedContext);
+
+/** Number of feed reconnects so far; use it as a reload dependency for data the feed keeps live. */
+export const useFeedReconnects = () => useContext(FeedContext).reconnects;
+
+/** Calls `onIssue` for every issue created through Agern in `repo` while mounted. The latest callback is always used. */
+export function useIssueFeed(repo: string, onIssue: (issue: Issue) => void) {
+  const { subscribeIssues } = useFeed();
+  const cb = useRef(onIssue);
+  cb.current = onIssue;
+  useEffect(
+    () =>
+      subscribeIssues((r, issue) => {
+        if (r === repo) cb.current(issue);
+      }),
+    [repo, subscribeIssues],
+  );
+}
 
 /** The feed version wins unless the fetched one is strictly newer (the server bumps updatedAt on every change, stages included). */
 const newer = <T extends { updatedAt: string }>(a: T, b: T | undefined) => (b && b.updatedAt >= a.updatedAt ? b : a);

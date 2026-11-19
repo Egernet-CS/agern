@@ -622,6 +622,7 @@ private fun Route.wsRoutes(s: Services) {
                 val frame = when (item) {
                     is FeedItem.Session -> FeedFrame(type = "session", session = item.session)
                     is FeedItem.Run -> FeedFrame(type = "run", run = item.run)
+                    is FeedItem.Issue -> FeedFrame(type = "issue", repo = item.repo, issue = item.issue)
                 }
                 send(Frame.Text(AppJson.encodeToString(FeedFrame.serializer(), frame)))
             }

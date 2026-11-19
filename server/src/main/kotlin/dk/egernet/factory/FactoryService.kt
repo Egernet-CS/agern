@@ -1,6 +1,8 @@
 package dk.egernet.factory
 
 import dk.egernet.factory.agent.AgentManager
+import dk.egernet.factory.agent.EventBus
+import dk.egernet.factory.agent.FeedItem
 import dk.egernet.factory.db.RunRecord
 import dk.egernet.factory.db.RunStore
 import dk.egernet.factory.db.SessionRecord
@@ -28,6 +30,7 @@ class FactoryService(
     private val agents: AgentManager,
     private val softwareRequests: SoftwareRequestStore,
     private val sessions: SessionStore,
+    private val bus: EventBus,
 ) {
     private val org get() = cfg.githubOrg
 
@@ -114,7 +117,11 @@ class FactoryService(
         withContext(Dispatchers.IO) { access.requireVisible(user, repo) }
         val client = access.requireClient(user)
         val i = gh { client.createIssue(org, repo, title.trim(), body, labels) }
-        return issueDto(repo, i, true, null)
+        val dto = issueDto(repo, i, true, null)
+        // Fresh openIssues on the next project fetch, then announce it to everyone who can see the repo.
+        access.forgetRepo(repo)
+        bus.emitFeed(FeedItem.Issue(repo, dto.copy(body = null)))
+        return dto
     }
 
     suspend fun startRun(user: UserRecord, repo: String, issueNumber: Int, startedBySession: UUID?): RunDto =

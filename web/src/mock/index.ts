@@ -3,6 +3,7 @@
 import { ApiError, type Api, type Channel } from '../api/api';
 import { isRunActive, isSessionActive, type AgentSession, type Attachment, type ClientConfig, type Issue, type LoginStep, type Preferences, type Run, type StageRole, type User } from '../api/types';
 import {
+  announceIssue,
   effective,
   approveRun,
   cancelRun,
@@ -260,6 +261,7 @@ export const mockApi: Api = {
       const now = new Date().toISOString();
       const i: Issue = { number, title: body.title, state: 'open', kind: body.kind, labels: [label], author: me().githubLogin ?? me().username, assignees: [], comments: 0, createdAt: now, updatedAt: now, htmlUrl: `https://github.com/${ORG}/${repo}/issues/${number}`, body: body.body, activeRunId: null };
       list.unshift(i);
+      announceIssue(repo, i);
       return i;
     }),
 

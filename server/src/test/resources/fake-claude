@@ -17,6 +17,8 @@ Behaviour
     - text containing "long"  -> replies with 80 numbered lines (a transcript taller than the screen)
     - "forward <runId> <role>: <message>" -> passes <message> to that run's agent through the MCP tool
                                  factory_send_to_agent and reports the tool's answer
+    - "file issue: <title>" -> creates a bug issue with that title through the MCP tool
+                                 factory_create_issue and reports the tool's answer
     - content blocks: image blocks are decoded and reported ("IMAGE 1: image/png 32x32, 70 bytes"); the
       "[Attachments]" text block's paths are checked on disk ("FILE ok name 123 bytes" / "FILE missing ...").
       Trigger words are only looked for in the user's own text, not in that listing.
@@ -299,6 +301,19 @@ def chat_mode():
                     "runId": forward.group(1), "role": forward.group(2), "message": forward.group(3).strip()}}, 2)
                 text = res["result"]["content"][0]["text"]
                 reply = ("Could not forward it: " if res["result"].get("isError") else "Forwarded. ") + text
+            except Exception as e:  # noqa
+                reply = "MCP call failed: %s" % e
+            stream_text(reply)
+            result(reply)
+            continue
+        file_issue = re.match(r"\s*file issue:\s*(.+)$", content, re.S)
+        if file_issue and mcp_config:
+            try:
+                mcp_call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake-claude", "version": "0"}}, 1)
+                res = mcp_call("tools/call", {"name": "factory_create_issue", "arguments": {
+                    "title": file_issue.group(1).strip(), "body": "Filed by fake-claude", "kind": "bug"}}, 2)
+                text = res["result"]["content"][0]["text"]
+                reply = ("Could not file it: " if res["result"].get("isError") else "") + text
             except Exception as e:  # noqa
                 reply = "MCP call failed: %s" % e
             stream_text(reply)

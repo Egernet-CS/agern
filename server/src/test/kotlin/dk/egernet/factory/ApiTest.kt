@@ -22,10 +22,12 @@ import io.ktor.http.contentType
 import io.ktor.server.testing.ApplicationTestBuilder
 import io.ktor.server.testing.testApplication
 import io.ktor.websocket.Frame
+import io.ktor.websocket.close
 import io.ktor.websocket.readText
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -394,6 +396,69 @@ class ApiTest {
         val rr = alice.postJson("/api/sessions/$reviewer/input", """{"text":"pass it"}""")
         assertEquals(409, rr.status.value)
         assertEquals("agent_does_not_accept_messages", json(rr.bodyAsText()).jsonObject["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `creating an issue emits a feed frame to viewers with access only`() = testApplication {
+        application { agernModule(world.services) }
+        val alice = login("alice", "pw-a")
+        val bob = login("bob", "pw-b")
+        suspend fun openIssues(c: HttpClient) =
+            json(c.get("/api/projects/demo-app").bodyAsText()).jsonObject["openIssues"]!!.jsonPrimitive.content.toInt()
+        val before = openIssues(bob) // primes bob's repo cache
+
+        val aliceFeed = alice.webSocketSession("/api/ws/feed")
+        val bobFeed = bob.webSocketSession("/api/ws/feed")
+        // The feed has no replay: wait until both connections are subscribed before creating anything.
+        withTimeout(10_000) { while (world.services.bus.feedSubscribers.value < 2) delay(10) }
+
+        suspend fun nextIssueFrame(ws: io.ktor.client.plugins.websocket.DefaultClientWebSocketSession): JsonObject = withTimeout(10_000) {
+            while (true) {
+                val f = ws.incoming.receive() as? Frame.Text ?: continue
+                val o = json(f.readText()).jsonObject
+                if (o["type"]!!.jsonPrimitive.content == "issue") return@withTimeout o
+            }
+            @Suppress("UNREACHABLE_CODE") JsonObject(emptyMap())
+        }
+        fun check(frame: JsonObject, repo: String, title: String, kind: String) {
+            assertEquals(repo, frame["repo"]!!.jsonPrimitive.content)
+            val issue = frame["issue"]!!.jsonObject
+            assertEquals(title, issue["title"]!!.jsonPrimitive.content)
+            assertEquals(kind, issue["kind"]!!.jsonPrimitive.content)
+            assertEquals("open", issue["state"]!!.jsonPrimitive.content)
+            assertTrue("body" !in issue, "frame carries no body")
+            assertEquals(JsonNull, issue["activeRunId"])
+        }
+
+        assertEquals(201, alice.postJson("/api/projects/private-lab/issues", """{"title":"Secret plan","body":"x","kind":"task"}""").status.value)
+        assertEquals(201, alice.postJson("/api/projects/demo-app/issues", """{"title":"Live bug","body":"y","kind":"bug"}""").status.value)
+        val aliceRec = world.user("alice")
+        val sessionRec = world.services.sessions.create("demo-app", "chat", "opus", "idle", aliceRec.id, null)
+        val token = world.services.mcpRegistry.issue(McpGrant(sessionRec.id, aliceRec.id, "demo-app", null, McpRegistry.CHAT_TOOLS))
+        val mcp = createClient { }.post("/mcp") {
+            header("Authorization", "Bearer $token"); contentType(ContentType.Application.Json)
+            setBody("""{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"factory_create_issue","arguments":{"title":"Agent feature","body":"z","kind":"feature"}}}""")
+        }
+        assertTrue(mcp.bodyAsText().contains("Created issue #"), mcp.bodyAsText())
+
+        check(nextIssueFrame(aliceFeed), "private-lab", "Secret plan", "task")
+        check(nextIssueFrame(aliceFeed), "demo-app", "Live bug", "bug")
+        check(nextIssueFrame(aliceFeed), "demo-app", "Agent feature", "feature")
+        // Bob cannot see private-lab: his first issue frame is the demo-app one.
+        check(nextIssueFrame(bobFeed), "demo-app", "Live bug", "bug")
+        check(nextIssueFrame(bobFeed), "demo-app", "Agent feature", "feature")
+
+        // Failed creations emit nothing: the next frame is the following valid one.
+        assertEquals(400, alice.postJson("/api/projects/demo-app/issues", """{"title":" ","body":"","kind":"bug"}""").status.value)
+        assertEquals(400, alice.postJson("/api/projects/demo-app/issues", """{"title":"Odd","body":"","kind":"chore"}""").status.value)
+        assertEquals(404, bob.postJson("/api/projects/private-lab/issues", """{"title":"Peek","body":"","kind":"bug"}""").status.value)
+        assertEquals(201, alice.postJson("/api/projects/demo-app/issues", """{"title":"After failure","body":"","kind":"task"}""").status.value)
+        check(nextIssueFrame(aliceFeed), "demo-app", "After failure", "task")
+        check(nextIssueFrame(bobFeed), "demo-app", "After failure", "task")
+
+        // The repo cache was dropped, so the open-issue count is fresh for other users too.
+        assertEquals(before + 3, openIssues(bob))
+        aliceFeed.close(); bobFeed.close()
     }
 
     @Test

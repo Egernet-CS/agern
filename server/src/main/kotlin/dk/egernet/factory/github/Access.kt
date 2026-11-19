@@ -45,6 +45,11 @@ class Access(
         cache.keys.removeIf { it.first == userId }
     }
 
+    /** Drops the cached entries of [repo] for all users, e.g. after its open-issue count changed. */
+    fun forgetRepo(repo: String) {
+        cache.keys.removeIf { it.second == repo }
+    }
+
     /** The repository as seen with the user's token, or null if they cannot read it. */
     fun visibleRepo(u: UserRecord, repo: String): GhRepo? {
         val key = u.id to repo
