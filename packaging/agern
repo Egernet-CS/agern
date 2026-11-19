@@ -9,6 +9,7 @@
 #   agern doctor                        check the host
 #   agern setup-db [--db N] [--user N]  create the PostgreSQL role and database (local, root)
 #   agern auto-upgrade on|off|status    automatic upgrades when idle (.deb installs, root)
+#   agern sandbox enable|disable|status|prune|selftest   build/test sandboxes in rootless Podman (.deb)
 #   agern run                           run the server in the foreground (used by the service)
 #
 # upgrade options: [VERSION | --version VERSION] [--force]; on .deb installs also
@@ -115,7 +116,9 @@ LAUNCHD_PLIST="/Library/LaunchDaemons/$LAUNCHD_LABEL.plist"
 KNOWN_KEYS=" FACTORY_HOST FACTORY_PORT FACTORY_DB_URL FACTORY_DB_USER FACTORY_DB_PASSWORD FACTORY_MASTER_KEY"
 KNOWN_KEYS="$KNOWN_KEYS FACTORY_GITHUB_ORG FACTORY_AUTH FACTORY_2FA FACTORY_ADMINS FACTORY_DEV_FAKE_GITHUB"
 KNOWN_KEYS="$KNOWN_KEYS FACTORY_DATA_DIR FACTORY_CLAUDE_BIN FACTORY_AGENT_PATH FACTORY_PUBLIC_URL"
-KNOWN_KEYS="$KNOWN_KEYS AGERN_JAVA AGERN_JAVA_OPTS JAVA_HOME AGERN_UPGRADE_CHANNEL AGERN_UPGRADE_MAX_WAIT_HOURS "
+KNOWN_KEYS="$KNOWN_KEYS AGERN_JAVA AGERN_JAVA_OPTS JAVA_HOME AGERN_UPGRADE_CHANNEL AGERN_UPGRADE_MAX_WAIT_HOURS"
+KNOWN_KEYS="$KNOWN_KEYS FACTORY_SANDBOX FACTORY_SANDBOX_PODMAN_URL FACTORY_SANDBOX_CGROUP_PARENT FACTORY_SANDBOX_REGISTRIES"
+KNOWN_KEYS="$KNOWN_KEYS AGERN_SANDBOX_PRUNE_HOURS AGERN_SANDBOX_TEST_IMAGE "
 
 # Is FILE safe for root to parse: owned by root and not writable by group or others?
 root_owned_file() {
@@ -1108,6 +1111,547 @@ cmd_setup_db() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# sandboxes (.deb installs): per-run build/test containers in rootless Podman
+#
+# agern-sandbox.socket + agern-sandbox.service run 'podman system service' as the agern user in a
+# unit of their own (agern.service keeps NoNewPrivileges and its empty capability bounding set,
+# under which rootless Podman cannot start: newuidmap/newgidmap need their file capabilities).
+# The server talks to it at SANDBOX_URL (podman --url). Off until 'agern sandbox enable'.
+# Everything that talks to Podman runs as the agern user (as_agern), never as root.
+
+SANDBOX_SOCKET_PATH=/run/agern-podman/podman.sock
+SANDBOX_URL="unix://$SANDBOX_SOCKET_PATH"
+SANDBOX_SOCKET_UNIT=agern-sandbox.socket
+SANDBOX_UNIT=agern-sandbox.service
+SANDBOX_PRUNE_TIMER=agern-sandbox-prune.timer
+SANDBOX_STORAGE="$AGERN_DATA_DIR/containers"
+SANDBOX_CGROUP_DEFAULT=/system.slice/agern-sandbox.service
+SANDBOX_SUBID_COUNT=65536
+SANDBOX_PODMAN_MIN=4.3
+SANDBOX_TEST_IMAGE_DEFAULT=docker.io/library/busybox:1.36.1
+SANDBOX_REGISTRIES_DEFAULT=docker.io,ghcr.io,quay.io,mcr.microsoft.com
+
+pkg_installed() { case $(dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null) in ii*) return 0 ;; esac; return 1; }
+
+# Runs a command as the service user with a minimal environment: root through runuser, the agern
+# user itself directly; anybody else cannot (status 126).
+as_agern() {
+    local envs=("HOME=$AGERN_DATA_DIR" "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" "LANG=C.UTF-8")
+    if [ "$(id -un)" = "$AGERN_USER" ]; then
+        (cd / && env -i "${envs[@]}" "$@")
+    elif is_root; then
+        (cd / && runuser -u "$AGERN_USER" -- env -i "${envs[@]}" "$@")
+    else
+        return 126
+    fi
+}
+can_reach_sandbox() { is_root || [ "$(id -un)" = "$AGERN_USER" ]; }
+# podman as the agern user, through the sandbox socket.
+spodman() { as_agern podman --url "$SANDBOX_URL" "$@"; }
+
+sandbox_podman_version() { # the installed podman's version, or nothing
+    local p
+    p=$(command -v podman 2>/dev/null) || return 0
+    root_may_exec "$p" || return 0
+    "$p" --version 2>/dev/null | awk '{print $NF; exit}'
+}
+
+# Packages rootless Podman needs here (names as on Debian 12/13 and Ubuntu 24.04). Podman 4 sets up
+# the rootless network namespace with slirp4netns, Podman 5 with pasta (package passt).
+sandbox_missing_packages() {
+    local p missing="" pv
+    for p in podman uidmap netavark aardvark-dns crun; do
+        pkg_installed "$p" || missing="$missing $p"
+    done
+    pv=$(sandbox_podman_version)
+    if [ -z "$pv" ] || dpkg --compare-versions "$pv" lt 5; then pkg_installed slirp4netns || missing="$missing slirp4netns"; fi
+    if [ -z "$pv" ] || dpkg --compare-versions "$pv" ge 5; then pkg_installed passt || missing="$missing passt"; fi
+    printf '%s\n' "${missing# }"
+}
+
+# subid_range FILE — "start count" of the agern user's first range of at least SANDBOX_SUBID_COUNT
+# ids in FILE (entries by name or by uid), or nothing.
+subid_range() {
+    local f=$1 uid
+    [ -r "$f" ] || return 0
+    uid=$(id -u "$AGERN_USER" 2>/dev/null || echo none)
+    awk -F: -v u="$AGERN_USER" -v id="$uid" -v n="$SANDBOX_SUBID_COUNT" \
+        '($1 == u || $1 == id) && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $3 + 0 >= n + 0 { print $2, $3; exit }' "$f"
+}
+
+# subid_free — the first block start (100000 + k*65536, as useradd counts) that overlaps no range in
+# /etc/subuid or /etc/subgid and no uid or gid the name service lists (a subordinate range must
+# never map onto a real account: container files would belong to it).
+subid_free() {
+    {
+        cat /etc/subuid /etc/subgid 2>/dev/null || true
+        getent passwd 2>/dev/null | awk -F: '{ print "u:" $3 ":1" }' || true
+        getent group 2>/dev/null | awk -F: '{ print "g:" $3 ":1" }' || true
+    } | awk -F: -v n="$SANDBOX_SUBID_COUNT" '
+        NF >= 3 && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ { k++; s[k] = $2 + 0; e[k] = $2 + $3 }
+        END {
+            for (start = 100000; start + n <= 4294967294; start += 65536) {
+                free = 1
+                for (i = 1; i <= k; i++) if (start < e[i] && s[i] < start + n) { free = 0; break }
+                if (free) { printf "%.0f\n", start; exit }
+            }
+        }'
+}
+
+# Makes sure the agern user has subordinate uid and gid ranges; adds the missing ones with usermod
+# (which locks and edits /etc/subuid and /etc/subgid). Sets SUBIDS_CHANGED=1 when it added one.
+SUBIDS_CHANGED=0
+sandbox_ensure_subids() {
+    local u g start end args=()
+    u=$(subid_range /etc/subuid)
+    g=$(subid_range /etc/subgid)
+    if [ -n "$u" ] && [ -n "$g" ]; then
+        info "subordinate ids of $AGERN_USER: uids ${u% *}+${u#* }, gids ${g% *}+${g#* } (kept)"
+        return 0
+    fi
+    command -v usermod >/dev/null 2>&1 || die "usermod not found (package passwd)"
+    [ -e /etc/subuid ] || install -m 0644 -o root -g root /dev/null /etc/subuid
+    [ -e /etc/subgid ] || install -m 0644 -o root -g root /dev/null /etc/subgid
+    start=$(subid_free)
+    [ -n "$start" ] || die "no free block of $SANDBOX_SUBID_COUNT subordinate ids found"
+    end=$((start + SANDBOX_SUBID_COUNT - 1))
+    [ -z "$u" ] && args+=(--add-subuids "$start-$end")
+    [ -z "$g" ] && args+=(--add-subgids "$start-$end")
+    usermod "${args[@]}" "$AGERN_USER" || die "usermod ${args[*]} $AGERN_USER failed"
+    SUBIDS_CHANGED=1
+    info "allocated subordinate ids $start-$end to $AGERN_USER (${args[*]})"
+}
+
+sandbox_cgroup() { # the cgroup of agern-sandbox.service (systemd's, when it runs)
+    local cg=""
+    [ "$AGERN_SERVICE" = systemd ] && cg=$(systemctl show -p ControlGroup --value "$SANDBOX_UNIT" 2>/dev/null || true)
+    printf '%s\n' "${cg:-$SANDBOX_CGROUP_DEFAULT}"
+}
+
+sandbox_wait_socket() {
+    local i
+    for i in $(seq 1 30); do
+        spodman version --format '{{.Server.Version}}' >/dev/null 2>&1 && return 0
+        [ "$i" = 30 ] || sleep 1
+    done
+    return 1
+}
+
+sandbox_hints() {
+    say "  hints: journalctl -u $SANDBOX_UNIT -n 50 --no-pager"
+    say "         the agern user must be allowed to create user namespaces:"
+    say "         sysctl user.max_user_namespaces (> 0); kernel.unprivileged_userns_clone (Debian: 1)"
+    say "         kernel.apparmor_restrict_unprivileged_userns (Ubuntu: 1 needs the AppArmor profiles of podman/crun)"
+}
+
+# sandbox_selftest CGROUP_PARENT — what the server does for a run, on a small scale, as the agern user
+# through the socket: pull an image from an allowed registry, a private network with a sidecar
+# reached by name, a sandbox with the server's options and limits and a bind-mounted directory under
+# the data directory, a process over the memory limit is killed; everything is removed afterwards.
+sandbox_selftest() {
+    local cg=$1 image=${AGERN_SANDBOX_TEST_IMAGE:-$SANDBOX_TEST_IMAGE_DEFAULT} regs reg tag dir="" out rc fails=$DOCTOR_FAILS
+    regs=$(printf '%s' "${FACTORY_SANDBOX_REGISTRIES:-$SANDBOX_REGISTRIES_DEFAULT}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    reg=${image%%/*}
+    case ",$regs," in
+        *",$reg,"*) ;;
+        *) bad "test image $image is not from an allowed registry ($regs); set AGERN_SANDBOX_TEST_IMAGE in $AGERN_ENV_FILE"; return 1 ;;
+    esac
+    if ! out=$(spodman info --format '{{.Host.Security.Rootless}} {{.Host.CgroupsVersion}} {{.Host.NetworkBackend}} {{.Store.GraphRoot}} {{.Version.Version}}' 2>&1); then
+        bad "the Podman service does not answer at $SANDBOX_URL: $out"
+        return 1
+    fi
+    local rootless cgv backend graphroot version
+    read -r rootless cgv backend graphroot version <<<"$out"
+    [ "$rootless" = true ] && ok "rootless Podman ${version:-?} (service), storage ${graphroot:-?}" || bad "the Podman service is not rootless ($out)"
+    [ "$cgv" = v2 ] && ok "cgroups v2" || bad "cgroups ${cgv:-?}: limits need cgroups v2"
+    [ "$backend" = netavark ] && ok "network backend netavark (DNS between containers with aardvark-dns)" || bad "network backend ${backend:-?}, expected netavark"
+    if ! out=$(spodman pull --quiet "$image" 2>&1); then
+        bad "pulling $image failed: $(printf '%s' "$out" | tail -n 3)"
+        return 1
+    fi
+    ok "pulled $image"
+
+    tag="agern-selftest-$(date +%s)-$$"
+    dir=$(as_agern mktemp -d "$AGERN_DATA_DIR/.sandbox-selftest.XXXXXX") || { bad "cannot create a directory under $AGERN_DATA_DIR as $AGERN_USER"; return 1; }
+    local common=(--label "agern.selftest=$tag" --network "$tag" --security-opt no-new-privileges --pids-limit 64
+        --cpus 0.5 --memory 64m --memory-swap 64m --stop-timeout 5 --pull=missing)
+    [ -n "$cg" ] && common+=(--cgroup-parent "$cg")
+    # shellcheck disable=SC2016 # expanded in the container
+    local keepalive='trap '\''exit 0'\'' TERM INT; while :; do sleep 3600 & wait $!; done'
+    rc=0
+    if ! out=$(spodman network create --label "agern.selftest=$tag" "$tag" 2>&1); then
+        bad "network create: $out"; rc=1
+    elif ! out=$(spodman run --detach --name "$tag-peer" --network-alias peer "${common[@]}" "$image" \
+        sh -c 'mkdir -p /w && echo pong > /w/index.html && exec httpd -f -p 8080 -h /w' 2>&1); then
+        bad "starting a sidecar: $out"; rc=1
+    elif ! out=$(spodman run --detach --name "$tag" "${common[@]}" --workdir /workspace --entrypoint sh \
+        --mount "type=bind,source=$dir,target=/workspace" "$image" -c "$keepalive" 2>&1); then
+        bad "starting a sandbox: $out"; rc=1
+    else
+        ok "sandbox and sidecar started on a private network${cg:+ (cgroup parent $cg)}"
+        out=$(spodman exec --workdir /workspace "$tag" sh -lc 'cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/cpu.max /sys/fs/cgroup/pids.max' 2>&1 | tr '\n' ' ') || true
+        if [ "$out" = "67108864 50000 100000 64 " ]; then
+            ok "limits applied in the container's cgroup (memory 64m, 0.5 CPUs, 64 pids)"
+        else
+            bad "limits not applied (memory.max, cpu.max, pids.max: ${out:-unreadable}); cgroup delegation of $SANDBOX_UNIT is not working"
+        fi
+        if spodman exec --workdir /workspace "$tag" sh -lc 'echo written > written-in-sandbox' >/dev/null 2>&1 &&
+            [ "$(stat -c %U "$dir/written-in-sandbox" 2>/dev/null)" = "$AGERN_USER" ]; then
+            ok "bind mount: a file written in /workspace belongs to $AGERN_USER on the host"
+        else
+            bad "bind mount: writing in /workspace failed or the file is not owned by $AGERN_USER ($(stat -c %U "$dir/written-in-sandbox" 2>&1))"
+        fi
+        out=$(spodman exec "$tag" sh -lc 'wget -q -T 10 -O - http://peer:8080/' 2>&1) || true
+        if [ "$out" = pong ]; then ok "the sidecar is reachable by name (DNS on the run's network)"; else bad "sidecar 'peer' not reachable by name: $out"; fi
+        # shellcheck disable=SC2016 # expanded in the container
+        out=$(spodman exec "$tag" sh -lc 'x=$(head -c 200000000 /dev/zero | tr "\0" a); echo survived' 2>&1) && rc=0 || rc=$?
+        if [ "$rc" != 0 ] && ! printf '%s' "$out" | grep -q survived; then
+            ok "a process allocating 200 MB in a 64 MB sandbox is killed (exit $rc)"
+        else
+            bad "the memory limit is not enforced (exit $rc: $out)"
+        fi
+        rc=0
+    fi
+    spodman rm --force --ignore --volumes "$tag" "$tag-peer" >/dev/null 2>&1 || true
+    spodman network rm --force "$tag" >/dev/null 2>&1 || true
+    as_agern rm -rf "$dir" || true
+    [ "$rc" = 0 ] && [ "$DOCTOR_FAILS" = "$fails" ]
+}
+
+# delete_env_key KEY — removes uncommented KEY= lines from agern.env (owner and mode kept). Root only.
+delete_env_key() {
+    local key=$1 f=$AGERN_ENV_FILE tmp
+    [[ $key =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "bad key $key"
+    root_owned_file "$f" || die "$f must exist, be owned by root and not be writable by group or others"
+    grep -q "^$key=" "$f" || return 0
+    tmp=$(mktemp "$f.XXXXXX")
+    chmod --reference="$f" "$tmp"
+    chown --reference="$f" "$tmp"
+    AGERN_DEL_KEY=$key awk 'index($0, ENVIRON["AGERN_DEL_KEY"] "=") != 1' "$f" >"$tmp"
+    mv -f "$tmp" "$f"
+    unset "$key"
+}
+
+# Restarts agern.service to apply a changed setting, but only when nobody's work is in progress.
+sandbox_restart_server() {
+    if [ "$AGERN_SERVICE" != systemd ]; then info "restart the server yourself to apply this"; return 0; fi
+    if ! systemctl is-active --quiet "$SYSTEMD_UNIT"; then
+        info "$SYSTEMD_UNIT is not running; the setting applies when it starts ('agern start')"
+        return 0
+    fi
+    server_activity
+    if [ "$ACT_STATE" = idle ]; then
+        info "restarting $SYSTEMD_UNIT (it is idle)"
+        svc_restart
+        wait_healthy || warn "the server did not come back healthy ('agern logs')"
+    else
+        warn "not restarting $SYSTEMD_UNIT now: the server is $(describe_activity). It uses the new setting after its next restart: sudo agern restart"
+    fi
+}
+
+sandbox_enable() {
+    need_root sandbox enable
+    need_deb sandbox
+    [ "$(uname -s)" = Linux ] || die "sandboxes need Linux"
+    local missing pv cg was
+    missing=$(sandbox_missing_packages)
+    if [ -n "$missing" ]; then
+        die "rootless Podman needs packages that are not installed: $missing
+Install them, then run 'sudo agern sandbox enable' again (nothing was changed):
+  sudo apt install $missing"
+    fi
+    pv=$(sandbox_podman_version)
+    [ -n "$pv" ] || die "podman is installed but cannot be run"
+    dpkg --compare-versions "$pv" ge "$SANDBOX_PODMAN_MIN" || die "Podman $pv is too old; $SANDBOX_PODMAN_MIN or newer is needed"
+    [ -f /sys/fs/cgroup/cgroup.controllers ] || die "sandboxes need cgroups v2 (the unified hierarchy, the default on Debian 12/13 and Ubuntu 24.04)"
+    [ "$AGERN_SERVICE" = systemd ] || die "sandboxes need systemd (they run in agern-sandbox.service)"
+    systemctl cat "$SANDBOX_SOCKET_UNIT" >/dev/null 2>&1 || die "$SANDBOX_SOCKET_UNIT is not installed (reinstall the agern package)"
+    ensure_env
+    [ "$ENV_LOADED" = 1 ] || die "cannot read $AGERN_ENV_FILE"
+    was=${FACTORY_SANDBOX:-off}
+    info "Podman $pv"
+
+    sandbox_ensure_subids
+    # Created by the agern user, never by root: root does not write inside the data directory.
+    as_agern mkdir -p -m 0700 "$SANDBOX_STORAGE" || die "cannot create $SANDBOX_STORAGE as $AGERN_USER"
+    [ "$(owner_of "$SANDBOX_STORAGE")" = "$AGERN_USER" ] || die "$SANDBOX_STORAGE is not owned by $AGERN_USER"
+
+    systemctl daemon-reload
+    if [ "$SUBIDS_CHANGED" = 1 ] && systemctl is-active --quiet "$SANDBOX_UNIT"; then
+        systemctl restart "$SANDBOX_UNIT"   # new id mapping
+    fi
+    systemctl enable --now "$SANDBOX_SOCKET_UNIT" >/dev/null 2>&1 || die "could not enable $SANDBOX_SOCKET_UNIT"
+    if ! systemctl start "$SANDBOX_UNIT" || ! sandbox_wait_socket; then
+        sandbox_hints
+        [ "$was" = podman ] || systemctl disable --now "$SANDBOX_SOCKET_UNIT" "$SANDBOX_UNIT" >/dev/null 2>&1 || true
+        die "the sandbox service did not start or does not answer at $SANDBOX_URL"
+    fi
+    ok "$SANDBOX_SOCKET_UNIT enabled, $SANDBOX_UNIT running"
+    cg="$(sandbox_cgroup)/containers"
+
+    say "self-test (as $AGERN_USER, through $SANDBOX_URL):"
+    if ! sandbox_selftest "$cg"; then
+        sandbox_hints
+        if [ "$was" != podman ]; then
+            systemctl disable --now "$SANDBOX_SOCKET_UNIT" "$SANDBOX_UNIT" >/dev/null 2>&1 || true
+            die "the self-test failed; sandboxes stay off ($AGERN_ENV_FILE unchanged, units stopped)"
+        fi
+        die "the self-test failed (sandboxes were already on; the settings are unchanged)"
+    fi
+
+    local changed=0
+    [ "${FACTORY_SANDBOX:-}" = podman ] && [ "${FACTORY_SANDBOX_PODMAN_URL:-}" = "$SANDBOX_URL" ] &&
+        [ "${FACTORY_SANDBOX_CGROUP_PARENT:-}" = "$cg" ] || changed=1
+    set_env_key FACTORY_SANDBOX podman
+    set_env_key FACTORY_SANDBOX_PODMAN_URL "$SANDBOX_URL"
+    set_env_key FACTORY_SANDBOX_CGROUP_PARENT "$cg"
+    systemctl enable --now "$SANDBOX_PRUNE_TIMER" >/dev/null 2>&1 || warn "could not enable $SANDBOX_PRUNE_TIMER"
+    info "sandboxes are on: FACTORY_SANDBOX=podman, FACTORY_SANDBOX_PODMAN_URL=$SANDBOX_URL, FACTORY_SANDBOX_CGROUP_PARENT=$cg in $AGERN_ENV_FILE"
+    info "projects use them once an admin approves their .agern/sandbox.yml; unused images are pruned daily ($SANDBOX_PRUNE_TIMER)"
+    if [ "$changed" = 1 ]; then
+        sandbox_restart_server
+    else
+        info "$AGERN_ENV_FILE already had these settings; no restart needed"
+    fi
+}
+
+# Removes the containers and networks of runs and of self-tests (never volumes or images).
+sandbox_remove_containers() {
+    local ids nets
+    ids=$(spodman ps --all --quiet --filter label=agern.run 2>/dev/null; spodman ps --all --quiet --filter label=agern.selftest 2>/dev/null) || true
+    ids=$(printf '%s\n' "$ids" | sed '/^$/d' | sort -u)
+    if [ -n "$ids" ]; then
+        # shellcheck disable=SC2086 # one id per word
+        spodman rm --force --ignore --volumes $ids >/dev/null 2>&1 || warn "removing sandbox containers failed"
+        info "removed $(printf '%s\n' "$ids" | wc -l | tr -d ' ') sandbox container(s)"
+    fi
+    nets=$(spodman network ls --filter label=agern.run --format '{{.Name}}' 2>/dev/null; spodman network ls --filter label=agern.selftest --format '{{.Name}}' 2>/dev/null) || true
+    for n in $(printf '%s\n' "$nets" | sed '/^$/d' | sort -u); do
+        spodman network rm --force "$n" >/dev/null 2>&1 || warn "removing network $n failed"
+    done
+}
+
+sandbox_disable() {
+    local force=0
+    [ "${1:-}" = --force ] && force=1
+    need_root sandbox disable
+    need_deb sandbox
+    ensure_env
+    [ "$ENV_LOADED" = 1 ] || die "cannot read $AGERN_ENV_FILE"
+    if svc_is_running; then
+        server_activity
+        case $ACT_STATE in
+            idle | stopped) ;;
+            *)
+                [ "$force" = 1 ] || die "not now: the server is $(describe_activity), and turning sandboxes off restarts it. Try again later, or use --force (interrupted runs fail)"
+                warn "proceeding although the server is $(describe_activity) (--force)"
+                ;;
+        esac
+    fi
+    set_env_key FACTORY_SANDBOX off
+    delete_env_key FACTORY_SANDBOX_PODMAN_URL
+    delete_env_key FACTORY_SANDBOX_CGROUP_PARENT
+    info "FACTORY_SANDBOX=off in $AGERN_ENV_FILE"
+    if [ "$AGERN_SERVICE" = systemd ] && systemctl is-active --quiet "$SYSTEMD_UNIT"; then
+        info "restarting $SYSTEMD_UNIT"
+        svc_restart
+        wait_healthy || warn "the server did not come back healthy ('agern logs')"
+    fi
+    local volumes=""
+    if [ "$AGERN_SERVICE" = systemd ] && systemctl is-active --quiet "$SANDBOX_SOCKET_UNIT" && spodman version >/dev/null 2>&1; then
+        sandbox_remove_containers
+        volumes=$(spodman volume ls --quiet --filter label=agern.cache 2>/dev/null | wc -l | tr -d ' ') || volumes=""
+    fi
+    if [ "$AGERN_SERVICE" = systemd ]; then
+        systemctl disable --now "$SANDBOX_PRUNE_TIMER" "$SANDBOX_SOCKET_UNIT" >/dev/null 2>&1 || true
+        systemctl stop "$SANDBOX_UNIT" >/dev/null 2>&1 || true
+        info "stopped and disabled $SANDBOX_SOCKET_UNIT, $SANDBOX_UNIT and $SANDBOX_PRUNE_TIMER"
+    else
+        info "systemd is not running here: no units to stop"
+    fi
+    info "kept: images and ${volumes:-the} per-project cache volume(s) in $SANDBOX_STORAGE, and the subordinate ids of $AGERN_USER"
+    info "      ('agern sandbox enable' uses them again; to free the space now: sudo rm -rf $SANDBOX_STORAGE)"
+}
+
+sandbox_status() {
+    need_deb sandbox
+    ensure_env
+    local mode pv u g
+    mode="unknown (cannot read $AGERN_ENV_FILE as $(id -un); run 'sudo agern sandbox status')"
+    [ "$ENV_LOADED" = 1 ] && mode=${FACTORY_SANDBOX:-off}
+    say "sandboxes:       $mode"
+    [ "$ENV_LOADED" = 1 ] && [ "$mode" = podman ] && say "podman url:      ${FACTORY_SANDBOX_PODMAN_URL:-unset}" && say "cgroup parent:   ${FACTORY_SANDBOX_CGROUP_PARENT:-unset}"
+    pv=$(sandbox_podman_version)
+    say "podman:          ${pv:-not installed}"
+    if [ "$AGERN_SERVICE" = systemd ]; then
+        say "socket unit:     $(systemctl is-enabled "$SANDBOX_SOCKET_UNIT" 2>/dev/null || echo not-installed), $(systemctl is-active "$SANDBOX_SOCKET_UNIT" 2>/dev/null || true)"
+        say "service unit:    $(systemctl is-active "$SANDBOX_UNIT" 2>/dev/null || true)"
+        say "prune timer:     $(systemctl is-enabled "$SANDBOX_PRUNE_TIMER" 2>/dev/null || echo not-installed)"
+    fi
+    u=$(subid_range /etc/subuid)
+    g=$(subid_range /etc/subgid)
+    say "subordinate ids: uids ${u:-none}, gids ${g:-none}"
+    if ! can_reach_sandbox; then
+        say "containers:      unknown (only root and $AGERN_USER can talk to the Podman service; run 'sudo agern sandbox status')"
+        say "disk:            unknown (run 'sudo agern sandbox status')"
+        return 0
+    fi
+    if ! spodman version >/dev/null 2>&1; then
+        say "service:         not answering at $SANDBOX_URL"
+        if is_root && [ -d "$SANDBOX_STORAGE" ]; then say "disk:            $(du -sh "$SANDBOX_STORAGE" 2>/dev/null | cut -f1) in $SANDBOX_STORAGE"; fi
+        return 0
+    fi
+    say "service:         Podman $(spodman version --format '{{.Server.Version}}' 2>/dev/null) at $SANDBOX_URL"
+    say "sandboxes now:"
+    spodman ps --all --filter label=agern.run --format '  {{.Names}}  {{.Status}}  run {{index .Labels "agern.run"}}  {{index .Labels "agern.repo"}}' 2>/dev/null | sed '/^ *$/d' | grep . || say "  none"
+    say "cache volumes:"
+    spodman volume ls --filter label=agern.cache --format '  {{.Name}}  {{index .Labels "agern.repo"}}  {{index .Labels "agern.cache"}}' 2>/dev/null | grep . || say "  none"
+    say "disk (podman system df):"
+    spodman system df 2>/dev/null | sed 's/^/  /' || true
+    if is_root || [ "$(id -un)" = "$AGERN_USER" ]; then
+        [ -d "$SANDBOX_STORAGE" ] && say "storage:         $(du -sh "$SANDBOX_STORAGE" 2>/dev/null | cut -f1) in $SANDBOX_STORAGE (free: $(df -Ph "$SANDBOX_STORAGE" | awk 'NR == 2 {print $4}'))"
+    fi
+    return 0
+}
+
+# Removes what nobody uses any more (agern-sandbox-prune.timer runs this daily as the agern user):
+# images no container uses that were built more than AGERN_SANDBOX_PRUNE_HOURS (default 168) ago,
+# volumes no container uses that are older than that and are not per-project caches, and leftovers
+# of self-tests. --caches also removes unused cache volumes; --all ignores the age as well.
+sandbox_prune() {
+    local all=0 caches=0 hours v name cache
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --all) all=1; caches=1 ;;
+            --caches) caches=1 ;;
+            *) die "usage: agern sandbox prune [--caches] [--all]" ;;
+        esac
+        shift
+    done
+    need_deb sandbox
+    can_reach_sandbox || die "this needs root or the $AGERN_USER user"
+    ensure_env
+    hours=${AGERN_SANDBOX_PRUNE_HOURS:-168}
+    [[ $hours =~ ^[0-9]+$ ]] || die "AGERN_SANDBOX_PRUNE_HOURS must be a whole number of hours"
+    if ! spodman version >/dev/null 2>&1; then
+        info "the sandbox service does not answer at $SANDBOX_URL (sandboxes off?); nothing to prune"
+        return 0
+    fi
+    v=$(spodman ps --all --quiet --filter label=agern.selftest 2>/dev/null || true)
+    # shellcheck disable=SC2086 # one id per word
+    [ -n "$v" ] && spodman rm --force --ignore --volumes $v >/dev/null 2>&1
+    for name in $(spodman network ls --filter label=agern.selftest --format '{{.Name}}' 2>/dev/null || true); do
+        spodman network rm --force "$name" >/dev/null 2>&1 || true
+    done
+    if [ "$all" = 1 ]; then
+        spodman image prune --all --force >/dev/null || warn "image prune failed"
+    else
+        spodman image prune --force >/dev/null || warn "image prune (dangling) failed"
+        spodman image prune --all --force --filter "until=${hours}h" >/dev/null || warn "image prune failed"
+    fi
+    local filters=(--filter dangling=true)
+    [ "$all" = 1 ] || filters+=(--filter "until=${hours}h")
+    local removed=0
+    while IFS=$'\t' read -r name cache; do
+        [ -n "$name" ] || continue
+        case $cache in '' | '<no value>') ;; *) [ "$caches" = 1 ] || continue ;; esac
+        spodman volume rm "$name" >/dev/null 2>&1 && removed=$((removed + 1))
+    done < <(spodman volume ls "${filters[@]}" --format '{{.Name}}	{{index .Labels "agern.cache"}}' 2>/dev/null || true)
+    info "pruned unused images$([ "$all" = 1 ] || echo " built more than ${hours}h ago") and $removed unused volume(s)$([ "$caches" = 1 ] && echo " (cache volumes included)" || echo " (cache volumes kept)")"
+    spodman system df 2>/dev/null | sed 's/^/  /' || true
+}
+
+# 'agern sandbox selftest': the enable self-test again, for an installation that is already on.
+sandbox_selftest_cmd() {
+    need_deb sandbox
+    can_reach_sandbox || die "this needs root or the $AGERN_USER user"
+    ensure_env
+    say "self-test (as $AGERN_USER, through $SANDBOX_URL):"
+    if sandbox_selftest "${FACTORY_SANDBOX_CGROUP_PARENT:-$(sandbox_cgroup)/containers}"; then
+        say "self-test passed"
+    else
+        sandbox_hints
+        return 1
+    fi
+}
+
+cmd_sandbox() {
+    local sub=${1:-status}
+    [ $# -gt 0 ] && shift
+    case $sub in
+        enable) sandbox_enable "$@" ;;
+        disable) sandbox_disable "$@" ;;
+        status) sandbox_status ;;
+        prune) sandbox_prune "$@" ;;
+        selftest) sandbox_selftest_cmd ;;
+        *) die "usage: agern sandbox enable | disable [--force] | status | prune [--caches] [--all] | selftest" ;;
+    esac
+}
+
+# doctor: the sandbox checks (deb installs).
+doctor_sandbox() {
+    say "sandboxes"
+    if [ "$ENV_LOADED" != 1 ]; then meh "cannot tell whether sandboxes are on ($AGERN_ENV_FILE not read)"; return 0; fi
+    if [ "${FACTORY_SANDBOX:-off}" != podman ]; then ok "sandboxes off ('sudo agern sandbox enable' turns them on)"; return 0; fi
+    local missing pv u g cg dir sc avail
+    missing=$(sandbox_missing_packages)
+    if [ -n "$missing" ]; then bad "packages for rootless Podman missing: $missing (sudo apt install $missing)"; fi
+    pv=$(sandbox_podman_version)
+    if [ -n "$pv" ] && dpkg --compare-versions "$pv" ge "$SANDBOX_PODMAN_MIN"; then ok "Podman $pv"; else bad "Podman ${pv:-not found}; $SANDBOX_PODMAN_MIN or newer is needed"; fi
+    u=$(subid_range /etc/subuid)
+    g=$(subid_range /etc/subgid)
+    if [ -n "$u" ] && [ -n "$g" ]; then ok "subordinate ids of $AGERN_USER: uids ${u% *}+${u#* }, gids ${g% *}+${g#* }"
+    else bad "$AGERN_USER has no subordinate $([ -z "$u" ] && echo uid)$([ -z "$u$g" ] && echo /)$([ -z "$g" ] && echo gid) range of $SANDBOX_SUBID_COUNT ids ('sudo agern sandbox enable' allocates it)"; fi
+    if [ -f /sys/fs/cgroup/cgroup.controllers ]; then ok "cgroups v2"; else bad "cgroups v1: sandbox limits need cgroups v2"; fi
+    [ "${FACTORY_SANDBOX_PODMAN_URL:-}" = "$SANDBOX_URL" ] && ok "FACTORY_SANDBOX_PODMAN_URL=$SANDBOX_URL" ||
+        bad "FACTORY_SANDBOX_PODMAN_URL is '${FACTORY_SANDBOX_PODMAN_URL:-}', expected $SANDBOX_URL ('sudo agern sandbox enable' sets it)"
+    if [ "$AGERN_SERVICE" = systemd ]; then
+        if systemctl is-enabled --quiet "$SANDBOX_SOCKET_UNIT" 2>/dev/null && systemctl is-active --quiet "$SANDBOX_SOCKET_UNIT"; then
+            ok "$SANDBOX_SOCKET_UNIT enabled and listening"
+        else
+            bad "$SANDBOX_SOCKET_UNIT is not enabled and listening ('sudo agern sandbox enable')"
+        fi
+        if can_reach_sandbox; then
+            if sc=$(spodman version --format '{{.Server.Version}}' 2>&1); then ok "$AGERN_USER reaches the Podman service (Podman $sc)"
+            else bad "$AGERN_USER cannot talk to the Podman service at $SANDBOX_URL: $(printf '%s' "$sc" | tail -n 1) (journalctl -u $SANDBOX_UNIT)"; fi
+        else
+            meh "only root and $AGERN_USER can talk to the Podman service; run 'sudo agern doctor' for that check"
+        fi
+        if systemctl is-active --quiet "$SANDBOX_UNIT"; then
+            cg=$(sandbox_cgroup)
+            dir="/sys/fs/cgroup$cg"
+            if [ -d "$dir" ] && [ "$(owner_of "$dir")" = "$AGERN_USER" ]; then ok "cgroup $cg is delegated to $AGERN_USER"
+            else bad "cgroup $cg is not delegated to $AGERN_USER (Delegate=yes missing from $SANDBOX_UNIT?)"; fi
+            local c missing_c=""
+            for c in cpu memory pids; do
+                grep -qw "$c" "$dir/cgroup.subtree_control" 2>/dev/null || missing_c="$missing_c $c"
+            done
+            if [ -z "$missing_c" ]; then ok "controllers cpu, memory, pids enabled for the containers (limits are effective)"
+            else bad "controllers not enabled below $cg:$missing_c — CPU/memory/pids limits would not apply ('sudo agern sandbox selftest')"; fi
+            [ "${FACTORY_SANDBOX_CGROUP_PARENT:-}" = "$cg/containers" ] && ok "FACTORY_SANDBOX_CGROUP_PARENT=$cg/containers" ||
+                bad "FACTORY_SANDBOX_CGROUP_PARENT is '${FACTORY_SANDBOX_CGROUP_PARENT:-}', expected $cg/containers ('sudo agern sandbox enable' sets it)"
+        else
+            meh "$SANDBOX_UNIT is not running (it starts on the first connection; cgroup delegation is checked when it runs)"
+        fi
+        systemctl is-enabled --quiet "$SANDBOX_PRUNE_TIMER" 2>/dev/null && ok "$SANDBOX_PRUNE_TIMER enabled (daily clean-up)" ||
+            meh "$SANDBOX_PRUNE_TIMER is not enabled: unused images are not removed automatically"
+    else
+        bad "systemd is not running: the sandbox service cannot run here"
+    fi
+    if [ -d "$SANDBOX_STORAGE" ]; then
+        if [ "$(owner_of "$SANDBOX_STORAGE")" = "$AGERN_USER" ] && [ "$(mode_of "$SANDBOX_STORAGE")" = 700 ]; then ok "storage $SANDBOX_STORAGE ($AGERN_USER, 700)"
+        else bad "storage $SANDBOX_STORAGE is $(owner_of "$SANDBOX_STORAGE") $(mode_of "$SANDBOX_STORAGE"), expected $AGERN_USER 700"; fi
+    else
+        meh "storage $SANDBOX_STORAGE does not exist yet ('sudo agern sandbox enable')"
+    fi
+    avail=$(df -Pk "$([ -d "$SANDBOX_STORAGE" ] && echo "$SANDBOX_STORAGE" || echo "$AGERN_DATA_DIR")" 2>/dev/null | awk 'NR == 2 {print $4}')
+    if [ -z "$avail" ]; then meh "free disk space unknown"
+    elif [ "$avail" -lt 2097152 ]; then bad "only $((avail / 1024)) MB free for images and caches ('sudo agern sandbox prune --all' frees unused ones)"
+    elif [ "$avail" -lt 10485760 ]; then meh "$((avail / 1048576)) GB free for images and caches (images of a few projects take several GB)"
+    else ok "$((avail / 1048576)) GB free for images and caches"; fi
+}
+
+# ---------------------------------------------------------------------------------------------
 # run (foreground)
 
 resolve_java() {
@@ -1424,6 +1968,8 @@ cmd_doctor() {
         fi
     fi
 
+    if [ "$LAYOUT" = deb ] && [ "$(uname -s)" = Linux ]; then doctor_sandbox; fi
+
     say "service"
     if svc_is_running; then
         local rv
@@ -1448,7 +1994,7 @@ cmd_doctor() {
 }
 
 usage() {
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1510,6 +2056,7 @@ case $cmd in
     doctor) cmd_doctor ;;
     setup-db) cmd_setup_db "$@" ;;
     auto-upgrade) cmd_auto_upgrade "$@" ;;
+    sandbox) cmd_sandbox "$@" ;;
     run) cmd_run ;;
     activate) cmd_activate "$@" ;;
     '' | help | -h | --help) usage ;;
