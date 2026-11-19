@@ -39,6 +39,12 @@ Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
 Environment=CONTAINERS_CONF=/usr/share/agern/podman/containers.conf
 Environment=CONTAINERS_STORAGE_CONF=/usr/share/agern/podman/storage.conf
 WorkingDirectory=/var/lib/agern
+# netavark starts the DNS server of a network (aardvark-dns) through 'systemd-run --user --scope'
+# whenever /run/systemd/system exists; the agern user has no user session bus, so that fails and
+# containers cannot find each other by name. With /run/systemd hidden (an empty read-only tmpfs)
+# netavark starts aardvark-dns directly, as a child of this unit. The journal socket stays reachable.
+TemporaryFileSystem=/run/systemd:ro
+BindReadOnlyPaths=/run/systemd/journal
 # Moves itself into a leaf cgroup, then becomes `podman system service --time=0` (socket-activated).
 ExecStart=/usr/lib/agern/sandbox-service
 Delegate=yes
