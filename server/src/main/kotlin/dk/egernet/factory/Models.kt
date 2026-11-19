@@ -189,7 +189,13 @@ data class AttachmentDto(
 
 @Serializable data class ClientConfigDto(val attachments: AttachmentLimitsDto)
 
-@Serializable data class FeedFrame(val type: String, val session: AgentSessionDto? = null, val run: RunDto? = null)
+@Serializable data class FeedFrame(
+    val type: String,
+    val session: AgentSessionDto? = null,
+    val run: RunDto? = null,
+    val repo: String? = null,
+    val issue: IssueDto? = null,
+)
 
 object RunStatus {
     const val QUEUED = "queued"; const val SPEC = "spec"; const val BUILDING = "building"
