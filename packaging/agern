@@ -611,9 +611,83 @@ fetch_release() {
     printf '%s\n' "$out"
 }
 
-# Makes sure current.deb holds the installed version (for a later rollback), best effort.
+# fetch_kept DIR_URL SEMVER DEBVER — downloads agern_<semver>_all.deb from a release directory into
+# current.deb when its SHA-256 matches that release's SHA256SUMS and it has exactly version DEBVER.
+fetch_kept() {
+    local dir=$1 sv=$2 inst=$3 part sha
+    part=$(deb_partial)
+    rm -f "$part/SHA256SUMS.keep" "$part/keep.deb"
+    if curl -fsSL --retry 2 --connect-timeout 15 -o "$part/SHA256SUMS.keep" "$dir/SHA256SUMS" 2>/dev/null &&
+        sha=$(awk -v f="agern_${sv}_all.deb" '{n=$2; sub(/^\*/, "", n); if (n == f) {print $1; exit}}' "$part/SHA256SUMS.keep") &&
+        [ -n "$sha" ] &&
+        curl -fsSL --retry 2 --connect-timeout 15 -o "$part/keep.deb" "$dir/agern_${sv}_all.deb" 2>/dev/null &&
+        [ "$(sha256_of "$part/keep.deb")" = "$sha" ] &&
+        [ "$(dpkg-deb -f "$part/keep.deb" Version 2>/dev/null || true)" = "$inst" ]; then
+        chmod 0644 "$part/keep.deb"
+        mv -f "$part/keep.deb" "$CACHE_DIR/current.deb"
+        rm -f "$part/SHA256SUMS.keep"
+        return 0
+    fi
+    rm -f "$part/SHA256SUMS.keep" "$part/keep.deb"
+    return 1
+}
+
+# repack_installed DEBVER — rebuilds the installed package into current.deb from dpkg's own records:
+# the file list and maintainer scripts in /var/lib/dpkg/info and the files under /usr. Everything
+# read is root-owned (checked); nothing the service user can write goes into the package. Refuses
+# when 'dpkg --verify' reports a changed file.
+repack_installed() {
+    local inst=$1 info=/var/lib/dpkg/info part root p f
+    [ "$(deb_installed_version)" = "$inst" ] || return 1
+    [ -r "$info/agern.list" ] || return 1
+    if [ -n "$(dpkg --verify agern 2>&1)" ]; then
+        warn "installed files differ from the package ('dpkg --verify agern'); not rebuilding a copy from them"
+        return 1
+    fi
+    part=$(deb_partial)
+    root="$part/repack"
+    rm -rf "$root"
+    mkdir -p "$root/DEBIAN"
+    while IFS= read -r p; do
+        case $p in /. | /usr) continue ;; /usr/*) ;; *) warn "unexpected path in the file list: $p"; rm -rf "$root"; return 1 ;; esac
+        if [ -L "$p" ]; then
+            warn "unexpected symbolic link $p"; rm -rf "$root"; return 1
+        elif [ -d "$p" ]; then
+            mkdir -p "$root$p"
+        elif [ -f "$p" ]; then
+            root_owned_file "$p" || { warn "$p is not root-owned or is writable by others"; rm -rf "$root"; return 1; }
+            mkdir -p "$root$(dirname "$p")"
+            cp -p "$p" "$root$p"
+        else
+            warn "$p from the file list is missing"; rm -rf "$root"; return 1
+        fi
+    done <"$info/agern.list"
+    find "$root" -type d -exec chmod 0755 {} +
+    dpkg-query -s agern | grep -v -e '^Status:' -e '^Conffiles:' >"$root/DEBIAN/control"
+    for f in postinst prerm postrm md5sums; do
+        if [ -f "$info/agern.$f" ]; then
+            root_owned_file "$info/agern.$f" || { rm -rf "$root"; return 1; }
+            cp "$info/agern.$f" "$root/DEBIAN/$f"
+        fi
+    done
+    chmod 0644 "$root/DEBIAN/control"
+    [ ! -f "$root/DEBIAN/md5sums" ] || chmod 0644 "$root/DEBIAN/md5sums"
+    for f in postinst prerm postrm; do [ ! -f "$root/DEBIAN/$f" ] || chmod 0755 "$root/DEBIAN/$f"; done
+    if dpkg-deb --build --root-owner-group -Zxz "$root" "$part/repack.deb" >/dev/null 2>&1 &&
+        [ "$(dpkg-deb -f "$part/repack.deb" Version 2>/dev/null || true)" = "$inst" ]; then
+        chmod 0644 "$part/repack.deb"
+        mv -f "$part/repack.deb" "$CACHE_DIR/current.deb"
+        rm -rf "$root"
+        return 0
+    fi
+    rm -rf "$root" "$part/repack.deb"
+    return 1
+}
+
+# Makes sure current.deb holds the installed version (for a later rollback): the cached copy, the
+# same version from its GitHub release (verified), or a copy rebuilt from the installed files.
 deb_keep_installed() {
-    local inst=$1 cand sv part sha
+    local inst=$1 cand sv
     [ -n "$inst" ] || return 0
     if [ -f "$CACHE_DIR/current.deb" ] && [ "$(dpkg-deb -f "$CACHE_DIR/current.deb" Version 2>/dev/null || true)" = "$inst" ]; then
         return 0
@@ -624,27 +698,20 @@ deb_keep_installed() {
         cp -f "$cand" "$CACHE_DIR/current.deb"
         return 0
     fi
+    local dir
     case $inst in
-        *~main*) ;;
-        *)
-            # A tagged release can be fetched again (verified like any download).
-            part=$(deb_partial)
-            if curl -fsSL --retry 2 --connect-timeout 15 -o "$part/SHA256SUMS.keep" "$(release_base)/download/v$sv/SHA256SUMS" 2>/dev/null &&
-                sha=$(awk -v f="agern_${sv}_all.deb" '{n=$2; sub(/^\*/, "", n); if (n == f) {print $1; exit}}' "$part/SHA256SUMS.keep") &&
-                [ -n "$sha" ] &&
-                curl -fsSL --retry 2 --connect-timeout 15 -o "$part/keep.deb" "$(release_base)/download/v$sv/agern_${sv}_all.deb" 2>/dev/null &&
-                [ "$(sha256_of "$part/keep.deb")" = "$sha" ] &&
-                [ "$(dpkg-deb -f "$part/keep.deb" Version 2>/dev/null || true)" = "$inst" ]; then
-                chmod 0644 "$part/keep.deb"
-                mv -f "$part/keep.deb" "$CACHE_DIR/current.deb"
-                rm -f "$part/SHA256SUMS.keep"
-                info "kept a copy of the installed version $inst for 'agern rollback'"
-                return 0
-            fi
-            rm -f "$part/SHA256SUMS.keep" "$part/keep.deb"
-            ;;
+        *~main*) dir="$(release_base)/download/main-latest" ;;   # only while it is still the newest main build
+        *) dir="$(release_base)/download/v$sv" ;;
     esac
-    warn "no copy of the installed version $inst is available; 'agern rollback' will not be able to return to it"
+    if fetch_kept "$dir" "$sv" "$inst"; then
+        info "kept a copy of the installed version $sv (downloaded and verified) for 'agern rollback'"
+        return 0
+    fi
+    if repack_installed "$inst"; then
+        info "kept a copy of the installed version $sv (rebuilt from the installed files) for 'agern rollback'"
+        return 0
+    fi
+    warn "no copy of the installed version $sv could be kept; after this upgrade 'agern rollback' cannot return to it"
     rm -f "$CACHE_DIR/current.deb"
 }
 
@@ -784,7 +851,7 @@ cmd_rollback_deb() {
     [ "${1:-}" = --force ] && force=1
     need_root rollback
     deb_lock
-    [ -f "$CACHE_DIR/previous.deb" ] || die "no previous package is kept in $CACHE_DIR: 'agern upgrade' keeps one, when it has (or can download) a copy of the version it replaces"
+    [ -f "$CACHE_DIR/previous.deb" ] || die "no previous package is kept in $CACHE_DIR, so there is nothing to roll back to (the last 'agern upgrade' could not keep a copy of the version it replaced). To go back, install an older release explicitly: sudo agern upgrade --version X.Y.Z --force, or --file <package> --force"
     local prev inst
     prev=$(deb_check_file "$CACHE_DIR/previous.deb")
     inst=$(deb_installed_version)
@@ -942,8 +1009,12 @@ cmd_auto_upgrade() {
             local enabled=no
             if [ "$AGERN_SERVICE" = systemd ] && systemctl is-enabled --quiet "$UPGRADE_TIMER" 2>/dev/null; then enabled=yes; fi
             say "automatic upgrades: $([ "$enabled" = yes ] && echo on || echo off)"
-            say "channel:            ${AGERN_UPGRADE_CHANNEL:-stable}"
-            say "max wait for idle:  ${AGERN_UPGRADE_MAX_WAIT_HOURS:-24}h"
+            if [ "$ENV_LOADED" = 1 ]; then
+                say "channel:            ${AGERN_UPGRADE_CHANNEL:-stable}"
+                say "max wait for idle:  ${AGERN_UPGRADE_MAX_WAIT_HOURS:-24}h"
+            else
+                say "channel:            unknown (cannot read $AGERN_ENV_FILE as $(id -un); run 'sudo agern auto-upgrade status')"
+            fi
             if [ "$enabled" = yes ]; then
                 say "timer:"
                 systemctl list-timers --all "$UPGRADE_TIMER" --no-pager 2>/dev/null | sed -n '1,2s/^/  /p' || true

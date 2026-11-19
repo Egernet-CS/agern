@@ -59,6 +59,9 @@ repack() { # repack SEMVER OUT — the package under test with another version n
     dpkg-deb -R "$WORK/a.deb" "$d"
     sed -i "s/^Version: .*/Version: $(semver_to_deb "$v")/" "$d/DEBIAN/control"
     printf '%s\n' "$v" >"$d/usr/share/agern/VERSION"
+    if [ -f "$d/DEBIAN/md5sums" ]; then
+        (cd "$d" && find usr -type f | LC_ALL=C sort | xargs md5sum) >"$d/DEBIAN/md5sums"
+    fi
     dpkg-deb --build --root-owner-group -Zxz "$d" "$out" >/dev/null
     rm -rf "$d"
 }
@@ -144,6 +147,12 @@ printf '%s' "$doc" | grep -q 'FAIL  claude not found.*claude.ai/install.sh' && p
 printf '%s' "$doc" | grep -q 'FAIL  gh not found.*apt install gh' && pass "doctor: gh missing, with install hint" || fail "doctor: gh hint"
 printf '%s' "$doc" | grep -q 'FAIL  FACTORY_GITHUB_ORG is not set' && pass "doctor: org not set" || fail "doctor: org not set"
 
+sed -i 's/^AGERN_UPGRADE_CHANNEL=stable$/AGERN_UPGRADE_CHANNEL=main/' /etc/agern/agern.env
+agern auto-upgrade status | grep -q '^channel: *main$' && pass "auto-upgrade status (root) reads the channel" || fail "auto-upgrade status as root"
+nobody_out=$(runuser -u nobody -- agern auto-upgrade status 2>&1 || true)
+printf '%s' "$nobody_out" | grep -q '^channel: *unknown (cannot read' && pass "auto-upgrade status without root says it cannot read the channel" || fail "auto-upgrade status without root: $nobody_out"
+sed -i 's/^AGERN_UPGRADE_CHANNEL=main$/AGERN_UPGRADE_CHANNEL=stable/' /etc/agern/agern.env
+
 section "configuration survives an upgrade (agern upgrade --file)"
 sed -i 's/^FACTORY_GITHUB_ORG=$/FACTORY_GITHUB_ORG=smoke-test-org/' /etc/agern/agern.env
 printf '# local edit by the smoke test\n' >>/etc/agern/agern.env
@@ -151,12 +160,11 @@ SUM_BEFORE=$(sha256sum /etc/agern/agern.env | cut -d' ' -f1)
 B_SEMVER=${A_SEMVER%%[-+]*}
 B_SEMVER="${B_SEMVER%.*}.$((${B_SEMVER##*.} + 1))"
 repack "$B_SEMVER" "$WORK/b.deb"
-# The first upgrade keeps a copy of the installed version for rollback; a tagged release is
-# fetched again (here from the file:// release directory).
-mkdir -p "$REL/download/v$A_SEMVER"
-cp "$WORK/a.deb" "$REL/download/v$A_SEMVER/agern_${A_SEMVER}_all.deb"
-(cd "$REL/download/v$A_SEMVER" && sha256sum "agern_${A_SEMVER}_all.deb" >SHA256SUMS)
+# Installed with apt, so there is no cached copy of the installed version, and its release is not
+# downloadable (as for a main build in CI): the upgrade rebuilds a copy from the installed files.
+check "installed files match the package (dpkg --verify)" test -z "$(dpkg --verify agern 2>&1)"
 if agern upgrade --file "$WORK/b.deb" >"$WORK/up1.log" 2>&1; then pass "agern upgrade --file b.deb"; else fail "agern upgrade --file b.deb"; cat "$WORK/up1.log"; fi
+grep -q 'rebuilt from the installed files' "$WORK/up1.log" && pass "a copy of the installed version was rebuilt for rollback" || { fail "rebuilt copy"; cat "$WORK/up1.log"; }
 eq "now $B_SEMVER" "$(semver_to_deb "$B_SEMVER")" "$(dpkg-query -W -f='${Version}' agern)"
 eq "env file unchanged" "$SUM_BEFORE" "$(sha256sum /etc/agern/agern.env | cut -d' ' -f1)"
 eq "env file permissions kept" "root:agern 640" "$(stat_of /etc/agern/agern.env)"
@@ -175,6 +183,9 @@ if agern rollback >"$WORK/rb.log" 2>&1; then pass "agern rollback"; else fail "a
 eq "rolled back to $A_DEB" "$A_DEB" "$(dpkg-query -W -f='${Version}' agern)"
 eq "previous.deb is now $B_SEMVER" "$(semver_to_deb "$B_SEMVER")" "$(dpkg-deb -f /var/cache/agern/previous.deb Version 2>/dev/null || echo none)"
 eq "env file unchanged after rollback" "$SUM_BEFORE" "$(sha256sum /etc/agern/agern.env | cut -d' ' -f1)"
+check "the rebuilt package reinstalled the original files (dpkg --verify)" test -z "$(dpkg --verify agern 2>&1)"
+eq "VERSION after rollback" "$A_SEMVER" "$(cat /usr/share/agern/VERSION)"
+check "agern works after rollback" agern version
 agern version
 
 section "upgrade from a release (stable channel, checksum)"
@@ -191,11 +202,15 @@ if agern upgrade >"$WORK/up2.log" 2>&1; then pass "agern upgrade (stable)"; else
 eq "now $C_SEMVER" "$(semver_to_deb "$C_SEMVER")" "$(dpkg-query -W -f='${Version}' agern)"
 out=$(agern upgrade 2>&1) && printf '%s' "$out" | grep -q 'already installed' && pass "stable again: already installed" || fail "stable again"
 
-section "main channel"
+section "main channel (and keeping a copy by downloading the installed release again)"
 NEXT=${C_SEMVER%.*}.$((${C_SEMVER##*.} + 1))
 M1="$NEXT-main.20261119101500.g1a2b3c4"
 publish download/main-latest "$M1"
+rm -f /var/cache/agern/current.deb
+publish "download/v$C_SEMVER" "$C_SEMVER"
 if agern upgrade --channel main >"$WORK/up3.log" 2>&1; then pass "agern upgrade --channel main"; else fail "agern upgrade --channel main"; cat "$WORK/up3.log"; fi
+grep -q 'downloaded and verified' "$WORK/up3.log" && pass "the installed release was downloaded again for rollback" || { fail "download copy"; cat "$WORK/up3.log"; }
+eq "previous.deb is $C_SEMVER" "$(semver_to_deb "$C_SEMVER")" "$(dpkg-deb -f /var/cache/agern/previous.deb Version 2>/dev/null || echo none)"
 eq "now the main build" "$(semver_to_deb "$M1")" "$(dpkg-query -W -f='${Version}' agern)"
 eq "VERSION file" "$M1" "$(cat /usr/share/agern/VERSION)"
 set +e
@@ -203,8 +218,22 @@ out=$(agern upgrade 2>&1)
 rc=$?
 set -e
 [ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'older than the installed' && pass "stable $C_SEMVER is older than the main build: refused" || fail "stable older than main refused ($out)"
+# No copy can be kept: not cached, not downloadable (main-latest moved on) and an installed file
+# was changed. The upgrade says so, and rollback refuses with a way out.
+rm -f /var/cache/agern/current.deb
+rm -rf "$REL/download/main-latest"
+echo '# changed' >>/usr/share/agern/env.example
 publish latest/download "$NEXT"
 if agern upgrade >"$WORK/up4.log" 2>&1; then pass "release $NEXT replaces the main build"; else fail "release replaces main build"; cat "$WORK/up4.log"; fi
+grep -q 'differ from the package' "$WORK/up4.log" && pass "changed installed files are not packed up" || fail "changed files detected"
+grep -q "no copy of the installed version $M1 could be kept" "$WORK/up4.log" && pass "upgrade says no rollback copy could be kept" || { fail "no-copy warning"; cat "$WORK/up4.log"; }
+check "no previous.deb" test ! -e /var/cache/agern/previous.deb
+set +e
+agern rollback >"$WORK/rb2.log" 2>&1
+rc=$?
+set -e
+[ "$rc" != 0 ] && grep -q 'nothing to roll back to.*--version X.Y.Z --force' "$WORK/rb2.log" && pass "rollback fails with a helpful message" || { fail "rollback without a copy"; cat "$WORK/rb2.log"; }
+check "the upgrade replaced the changed file (dpkg --verify)" test -z "$(dpkg --verify agern 2>&1)"
 eq "now $NEXT" "$NEXT" "$(dpkg-query -W -f='${Version}' agern)"
 eq "env file unchanged after all upgrades" "$SUM_BEFORE" "$(sha256sum /etc/agern/agern.env | cut -d' ' -f1)"
 eq "master key unchanged" "$KEY_BEFORE" "$(grep '^FACTORY_MASTER_KEY=' /etc/agern/agern.env)"

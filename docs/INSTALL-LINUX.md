@@ -186,11 +186,16 @@ installs with `apt-get install`, so new dependencies resolve, and waits until `/
 reports the new version — reinstalling the previous package automatically if it does not come up.
 It refuses while pipeline runs or agents are active (a restart fails runs in progress); `--force`
 overrides that, reinstalls the installed version and allows a downgrade. The installed package and
-the one before it are kept in `/var/cache/agern` for `agern rollback`. Database migrations run on
-startup and are not undone by a rollback.
+the one before it are kept in `/var/cache/agern` for `agern rollback`. When the version being
+replaced was installed some other way (the first `apt install`, a main build that has since moved
+on), `agern upgrade` downloads it again from its release if it can, and otherwise rebuilds the
+package from the installed files (only when `dpkg --verify agern` finds them unchanged). If neither
+works it says that no rollback copy could be kept, and `agern rollback` then refuses and points to
+`agern upgrade --version X.Y.Z --force`. Database migrations run on startup and are not undone by a
+rollback.
 
 You can also upgrade with plain `apt install ./agern_….deb`; the configuration is never touched
-either way. (Such an install is not kept for rollback.)
+either way.
 
 **Automatic upgrades** (opt-in):
 

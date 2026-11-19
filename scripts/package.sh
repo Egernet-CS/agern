@@ -129,6 +129,16 @@ if [ "$DEB" != no ]; then
     find "$STAGE" -type d -exec chmod 0755 {} +
     find "$STAGE" -type f -exec chmod 0644 {} +
     chmod 0755 "$STAGE/usr/bin/agern" "$STAGE/DEBIAN/postinst" "$STAGE/DEBIAN/prerm" "$STAGE/DEBIAN/postrm"
+    # DEBIAN/md5sums: lets 'dpkg --verify agern' (and 'agern upgrade', before it rebuilds a copy of the
+    # installed package for rollback) detect changed files.
+    (
+        cd "$STAGE"
+        find usr -type f | LC_ALL=C sort | while IFS= read -r f; do
+            if command -v md5sum >/dev/null 2>&1; then sum=$(md5sum "$f" | cut -d' ' -f1); else sum=$(md5 -q "$f"); fi
+            printf '%s  %s\n' "$sum" "$f"
+        done
+    ) >"$STAGE/DEBIAN/md5sums"
+    chmod 0644 "$STAGE/DEBIAN/md5sums"
     size=$(du -sk "$STAGE/usr" | awk '{print $1}')
     sed -e "s|@VERSION@|$DEB_VERSION|" -e "s|@INSTALLED_SIZE@|$size|" packaging/deb/control >"$STAGE/DEBIAN/control"
     chmod 0644 "$STAGE/DEBIAN/control"

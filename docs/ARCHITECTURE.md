@@ -602,7 +602,14 @@ verifies the SHA-256 and the package's name, architecture and version, then inst
 the new version — reinstalling the previous package if it does not. `--file` installs a package
 the admin names (copied root-only first; no checksum). The installed package and the one before
 it are kept as `/var/cache/agern/{current,previous}.deb`; `agern rollback` reinstalls
-`previous.deb` (downgrade). Without `--force`, upgrade and rollback refuse while the server is
+`previous.deb` (downgrade). Without a cached copy of the version being replaced, `agern upgrade`
+fetches it from its release (`download/v<semver>/`, or `main-latest` while that still holds it;
+checksum- and version-verified), else rebuilds it with `dpkg-deb` from dpkg's own records
+(`/var/lib/dpkg/info/agern.{list,postinst,prerm,postrm,md5sums}`, `dpkg-query -s` for the control
+file) and the listed files under `/usr` — only when `dpkg --verify agern` is clean and every file is
+root-owned and not group/world-writable, so nothing the service user can write ends up in a package
+root installs. Failing both, it warns that no rollback copy was kept and `agern rollback` refuses
+with a pointer to `agern upgrade --version X.Y.Z --force`. Packages carry `DEBIAN/md5sums`. Without `--force`, upgrade and rollback refuse while the server is
 busy (below), refuse downgrades and do nothing when the version is installed. Downloads are
 anonymous (the repository is public); no token is ever used.
 
