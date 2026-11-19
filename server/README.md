@@ -71,12 +71,18 @@ tests `FACTORY_2FA=off` is accepted when `dev` is the only provider.
     variable names it received, `crash` exits with status 3, `long` answers with 80 lines; a message with
     attachments gets a report of what arrived (`IMAGE 1: image/png 32x16, … bytes` per decoded image block,
     `FILE ok <name> <n> bytes` per listed path found on disk, `FILE missing …` otherwise);
+    `forward <runId> <role>: <message>` passes the message to that run's agent through the MCP tool
+    `factory_send_to_agent` and reports the answer;
   * pipeline: the spec-writer prints a small spec, the builder commits to `AGERN_FAKE.md`,
     reviewers answer PASS and the approver APPROVE. Put `fake:changes` in the issue body for one
     round of CHANGES, `fake:always-changes` to exhaust the fix rounds (→ `needs_human`),
     `fake:escalate` for an approver ESCALATE, `fake:fail-<role>` to make a stage fail,
     `fake:hang-<role>` to make it hang (try the stage time limit or Cancel), `fake:slow` to make every
-    stage take ~1.5 s so the diagram can be watched advancing.
+    stage take ~1.5 s so the diagram can be watched advancing, `fake:busy-<role>` (spec-writer, builder) to
+    keep that agent working in short Bash steps until a message from the run owner contains `finish`
+    (try the composer under its transcript on the run page). Like the real CLI, the spec-writer and
+    builder pick up the owner's messages after their current tool call, or as a further turn when they
+    were finishing.
 
 With both, the whole product — chat, runs with live stages, needs-human approval — works locally for
 UI development at zero cost.
@@ -105,8 +111,8 @@ src/test/resources/fake-claude            the CLI stub described above
 * Agent processes get an environment built from scratch (`PATH`, `HOME`, `LANG`, `TERM`, the
   owner's Claude credential, git auth via `GIT_CONFIG_*`, `GH_TOKEN`, git author). Nothing else
   from the server environment is inherited.
-* Only the owner of a session or run can drive it (input, interrupt, approve); admins can stop and
-  cancel. Everyone else who can read the repository on GitHub may observe. The MCP endpoint applies
+* Only the owner of a session or run can drive it (input, interrupt, approve, messages to a running
+  spec-writer or builder); admins can stop and cancel. Everyone else who can read the repository on GitHub may observe. The MCP endpoint applies
   the same rules as the token's owner.
 * `os` login on Linux uses PAM; the server's account must be allowed to check other users'
   passwords (e.g. membership in the `shadow` group for `pam_unix`). On macOS the `chkpasswd`
