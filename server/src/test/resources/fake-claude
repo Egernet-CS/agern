@@ -45,7 +45,8 @@ Behaviour
       (lists, bold, inline code with a long path, a code block, a link and literal HTML)
     - "fake:sandbox" makes the builder call the MCP tools factory_sandbox_info and factory_sandbox_exec (command
         "echo built in the sandbox && ls") like a real agent (tool_use + tool_result events) and report both answers
-        in its result ("Sandbox info: ..." / "Sandbox exec: ...")
+        in its result ("Sandbox info: ..." / "Sandbox exec: ..."); with "fake:platform=<name>" it then runs the same
+        command once more with that platform ("Sandbox exec on <name>: ...")
     - "fake:busy-<role>" makes that (stream-json) role work in Bash steps of ~0.4 s for up to ~2 minutes,
       until a message from the owner contains "finish"; each picked-up message is acknowledged with
       "Noted the owner's message: ..." and listed in the final result
@@ -454,6 +455,10 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
                 info, _ = mcp_tool_roundtrip("factory_sandbox_info", {}, 2)
                 out, _ = mcp_tool_roundtrip("factory_sandbox_exec", {"command": "echo built in the sandbox && ls"}, 3)
                 sandbox_report = "\nSandbox info: %s\nSandbox exec: %s" % (info, out)
+                m = re.search(r"fake:platform=([a-z][a-z0-9-]*)", prompt)
+                if m:
+                    pout, _ = mcp_tool_roundtrip("factory_sandbox_exec", {"command": "echo built in the sandbox && ls", "platform": m.group(1)}, 4)
+                    sandbox_report += "\nSandbox exec on %s: %s" % (m.group(1), pout)
             except Exception as e:  # noqa
                 sandbox_report = "\nSandbox MCP calls failed: %s" % e
             checkpoint()

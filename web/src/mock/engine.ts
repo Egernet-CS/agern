@@ -134,7 +134,7 @@ export const db = {
   /** FACTORY_SANDBOX is not off (scenario `nosandbox`: switched off). */
   sandboxEnabled: scenario !== 'nosandbox',
   /** Sandboxes that exist right now, by run id (created when an approved run's builder starts, removed after review). */
-  runningSandboxes: new Map<string, { createdAt: string; builderSessionId: string }>(),
+  runningSandboxes: new Map<string, { createdAt: string; builderSessionId: string; containers: { platform: string; image: string; createdAt: string }[] }>(),
   players: new Map<string, Player>(),
   settings: {
     agentsMayInstallSoftware: false,
@@ -608,10 +608,17 @@ function runStage(r: Run, role: StageRole, round: number, plan: Plan, startMs: n
     const prev = r.stages.filter((x) => x.round === round - 1 && x.verdict === 'CHANGES').flatMap((x) => x.findings.map((f) => f.detail));
     const sb = r.sandbox;
     const def = sb?.state === 'approved' ? db.sandboxFiles.get(r.repo)?.definition : null;
-    steps = def ? sandboxBuilderScript(round, def.image, def.setup, def.services.map((x) => x.name)) : builderScript(round, prev);
+    steps = def ? sandboxBuilderScript(round, def.image, def.setup, def.services.map((x) => x.name), def.platforms) : builderScript(round, prev);
     // Like the backend: the builder's transcript starts with the run's sandbox decision.
     if (sb && sb.state !== 'disabled') steps = [{ kind: 'system', level: sb.state === 'approved' ? 'info' : 'warn', text: `Sandbox: ${sb.reason}`, ms: 50 }, ...steps];
-    if (def && !db.runningSandboxes.has(r.id)) db.runningSandboxes.set(r.id, { createdAt: iso(Math.min(Date.now(), p.endMs + 4000)), builderSessionId: s.id });
+    if (def && !db.runningSandboxes.has(r.id)) {
+      const at = iso(Math.min(Date.now(), p.endMs + 4000));
+      // Like the backend: one container per image used — the default one, then each platform the builder tests on.
+      const containers = [{ platform: 'default', image: def.image, createdAt: at }, ...def.platforms.map((x) => ({ platform: x.name, image: x.image, createdAt: at }))];
+      db.runningSandboxes.set(r.id, { createdAt: at, builderSessionId: s.id, containers });
+      if (sb && def.platforms.length) sb.platformsUsed = ['default', ...def.platforms.map((x) => x.name)];
+      feed({ type: 'sandboxes', runId: r.id, change: 'created' });
+    }
     summary = round > 0 ? 'Addressed review findings; tests green.' : 'Implemented the spec; 9 tests added, all green.';
   } else if (role === 'approver') {
     verdict = plan.approver;
@@ -680,14 +687,14 @@ function pipeline(r: Run, plan: Plan, owner: User, startMs: number) {
         else if (changes) {
           for (const st of r.stages) if (st.role === 'approver' && st.status === 'pending') st.status = 'skipped';
           r.error = `Reviewers still request changes after ${round} fix round(s).`;
-          db.runningSandboxes.delete(r.id);
+          dropSandbox(r.id);
           setRunStatus(r, 'needs_human', iso(end));
         } else approve(round, end + 400);
       });
     }
   };
   const approve = (round: number, t: number) => {
-    db.runningSandboxes.delete(r.id);
+    dropSandbox(r.id);
     for (const st of r.stages) if (st.role === 'approver' && st.status === 'pending') st.round = round;
     setRunStatus(r, 'approving', iso(t));
     runStage(r, 'approver', round, plan, t, owner, (t2, stage) => {
@@ -733,6 +740,11 @@ export function revokeSandboxApproval(repo: string, by: User): SandboxStatus {
   return sandboxStatus(repo);
 }
 
+/** Like the backend: the run's sandbox containers are gone; admins hear about it on the feed. */
+function dropSandbox(runId: string, change: 'removed' | 'stopped' = 'removed') {
+  if (db.runningSandboxes.delete(runId)) feed({ type: 'sandboxes', runId, change });
+}
+
 export function sandboxOverview(): SandboxOverview {
   const sandboxes: RunningSandbox[] = [];
   for (const [runId, sb] of db.runningSandboxes) {
@@ -743,14 +755,16 @@ export function sandboxOverview(): SandboxOverview {
       runId, repo: r.repo, visible: true, issueNumber: r.issueNumber, issueTitle: r.issueTitle, runStatus: r.status, owner: r.owner,
       image: def.image, services: def.services.map((x) => x.name), sha256: r.sandbox?.sha256 ?? '', createdAt: sb.createdAt,
       cpus: def.limits.cpus, memory: def.limits.memory,
+      containers: sb.containers, platforms: def.platforms.map((x) => x.name), slots: sb.containers.length,
+      memoryTotal: `${parseInt(def.limits.memory, 10) * (sb.containers.length + def.services.length)}${def.limits.memory.replace(/^[0-9]+/, '')}`,
     });
   }
   sandboxes.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   return {
     enabled: db.sandboxEnabled,
     runtime: db.sandboxEnabled ? 'podman' : 'off',
-    inUse: sandboxes.length,
-    limits: { maxCpus: 2, maxMemory: '4g', maxConcurrent: 2, execTimeoutMinutes: 30, registries: ['docker.io', 'ghcr.io', 'quay.io', 'mcr.microsoft.com'] },
+    inUse: sandboxes.reduce((n, x) => n + x.slots, 0),
+    limits: { maxCpus: 2, maxMemory: '4g', maxConcurrent: 4, execTimeoutMinutes: 30, registries: ['docker.io', 'ghcr.io', 'quay.io', 'mcr.microsoft.com'], maxPlatforms: 4 },
     sandboxes,
   };
 }
@@ -768,7 +782,7 @@ export function pendingSandboxes(): PendingSandbox[] {
 export function stopSandbox(runId: string, by: User): SandboxOverview {
   const sb = db.runningSandboxes.get(runId);
   if (!sb) throw new MockError(404, 'not_found', `Run ${runId} has no sandbox right now`);
-  db.runningSandboxes.delete(runId);
+  dropSandbox(runId, 'stopped');
   emit(sb.builderSessionId, 'system', {
     level: 'warn',
     text: `An admin (${by.username}) stopped this run's sandbox: its containers and network were removed (cache volumes are kept). The run continues; the next sandbox command creates a new sandbox and runs the setup script again.`,
@@ -780,25 +794,29 @@ export function stopSandbox(runId: string, by: User): SandboxOverview {
 function runSandboxFor(repo: string): RunSandbox {
   const st = sandboxStatus(repo);
   const short = st.sha256?.slice(0, 12);
-  if (!st.enabled) return { state: 'disabled', reason: 'Sandboxes are switched off on this server (FACTORY_SANDBOX=off).', sha256: null, image: null };
+  if (!st.enabled) return { state: 'disabled', reason: 'Sandboxes are switched off on this server (FACTORY_SANDBOX=off).', sha256: null, image: null, platforms: [], platformsUsed: [] };
   switch (st.state) {
     case 'none':
-      return { state: 'none', reason: 'The repository has no .agern/sandbox.yml on its default branch (origin/main).', sha256: null, image: null };
+      return { state: 'none', reason: 'The repository has no .agern/sandbox.yml on its default branch (origin/main).', sha256: null, image: null, platforms: [], platformsUsed: [] };
     case 'invalid':
-      return { state: 'invalid', reason: `.agern/sandbox.yml on origin/main is invalid: ${st.errors.join('; ')}`, sha256: st.sha256, image: null };
+      return { state: 'invalid', reason: `.agern/sandbox.yml on origin/main is invalid: ${st.errors.join('; ')}`, sha256: st.sha256, image: null, platforms: [], platformsUsed: [] };
     case 'pending':
       return {
         state: 'unapproved',
         reason: `.agern/sandbox.yml (${short}) is not approved: ${st.approval ? `it changed since an admin approved version ${st.approval.sha256.slice(0, 12)}` : 'no version of it has been approved by an admin'}. An admin can approve it in the project's sandbox settings.`,
         sha256: st.sha256,
         image: st.definition?.image ?? null,
+        platforms: [],
+        platformsUsed: [],
       };
     case 'approved':
       return {
         state: 'approved',
-        reason: `Sandbox definition ${short} approved by ${st.approval!.approvedBy.username}; image ${st.definition!.image}. It is created on the builder's first sandbox command.`,
+        reason: `Sandbox definition ${short} approved by ${st.approval!.approvedBy.username}; image ${st.definition!.image}${st.definition!.platforms.length ? `; platforms ${st.definition!.platforms.map((x) => `${x.name} (${x.image})`).join(', ')}` : ''}. It is created on the builder's first sandbox command.`,
         sha256: st.sha256,
         image: st.definition!.image,
+        platforms: st.definition!.platforms.map((x) => x.name),
+        platformsUsed: [],
       };
   }
 }
@@ -874,7 +892,7 @@ export function cancelRun(r: Run) {
       st.endedAt = iso(Date.now());
     }
   }
-  db.runningSandboxes.delete(r.id);
+  dropSandbox(r.id);
   setRunStatus(r, 'cancelled', iso(Date.now()));
 }
 
@@ -1024,7 +1042,7 @@ function seed() {
     proj('infra', 'Terraform for the hosting environment', 'HCL', 0, 60 * 24 * 19),
   ];
   // Sandbox definitions: web-shop's is approved, billing-service's changed since its approval, design-system's is invalid.
-  const webShopSandbox = 'image: docker.io/library/eclipse-temurin:21-jdk\nsetup: |\n  apt-get update && apt-get install -y nodejs npm\nservices:\n  postgres:\n    image: docker.io/library/postgres:17\n    env: { POSTGRES_PASSWORD: dev }\ncaches: [ /root/.gradle, /root/.npm ]\nresources: { cpus: 2, memory: 4g }\n';
+  const webShopSandbox = 'image: docker.io/library/eclipse-temurin:21-jdk\nuser: builder\nsetup: |\n  apt-get update && apt-get install -y nodejs npm\nservices:\n  postgres:\n    image: docker.io/library/postgres:17\n    env: { POSTGRES_PASSWORD: dev }\n    ready: { command: "pg_isready -h 127.0.0.1", timeoutSeconds: 60 }\ncaches: [ /home/builder/.gradle, /home/builder/.npm ]\nresources: { cpus: 2, memory: 4g }\nplatforms:\n  jdk17:\n    image: docker.io/library/eclipse-temurin:17-jdk\n';
   db.sandboxFiles.set('web-shop', {
     content: webShopSandbox,
     sha256: '3f6c1d0e9a8b7c6d5e4f30211a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d',
@@ -1032,9 +1050,11 @@ function seed() {
       image: 'docker.io/library/eclipse-temurin:21-jdk',
       setup: 'apt-get update && apt-get install -y nodejs npm\n',
       env: {},
-      services: [{ name: 'postgres', image: 'docker.io/library/postgres:17', env: { POSTGRES_PASSWORD: 'dev' } }],
-      caches: ['/root/.gradle', '/root/.npm'],
+      services: [{ name: 'postgres', image: 'docker.io/library/postgres:17', env: { POSTGRES_PASSWORD: 'dev' }, ready: { command: 'pg_isready -h 127.0.0.1', timeoutSeconds: 60 } }],
+      caches: ['/home/builder/.gradle', '/home/builder/.npm'],
       limits: { cpus: 2, memory: '4g', requestedCpus: 2, requestedMemory: '4g', capped: false },
+      platforms: [{ name: 'jdk17', image: 'docker.io/library/eclipse-temurin:17-jdk', setup: 'apt-get update && apt-get install -y nodejs npm\n', setupInherited: true }],
+      user: { name: 'builder', uid: 1000 },
     },
     errors: [],
   });
@@ -1050,6 +1070,8 @@ function seed() {
       services: [],
       caches: [],
       limits: { cpus: 2, memory: '4g', requestedCpus: 8, requestedMemory: '16g', capped: true },
+      platforms: [],
+      user: null,
     },
     errors: [],
   });
@@ -1067,9 +1089,11 @@ function seed() {
       image: 'docker.io/library/python:3.12-slim',
       setup: 'pip install -r requirements-dev.txt',
       env: { PYTHONUNBUFFERED: '1' },
-      services: [{ name: 'warehouse', image: 'docker.io/library/postgres:17', env: { POSTGRES_PASSWORD: 'dev', POSTGRES_DB: 'warehouse' } }],
+      services: [{ name: 'warehouse', image: 'docker.io/library/postgres:17', env: { POSTGRES_PASSWORD: 'dev', POSTGRES_DB: 'warehouse' }, ready: null }],
       caches: ['/root/.cache/pip'],
       limits: { cpus: 2, memory: '4g', requestedCpus: null, requestedMemory: null, capped: false },
+      platforms: [],
+      user: null,
     },
     errors: [],
   });

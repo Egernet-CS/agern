@@ -1,6 +1,6 @@
 // Canned agent transcripts for the mock backend. Each script is a list of steps that the
 // engine either plays live (with streamed partials) or materialises instantly as history.
-import type { SandboxLog } from '../api/types';
+import type { SandboxLog, SandboxPlatform } from '../api/types';
 
 /** A `system` event; with `sandbox` the full log of a sandbox command (docs/ARCHITECTURE.md §8 "Event"). */
 export type SystemStep = { kind: 'system'; level: 'info' | 'warn' | 'error'; text: string; sandbox?: SandboxLog; ms?: number };
@@ -75,20 +75,22 @@ export function builderScript(round: number, findings: string[]): Step[] {
 const EXEC = 'mcp__factory__factory_sandbox_exec';
 
 /** A finished sandbox command: its full log (system event) and the JSON the agent gets back (the tail). */
-function sandboxExec(command: string, exitCode: number, output: string, durationMs: number, extraLogs: SystemStep[] = [], kind: SandboxLog['kind'] = 'exec'): Step {
+function sandboxExec(
+  command: string, exitCode: number, output: string, durationMs: number, extraLogs: SystemStep[] = [], kind: SandboxLog['kind'] = 'exec', platform: string | null = null,
+): Step {
   const what = kind === 'setup' ? 'setup script' : `\`${command.split('\n')[0].slice(0, 200)}\``;
   const log: SystemStep = {
     kind: 'system',
     level: exitCode === 0 ? 'info' : 'warn',
-    text: `Sandbox ${what}: exit ${exitCode} in ${(durationMs / 1000).toFixed(1)} s`,
-    sandbox: { kind, command, exitCode, timedOut: false, durationMs, output, outputTruncated: false },
+    text: `Sandbox${platform ? ` [${platform}]` : ''} ${what}: exit ${exitCode} in ${(durationMs / 1000).toFixed(1)} s`,
+    sandbox: { kind, command, exitCode, timedOut: false, durationMs, output, outputTruncated: false, platform },
   };
   const tail = output.slice(-20_000);
   return {
     kind: 'tool',
     name: EXEC,
-    input: { command },
-    result: JSON.stringify({ exitCode, output: tail, truncated: tail.length < output.length, durationMs, timedOut: false }),
+    input: platform && platform !== 'default' ? { command, platform } : { command },
+    result: JSON.stringify({ exitCode, output: tail, truncated: tail.length < output.length, durationMs, timedOut: false, ...(platform ? { platform } : {}) }),
     ms: Math.min(3200, 900 + durationMs / 40),
     logs: [...extraLogs, log],
   };
@@ -134,12 +136,14 @@ const npmOutput = () =>
     .join('\n') + '\n';
 
 /** The builder of a run with an approved sandbox: builds and tests inside it through the factory's MCP tools. */
-export function sandboxBuilderScript(round: number, image: string, setup: string | null, services: string[]): Step[] {
+export function sandboxBuilderScript(round: number, image: string, setup: string | null, services: string[], platforms: SandboxPlatform[] = []): Step[] {
+  // With platforms, every log names where it ran (null without, like the backend).
+  const at = platforms.length ? 'default' : null;
   if (round > 0) {
     return [
       { kind: 'text', text: 'Addressing the review findings; tests run in the sandbox again.' },
       tool('Edit', { file_path: 'src/main/kotlin/shop/cart/CartRoutes.kt', old_string: 'service.addItem(CartId(id)', new_string: 'service.addItem(requireOwnCart(CartId(id)))' }, 'The file src/main/kotlin/shop/cart/CartRoutes.kt has been updated.', 700),
-      sandboxExec('./gradlew test --tests "shop.cart.*"', 0, gradleTest(false), 24_100),
+      sandboxExec('./gradlew test --tests "shop.cart.*"', 0, gradleTest(false), 24_100, [], 'exec', at),
       tool('Bash', { command: 'git commit -am "Address review: enforce cart ownership"', description: 'Commit fixes' }, '[factory/issue-42-saved-carts 5e1c0d2] Address review: enforce cart ownership\n 2 files changed, 31 insertions(+), 4 deletions(-)', 600),
       { kind: 'text', text: 'Ownership is enforced on every cart route; the cart tests are green in the sandbox.' },
     ];
@@ -148,7 +152,7 @@ export function sandboxBuilderScript(round: number, image: string, setup: string
     { kind: 'system', level: 'info', text: `Creating the sandbox: image ${image}${services.length ? `, services ${services.join(', ')}` : ''} …` },
   ];
   const setupLogs: SystemStep[] = setup
-    ? [{ kind: 'system', level: 'info', text: 'Sandbox setup script: exit 0 in 41.3 s', sandbox: { kind: 'setup', command: setup, exitCode: 0, timedOut: false, durationMs: 41_300, output: aptOutput, outputTruncated: false } }]
+    ? [{ kind: 'system', level: 'info', text: `Sandbox${at ? ` [${at}]` : ''} setup script: exit 0 in 41.3 s`, sandbox: { kind: 'setup', command: setup, exitCode: 0, timedOut: false, durationMs: 41_300, output: aptOutput, outputTruncated: false, platform: at } }]
     : [];
   const ready: SystemStep = { kind: 'system', level: 'info', text: `Sandbox ready in 47.9 s: ${image}, 2 CPUs, 4g memory.` };
   return [
@@ -156,13 +160,23 @@ export function sandboxBuilderScript(round: number, image: string, setup: string
     tool('mcp__factory__factory_sandbox_info', {}, JSON.stringify({ available: true, state: 'approved', image, created: false, workdir: '/workspace', services: services.map((n) => ({ name: n, host: n, image: 'docker.io/library/postgres:17', ports: [] })), caches: ['/root/.gradle', '/root/.npm'], limits: { cpus: 2, memory: '4g', execTimeoutSeconds: 1800, outputTailChars: 20000 }, capacity: { inUse: 1, max: 2 } }, null, 2), 500),
     tool('Write', { file_path: 'src/main/resources/db/migration/V7__saved_carts.sql', content: '…' }, 'File created successfully at: src/main/resources/db/migration/V7__saved_carts.sql', 700),
     tool('Edit', { file_path: 'src/main/kotlin/shop/cart/CartService.kt', old_string: '…', new_string: '…' }, 'The file src/main/kotlin/shop/cart/CartService.kt has been updated.', 700),
-    sandboxExec('./gradlew test', 1, gradleTest(true), 38_400, [...created, ...setupLogs, ready]),
+    sandboxExec('./gradlew test', 1, gradleTest(true), 38_400, [...created, ...setupLogs, ready], 'exec', at),
     { kind: 'text', text: 'One failure — the expiry check compares `Instant` against a `LocalDate`. Fixing.' },
     tool('Edit', { file_path: 'src/main/kotlin/shop/cart/CartService.kt', old_string: 'updatedAt < cutoff.toLocalDate()', new_string: 'updatedAt < cutoff' }, 'The file src/main/kotlin/shop/cart/CartService.kt has been updated.', 600),
-    sandboxExec('npm ci && npm run build', 0, npmOutput(), 52_700),
-    sandboxExec('./gradlew test', 0, gradleTest(false), 31_900),
+    sandboxExec('npm ci && npm run build', 0, npmOutput(), 52_700, [], 'exec', at),
+    sandboxExec('./gradlew test', 0, gradleTest(false), 31_900, [], 'exec', at),
+    ...platforms.map((pl) => {
+      const plSetup: SystemStep[] = pl.setup
+        ? [{ kind: 'system', level: 'info', text: `Sandbox [${pl.name}] setup script: exit 0 in 38.0 s`, sandbox: { kind: 'setup', command: pl.setup, exitCode: 0, timedOut: false, durationMs: 38_000, output: aptOutput, outputTruncated: false, platform: pl.name } }]
+        : [];
+      return sandboxExec('./gradlew test', 0, gradleTest(false), 29_400, [
+        { kind: 'system', level: 'info', text: `Creating platform \`${pl.name}\`: image ${pl.image} …` },
+        ...plSetup,
+        { kind: 'system', level: 'info', text: `Platform \`${pl.name}\` ready in 40.2 s: ${pl.image}, 2 CPUs, 4g memory, commands as builder (uid 1000).` },
+      ], 'exec', pl.name);
+    }),
     tool('Bash', { command: 'git add -A && git commit -m "Saved carts for signed-in users (#42)"', description: 'Commit' }, '[factory/issue-42-saved-carts a91f3b7] Saved carts for signed-in users (#42)\n 6 files changed, 284 insertions(+), 12 deletions(-)', 600),
-    { kind: 'text', text: 'Implemented saved carts. Built the frontend and ran the test suite in the sandbox (PostgreSQL sidecar): all green.' },
+    { kind: 'text', text: `Implemented saved carts. Built the frontend and ran the test suite in the sandbox (PostgreSQL sidecar): all green${platforms.length ? ` — default image and ${platforms.map((x) => x.name).join(', ')}` : ''}.` },
   ];
 }
 

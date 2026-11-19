@@ -29,7 +29,12 @@ export function SandboxLogBlock({ log }: { log: SandboxLog }) {
           {open ? '▾' : '▸'}
         </span>
         <span className="t-sbx-cmd">
-          <span className="sr-only">{setup ? 'Sandbox setup script' : 'Sandbox command'}: </span>
+          <span className="sr-only">{setup ? 'Sandbox setup script' : 'Sandbox command'}{log.platform ? ` on platform ${log.platform}` : ''}: </span>
+          {log.platform && (
+            <span className="sbx-plat t-sbx-plat" aria-hidden title={`Ran on platform ${log.platform}`}>
+              {log.platform}
+            </span>
+          )}
           {setup ? <span className="t-sbx-setup">setup script</span> : <><span className="t-sbx-prompt" aria-hidden>$ </span>{firstLine}{multiLine && ' …'}</>}
         </span>
         <span className="t-sbx-meta">

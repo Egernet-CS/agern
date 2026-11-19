@@ -181,9 +181,27 @@ export type Run = {
  * `disabled` = FACTORY_SANDBOX is off; `none` = no `.agern/sandbox.yml`; `invalid`; `unapproved` = not approved, or changed since.
  */
 export type RunSandboxState = 'disabled' | 'none' | 'invalid' | 'unapproved' | 'approved';
-export type RunSandbox = { state: RunSandboxState; reason: string; sha256: string | null; image: string | null };
+export type RunSandbox = {
+  state: RunSandboxState;
+  reason: string;
+  sha256: string | null;
+  image: string | null;
+  /** The definition's platforms besides the default image (empty when none, and for older runs). */
+  platforms: string[];
+  /** Where the builder ran commands: `default` and platform names, in first-use order (only when there are platforms). */
+  platformsUsed: string[];
+};
 
-export type SandboxService = { name: string; image: string; env: Record<string, string> };
+/** A sidecar's readiness check: run inside the service until it exits 0, for at most `timeoutSeconds`. */
+export type SandboxReady = { command: string; timeoutSeconds: number };
+
+export type SandboxService = { name: string; image: string; env: Record<string, string>; ready: SandboxReady | null };
+
+/** Another image the builder can run commands in. `setupInherited`: it uses the top-level `setup`. */
+export type SandboxPlatform = { name: string; image: string; setup: string | null; setupInherited: boolean };
+
+/** `user:` as written (`name` or `uid`) and the uid commands run as inside the container. */
+export type SandboxUser = { name: string | null; uid: number };
 
 /** A validated `.agern/sandbox.yml`. `limits`: effective per-container limits (the request, capped by the server). */
 export type SandboxDefinition = {
@@ -193,6 +211,9 @@ export type SandboxDefinition = {
   services: SandboxService[];
   caches: string[];
   limits: { cpus: number; memory: string; requestedCpus: number | null; requestedMemory: string | null; capped: boolean };
+  platforms: SandboxPlatform[];
+  /** Null: commands run as root inside the container. */
+  user: SandboxUser | null;
 };
 
 export type SandboxApproval = { sha256: string; content: string; approvedBy: Owner; approvedAt: string };
@@ -236,15 +257,26 @@ export type RunningSandbox = {
   /** Per-container limits it runs with. */
   cpus: number;
   memory: string;
+  /** The containers that run commands right now (`default` = the top-level image, or a platform); one slot each. */
+  containers: SandboxContainer[];
+  /** The definition's platforms (whether or not they exist right now). */
+  platforms: string[];
+  /** Slots of the server's cap this run holds (one per container). */
+  slots: number;
+  /** What all its containers may use together: `memory` × (containers + services). */
+  memoryTotal: string;
 };
+
+export type SandboxContainer = { platform: string; image: string; createdAt: string };
 
 /** Admin overview of the sandbox runtime: its limits and the sandboxes that exist (oldest first). */
 export type SandboxOverview = {
   enabled: boolean;
   /** `fake` is a development mode that only pretends to run commands. */
   runtime: 'off' | 'podman' | 'fake';
+  /** Command containers that exist (slots in use), over all runs. */
   inUse: number;
-  limits: { maxCpus: number; maxMemory: string; maxConcurrent: number; execTimeoutMinutes: number; registries: string[] };
+  limits: { maxCpus: number; maxMemory: string; maxConcurrent: number; execTimeoutMinutes: number; registries: string[]; maxPlatforms: number };
   sandboxes: RunningSandbox[];
 };
 
@@ -266,6 +298,8 @@ export type SandboxLog = {
   durationMs: number;
   output: string;
   outputTruncated: boolean;
+  /** Where it ran: null when the definition has no platforms, else `default` or the platform's name. */
+  platform?: string | null;
 };
 
 export type EventType = 'user' | 'claude' | 'system' | 'status';
@@ -356,7 +390,9 @@ export type FeedFrame =
   | { type: 'release'; repo: string; release: Release }
   | { type: 'release_deleted'; repo: string; releaseId: string }
   /** An admin approved (approval set) or revoked (null) the project's sandbox definition. */
-  | { type: 'sandbox_approval'; repo: string; approval: SandboxApproval | null };
+  | { type: 'sandbox_approval'; repo: string; approval: SandboxApproval | null }
+  /** Admins only: a container of a run's sandbox was created or removed, or an admin stopped the sandbox. */
+  | { type: 'sandboxes'; runId: string; change: 'created' | 'removed' | 'stopped' };
 
 /** Agents are working on these runs. */
 export const WORKING_RUN_STATUSES: RunStatus[] = ['queued', 'spec', 'building', 'reviewing', 'approving'];

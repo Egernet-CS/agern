@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, Navigate } from 'react-router-dom';
 import { api, ApiError, type RunningSandbox, type Settings, type SoftwareRequest, type StageRole, type User } from '../api';
 import { shortHash, shortImage } from '../components/sandbox/SandboxBits';
@@ -6,7 +6,7 @@ import { Dialog, ErrorBox, Loading, Notice } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
 import { between, timeAgo } from '../lib/format';
-import { useFeedReconnects } from '../lib/realtime';
+import { useFeedReconnects, useSandboxesFeed } from '../lib/realtime';
 import { useNow } from '../lib/useNow';
 
 const MODELS = ['opus', 'sonnet', 'haiku', 'fable'];
@@ -162,7 +162,19 @@ function RequestsCard() {
 /** Running sandboxes (with Stop), the runtime's limits and the projects whose definitions wait for an approval. */
 function SandboxesCard() {
   const reconnects = useFeedReconnects();
-  const q = useAsync(() => api.sandboxes(), [reconnects], { pollMs: 5000 });
+  // Live: the server announces every sandbox container that comes or goes (admins only); the slow poll is a fallback.
+  const q = useAsync(() => api.sandboxes(), [reconnects], { pollMs: 60_000 });
+  const debounce = useRef<number | null>(null);
+  useSandboxesFeed(() => {
+    if (debounce.current !== null) window.clearTimeout(debounce.current);
+    debounce.current = window.setTimeout(() => {
+      debounce.current = null;
+      q.reload();
+    }, 250);
+  });
+  useEffect(() => () => {
+    if (debounce.current !== null) window.clearTimeout(debounce.current);
+  }, []);
   const pending = useAsync(() => api.pendingSandboxes(), [reconnects]);
   const now = useNow(5000);
   const [target, setTarget] = useState<RunningSandbox | null>(null);
@@ -187,7 +199,7 @@ function SandboxesCard() {
     }
   };
   const o = q.data;
-  const used = o ? `${o.inUse} of ${o.limits.maxConcurrent}` : '';
+  const used = o ? `${o.inUse} of ${o.limits.maxConcurrent} container${o.limits.maxConcurrent === 1 ? '' : 's'}` : '';
   return (
     <section className="card settings-card" aria-labelledby="sb-h">
       <header className="sc-head">
@@ -229,6 +241,10 @@ function SandboxesCard() {
               </dd>
             </div>
             <div>
+              <dt>platforms</dt>
+              <dd>up to {o.limits.maxPlatforms} per project</dd>
+            </div>
+            <div>
               <dt>command limit</dt>
               <dd>{o.limits.execTimeoutMinutes} min</dd>
             </div>
@@ -237,6 +253,9 @@ function SandboxesCard() {
               <dd className="mono small">{o.limits.registries.join(', ')}</dd>
             </div>
           </dl>
+          <p className="muted small sbx-slots-note">
+            Every container that runs commands takes one slot: a run’s default image and each platform it tests on. Services do not take a slot, but use memory.
+          </p>
           <h3 className="sd-h">
             Running <span className="muted">{o.sandboxes.length}</span>
           </h3>
@@ -266,11 +285,23 @@ function SandboxesCard() {
                     <span>· {s.runStatus.replace('_', ' ')}</span>
                     <span>· up {between(s.createdAt, null, now)}</span>
                   </div>
+                  <ul className="sbx-run-containers" aria-label="Containers">
+                    {s.containers.map((c) => (
+                      <li key={c.platform}>
+                        <span className="sbx-plat">{c.platform}</span> <code title={c.image}>{shortImage(c.image)}</code>
+                      </li>
+                    ))}
+                    {s.containers.length === 0 && <li className="muted small">no command container right now</li>}
+                  </ul>
                   <div className="sbx-run-spec">
-                    <code title={s.image}>{shortImage(s.image)}</code>
-                    {s.services.length > 0 && <span className="muted small">+ {s.services.join(', ')}</span>}
+                    {s.services.length > 0 && <span className="muted small">services {s.services.join(', ')}</span>}
+                    {s.platforms.length > s.containers.filter((c) => c.platform !== 'default').length && (
+                      <span className="muted small">
+                        platforms not started: {s.platforms.filter((p) => !s.containers.some((c) => c.platform === p)).join(', ')}
+                      </span>
+                    )}
                     <span className="muted small">
-                      {s.cpus} CPU{s.cpus === 1 ? '' : 's'} · {s.memory}
+                      {s.slots} slot{s.slots === 1 ? '' : 's'} · {s.cpus} CPU{s.cpus === 1 ? '' : 's'} · {s.memory} per container · up to {s.memoryTotal} in all
                     </span>
                     <span className="muted small">definition {shortHash(s.sha256)}</span>
                   </div>

@@ -142,6 +142,7 @@ export function useSessionStream(sessionId: string | null): SessionStream {
 
 type IssueListener = (repo: string, issue: Issue) => void;
 type SandboxApprovalListener = (repo: string, approval: SandboxApproval | null) => void;
+type SandboxesListener = (runId: string, change: 'created' | 'removed' | 'stopped') => void;
 
 type FeedState = {
   sessions: Map<string, AgentSession>;
@@ -154,6 +155,8 @@ type FeedState = {
   subscribeIssues: (fn: IssueListener) => () => void;
   /** Registers a listener for `sandbox_approval` frames; returns the unsubscribe function. Stable identity. */
   subscribeSandboxApprovals: (fn: SandboxApprovalListener) => () => void;
+  /** Registers a listener for `sandboxes` frames (admins only: a sandbox container came or went); returns the unsubscribe function. */
+  subscribeSandboxes: (fn: SandboxesListener) => () => void;
   /** Ids of chats closed while this app was open (tombstones: they never reappear). */
   closedSessions: Set<string>;
   /** Records a chat as closed and drops it from the live sessions. Stable identity. */
@@ -180,6 +183,7 @@ const FeedContext = createContext<FeedState>({
   reconnects: 0,
   subscribeIssues: () => () => {},
   subscribeSandboxApprovals: () => () => {},
+  subscribeSandboxes: () => () => {},
   closedSessions: new Set(),
   markSessionClosed: () => {},
   releases: new Map(),
@@ -213,6 +217,13 @@ export function FeedProvider({ enabled, children }: { enabled: boolean; children
     approvalListeners.current.add(fn);
     return () => {
       approvalListeners.current.delete(fn);
+    };
+  }, []);
+  const sandboxesListeners = useRef(new Set<SandboxesListener>());
+  const subscribeSandboxes = useCallback((fn: SandboxesListener) => {
+    sandboxesListeners.current.add(fn);
+    return () => {
+      sandboxesListeners.current.delete(fn);
     };
   }, []);
   const opened = useRef(false);
@@ -272,6 +283,10 @@ export function FeedProvider({ enabled, children }: { enabled: boolean; children
             for (const fn of approvalListeners.current) fn(f.repo, f.approval);
             return;
           }
+          if (f.type === 'sandboxes') {
+            for (const fn of sandboxesListeners.current) fn(f.runId, f.change);
+            return;
+          }
           if (f.type === 'session_closed') {
             markSessionClosed(f.sessionId);
             return;
@@ -302,6 +317,7 @@ export function FeedProvider({ enabled, children }: { enabled: boolean; children
       reconnects,
       subscribeIssues,
       subscribeSandboxApprovals,
+      subscribeSandboxes,
       closedSessions: store.current.closed,
       markSessionClosed,
       releases: store.current.releases,
@@ -311,7 +327,7 @@ export function FeedProvider({ enabled, children }: { enabled: boolean; children
       releaseMark,
       releaseSeen: store.current.releaseSeen,
     }),
-    [version, conn, reconnects, subscribeIssues, subscribeSandboxApprovals, markSessionClosed, noteReleases, markReleaseDeleted, releaseMark],
+    [version, conn, reconnects, subscribeIssues, subscribeSandboxApprovals, subscribeSandboxes, markSessionClosed, noteReleases, markReleaseDeleted, releaseMark],
   );
   return createElement(FeedContext.Provider, { value }, children);
 }
@@ -347,6 +363,14 @@ export function useSandboxApprovalFeed(repo: string, onChange: (approval: Sandbo
       }),
     [repo, subscribeSandboxApprovals],
   );
+}
+
+/** Calls `onChange` whenever a sandbox container is created or removed on the server (admins only receive these). */
+export function useSandboxesFeed(onChange: (runId: string, change: 'created' | 'removed' | 'stopped') => void) {
+  const { subscribeSandboxes } = useFeed();
+  const cb = useRef(onChange);
+  cb.current = onChange;
+  useEffect(() => subscribeSandboxes((runId, change) => cb.current(runId, change)), [subscribeSandboxes]);
 }
 
 /**

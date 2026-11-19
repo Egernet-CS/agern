@@ -71,6 +71,7 @@ export function sandboxLogOf(v: unknown): SandboxLog | undefined {
     durationMs: num(v.durationMs) ?? 0,
     output: str(v.output) ?? '',
     outputTruncated: v.outputTruncated === true,
+    platform: str(v.platform) ?? null,
   };
 }
 
