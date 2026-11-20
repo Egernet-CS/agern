@@ -149,7 +149,8 @@ class ReleaseMerger(
     private fun ownerOf(r: ReleaseRecord): UserRecord? = r.ownerId?.let { users.byId(it) }
     private fun ownerClient(r: ReleaseRecord): GitHubClient? = ownerOf(r)?.let { access.client(it) }
     private fun login(u: UserRecord?) = u?.let { it.githubLogin ?: it.username } ?: "the owner"
-    private fun pageUrl(r: ReleaseRecord) = "${cfg.publicUrl.trimEnd('/')}/p/${r.repo}/releases/${r.id}"
+    /** The release page as GitHub text may name it: a link, or only its name when this installation has an internal address. */
+    private fun pageUrl(r: ReleaseRecord) = cfg.pageRef("p/${r.repo}/releases/${r.id}", "the page of release `${r.name}`")
 
     private suspend fun setNotice(id: UUID, notice: String?) = io { store.setNotice(id, notice?.take(2000)) }
 

@@ -326,7 +326,7 @@ class ReleaseBuilder(
                 client.comment(
                     org, r.repo, number,
                     "**Agern:** release `${r.name}` is paused. $note It resumes by itself at ${TIME.format(resumeAt)} and builds this issue again; " +
-                        "the owner can also resume it on ${cfg.publicUrl.trimEnd('/')}/p/${r.repo}/releases/${r.id}",
+                        "the owner can also resume it on ${cfg.pageRef("p/${r.repo}/releases/${r.id}", "the page of release `${r.name}`")}",
                 )
             }
         } catch (e: Exception) {
