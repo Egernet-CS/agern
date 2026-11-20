@@ -29,6 +29,62 @@ class FakeGitHub(private val org: String) : GitHub {
     /** Branches per repo besides `main`, which always exists. */
     val branches = mutableMapOf<String, MutableSet<String>>()
 
+    /** What the fake knows about each pull request, by number. */
+    data class PullMeta(
+        val repo: String, val head: String, val base: String, var title: String,
+        var state: String = "open", var merged: Boolean = false, var mergeCommit: String? = null,
+    )
+    val pullMeta = java.util.concurrent.ConcurrentHashMap<Int, PullMeta>()
+    /**
+     * Commit titles per `"<repo>:<branch>"`, oldest first (`main` starts with "Initial commit"): a branch is created
+     * with its source's commits, a squash merge adds one commit to the base, a rebase merge replays the head's own
+     * commits onto the base and a merge commit adds them plus the merge commit. Lets tests count commits per issue.
+     */
+    val commits = java.util.concurrent.ConcurrentHashMap<String, MutableList<String>>()
+    fun commitsOf(repo: String, branch: String): List<String> = synchronized(this) {
+        commits.getOrPut("$repo:$branch") { if (branch == "main") mutableListOf("Initial commit") else mutableListOf() }.toList()
+    }
+    private fun commitList(repo: String, branch: String) =
+        commits.getOrPut("$repo:$branch") { if (branch == "main") mutableListOf("Initial commit") else mutableListOf() }
+
+    /** Head branches (`"<repo>:<branch>"`) whose pull requests do not merge cleanly (mergeable false; merging fails). */
+    val conflicting: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+    /** The next this many `getPull` reads report mergeability as not computed yet (null). */
+    @Volatile var mergeableComputing = 0
+    /** The repository's merge settings, as `getRepo` reports them (null: GitHub leaves the field out). */
+    @Volatile var allowRebaseMerge: Boolean? = true
+    @Volatile var allowMergeCommit: Boolean? = true
+    /** `getRepo` leaves the merge settings out (as GitHub does for some tokens); merging still follows them. */
+    @Volatile var hideMergeSettings = false
+    /** Lets tests make opening pull requests fail. */
+    @Volatile var failCreatePull = false
+
+    /** As if a person merged pull request [number] on GitHub (rebase), outside Agern. */
+    fun mergeOnGitHub(number: Int) = synchronized(this) { applyMerge(pullMeta.getValue(number), number, "rebase") }
+
+    /** As if a person closed pull request [number] on GitHub without merging it. */
+    fun closePull(number: Int) = synchronized(this) {
+        pullMeta.getValue(number).state = "closed"
+        pulls.values.forEach { l -> l.replaceAll { if (it.number == number) it.copy(state = "closed") else it } }
+    }
+
+    private fun applyMerge(m: PullMeta, number: Int, method: String): String {
+        val base = commitList(m.repo, m.base)
+        when (method) {
+            "squash" -> base += m.title
+            else -> {
+                val own = commitList(m.repo, m.head).filter { it !in base }
+                base += own
+                if (method == "merge") base += m.title
+            }
+        }
+        m.state = "closed"
+        m.merged = true
+        m.mergeCommit = "sha-${m.base}-${base.size}"
+        pulls.values.forEach { l -> l.replaceAll { if (it.number == number) it.copy(state = "merged") else it } }
+        return m.mergeCommit!!
+    }
+
     override val isFake = true
     override fun cloneUrl(org: String, repo: String) = "fake://$org/$repo"
 
@@ -103,6 +159,8 @@ class FakeGitHub(private val org: String) : GitHub {
             name = r.name, fullName = "$org/${r.name}", description = r.description, private = r.private,
             defaultBranch = "main", language = "Kotlin", openIssuesCount = r.issues.count { it.state == "open" },
             pushedAt = Instant.now().toString(), htmlUrl = "https://github.com/$org/${r.name}", cloneUrl = cloneUrl(org, r.name),
+            allowRebaseMerge = if (hideMergeSettings) null else allowRebaseMerge,
+            allowMergeCommit = if (hideMergeSettings) null else allowMergeCommit,
         )
 
         override fun currentUser() = GhUser(login, login.replaceFirstChar { it.uppercase() }, scopes)
@@ -170,9 +228,11 @@ class FakeGitHub(private val org: String) : GitHub {
         override fun createPull(org: String, repo: String, head: String, base: String, title: String, body: String): GhPull =
             synchronized(this@FakeGitHub) {
                 repo(org, repo)
+                if (failCreatePull) throw GitHubException(422, "Validation Failed")
                 val n = 1000 + pulls.values.sumOf { it.size } + 1
                 val pr = GhPull(n, "https://github.com/$org/$repo/pull/$n")
                 pulls.getOrPut("$repo:$head") { mutableListOf() } += pr
+                pullMeta[n] = PullMeta(repo, head, base, title)
                 pullBodies[n] = body
                 actions += "pr $repo $head -> $base #$n"
                 pr
@@ -186,7 +246,9 @@ class FakeGitHub(private val org: String) : GitHub {
         override fun squashMerge(org: String, repo: String, number: Int, title: String) = synchronized(this@FakeGitHub) {
             repo(org, repo)
             if (failMerge) throw GitHubException(405, "Pull Request is not mergeable")
-            pulls.values.forEach { l -> l.replaceAll { if (it.number == number) it.copy(state = "merged") else it } }
+            val m = pullMeta[number]
+            if (m != null) applyMerge(m, number, "squash")
+            else pulls.values.forEach { l -> l.replaceAll { if (it.number == number) it.copy(state = "merged") else it } }
             actions += "merge $repo #$number"
             Unit
         }
@@ -201,8 +263,64 @@ class FakeGitHub(private val org: String) : GitHub {
             if (failCreateBranch) throw GitHubException(403, "Resource not accessible by personal access token")
             if (branch == "main" || branch in branches[repo].orEmpty()) throw GitHubException(422, "Reference already exists")
             branches.getOrPut(repo) { mutableSetOf() } += branch
+            // The new branch has the commits of the branch whose tip it starts at (`sha-<branch>`).
+            val from = sha.removePrefix("sha-").takeIf { sha.startsWith("sha-") && (it == "main" || it in branches[repo].orEmpty()) } ?: "main"
+            commits["$repo:$branch"] = commitList(repo, from).toMutableList()
             actions += "branch $repo $branch"
             Unit
         }
+
+        override fun getPull(org: String, repo: String, number: Int): GhPullInfo? = synchronized(this@FakeGitHub) {
+            repo(org, repo)
+            val m = pullMeta[number]?.takeIf { it.repo == repo } ?: return@synchronized null
+            val computing = mergeableComputing > 0
+            if (computing) mergeableComputing--
+            val clean = "$repo:${m.head}" !in conflicting
+            GhPullInfo(
+                number = number, htmlUrl = "https://github.com/$org/$repo/pull/$number", state = m.state, merged = m.merged,
+                mergeable = if (m.state != "open" || computing) null else clean,
+                mergeableState = if (m.state != "open" || computing) "unknown" else if (clean) "clean" else "dirty",
+                head = GhRef(m.head, "sha-${m.head}-${commitList(repo, m.head).size}"), base = GhRef(m.base, "sha-${m.base}"),
+                mergeCommitSha = m.mergeCommit,
+            )
+        }
+
+        override fun updatePull(org: String, repo: String, number: Int, title: String, body: String) = synchronized(this@FakeGitHub) {
+            repo(org, repo)
+            val m = pullMeta[number]?.takeIf { it.repo == repo } ?: throw GitHubException(404, "Not Found")
+            m.title = title
+            pullBodies[number] = body
+            actions += "update-pr $repo #$number"
+            Unit
+        }
+
+        override fun mergePull(org: String, repo: String, number: Int, method: String, commitTitle: String?, expectedHeadSha: String?): String? =
+            synchronized(this@FakeGitHub) {
+                repo(org, repo)
+                require(method in NON_SQUASH_MERGE_METHODS) { "Unsupported merge method $method" }
+                val m = pullMeta[number]?.takeIf { it.repo == repo } ?: throw GitHubException(404, "Not Found")
+                if (method == "rebase" && allowRebaseMerge == false) throw GitHubException(405, "Rebase merges are not allowed on this repository.")
+                if (method == "merge" && allowMergeCommit == false) throw GitHubException(405, "Merge commits are not allowed on this repository.")
+                if (m.state != "open") throw GitHubException(405, "Pull Request is not mergeable")
+                if (failMerge || "$repo:${m.head}" in conflicting) throw GitHubException(405, "Pull Request is not mergeable")
+                if (commitTitle != null) m.title = commitTitle
+                val sha = applyMerge(m, number, method)
+                actions += "merge-$method $repo #$number"
+                sha
+            }
+
+        override fun deleteBranch(org: String, repo: String, branch: String) = synchronized(this@FakeGitHub) {
+            repo(org, repo)
+            if (branch == "main") throw GitHubException(422, "Cannot delete the default branch")
+            branches[repo]?.remove(branch)
+            commits.remove("$repo:$branch")
+            // As on GitHub: open pull requests from a deleted branch are closed.
+            pullMeta.forEach { (n, m) -> if (m.repo == repo && m.head == branch && m.state == "open") { m.state = "closed"; closePullList(n) } }
+            actions += "delete-branch $repo $branch"
+            Unit
+        }
+
+        private fun closePullList(number: Int) =
+            pulls.values.forEach { l -> l.replaceAll { if (it.number == number) it.copy(state = "closed") else it } }
     }
 }

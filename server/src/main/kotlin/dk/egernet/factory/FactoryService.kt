@@ -251,8 +251,12 @@ class FactoryService(
 
     /** `/factory release create|add|remove …` (docs/ARCHITECTURE.md §7). */
     private suspend fun releaseCommand(owner: UserRecord, repo: String, args: List<String>): String {
-        val usage = "Usage: /factory release create <name> [description] | add <name> <issue>… | remove <issue>…"
+        val usage = "Usage: /factory release create <name> [description] | add <name> <issue>… | remove <issue>… | approve <name>"
         return when (args.firstOrNull()?.lowercase()) {
+            "approve" -> {
+                val name = args.getOrNull(1) ?: return "Usage: /factory release approve <name>"
+                approvedReply(releases.approve(owner, releases.find(owner, repo, name).id))
+            }
             "create" -> {
                 val name = args.getOrNull(1) ?: return "Usage: /factory release create <name> [description]"
                 val r = releases.create(owner, repo, name, args.drop(2).joinToString(" "))
@@ -289,6 +293,14 @@ class FactoryService(
             return nums.ifEmpty { null }
         }
 
+        /** The reply to an approval (`/factory release approve`, `factory_approve_release`). */
+        fun approvedReply(r: dk.egernet.factory.db.ReleaseRecord): String {
+            val closed = r.merged.size
+            val target = r.targetBranch ?: "the default branch"
+            return "Release \"${r.name}\" is released: pull request ${r.prUrl ?: "#${r.prNumber}"} merged into $target, " +
+                "$closed issue${if (closed == 1) "" else "s"} closed." + (r.notice?.let { " $it" } ?: "")
+        }
+
         /** E.g. `Release "1.4": added #5, #6 (now 4 issues).` plus moves from other releases. */
         fun assignReply(name: String, out: ReleaseService.AssignOutcome): String {
             val total = out.release?.issues?.size ?: 0
@@ -310,6 +322,7 @@ class FactoryService(
             |  /factory release create <name> [description]   plan a new release
             |  /factory release add <name> <issue>…            put issues into a release (moves them from another)
             |  /factory release remove <issue>…                take issues out of their release
+            |  /factory release approve <name>                 merge a release that is ready to release (owner only)
             |  /factory help              this help
             |To steer a running spec-writer or builder, select it on the run page and type below its transcript,
             |or ask the chat agent to pass a message on (it uses the factory_send_to_agent tool).

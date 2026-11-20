@@ -36,6 +36,12 @@ interface GitOps {
      * exist there. Throws [GitException] when it is larger than [maxBytes] or git fails.
      */
     fun readFile(dir: Path, ref: String, path: String, home: Path, maxBytes: Int): String?
+    /**
+     * Forgets a branch that is gone on GitHub (a released release's `release/<name>`) in the clone at [mainDir]: its
+     * remote-tracking ref, and its local branch unless a worktree has it checked out or it holds commits found on no
+     * other local branch and no remote-tracking branch. Never throws.
+     */
+    fun forgetBranch(mainDir: Path, branch: String, home: Path) {}
 }
 
 /**
@@ -137,6 +143,30 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
             val path = lines.firstOrNull { it.startsWith("worktree ") }?.removePrefix("worktree ") ?: return@mapNotNull null
             val branch = lines.firstOrNull { it.startsWith("branch ") }?.removePrefix("branch ")?.removePrefix("refs/heads/")
             WorktreeInfo(Path.of(path), branch)
+        }
+    }
+
+    override fun forgetBranch(mainDir: Path, branch: String, home: Path) {
+        try {
+            if (!Files.isDirectory(mainDir.resolve(".git")) || branch.startsWith("-")) return
+            runCatching { git(mainDir, home, null, "update-ref", "-d", "refs/remotes/origin/$branch") }
+            if (gitStatus(mainDir, home, null, "rev-parse", "--verify", "--quiet", "refs/heads/$branch").first != 0) return
+            if (listWorktrees(mainDir, home).any { it.branch == branch }) {
+                log.info("Keeping local branch {}: a worktree has it checked out", branch)
+                return
+            }
+            val unique = runCatching {
+                git(mainDir, home, null, "rev-list", "--count", "refs/heads/$branch", "--not", "--exclude=$branch", "--branches", "--remotes")
+                    .trim().toInt()
+            }.getOrDefault(1)
+            if (unique > 0) {
+                log.info("Keeping local branch {}: it has {} commit(s) found on no other branch", branch, unique)
+                return
+            }
+            runCatching { git(mainDir, home, null, "branch", "-D", branch) }
+                .onFailure { log.warn("Could not delete local branch {}: {}", branch, it.message) }
+        } catch (e: Exception) {
+            log.warn("Forgetting branch {} failed: {}", branch, e.message)
         }
     }
 

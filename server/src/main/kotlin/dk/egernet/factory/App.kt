@@ -106,13 +106,17 @@ class Services(
     )
     val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes)
     val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
-    val releaseBuilder = dk.egernet.factory.pipeline.ReleaseBuilder(cfg, releaseStore, runs, users, access, orchestrator, bus, scope)
+    val releaseLocks = dk.egernet.factory.pipeline.ReleaseLocks()
+    val releaseMerger = dk.egernet.factory.pipeline.ReleaseMerger(cfg, releaseStore, users, access, workspaces, bus, releaseLocks, scope)
+    val releaseBuilder = dk.egernet.factory.pipeline.ReleaseBuilder(
+        cfg, releaseStore, runs, users, access, orchestrator, bus, scope, releaseLocks, releaseMerger,
+    )
     // A scheduled start goes through the same start as "start now" (ReleaseService.startScheduled), as the owner.
     val releaseScheduler: ReleaseScheduler = ReleaseScheduler(
         cfg, clock, releaseStore, users, access, bus,
         releaseStarter ?: ReleaseStarter { release, owner -> releases.startScheduled(owner, release.id) },
     )
-    val releases: ReleaseService = ReleaseService(cfg, access, releaseStore, bus, releaseBuilder, releaseScheduler)
+    val releases: ReleaseService = ReleaseService(cfg, access, releaseStore, bus, releaseBuilder, releaseScheduler, releaseMerger)
     val factory = FactoryService(cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases)
     val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes)
 
