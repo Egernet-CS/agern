@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { api, ApiError, isReleaseActive, releaseReadiness, type Release, type ReleaseIssue } from '../api';
+import { api, ApiError, isReleaseActive, releaseReadiness, type Release, type ReleaseChecks, type ReleaseIssue, type ReleaseMode } from '../api';
 import { Dialog, Empty, ErrorBox, IssueStateBadge, KindBadge, Loading, Notice, ReleaseStatusPill } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
@@ -180,6 +180,7 @@ export function ReleasePage() {
     await change(() => api.approveRelease(release.id));
     setConfirmRelease(false);
   };
+  const setMode = (mode: ReleaseMode) => void change(() => api.setReleaseMode(release.id, mode));
 
   const n = release.issues.length;
   const scheduled = status === 'scheduled';
@@ -312,6 +313,9 @@ export function ReleasePage() {
             </>
           ) : (
             status === 'planning' && <p className="muted small">This release is a plan. Nothing is built until it is started.</p>
+          )}
+          {!released && status !== 'cancelled' && (
+            <ReleaseModeField release={release} isOwner={isOwner} isAdmin={me.isAdmin} busy={busy} onChange={setMode} />
           )}
           {released && <ReleasedFacts release={release} repo={repo} />}
           {mayNothing && <p className="muted small">Only {ownerName}, who started this release, and admins can change it.</p>}
@@ -611,6 +615,7 @@ function ReleasePullSection({
   const blocked = readiness !== 'complete' || release.mergeState === 'conflict' || release.mergeMethod === 'unavailable';
   const approvable = !blocked && release.prNumber !== null;
   const method = approvable ? methodWords(release, target, false) : '';
+  const auto = release.mode === 'automatic' && approvable ? automaticLine(release.checks) : null;
   return (
     <section className="release-pr" aria-labelledby="release-pr-h">
       <div className="section-head">
@@ -633,7 +638,9 @@ function ReleasePullSection({
       <p id="release-ready-status" className={`release-status release-status--${blocked ? 'blocked' : 'ready'}`} role="status">
         {readyLine(release, target)}
       </p>
+      {release.checks && <ChecksLine checks={release.checks} />}
       {method && <p className="muted small">{method}</p>}
+      {auto && <p className="muted small release-auto">{auto}</p>}
       {isOwner ? (
         <div className="release-pr-actions">
           <button type="button" className="btn" onClick={onCheck} disabled={busy}>
@@ -650,13 +657,115 @@ function ReleasePullSection({
   );
 }
 
+const MODE_LABEL: Record<ReleaseMode, string> = { manual: 'Manual approval', automatic: 'Automatic' };
+
+/**
+ * The release mode, and (for whoever may change it) a select. Planned: anyone; scheduled or started: automatic is the
+ * owner's alone (it merges with the owner's token), manual also an admin's (it only stops something).
+ */
+function ReleaseModeField({
+  release,
+  isOwner,
+  isAdmin,
+  busy,
+  onChange,
+}: {
+  release: Release;
+  isOwner: boolean;
+  isAdmin: boolean;
+  busy: boolean;
+  onChange: (mode: ReleaseMode) => void;
+}) {
+  const planning = release.status === 'planning';
+  const mayAutomatic = planning || isOwner;
+  const mayManual = planning || isOwner || isAdmin;
+  const mayChange = release.mode === 'automatic' ? mayManual : mayAutomatic;
+  const who = release.owner ? release.owner.username : 'whoever starts it';
+  const hint =
+    release.mode === 'automatic'
+      ? `Once everything is built, merges cleanly and all checks on the release pull request have passed, Agern merges it with ${who}'s GitHub token. Held issues, conflicts and failed checks stop it.`
+      : `It waits as “ready to release” until ${who} approves it.`;
+  return (
+    <div className="release-mode">
+      {mayChange ? (
+        <label className="release-mode-pick small">
+          Release mode
+          <select value={release.mode} onChange={(e) => onChange(e.target.value as ReleaseMode)} disabled={busy} aria-describedby="release-mode-hint">
+            <option value="manual">{MODE_LABEL.manual}</option>
+            <option value="automatic" disabled={!mayAutomatic}>
+              {MODE_LABEL.automatic}
+            </option>
+          </select>
+        </label>
+      ) : (
+        <span className="small">
+          Release mode: <strong>{MODE_LABEL[release.mode]}</strong>
+        </span>
+      )}
+      <span id="release-mode-hint" className="muted small">
+        {hint}
+      </span>
+    </div>
+  );
+}
+
+const CHECKS_LABEL: Record<ReleaseChecks['state'], string> = {
+  unknown: 'checks unknown',
+  awaiting: 'waiting for checks to appear',
+  none: 'no checks',
+  pending: 'checks pending',
+  passed: 'checks passed',
+  failed: 'checks failed',
+};
+const CHECKS_TONE: Record<ReleaseChecks['state'], string> = {
+  unknown: 'idle',
+  awaiting: 'active',
+  none: 'idle',
+  pending: 'active',
+  passed: 'pass',
+  failed: 'fail',
+};
+
+/** The checks on the release pull request's head commit (GitHub Actions and other status checks). */
+function ChecksLine({ checks }: { checks: ReleaseChecks }) {
+  const detail = checks.state === 'none' ? 'This pull request has no checks; that counts as green.' : checks.detail;
+  return (
+    <p className={`release-checks release-checks--${checks.state}`}>
+      <span className={`pill pill--${CHECKS_TONE[checks.state]}`}>
+        <span className="pill-dot" aria-hidden />
+        {CHECKS_LABEL[checks.state]}
+      </span>
+      {detail && <span className="muted small">{detail}</span>}
+    </p>
+  );
+}
+
+/** What an automatic, approvable release is waiting for (failed or unreadable checks also show as the notice). */
+function automaticLine(checks: ReleaseChecks | null): string {
+  switch (checks?.state) {
+    case 'failed':
+      return 'Set to release automatically, but a check failed: Agern will not merge it until the checks pass.';
+    case 'none':
+    case 'passed':
+      return 'Set to release automatically: Agern is merging it.';
+    case 'awaiting':
+      return 'Set to release automatically: Agern waits for checks to appear before merging it.';
+    default:
+      return 'Set to release automatically: Agern merges it once all checks have passed.';
+  }
+}
+
 /** `released`: who released it and when, the pull request and the commit. */
 function ReleasedFacts({ release, repo }: { release: Release; repo: string }) {
   const target = release.targetBranch ?? 'the default branch';
   return (
     <div className="release-released">
       <p>
-        {release.releasedBy ? `Released ${timeAgo(release.releasedAt)} by ${release.releasedBy.username}` : `Merged on GitHub ${timeAgo(release.releasedAt)}`}
+        {!release.releasedBy
+          ? `Merged on GitHub ${timeAgo(release.releasedAt)}`
+          : release.releasedAutomatically
+            ? `Released automatically ${timeAgo(release.releasedAt)} for ${release.releasedBy.username}`
+            : `Released ${timeAgo(release.releasedAt)} by ${release.releasedBy.username}`}
         {release.prNumber !== null && (
           <>
             {' '}· pull request{' '}
@@ -702,6 +811,18 @@ function ApproveReleaseDialog({
   const issues = `${n} issue${n === 1 ? '' : 's'}`;
   const how =
     release.mergeMethod === 'merge' ? `with a merge commit: ${issues}, one commit each, plus the merge commit` : `by rebasing: ${issues}, one commit each`;
+  // Approval is never blocked by checks (the owner decides), but it says what it would override.
+  const checks = release.checks;
+  const warning =
+    checks?.state === 'failed'
+      ? `Checks failed on this pull request (${checks.detail ?? 'a check failed'}). Approving merges it anyway.`
+      : checks?.state === 'pending'
+        ? `Some checks have not finished yet (${checks.detail ?? 'pending'}). Approving merges it without waiting for them.`
+        : checks?.state === 'awaiting'
+          ? 'No checks have appeared on this pull request yet; CI may not have started. Approving merges it without waiting for them.'
+          : checks?.state === 'unknown'
+          ? 'The checks on this pull request could not be read. Approving merges it without them.'
+          : null;
   return (
     <Dialog open={open} onClose={onClose} title={`Release ${release.name}?`}>
       <div className="form">
@@ -709,6 +830,7 @@ function ApproveReleaseDialog({
           This merges pull request #{release.prNumber} into {target} {how}. The issues are closed and the branch release/{release.name} is deleted. This
           cannot be undone.
         </p>
+        {warning && <p className="release-warning">{warning}</p>}
         <div className="dialog-actions">
           <button type="button" className="btn btn--ghost" onClick={onClose} disabled={busy} data-autofocus>
             Cancel
@@ -760,6 +882,11 @@ function StartReleaseDialog({
         <p>
           Agern creates the branch <code>release/{release.name}</code> from <code>{defaultBranch ?? 'the default branch'}</code> and builds its {n} issue
           {n === 1 ? '' : 's'} one at a time with your Claude and GitHub credentials. Approved issues are merged into the release branch and stay open.
+        </p>
+        <p>
+          {release.mode === 'automatic'
+            ? 'It is set to release automatically: once everything is built, merges cleanly and all checks have passed, Agern merges it into the default branch with your GitHub token, without asking you.'
+            : 'When everything is built, it waits for your approval before anything reaches the default branch.'}
         </p>
         {err && (
           <p className="form-error" role="alert">
@@ -920,6 +1047,7 @@ function ScheduleDialog({
           <p id="rs-at-hint" className="muted small">
             Your local time ({zone}). The release is built with your Claude and GitHub credentials. If another release of this
             project is still building at that time, this one waits for it.
+            {release.mode === 'automatic' && ' It is set to release automatically: once built, clean and green, Agern merges it with your GitHub token.'}
           </p>
         </div>
         {err && (

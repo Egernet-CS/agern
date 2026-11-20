@@ -72,6 +72,14 @@ export type ReleaseMergeState = 'unknown' | 'clean' | 'conflict';
 
 /** How approval merges the release (never squashed): `unavailable` when the repository only allows squash merges. */
 export type ReleaseMergeMethod = 'rebase' | 'merge' | 'unavailable';
+/** How a ready release reaches the default branch: the owner's approval, or Agern by itself once it is green. */
+export type ReleaseMode = 'manual' | 'automatic';
+/**
+ * The checks on the release pull request's head commit. `awaiting`: none yet, but the commit is younger than the settle
+ * period (CI may not have registered its checks); `none` (no checks for the whole period) counts as green.
+ */
+export type ReleaseChecksState = 'unknown' | 'awaiting' | 'none' | 'pending' | 'passed' | 'failed';
+export type ReleaseChecks = { state: ReleaseChecksState; detail: string | null; sha: string | null };
 
 /** A scheduled start that did not happen (docs/ARCHITECTURE.md §6 "Scheduled start"). */
 export type ReleaseStartFailure = { at: string; owner: Owner; reason: string };
@@ -135,10 +143,16 @@ export type Release = {
   notice: string | null;
   readyAt: string | null;
   releasedAt: string | null;
-  /** Who approved it; null when its pull request was merged on GitHub outside Agern. */
+  /** Who approved it (an automatic release: its owner); null when its pull request was merged on GitHub outside Agern. */
   releasedBy: Owner | null;
   /** The default branch's commit after the release merge. */
   mergeCommit: string | null;
+  /** `manual` (default): waits for the owner's approval; `automatic`: merged by Agern once ready, clean and green. */
+  mode: ReleaseMode;
+  /** True when Agern merged it by itself (automatic mode). */
+  releasedAutomatically: boolean;
+  /** The checks on the release pull request, as last read; null until it has one. */
+  checks: ReleaseChecks | null;
 };
 
 /** Building or paused: at most one per project. */

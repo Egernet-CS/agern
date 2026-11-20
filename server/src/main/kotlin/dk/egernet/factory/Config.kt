@@ -41,6 +41,11 @@ data class Config(
     val attachmentMaxCount: Int = 10,
     /** FACTORY_SANDBOX*: per-run build/test sandboxes (docs/ARCHITECTURE.md §5 "Sandboxes"). */
     val sandbox: SandboxConfig = SandboxConfig(),
+    /**
+     * FACTORY_RELEASE_CHECKS_SETTLE_SECONDS: how long a release pull request's head commit must have had no checks at
+     * all before "no checks" counts as green for an automatic release (CI registers its checks some seconds after a push).
+     */
+    val releaseChecksSettleSeconds: Long = 120,
 ) {
     /** Agents reach the MCP endpoint over loopback, never through the public URL. */
     val mcpUrl: String get() = "http://127.0.0.1:$port/mcp"
@@ -147,6 +152,10 @@ data class Config(
                     throw IllegalArgumentException("FACTORY_ATTACHMENT_MAX_COUNT must be a whole number")
                 } ?: 10).also { require(it in 1..20) { "FACTORY_ATTACHMENT_MAX_COUNT must be between 1 and 20" } },
                 sandbox = sandbox,
+                releaseChecksSettleSeconds = get("FACTORY_RELEASE_CHECKS_SETTLE_SECONDS")?.let { v ->
+                    (v.toLongOrNull() ?: throw IllegalArgumentException("FACTORY_RELEASE_CHECKS_SETTLE_SECONDS must be a whole number of seconds"))
+                        .also { require(it in 0..3600) { "FACTORY_RELEASE_CHECKS_SETTLE_SECONDS must be between 0 and 3600" } }
+                } ?: 120,
             ).also {
                 require(it.attachmentMaxMessageBytes >= it.attachmentMaxBytes) {
                     "FACTORY_ATTACHMENT_MAX_MESSAGE_MB must be at least FACTORY_ATTACHMENT_MAX_MB"
