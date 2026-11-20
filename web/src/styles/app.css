@@ -2760,6 +2760,10 @@ html.app-locked #root {
   .ro-item {
     flex-wrap: wrap;
   }
+  /* The title keeps most of the row; state, run and PR links wrap below it. */
+  .ro-main {
+    flex: 1 1 60%;
+  }
   .ro-actions {
     margin-left: auto;
   }
