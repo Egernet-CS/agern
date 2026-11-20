@@ -400,7 +400,7 @@ export function chatInput(s: AgentSession, text: string, by: User, attachments: 
       if (db.closedSessions.has(s.id)) return;
       try {
         if (!cmd || cmd === 'help') {
-          systemReply(s, ['/factory run <issue>      start a pipeline run for an issue', '/factory status           list runs in this project', '/factory approve [runId]  approve a run waiting for a human', '/factory cancel <runId>   cancel a run', '/factory releases         list the releases of this project and their progress', '/factory release create <name> [description]', '/factory release add <name> <issue>…', '/factory release remove <issue>…', '/factory help             this help'].join('\n'));
+          systemReply(s, ['/factory run <issue>      start a pipeline run for an issue', '/factory status           list runs in this project', '/factory approve [runId]  approve a run waiting for a human', '/factory cancel <runId>   cancel a run', '/factory releases         list the releases of this project and their progress', '/factory release create <name> [description]', '/factory release add <name> <issue>…', '/factory release remove <issue>…', '/factory release approve <name>  merge a release that is ready to release (owner only)', '/factory help             this help'].join('\n'));
         } else if (cmd === 'releases') {
           const list = releasesOf(s.repo);
           systemReply(s, list.length ? list.map(releaseSummary).join('\n\n') : `No releases in ${s.repo} yet.`);
@@ -421,7 +421,13 @@ export function chatInput(s: AgentSession, text: string, by: User, attachments: 
             const n = nums(rest);
             assignIssues(s.repo, n, null, by);
             systemReply(s, `Removed ${n.map((x) => `#${x}`).join(', ')} from their release.`);
-          } else systemReply(s, 'Usage: /factory release create <name> [description] | add <name> <issue>… | remove <issue>…', 'warn');
+          } else if (sub === 'approve' && rest[0]) {
+            const r = find(rest[0]);
+            if (!r) throw new Error(`No release "${rest[0]}" in ${s.repo}. Releases: ${releasesOf(s.repo).map((x) => x.name).join(', ') || 'none'}.`);
+            approveRelease(r, by);
+            const k = r.issues.filter((i) => i.state === 'merged').length;
+            systemReply(s, `Release "${r.name}" is released: pull request ${r.prUrl} merged into ${r.targetBranch ?? 'main'}, ${k} issue${k === 1 ? '' : 's'} closed.`);
+          } else systemReply(s, 'Usage: /factory release create <name> [description] | add <name> <issue>… | remove <issue>… | approve <name>', 'warn');
         } else if (cmd === 'status') {
           const runs = [...db.runs.values()].filter((r) => r.repo === s.repo).slice(0, 6);
           systemReply(s, runs.length ? runs.map((r) => `${r.id.slice(0, 8)}  #${r.issueNumber}  ${r.status.padEnd(11)} ${r.issueTitle}`).join('\n') : 'No runs in this project.');
@@ -962,6 +968,16 @@ export function createRelease(repo: string, body: { name: string; description: s
     scheduledAt: null,
     waitingFor: null,
     startFailure: null,
+    prNumber: null,
+    prUrl: null,
+    targetBranch: null,
+    mergeState: 'unknown',
+    mergeMethod: null,
+    notice: null,
+    readyAt: null,
+    releasedAt: null,
+    releasedBy: null,
+    mergeCommit: null,
   };
   db.releases.set(r.id, r);
   feed({ type: 'release', repo, release: r });
@@ -973,6 +989,8 @@ const RELEASE_STATUS_TEXT: Record<Release['status'], string> = {
   scheduled: 'scheduled',
   building: 'building',
   paused: 'paused',
+  ready: 'ready to release',
+  released: 'released',
   cancelled: 'cancelled',
 };
 
@@ -987,6 +1005,12 @@ function releaseSummary(r: Release): string {
 }
 
 const isActiveRelease = (r: Release) => r.status === 'building' || r.status === 'paused';
+/** Started and still open: building, paused or ready (owner rules apply). */
+const isStartedOpen = (r: Release) => isActiveRelease(r) || r.status === 'ready';
+
+function notEditable(r: Release): never {
+  throw new MockError(409, 'release_not_editable', `Release "${r.name}" is released and kept as history.`);
+}
 
 /**
  * Who may change a started release (a `planning` release: anyone who can see the project). `owner`: only the user who
@@ -999,6 +1023,7 @@ function guardRelease(r: Release, by: User, who: 'owner' | 'ownerOrAdmin') {
 }
 
 export function updateRelease(r: Release, body: { name: string; description: string }, by: User) {
+  if (r.status === 'released') notEditable(r);
   guardRelease(r, by, 'ownerOrAdmin');
   const v = validRelease(r.repo, body.name, body.description ?? '', r.id);
   if (r.status !== 'planning' && r.status !== 'scheduled' && v.name !== r.name) throw new MockError(409, 'release_name_locked', 'The name is fixed once the release is started');
@@ -1009,7 +1034,8 @@ export function updateRelease(r: Release, body: { name: string; description: str
 
 export function deleteRelease(r: Release, by: User) {
   if (r.status === 'scheduled') throw new MockError(409, 'release_scheduled', 'Cancel the scheduled start before deleting this release');
-  if (isActiveRelease(r)) throw new MockError(409, 'release_active', 'Cancel the release first');
+  if (r.status === 'released') notEditable(r);
+  if (isStartedOpen(r)) throw new MockError(409, 'release_active', 'Cancel the release first');
   guardRelease(r, by, 'ownerOrAdmin');
   db.releases.delete(r.id);
   feed({ type: 'release_deleted', repo: r.repo, releaseId: r.id });
@@ -1026,6 +1052,7 @@ export function assignIssues(repo: string, numbers: number[], releaseId: string 
     target = db.releases.get(releaseId) ?? null;
     if (!target || target.repo !== repo) throw new MockError(404, 'not_found', 'Release not found');
     if (target.status === 'cancelled') throw new MockError(409, 'release_closed', `Release "${target.name}" is cancelled; it takes no more issues`);
+    if (target.status === 'released') notEditable(target);
     guardRelease(target, by, 'owner');
   }
   // Check everything before changing anything.
@@ -1037,27 +1064,34 @@ export function assignIssues(repo: string, numbers: number[], releaseId: string 
     }
     const source = sourceOf(n);
     if (!source || source === target) return [];
+    if (source.status === 'released') notEditable(source);
     guardRelease(source, by, 'ownerOrAdmin');
     const state = source.issues.find((x) => x.number === n)!.state;
-    if (isActiveRelease(source) && state !== 'waiting' && state !== 'held' && state !== 'skipped')
+    if (isStartedOpen(source) && state !== 'waiting' && state !== 'held' && state !== 'skipped')
       throw new MockError(409, 'release_issue_started', `Issue #${n} is ${state} in release "${source.name}"; only waiting, held or skipped issues can be taken out`);
     return [{ n, source }];
   });
+  // A ready release builds again for new issues: it needs the project's building slot.
+  const adds = target ? nums.filter((n) => !target!.issues.some((x) => x.number === n)) : [];
+  if (target && target.status === 'ready' && adds.length) {
+    const other = releasesOf(repo).find((x) => x.id !== target!.id && isActiveRelease(x));
+    if (other) throw slotTaken();
+  }
   for (const { n, source } of moving) {
     source.issues = source.issues.filter((i) => i.number !== n);
     changed.add(source);
   }
   if (target) {
-    for (const n of nums) {
-      if (target.issues.some((x) => x.number === n)) continue;
+    for (const n of adds) {
       const i = db.issues[repo]!.find((x) => x.number === n)!;
-      target.issues.push({ number: n, title: i.title, kind: i.kind, state: 'waiting', runId: null, note: null });
+      target.issues.push({ number: n, title: i.title, kind: i.kind, state: 'waiting', runId: null, note: null, prNumber: null, prUrl: null });
       changed.add(target);
     }
+    if (adds.length && target.status === 'ready') Object.assign(target, { status: 'building', readyAt: null });
   }
   changed.forEach(touchRelease);
-  // An idle building release continues by itself.
-  if (target && changed.has(target)) advanceRelease(target);
+  // New issues are built; a source may have nothing left to build, a ready one may be complete now.
+  changed.forEach((r) => advanceRelease(r));
   return releasesOf(repo);
 }
 
@@ -1157,11 +1191,12 @@ export function cancelReleaseSchedule(r: Release, by: User): Release {
 
 export function reorderRelease(r: Release, numbers: number[], by: User) {
   if (r.status === 'cancelled') throw new MockError(409, 'release_closed', `Release "${r.name}" is cancelled`);
+  if (r.status === 'released') notEditable(r);
   guardRelease(r, by, 'owner');
   const current = r.issues.map((i) => i.number);
   const same = numbers.length === current.length && new Set(numbers).size === numbers.length && numbers.every((n) => current.includes(n));
   if (!same) throw new MockError(409, 'release_issues_changed', "The release's issues changed in the meantime; reload and try again.");
-  if (isActiveRelease(r)) {
+  if (isStartedOpen(r)) {
     const moved = r.issues.find((i, idx) => i.state !== 'waiting' && numbers[idx] !== i.number);
     if (moved) throw new MockError(409, 'release_issue_started', `Issue #${moved.number} is ${moved.state}; only waiting issues can be moved`);
   }
@@ -1189,12 +1224,17 @@ function skipIfUnbuildable(r: Release, it: Release['issues'][number]): boolean {
   return true;
 }
 
-/** Starts the next waiting issue of a building release when none is running. */
+/**
+ * Starts the next waiting issue of a building release when none is running; with nothing left to build the release
+ * becomes `ready`. A ready release is then evaluated (pull request, mergeability), as on the server.
+ */
 function advanceRelease(r: Release) {
+  if (r.status === 'ready') return evaluateRelease(r);
   if (r.status !== 'building' || r.issues.some((i) => i.state === 'running')) return;
   const owner = r.owner && userNamed(r.owner.username);
   if (!owner) return;
   let changed = false;
+  let started = false;
   for (const it of r.issues) {
     if (it.state !== 'waiting') continue;
     if (skipIfUnbuildable(r, it)) {
@@ -1206,9 +1246,85 @@ function advanceRelease(r: Release) {
     it.runId = run.id;
     it.note = null;
     changed = true;
+    started = true;
     break;
   }
+  if (!started) {
+    Object.assign(r, { status: 'ready', readyAt: iso(Date.now()), mergeState: 'unknown' });
+    return evaluateRelease(r);
+  }
   if (changed) touchRelease(r);
+}
+
+/** Release branches (`<repo>:<branch>`) whose pull request does not merge cleanly into the default branch. */
+export const conflictingReleases = new Set<string>();
+/** Repositories that only allow squash merges (no rebase, no merge commit). */
+export const squashOnlyRepos = new Set<string>();
+let nextReleasePr = 120;
+
+/** A ready release: open its pull request when complete, then check mergeability and the merge method. */
+function evaluateRelease(r: Release) {
+  if (r.status !== 'ready') return;
+  const complete = r.issues.some((i) => i.state === 'merged') && !r.issues.some((i) => i.state === 'held');
+  r.targetBranch = 'main';
+  if (!r.prNumber && complete) {
+    r.prNumber = nextReleasePr++;
+    r.prUrl = `https://github.com/${ORG}/${r.repo}/pull/${r.prNumber}`;
+  }
+  if (r.prNumber) {
+    r.mergeState = conflictingReleases.has(`${r.repo}:${r.branch}`) ? 'conflict' : 'clean';
+    r.mergeMethod = squashOnlyRepos.has(r.repo) ? 'unavailable' : 'rebase';
+  } else r.mergeState = 'unknown';
+  r.notice = null;
+  touchRelease(r);
+}
+
+const slotTaken = () =>
+  new MockError(409, 'release_already_building', 'Another release of this project is building; it must finish before this one can build again');
+
+const conflictOf = (r: Release) =>
+  new MockError(409, 'release_not_ready', `Release is ${r.status === 'planning' ? 'in preparation' : RELEASE_STATUS_TEXT[r.status]}, not ready to release`);
+
+/** "Check again" (owner only). */
+export function checkRelease(r: Release, by: User) {
+  if (r.status === 'planning' || r.status === 'scheduled') throw conflictOf(r);
+  guardRelease(r, by, 'owner');
+  if (r.status !== 'ready') throw conflictOf(r);
+  evaluateRelease(r);
+  return r;
+}
+
+/** Owner-only approval: merges the release pull request (rebase), closes the issues, deletes the branch. */
+export function approveRelease(r: Release, by: User) {
+  if (r.status === 'planning' || r.status === 'scheduled') throw conflictOf(r);
+  guardRelease(r, by, 'owner');
+  if (r.status !== 'ready') throw conflictOf(r);
+  const held = r.issues.filter((i) => i.state === 'held');
+  if (held.length)
+    throw new MockError(409, 'release_incomplete', `${held.length} issue(s) are held: ${held.map((i) => `#${i.number}`).join(', ')}. Approve or retry their runs, or move them out of the release first.`);
+  const merged = r.issues.filter((i) => i.state === 'merged');
+  if (!merged.length) throw new MockError(409, 'release_empty', 'Nothing was merged into the release branch, so there is nothing to release.');
+  evaluateRelease(r);
+  if (r.mergeState === 'conflict') throw new MockError(409, 'release_conflict', `\`${r.branch}\` no longer merges cleanly into \`main\`. Nothing was merged.`);
+  if (r.mergeMethod === 'unavailable')
+    throw new MockError(409, 'release_merge_method_unavailable', 'This repository only allows squash merges. Allow rebase merging or merge commits in its GitHub settings to release.');
+  for (const it of merged) {
+    const issue = db.issues[r.repo]?.find((i) => i.number === it.number);
+    if (issue) issue.state = 'closed';
+  }
+  releaseBranches.delete(`${r.repo}:${r.branch}`);
+  const now = iso(Date.now());
+  Object.assign(r, {
+    status: 'released',
+    releasedAt: now,
+    endedAt: now,
+    releasedBy: ownerOf(by),
+    mergeCommit: Array.from({ length: 40 }, (_, i) => '0123456789abcdef'[(i * 7 + r.name.length) % 16]).join(''),
+    mergeState: 'clean',
+    notice: null,
+  });
+  touchRelease(r);
+  return r;
 }
 
 /** A release run reached `merged`, `needs_human`, `failed` or `cancelled`: update its issue and go on. */
@@ -1217,6 +1333,8 @@ function releaseRunEnded(run: Run) {
   const it = r?.issues.find((i) => i.runId === run.id);
   // Retried or taken out meanwhile, or the release was cancelled (that sets the issue states itself).
   if (!r || !it || r.status === 'cancelled') return;
+  it.prNumber = run.prNumber;
+  it.prUrl = run.prUrl;
   if (run.status === 'merged') {
     it.state = 'merged';
     it.note = null;
@@ -1273,8 +1391,9 @@ export function resumeRelease(r: Release, by: User) {
 }
 
 export function cancelRelease(r: Release, by: User) {
+  if (r.status === 'released') notEditable(r);
   guardRelease(r, by, 'ownerOrAdmin');
-  if (!isActiveRelease(r)) throw new MockError(409, 'release_not_building', `Release "${r.name}" is not building or paused`);
+  if (!isStartedOpen(r)) throw new MockError(409, 'release_not_building', `Release "${r.name}" is not building or paused`);
   r.status = 'cancelled';
   r.pause = null;
   r.endedAt = iso(Date.now());
@@ -1291,11 +1410,16 @@ export function cancelRelease(r: Release, by: User) {
 }
 
 export function retryReleaseIssue(r: Release, n: number, by: User) {
-  if (!isActiveRelease(r)) throw new MockError(409, 'release_not_building', `Release "${r.name}" is not building or paused`);
+  if (r.status === 'released') notEditable(r);
+  if (!isStartedOpen(r)) throw new MockError(409, 'release_not_building', `Release "${r.name}" is not building or paused`);
   guardRelease(r, by, 'owner');
   const it = r.issues.find((i) => i.number === n);
   if (!it) throw new MockError(404, 'not_found', `Issue #${n} is not in release "${r.name}"`);
   if (it.state !== 'held' && it.state !== 'skipped') throw new MockError(409, 'release_issue_not_held', `Issue #${n} is ${it.state}; only held or skipped issues can be retried`);
+  if (r.status === 'ready') {
+    if (releasesOf(r.repo).some((x) => x.id !== r.id && isActiveRelease(x))) throw slotTaken();
+    Object.assign(r, { status: 'building', readyAt: null });
+  }
   const run = it.runId ? db.runs.get(it.runId) : undefined;
   it.state = 'waiting';
   it.note = null;
@@ -1428,6 +1552,15 @@ function seed() {
     issue('web-shop', 60, 'bug', 'Danish characters broken in order e-mails', 'carl', 0.3),
     issue('web-shop', 47, 'bug', 'VAT rounding differs between checkout and invoice', 'alice', 12, { state: 'closed' }),
     issue('web-shop', 44, 'task', 'Move product images to the CDN', 'bob', 15),
+    issue('web-shop', 61, 'feature', 'Newsletter sign-up in the footer', 'alice', 10),
+    issue('web-shop', 62, 'bug', 'Receipt page shows prices without VAT', 'carl', 9),
+    issue('web-shop', 63, 'task', 'Rename the order-status enum', 'bob', 11),
+    issue('web-shop', 64, 'bug', 'Cart badge shows a stale count', 'carl', 7),
+    issue('web-shop', 65, 'feature', 'Pay by MobilePay', 'alice', 14),
+    issue('web-shop', 66, 'bug', 'Refunds fail for split payments', 'bob', 13),
+    issue('web-shop', 67, 'feature', 'Product reviews with photos', 'alice', 30, { state: 'closed' }),
+    issue('web-shop', 68, 'bug', 'Sitemap misses category pages', 'carl', 28, { state: 'closed' }),
+    issue('web-shop', 69, 'task', 'Drop the old promo banner', 'bob', 21),
   ];
   db.issues['billing-service'] = [
     issue('billing-service', 17, 'feature', 'Switch card payments to the new provider', 'alice', 5),
@@ -1450,7 +1583,7 @@ function seed() {
   const spring = createRelease('web-shop', { name: '1.4', description: 'Checkout polish before the spring campaign.\nShip together.' }, alice, Date.now() - 2 * 86400_000);
   const planned = (repo: string, n: number): Release['issues'][number] => {
     const i = db.issues[repo].find((x) => x.number === n)!;
-    return { number: n, title: i.title, kind: i.kind, state: 'waiting', runId: null, note: null };
+    return { number: n, title: i.title, kind: i.kind, state: 'waiting', runId: null, note: null, prNumber: null, prUrl: null };
   };
   spring.issues = [51, 55, 57].map((n) => planned('web-shop', n));
   const cleanup = createRelease('web-shop', { name: 'chat-cleanup', description: '' }, bob, Date.now() - 86400_000);
@@ -1529,6 +1662,43 @@ function seed() {
   seededRun(53, { liveFrom: never }, 50);
   seededRun(60, { approver: 'ESCALATE', liveFrom: never }, 35);
   seededRun(58, { liveFrom: (role) => role !== 'spec-writer' && role !== 'builder' }, 3);
+
+  // Releasing (step 3): finished releases with their runs, in every state of the release pull request.
+  const finished = (name: string, description: string, owner: User, issues: [number, Partial<Plan>][], startedMin: number) => {
+    const r = createRelease('web-shop', { name, description }, owner, Date.now() - (startedMin + 60) * 60_000);
+    r.issues = issues.map(([n]) => planned('web-shop', n));
+    Object.assign(r, { status: 'building', owner: ownerOf(owner), branch: `release/${name}`, startedAt: ago(startedMin) });
+    releaseBranches.add(`web-shop:release/${name}`);
+    issues.forEach(([n, plan], k) => {
+      const run = startRun('web-shop', n, owner, null, { changes: {}, liveFrom: never, ...plan }, Date.now() - (startedMin - k * 20) * 60_000, r);
+      const it = r.issues.find((i) => i.number === n)!;
+      Object.assign(it, { runId: run.id, prNumber: run.prNumber, prUrl: run.prUrl, state: run.status === 'merged' ? 'merged' : 'held', note: run.status === 'merged' ? null : run.error });
+    });
+    return r;
+  };
+  // Ready, complete and clean: alice may approve it.
+  const ready = finished('1.2', 'Footer and receipt fixes.', alice, [[61, {}], [62, {}]], 300);
+  advanceRelease(ready);
+  // Ready, but main moved on and the release branch conflicts.
+  conflictingReleases.add('web-shop:release/cart-fixes');
+  const conflicting = finished('cart-fixes', '', alice, [[63, {}], [64, {}]], 500);
+  advanceRelease(conflicting);
+  // Ready but incomplete: one issue is held (bob's release).
+  const incomplete = finished('payments', 'MobilePay and refunds.', bob, [[65, {}], [66, { approver: 'ESCALATE' }]], 700);
+  advanceRelease(incomplete);
+  // Released two days ago (history), and a cancelled one.
+  const old = finished('1.1', 'Reviews and SEO.', alice, [[67, {}], [68, {}]], 3 * 1440);
+  advanceRelease(old);
+  approveRelease(old, alice);
+  for (const n of [67, 68]) db.issues['web-shop'].find((i) => i.number === n)!.state = 'closed';
+  Object.assign(old, { releasedAt: ago(2 * 1440), endedAt: ago(2 * 1440), updatedAt: ago(2 * 1440) });
+  const promo = finished('promo', 'Spring promo clean-up.', bob, [[69, { approver: 'ESCALATE' }]], 4 * 1440);
+  for (const it of promo.issues) {
+    const run = it.runId ? db.runs.get(it.runId) : undefined;
+    if (run?.status === 'needs_human') cancelRun(run);
+    Object.assign(it, { state: 'held', note: 'Cancelled with the release' });
+  }
+  Object.assign(promo, { status: 'cancelled', endedAt: ago(3 * 1440), updatedAt: ago(3 * 1440) });
 
   db.softwareRequests = [
     { id: uid(), name: 'imagemagick', reason: 'Generate product thumbnails in the image pipeline tests', repo: 'web-shop', requestedBy: 'bob', sessionId: null, status: 'pending', note: null, createdAt: ago(90), resolvedAt: null },

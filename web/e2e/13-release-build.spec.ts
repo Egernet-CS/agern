@@ -79,8 +79,9 @@ test('start a release: its issues are built one at a time and merged into the re
   await expect(stateOf(page, titles[0])).toHaveText('merged', BUILD);
   await expect(stateOf(page, titles[1])).toHaveText('merged', BUILD);
   await expect(page.locator('.release-progress')).toHaveText('2 of 2 merged');
-  await expect(statusLine(page)).toHaveText('Nothing left to build.');
-  await expect(pill(page)).toHaveText('building');
+  // Nothing left to build: ready to release (step 3), with the release pull request into main.
+  await expect(pill(page)).toHaveText('ready to release', BUILD);
+  await expect(statusLine(page)).toContainText('Ready to release.');
 
   // The run merged into the release branch.
   await item(page, titles[0]).getByRole('link', { name: 'run' }).click();
@@ -111,7 +112,10 @@ test('a failing issue is held and the build goes on; approving its run merges it
   await expect(item(page, titles[0]).locator('.ro-note')).toContainText('The approver escalated');
   await expect(stateOf(page, titles[1])).toHaveText('merged', BUILD);
   await expect(page.locator('.release-progress')).toHaveText('1 of 2 merged · 1 held');
-  await expect(statusLine(page)).toHaveText('Nothing left to build. 1 held issue needs attention.');
+  await expect(pill(page)).toHaveText('ready to release', BUILD);
+  await expect(statusLine(page)).toHaveText(
+    `Incomplete: 1 issue is held (#${numbers[0]}). Approve or retry their runs, or move them out, before releasing.`,
+  );
   await expect(page.getByRole('button', { name: `Retry #${numbers[0]}` })).toBeVisible();
 
   await item(page, titles[0]).getByRole('link', { name: 'run' }).click();
@@ -122,6 +126,7 @@ test('a failing issue is held and the build goes on; approving its run merges it
   await openRelease(page, id, name);
   await expect(stateOf(page, titles[0])).toHaveText('merged');
   await expect(page.locator('.release-progress')).toHaveText('2 of 2 merged');
+  await expect(statusLine(page)).toContainText('Ready to release.', BUILD);
 
   await cancelRelease(page, id);
 });

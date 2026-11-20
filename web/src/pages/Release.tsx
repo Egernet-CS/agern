@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { api, ApiError, isReleaseActive, type Release, type ReleaseIssue } from '../api';
+import { api, ApiError, isReleaseActive, releaseReadiness, type Release, type ReleaseIssue } from '../api';
 import { Dialog, Empty, ErrorBox, IssueStateBadge, KindBadge, Loading, Notice, ReleaseStatusPill } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
@@ -38,6 +38,8 @@ export function ReleasePage() {
   const [scheduling, setScheduling] = useState(false);
   const [confirmStart, setConfirmStart] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
+  const [confirmRelease, setConfirmRelease] = useState(false);
+  const [checking, setChecking] = useState(false);
   // Set before this user's own delete request, so they are not told "This release was deleted".
   const deletedByMe = useRef(false);
 
@@ -103,24 +105,29 @@ export function ReleasePage() {
   const status = release.status;
   const planned = status === 'planning' || status === 'scheduled';
   const started = !planned;
-  const active = isReleaseActive(release);
+  const released = status === 'released';
+  const ready = status === 'ready';
+  // Building, paused or ready: the owner drives it (a ready release builds again for added or retried issues).
+  const open = isReleaseActive(release) || ready;
   const ownerName = release.owner?.username ?? 'its owner';
   const isOwner = !!release.owner && release.owner.username === me.username;
   const ownerOrAdmin = isOwner || me.isAdmin;
-  // What this user may do (the server checks the same rules; see docs/ARCHITECTURE.md §6 "Releases").
+  // What this user may do (the server checks the same rules; see docs/ARCHITECTURE.md §6 "Releases"). A released
+  // release is read-only for everyone.
   const may = {
     start: status === 'planning',
-    edit: planned || ownerOrAdmin,
+    edit: !released && (planned || ownerOrAdmin),
     delete: status === 'planning' || (status === 'cancelled' && ownerOrAdmin),
     pause: status === 'building' && ownerOrAdmin,
     resume: status === 'paused' && isOwner,
-    cancel: active && ownerOrAdmin,
-    reorder: planned || (active && isOwner),
-    add: planned || (active && isOwner),
-    remove: (i: ReleaseIssue) => planned || (ownerOrAdmin && (status === 'cancelled' || i.state === 'waiting' || i.state === 'held' || i.state === 'skipped')),
-    retry: (i: ReleaseIssue) => active && isOwner && (i.state === 'held' || i.state === 'skipped'),
+    cancel: open && ownerOrAdmin,
+    reorder: planned || (open && isOwner),
+    add: planned || (open && isOwner),
+    remove: (i: ReleaseIssue) =>
+      !released && (planned || (ownerOrAdmin && (status === 'cancelled' || i.state === 'waiting' || i.state === 'held' || i.state === 'skipped'))),
+    retry: (i: ReleaseIssue) => open && isOwner && (i.state === 'held' || i.state === 'skipped'),
   };
-  const mayNothing = started && !ownerOrAdmin;
+  const mayNothing = started && !released && !ownerOrAdmin;
 
   const move = (index: number, delta: -1 | 1) => {
     const next = [...numbers];
@@ -164,6 +171,15 @@ export function ReleasePage() {
     await change(() => api.cancelRelease(release.id));
     setConfirmCancel(false);
   };
+  const doCheck = async () => {
+    setChecking(true);
+    await change(() => api.checkRelease(release.id));
+    setChecking(false);
+  };
+  const doRelease = async () => {
+    await change(() => api.approveRelease(release.id));
+    setConfirmRelease(false);
+  };
 
   const n = release.issues.length;
   const scheduled = status === 'scheduled';
@@ -175,7 +191,8 @@ export function ReleasePage() {
   const held = count('held');
   const skipped = count('skipped');
   const running = release.issues.find((i) => i.state === 'running');
-  const branchUrl = project.data && release.branch ? `${project.data.htmlUrl}/tree/${release.branch}` : undefined;
+  // A released release's branch is deleted on GitHub: shown as text, not linked.
+  const branchUrl = project.data && release.branch && status !== 'released' ? `${project.data.htmlUrl}/tree/${release.branch}` : undefined;
   const statusLine = releaseStatusLine(release, running, held);
 
   return (
@@ -296,6 +313,7 @@ export function ReleasePage() {
           ) : (
             status === 'planning' && <p className="muted small">This release is a plan. Nothing is built until it is started.</p>
           )}
+          {released && <ReleasedFacts release={release} repo={repo} />}
           {mayNothing && <p className="muted small">Only {ownerName}, who started this release, and admins can change it.</p>}
         </div>
       </header>
@@ -306,6 +324,23 @@ export function ReleasePage() {
         </p>
       )}
       {err && <p className="form-error" role="alert">{err}</p>}
+      {(ready || released) && release.notice && (
+        <p className="form-error release-notice" role="alert">
+          {release.notice}
+        </p>
+      )}
+
+      {ready && (
+        <ReleasePullSection
+          release={release}
+          isOwner={isOwner}
+          ownerName={ownerName}
+          busy={busy}
+          checking={checking}
+          onCheck={() => void doCheck()}
+          onApprove={() => setConfirmRelease(true)}
+        />
+      )}
 
       {failure && (
         <Notice tone="error" title="The scheduled start did not happen">
@@ -347,6 +382,11 @@ export function ReleasePage() {
                     <Link to={`/p/${repo}/runs/${i.runId}`} className="ro-run small" aria-label={`run of #${i.number}`}>
                       run
                     </Link>
+                  )}
+                  {i.prUrl && (
+                    <a href={i.prUrl} target="_blank" rel="noreferrer" className="ro-run small" aria-label={`pull request #${i.prNumber} of #${i.number}`}>
+                      PR #{i.prNumber}
+                    </a>
                   )}
                   <span className="ro-actions">
                     {may.retry(i) && (
@@ -419,15 +459,25 @@ export function ReleasePage() {
         onClose={() => setConfirmStart(false)}
         onStarted={(r) => noteReleases([r])}
       />
+      <ApproveReleaseDialog release={release} open={confirmRelease} busy={busy} onClose={() => setConfirmRelease(false)} onConfirm={() => void doRelease()} />
       <Dialog open={confirmCancel} onClose={() => setConfirmCancel(false)} title="Cancel release?">
         <div className="form">
           <p>
-            Cancel release “{release.name}”? The running issue is stopped and no more are built. What is already merged stays on{' '}
-            <code>{release.branch ?? `release/${release.name}`}</code>.
+            {ready ? (
+              <>
+                Cancel release “{release.name}”? Agern will not merge it.{release.prNumber ? ` Pull request #${release.prNumber} and the` : ' The'} branch{' '}
+                <code>{release.branch ?? `release/${release.name}`}</code> stay on GitHub as they are.
+              </>
+            ) : (
+              <>
+                Cancel release “{release.name}”? The running issue is stopped and no more are built. What is already merged stays on{' '}
+                <code>{release.branch ?? `release/${release.name}`}</code>.
+              </>
+            )}
           </p>
           <div className="dialog-actions">
             <button type="button" className="btn btn--ghost" onClick={() => setConfirmCancel(false)} data-autofocus>
-              Keep building
+              {ready ? 'Keep it' : 'Keep building'}
             </button>
             <button type="button" className="btn btn--danger" onClick={() => void doCancel()} disabled={busy}>
               {busy ? 'Cancelling…' : 'Cancel release'}
@@ -494,7 +544,182 @@ function releaseStatusLine(release: Release, running: ReleaseIssue | undefined, 
     }
     case 'cancelled':
       return `Cancelled ${timeAgo(release.endedAt)}. What was merged stays on ${branch}.`;
+    default:
+      // `ready` and `released` have their own sections.
+      return null;
   }
+}
+
+const shortSha = (sha: string) => sha.slice(0, 7);
+
+/** How a release is (or was) merged into the default branch, in words. */
+function methodWords(release: Release, target: string, past: boolean): string {
+  switch (release.mergeMethod) {
+    case 'rebase':
+      return past ? `Rebased onto ${target}, one commit per issue` : `Approval merges it by rebasing: one commit per issue on ${target}.`;
+    case 'merge':
+      return past
+        ? `Merged into ${target} with a merge commit, one commit per issue`
+        : `Approval merges it with a merge commit: one commit per issue on ${target}, plus the merge commit.`;
+    default:
+      return past ? `Merged into ${target}` : '';
+  }
+}
+
+/** The status line of a `ready` release: why it can or cannot be released now. */
+function readyLine(release: Release, target: string) {
+  const readiness = releaseReadiness(release);
+  const branch = release.branch ?? `release/${release.name}`;
+  if (readiness === 'incomplete') {
+    const held = release.issues.filter((i) => i.state === 'held');
+    return `Incomplete: ${held.length} issue${held.length === 1 ? ' is' : 's are'} held (${held.map((i) => `#${i.number}`).join(', ')}). Approve or retry their runs, or move them out, before releasing.`;
+  }
+  if (readiness === 'empty') return 'Nothing was merged into the release branch, so there is nothing to release.';
+  if (release.mergeState === 'conflict')
+    return (
+      <>
+        <code>{branch}</code> no longer merges cleanly into {target}. Agern will not merge it. Resolve the conflicts on the release branch, then check
+        again.
+      </>
+    );
+  if (release.mergeMethod === 'unavailable')
+    return 'This repository only allows squash merges. Allow rebase merging or merge commits in its GitHub settings to release.';
+  if (release.mergeState === 'clean') return `Ready to release. Merges cleanly into ${target}.`;
+  return 'Ready to release. Mergeability has not been confirmed yet.';
+}
+
+/** `ready`: the release pull request, whether it can be merged, and (owner only) "Check again" / "Approve and release". */
+function ReleasePullSection({
+  release,
+  isOwner,
+  ownerName,
+  busy,
+  checking,
+  onCheck,
+  onApprove,
+}: {
+  release: Release;
+  isOwner: boolean;
+  ownerName: string;
+  busy: boolean;
+  checking: boolean;
+  onCheck: () => void;
+  onApprove: () => void;
+}) {
+  const target = release.targetBranch ?? 'the default branch';
+  const readiness = releaseReadiness(release);
+  const blocked = readiness !== 'complete' || release.mergeState === 'conflict' || release.mergeMethod === 'unavailable';
+  const approvable = !blocked && release.prNumber !== null;
+  const method = approvable ? methodWords(release, target, false) : '';
+  return (
+    <section className="release-pr" aria-labelledby="release-pr-h">
+      <div className="section-head">
+        <h2 id="release-pr-h">Release pull request</h2>
+      </div>
+      <p className="release-pr-link">
+        {release.prNumber !== null && release.prUrl ? (
+          <>
+            <a href={release.prUrl} target="_blank" rel="noreferrer" className="mono">
+              #{release.prNumber}
+            </a>
+            <span className="mono small muted">
+              {release.branch ?? `release/${release.name}`} → {target}
+            </span>
+          </>
+        ) : (
+          <span className="muted">No pull request yet.</span>
+        )}
+      </p>
+      <p id="release-ready-status" className={`release-status release-status--${blocked ? 'blocked' : 'ready'}`} role="status">
+        {readyLine(release, target)}
+      </p>
+      {method && <p className="muted small">{method}</p>}
+      {isOwner ? (
+        <div className="release-pr-actions">
+          <button type="button" className="btn" onClick={onCheck} disabled={busy}>
+            {checking ? 'Checking…' : 'Check again'}
+          </button>
+          <button type="button" className="btn btn--primary" onClick={onApprove} disabled={busy || !approvable} aria-describedby="release-ready-status">
+            Approve and release
+          </button>
+        </div>
+      ) : (
+        <p className="muted small">Only {ownerName} can approve this release.</p>
+      )}
+    </section>
+  );
+}
+
+/** `released`: who released it and when, the pull request and the commit. */
+function ReleasedFacts({ release, repo }: { release: Release; repo: string }) {
+  const target = release.targetBranch ?? 'the default branch';
+  return (
+    <div className="release-released">
+      <p>
+        {release.releasedBy ? `Released ${timeAgo(release.releasedAt)} by ${release.releasedBy.username}` : `Merged on GitHub ${timeAgo(release.releasedAt)}`}
+        {release.prNumber !== null && (
+          <>
+            {' '}· pull request{' '}
+            {release.prUrl ? (
+              <a href={release.prUrl} target="_blank" rel="noreferrer" className="mono">
+                #{release.prNumber}
+              </a>
+            ) : (
+              <span className="mono">#{release.prNumber}</span>
+            )}
+          </>
+        )}
+      </p>
+      <p className="muted small">
+        {methodWords(release, target, true)}
+        {release.mergeCommit && (
+          <>
+            {' '}· {target} at <code title={release.mergeCommit}>{shortSha(release.mergeCommit)}</code>
+          </>
+        )}
+        . Its issues were closed and the branch {release.branch ?? `release/${release.name}`} was deleted. <Link to={`/p/${repo}`}>Back to {repo}</Link>
+      </p>
+    </div>
+  );
+}
+
+/** Confirms the release merge; refusals show on the page (the dialog closes either way). */
+function ApproveReleaseDialog({
+  release,
+  open,
+  busy,
+  onClose,
+  onConfirm,
+}: {
+  release: Release;
+  open: boolean;
+  busy: boolean;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  const target = release.targetBranch ?? 'the default branch';
+  const n = release.issues.filter((i) => i.state === 'merged').length;
+  const issues = `${n} issue${n === 1 ? '' : 's'}`;
+  const how =
+    release.mergeMethod === 'merge' ? `with a merge commit: ${issues}, one commit each, plus the merge commit` : `by rebasing: ${issues}, one commit each`;
+  return (
+    <Dialog open={open} onClose={onClose} title={`Release ${release.name}?`}>
+      <div className="form">
+        <p>
+          This merges pull request #{release.prNumber} into {target} {how}. The issues are closed and the branch release/{release.name} is deleted. This
+          cannot be undone.
+        </p>
+        <div className="dialog-actions">
+          <button type="button" className="btn btn--ghost" onClick={onClose} disabled={busy} data-autofocus>
+            Cancel
+          </button>
+          <button type="button" className="btn btn--primary" onClick={onConfirm} disabled={busy}>
+            {busy ? 'Releasing…' : 'Approve and release'}
+          </button>
+        </div>
+      </div>
+    </Dialog>
+  );
 }
 
 /** Confirms starting a release; server refusals show inside the dialog. */

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, ApiError, isRunWorking, isSessionActive, type AgentSession, type Issue, type IssueKind, type Release, type Run } from '../api';
+import { api, ApiError, isReleaseFinished, isReleaseOpen, isRunWorking, isSessionActive, type AgentSession, type Issue, type IssueKind, type Release, type Run } from '../api';
 import { ChatView } from '../components/chat/ChatView';
 import { REVIEWERS, roundName } from '../components/pipeline/model';
 import { sandboxSummary } from '../components/sandbox/SandboxBits';
@@ -379,8 +379,8 @@ function IssuesPanel({ repo, releases }: { repo: string; releases: Release[] }) 
     return m;
   }, [releases]);
   const hasReleases = releases.length > 0;
-  // Cancelled releases take no new issues; they are not offered as targets.
-  const targets = useMemo(() => releases.filter((r) => r.status !== 'cancelled'), [releases]);
+  // Released and cancelled releases take no new issues; they are not offered as targets.
+  const targets = useMemo(() => releases.filter(isReleaseOpen), [releases]);
   // A deleted release falls back to all issues.
   const filter: ReleaseFilter =
     releaseFilter === 'all' || releaseFilter === 'none' || releases.some((r) => r.id === releaseFilter) ? releaseFilter : 'all';
@@ -543,8 +543,8 @@ function IssuesPanel({ repo, releases }: { repo: string; releases: Release[] }) 
                         {targets.map((r) => (
                           <option key={r.id} value={r.id}>{r.name}</option>
                         ))}
-                        {rel?.status === 'cancelled' && (
-                          <option value={rel.id} disabled>{rel.name} (cancelled)</option>
+                        {rel && isReleaseFinished(rel) && (
+                          <option value={rel.id} disabled>{rel.name} ({rel.status})</option>
                         )}
                       </select>
                     </span>
@@ -629,7 +629,45 @@ function releaseProgress(r: Release): string {
   if (r.status === 'planning' || r.status === 'scheduled') return `${n} issue${n === 1 ? '' : 's'}`;
   const merged = r.issues.filter((i) => i.state === 'merged').length;
   const held = r.issues.filter((i) => i.state === 'held').length;
-  return `${merged} of ${n} merged${held > 0 ? ` · ${held} held` : ''}`;
+  const conflict = r.status === 'ready' && held === 0 && r.mergeState === 'conflict';
+  return `${merged} of ${n} merged${held > 0 ? ` · ${held} held` : ''}${conflict ? ' · conflict' : ''}`;
+}
+
+/** Released and cancelled releases, newest first (by release time, else last change). */
+function historyOf(releases: Release[]): Release[] {
+  const at = (r: Release) => r.releasedAt ?? r.updatedAt;
+  return releases.filter(isReleaseFinished).sort((a, b) => at(b).localeCompare(at(a)));
+}
+
+/** Released and cancelled releases, collapsed under "History (N)"; not rendered without any. */
+function ReleaseHistory({ repo, releases }: { repo: string; releases: Release[] }) {
+  if (releases.length === 0) return null;
+  return (
+    <details className="release-history">
+      <summary>History ({releases.length})</summary>
+      <ul className="run-list release-list">
+        {releases.map((r) => {
+          const n = r.issues.length;
+          return (
+            <li key={r.id}>
+              <Link to={`/p/${repo}/releases/${r.id}`} className="run-row release-row">
+                <div className="rr-top">
+                  <span className="rr-title">{r.name}</span>
+                </div>
+                <div className="rr-bot">
+                  <ReleaseStatusPill status={r.status} />
+                  <span className="rr-line">
+                    {n} issue{n === 1 ? '' : 's'}
+                    {r.status === 'released' && r.releasedAt && <> · {timeAgo(r.releasedAt)}</>}
+                  </span>
+                </div>
+              </Link>
+            </li>
+          );
+        })}
+      </ul>
+    </details>
+  );
 }
 
 /** Creates a release; the new release shows through the shared live list (once, even though its feed frame follows). */
@@ -820,7 +858,7 @@ function ActivityPanel({
         <p className="muted pad">No releases yet. Create one to plan issues ahead.</p>
       )}
       <ul className="run-list release-list">
-        {releases.releases.map((r) => (
+        {releases.releases.filter((r) => !isReleaseFinished(r)).map((r) => (
           <li key={r.id}>
             <Link to={`/p/${repo}/releases/${r.id}`} className="run-row release-row">
               <div className="rr-top">
@@ -847,6 +885,7 @@ function ActivityPanel({
           </li>
         ))}
       </ul>
+      <ReleaseHistory repo={repo} releases={historyOf(releases.releases)} />
       <NewReleaseDialog repo={repo} open={creatingRelease} onClose={() => setCreatingRelease(false)} />
       <SandboxSection repo={repo} />
       <div className="panel-head">
