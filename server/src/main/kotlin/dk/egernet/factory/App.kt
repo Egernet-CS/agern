@@ -88,7 +88,8 @@ class Services(
     val workspaces = Workspaces(cfg, git, github)
     val attachments = dk.egernet.factory.agent.Attachments(cfg, dk.egernet.factory.db.AttachmentStore(db))
     val preferences = dk.egernet.factory.db.PreferenceStore(db, settings)
-    val agents = AgentManager(cfg, sessions, events, access, launcher, bus, mcpRegistry, settings, prompts, workspaces, scope, attachments, preferences)
+    val usage = dk.egernet.factory.db.ClaudeUsageStore(db, clock)
+    val agents = AgentManager(cfg, sessions, events, access, launcher, bus, mcpRegistry, settings, prompts, workspaces, scope, attachments, preferences, usage)
     val sandboxes = SandboxManager(
         cfg, sandboxRuntime, SandboxApprovalStore(db), runs, access, git,
         publishSystem = { sessionId, payload -> agents.publish(sessionId, "system", payload) },

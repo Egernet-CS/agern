@@ -335,13 +335,17 @@ private fun Route.meRoutes(s: Services) {
         val v = req.value.trim()
         if (v.isEmpty() || v.length > 4096 || v.any { it.isWhitespace() }) throw unprocessable("The credential looks malformed")
         s.users.setClaude(u.id, req.kind, s.box.encrypt(v, u.username))
+        s.bus.emitFeed(FeedItem.Usage(u.id))
         call.respond(s.users.byId(u.id)!!.toDto())
     }
     delete("/me/claude-credential") {
         val u = call.requireUser(s)
         s.users.setClaude(u.id, null, null)
+        s.bus.emitFeed(FeedItem.Usage(u.id))
         call.respond(s.users.byId(u.id)!!.toDto())
     }
+    // The caller's own Claude usage; there is deliberately no way to name another user (also not for admins).
+    get("/me/usage") { call.respond(s.usage.usage(call.requireUser(s))) }
     put("/me/github-token") {
         val u = call.requireUser(s)
         val token = call.receive<GithubTokenReq>().token.trim()
@@ -775,6 +779,11 @@ private fun Route.wsRoutes(s: Services) {
         webSocket("/feed") {
             val u = call.requireUser(s)
             s.bus.feed.collect { item ->
+                if (item is FeedItem.Usage) {
+                    // Private: only the user whose usage changed hears about it, and the frame says nothing more.
+                    if (item.userId == u.id) send(Frame.Text(AppJson.encodeToString(FeedFrame.serializer(), FeedFrame(type = "usage"))))
+                    return@collect
+                }
                 if (item is FeedItem.Sandboxes) {
                     // Admins see every sandbox in the overview, also of projects they cannot see; others get nothing.
                     if (u.isAdmin) send(Frame.Text(AppJson.encodeToString(FeedFrame.serializer(), FeedFrame(type = "sandboxes", runId = item.runId, change = item.change))))
@@ -790,7 +799,7 @@ private fun Route.wsRoutes(s: Services) {
                     is FeedItem.Release -> FeedFrame(type = "release", repo = item.repo, release = item.release)
                     is FeedItem.ReleaseDeleted -> FeedFrame(type = "release_deleted", repo = item.repo, releaseId = item.releaseId)
                     is FeedItem.SandboxApproval -> FeedFrame(type = "sandbox_approval", repo = item.repo, approval = item.approval)
-                    is FeedItem.Sandboxes -> return@collect
+                    is FeedItem.Sandboxes, is FeedItem.Usage -> return@collect
                 }
                 send(Frame.Text(AppJson.encodeToString(FeedFrame.serializer(), frame)))
             }

@@ -1,5 +1,6 @@
 // Mock implementation of the Api interface. Enabled with VITE_MOCK=1 (npm run dev:mock).
-// Scenarios via ?mock=default|fresh|noclaude|observer|loggedout|nosandbox (remembered per tab; nosandbox: FACTORY_SANDBOX=off).
+// Scenarios via ?mock=default|fresh|noclaude|observer|loggedout|nosandbox|usage-none|usage-high|usage-limit (remembered per tab;
+// nosandbox: FACTORY_SANDBOX=off; usage-*: alice's Claude usage without data, at 86 % or at a reached limit).
 import { ApiError, type Api, type Channel } from '../api/api';
 import { isRunActive, isSessionActive, type AgentSession, type Attachment, type ClientConfig, type Issue, type LoginStep, type Preferences, type Release, type Run, type StageRole, type User } from '../api/types';
 import {
@@ -31,6 +32,7 @@ import {
   sandboxStatus,
   stopSandbox,
   chatInput,
+  clearUsageWindows,
   closeChat,
   createChat,
   db,
@@ -40,6 +42,7 @@ import {
   ORG,
   startRun,
   stopSession,
+  usageOf,
 } from './engine';
 
 /** Mock rule: any 6 digits except 000000, or a recovery code like abcd-1234 (login only). */
@@ -236,9 +239,15 @@ export const mockApi: Api = {
     ok(() => {
       if (value.trim().length < 8) throw new MockError(422, 'unprocessable', 'The credential looks malformed');
       Object.assign(me(), { hasClaudeCredential: true, claudeCredentialKind: kind });
+      clearUsageWindows(me());
       return me();
     }),
-  deleteClaudeCredential: () => ok(() => Object.assign(me(), { hasClaudeCredential: false, claudeCredentialKind: null })),
+  deleteClaudeCredential: () =>
+    ok(() => {
+      Object.assign(me(), { hasClaudeCredential: false, claudeCredentialKind: null });
+      clearUsageWindows(me());
+      return me();
+    }),
   putGithubToken: (token) =>
     ok(() => {
       if (token.startsWith('bad') || token.length < 8) throw new MockError(422, 'github_token_invalid', 'GitHub rejected the token (401)');
@@ -254,6 +263,7 @@ export const mockApi: Api = {
   deleteGithubToken: () => ok(() => Object.assign(me(), { hasGithubToken: false, githubLogin: null, githubTokenKind: null, githubTokenScopes: null })),
 
   preferences: () => ok(preferences),
+  usage: () => ok(() => usageOf(me())),
   putPreferences: (p) =>
     ok(() => {
       const chat = p.chatModel?.trim() || null;
@@ -530,8 +540,9 @@ export const mockApi: Api = {
   },
   openFeed(handlers): Channel {
     let closed = false;
-    // Like the backend: `sandboxes` frames go to admins only.
-    const sub = (f: Parameters<typeof handlers.onFrame>[0]) => !closed && db.loggedIn && db.me.hasGithubToken && (f.type !== 'sandboxes' || db.me.isAdmin) && handlers.onFrame(f);
+    // Like the backend: `sandboxes` frames go to admins only; `usage` frames (only ever sent for the signed-in user) skip the repository filter.
+    const sub = (f: Parameters<typeof handlers.onFrame>[0]) =>
+      !closed && db.loggedIn && (f.type === 'usage' || (db.me.hasGithubToken && (f.type !== 'sandboxes' || db.me.isAdmin))) && handlers.onFrame(f);
     const t = setTimeout(() => {
       handlers.onOpen?.();
       db.feedSubs.add(sub);
