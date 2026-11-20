@@ -104,7 +104,7 @@ data class ReleaseDto(
     val createdBy: OwnerDto, val createdAt: String, val updatedAt: String,
     /** In build order. */
     val issues: List<ReleaseIssueDto>,
-    /** Who started the release; null while it is planned. */
+    /** Who scheduled or started the release (its runs use this user's credentials); null while it is planned. */
     val owner: OwnerDto? = null,
     /** `release/<name>` once started. */
     val branch: String? = null,
@@ -112,7 +112,15 @@ data class ReleaseDto(
     val endedAt: String? = null,
     /** Set while the release is `paused`. */
     val pause: ReleasePauseDto? = null,
+    /** ISO instant of the scheduled start; non-null exactly while `scheduled`. */
+    val scheduledAt: String? = null,
+    /** The release this one waits behind (only while `scheduled` and due). */
+    val waitingFor: IssueReleaseDto? = null,
+    /** The last scheduled start that did not happen; kept until the release is scheduled again. */
+    val startFailure: ReleaseStartFailureDto? = null,
 )
+
+@Serializable data class ReleaseStartFailureDto(val at: String, val owner: OwnerDto, val reason: String)
 
 @Serializable data class OwnerDto(val username: String, val displayName: String)
 
@@ -249,12 +257,15 @@ object RunStatus {
     val ALL = ACTIVE + TERMINAL
 }
 
-/** Release states (docs/ARCHITECTURE.md §6 "Releases"). Later steps add `scheduled`, `ready` and `released`. */
+/** Release states (docs/ARCHITECTURE.md §6 "Releases"). Later steps add `ready` and `released`. */
 object ReleaseStatus {
-    const val PLANNING = "planning"; const val BUILDING = "building"; const val PAUSED = "paused"; const val CANCELLED = "cancelled"
+    const val PLANNING = "planning"; const val SCHEDULED = "scheduled"
+    const val BUILDING = "building"; const val PAUSED = "paused"; const val CANCELLED = "cancelled"
+    /** Not started yet: planning rules apply (a scheduled release is still a plan with a start time). */
+    val PLANNED = setOf(PLANNING, SCHEDULED)
     /** Started: has an owner and a branch. */
     val STARTED = setOf(BUILDING, PAUSED, CANCELLED)
-    /** Holds the project's one building slot. */
+    /** Holds the project's one building slot; a due scheduled release of the same project waits behind it. */
     val ACTIVE = setOf(BUILDING, PAUSED)
 }
 

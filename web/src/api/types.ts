@@ -60,8 +60,14 @@ export type Issue = {
   release: { id: string; name: string } | null;
 };
 
-/** `planning` until started; then `building` / `paused` until it is `cancelled` (docs/ARCHITECTURE.md §6 "Releases"). */
-export type ReleaseStatus = 'planning' | 'building' | 'paused' | 'cancelled';
+/**
+ * `planning` until started (`scheduled` while a start time is set); then `building` / `paused` until it is
+ * `cancelled` (docs/ARCHITECTURE.md §6 "Releases"). Later steps may add states: render unknown ones as text.
+ */
+export type ReleaseStatus = 'planning' | 'scheduled' | 'building' | 'paused' | 'cancelled';
+
+/** A scheduled start that did not happen (docs/ARCHITECTURE.md §6 "Scheduled start"). */
+export type ReleaseStartFailure = { at: string; owner: Owner; reason: string };
 
 /** Where an issue is in its release's build. All issues of a `planning` release are `waiting`. */
 export type ReleaseIssueState = 'waiting' | 'running' | 'merged' | 'held' | 'skipped';
@@ -93,7 +99,7 @@ export type Release = {
   updatedAt: string;
   /** In build order. */
   issues: ReleaseIssue[];
-  /** Who started it; null while `planning`. */
+  /** Who scheduled or started the release (its runs use this user's credentials); null while `planning`. */
   owner: Owner | null;
   /** `release/<name>` once started. */
   branch: string | null;
@@ -101,6 +107,12 @@ export type Release = {
   endedAt: string | null;
   /** Set while `paused`. */
   pause: { reason: ReleasePauseReason; note: string | null; resumeAt: string | null } | null;
+  /** ISO instant of the scheduled start; set exactly while `scheduled`. */
+  scheduledAt: string | null;
+  /** The release this one waits behind: only while `scheduled` and its time has come. */
+  waitingFor: { id: string; name: string } | null;
+  /** The last scheduled start that did not happen; kept until the release is scheduled again. */
+  startFailure: ReleaseStartFailure | null;
 };
 
 /** Building or paused: at most one per project. */

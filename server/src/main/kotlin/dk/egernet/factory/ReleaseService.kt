@@ -13,6 +13,8 @@ import dk.egernet.factory.github.GitHubException
 import dk.egernet.factory.pipeline.ReleaseBuilder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.time.Instant
+import java.time.format.DateTimeParseException
 import java.util.UUID
 
 /**
@@ -28,6 +30,7 @@ class ReleaseService(
     private val store: ReleaseStore,
     private val bus: EventBus,
     private val builder: ReleaseBuilder,
+    private val scheduler: ReleaseScheduler,
 ) {
     companion object {
         /** Safe as the git branch `release/<name>` and in URLs. */
@@ -135,12 +138,18 @@ class ReleaseService(
     /** Planned releases as before; a cancelled one by its owner or an admin (its branch and runs stay). */
     suspend fun delete(user: UserRecord, id: UUID) {
         val r = visible(user, id)
-        if (r.status in ReleaseStatus.ACTIVE) throw conflict("Cancel the release first", "release_active")
+        val scheduled = conflict("Cancel the scheduled start before deleting this release", "release_scheduled")
+        val active = conflict("Cancel the release first", "release_active")
+        if (r.status == ReleaseStatus.SCHEDULED) throw scheduled
+        if (r.status in ReleaseStatus.ACTIVE) throw active
         if (r.status == ReleaseStatus.CANCELLED) requireOwnerOrAdmin(user, r)
         if (io { store.delete(id) }) {
             bus.emitFeed(FeedItem.ReleaseDeleted(r.repo, r.id.toString()))
-        } else if (io { store.get(id) }?.status in ReleaseStatus.ACTIVE) {
-            throw conflict("Cancel the release first", "release_active")
+        } else {
+            // Scheduled or started in the meantime.
+            val now = io { store.get(id) }?.status
+            if (now == ReleaseStatus.SCHEDULED) throw scheduled
+            if (now in ReleaseStatus.ACTIVE) throw active
         }
     }
 
@@ -149,7 +158,25 @@ class ReleaseService(
     /** Starts a planned release; the caller becomes its owner (docs/ARCHITECTURE.md §6 "Releases", starting). */
     suspend fun start(user: UserRecord, id: UUID): ReleaseRecord {
         val r = visible(user, id)
+        if (r.status == ReleaseStatus.SCHEDULED) {
+            throw conflict("The release is scheduled to start at ${r.scheduledAt}; cancel the scheduled start to start it now", "release_not_planning")
+        }
         if (r.status != ReleaseStatus.PLANNING) throw conflict("The release is ${r.status}, not in preparation", "release_not_planning")
+        return startAs(user, r)
+    }
+
+    /**
+     * The scheduled start of a due release (§6 "Scheduled start"), called by the scheduler as the release's [owner]:
+     * the same checks and the same start as "start now", except that the release must be `scheduled`.
+     */
+    suspend fun startScheduled(owner: UserRecord, id: UUID): ReleaseRecord {
+        val r = visible(owner, id)
+        if (r.status != ReleaseStatus.SCHEDULED) throw conflict("The release is ${r.status}, not scheduled", "release_not_scheduled")
+        return startAs(owner, r)
+    }
+
+    /** Checks [user]'s credentials and the project's building slot, then builds [r] as [user]. */
+    private suspend fun startAs(user: UserRecord, r: ReleaseRecord): ReleaseRecord {
         if (user.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
         val client = access.requireClient(user)
         if (r.issues.isEmpty()) throw conflict("Add an issue to the release first", "release_empty")
@@ -192,6 +219,20 @@ class ReleaseService(
         builder.retry(user, id, number)
         return io { store.get(id) } ?: throw notFound("Release not found")
     }
+
+    /** Sets or changes the scheduled start (§6 "Scheduled start"); [startAt] is an ISO-8601 instant. */
+    suspend fun schedule(user: UserRecord, id: UUID, startAt: String): ReleaseRecord {
+        val r = visible(user, id)
+        val at = try {
+            Instant.parse(startAt.trim())
+        } catch (e: DateTimeParseException) {
+            throw badRequest("startAt must be an ISO-8601 time")
+        }
+        return scheduler.schedule(user, r, at)
+    }
+
+    /** Cancels the scheduled start; the release is in preparation again. */
+    suspend fun cancelSchedule(user: UserRecord, id: UUID): ReleaseRecord = scheduler.cancel(user, visible(user, id))
 
     /** What an assignment did, for `/factory` and MCP replies. */
     data class AssignOutcome(val release: ReleaseRecord?, val added: List<Int>, val movedFrom: Map<String, List<Int>>, val removed: List<Int>)
@@ -249,6 +290,16 @@ class ReleaseService(
     fun releaseByIssue(repo: String): Map<Int, IssueReleaseDto> =
         store.releaseByIssue(repo).mapValues { (_, v) -> IssueReleaseDto(v.first.toString(), v.second) }
 
+    /** The state of a release that is not started, for [describe]. */
+    private fun state(r: ReleaseRecord): String = when (r.status) {
+        ReleaseStatus.PLANNING -> "in preparation" + (r.startFailedReason?.let { " (scheduled start failed: $it)" } ?: "")
+        ReleaseStatus.SCHEDULED -> buildString {
+            append("scheduled for ${r.scheduledAt} by ${r.ownerUsername ?: "unknown"}")
+            r.waitingForName?.let { append(", waiting for release \"$it\"") }
+        }
+        else -> r.status
+    }
+
     private fun statusText(status: String) = when (status) {
         ReleaseStatus.PLANNING -> "in preparation"
         else -> status
@@ -267,7 +318,7 @@ class ReleaseService(
                     r.ownerUsername?.let { append(", started by $it") }
                     r.branch?.let { append(", branch $it") }
                 } else {
-                    append("• ${r.name} — in preparation, $n issue${if (n == 1) "" else "s"}")
+                    append("• ${r.name} — ${state(r)}, $n issue${if (n == 1) "" else "s"}")
                 }
                 if (withIds) append(" (id ${r.id})")
                 if (r.status == ReleaseStatus.PAUSED) r.pauseNote?.let { append("\n    Paused: $it") }

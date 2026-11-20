@@ -189,10 +189,20 @@ fun testConfig(dataDir: Path, twoFactor: Boolean = true, devUsers: Map<String, S
     chatIdleMinutes = 30,
 )
 
+/** A clock whose instant the test sets and advances. */
+class MutableClock(@Volatile var now: java.time.Instant = java.time.Instant.parse("2026-01-01T12:00:00Z")) : java.time.Clock() {
+    override fun instant(): java.time.Instant = now
+    override fun getZone(): java.time.ZoneId = java.time.ZoneOffset.UTC
+    override fun withZone(zone: java.time.ZoneId?): java.time.Clock = this
+    fun advance(d: java.time.Duration) { now = now.plus(d) }
+}
+
 class TestWorld(
     twoFactor: Boolean = true,
     tweak: (Config) -> Config = { it },
     loginThrottle: dk.egernet.factory.auth.LoginThrottle = dk.egernet.factory.auth.LoginThrottle(stepDelay = java.time.Duration.ZERO),
+    clock: java.time.Clock = java.time.Clock.systemUTC(),
+    releaseStarter: ReleaseStarter? = null,
     /** Use the real git CLI in fake-GitHub mode (local clone, no pushes) instead of [FakeGitOps]. */
     realGit: Boolean = false,
 ) {
@@ -203,7 +213,9 @@ class TestWorld(
     val cliGit: dk.egernet.factory.git.CliGitOps? =
         if (realGit) dk.egernet.factory.git.CliGitOps(System.getenv("PATH") ?: "/usr/bin:/bin", "https://github.invalid/", localOnly = true) else null
     val launcher = FakeLauncher()
-    val services = Services(cfg, TestDb.fresh(), github, cliGit ?: git, launcher, loginThrottle = loginThrottle)
+    val services = Services(
+        cfg, TestDb.fresh(), github, cliGit ?: git, launcher, loginThrottle = loginThrottle, clock = clock, releaseStarter = releaseStarter,
+    )
 
     /** Creates a user with credentials registered, as if they had logged in and filled in Settings. */
     fun user(name: String, admin: Boolean = false, claude: Boolean = true, github: Boolean = true): UserRecord {

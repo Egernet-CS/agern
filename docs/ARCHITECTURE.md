@@ -310,17 +310,20 @@ Stage `verdict`: `PASS`, `CHANGES`, `APPROVE`, `ESCALATE` or null.
 A **release** is a named plan of issues for one project, in the order they will be built. Once **started**, Agern
 builds it unattended on the branch `release/<name>`: one issue at a time, each run branching from and squash-merging
 into the release branch, without closing its issue. Delivered in steps (issue #13): planning (#17), starting and
-building (#19, this section). The release pull request, approval and merge into the default branch (#20) and
-scheduled starts (#21) come later. Single runs are unaffected and still merge into the default branch.
+building (#19), scheduled starts (#21, "Scheduled start" below). The release pull request, approval and merge
+into the default branch (#20) come later. Single runs are unaffected and still merge into the default branch.
 
 - **Model.** Tables `releases` (`id`, `repo`, `name`, `description`, `status`, `created_by`, timestamps; once
   started also `owner_id`, `branch`, `started_at`, `ended_at`, and while paused `pause_reason`, `pause_note`,
-  `resume_at`) and `release_issues` (`release_id`, `repo`, `issue_number`, `position`, `issue_title`, `issue_kind`,
+  `resume_at`; for a scheduled start `owner_id` (set when scheduled), `scheduled_at`, `waiting_for` → `releases`
+  (`ON DELETE SET NULL`), `start_failed_at`, `start_failed_owner`, `start_failed_reason`, with the partial index
+  `releases_due` on `scheduled_at` for `status = 'scheduled'`; migrations V7 and V8) and `release_issues` (`release_id`, `repo`, `issue_number`, `position`, `issue_title`, `issue_kind`,
   `added_by`, `added_at`, `state`, `run_id` = the issue's latest release run, `note`). `runs` carry `release_id`
   (`ON DELETE SET NULL`) and `base_branch` (null = the default branch). Several releases may exist per project.
   Creating one creates no branch, no run and makes no GitHub write.
-- **States.** Release `status`: `planning` (shown as "in preparation"), `building`, `paused`, `cancelled`; later
-  steps add `scheduled`, `ready` and `released`. *Started* means `building`, `paused` or `cancelled`. Issue
+- **States.** Release `status`: `planning` (shown as "in preparation"), `scheduled`, `building`, `paused`,
+  `cancelled`; later steps add `ready` and `released`. *Planned* means `planning` or `scheduled` (a scheduled release
+  is a plan with a start time: the planning rules apply). *Started* means `building`, `paused` or `cancelled`. Issue
   `state` within a release: `waiting`, `running`, `merged`, `held`, `skipped`; all issues of a planned release are
   `waiting`. A `building` release with no `waiting` or `running` issue is *idle*: it stays `building` (and keeps the
   project's slot until it is cancelled) and continues by itself when an issue is added or retried. **At most one
@@ -349,7 +352,9 @@ scheduled starts (#21) come later. Single runs are unaffected and still merge in
 
   | Release status | Action | Allowed for |
   |---|---|---|
-  | `planning` | everything, including start | anyone who can see the project |
+  | `planning` | everything, including start and scheduling a start | anyone who can see the project |
+  | `scheduled` | edit, assign, reorder (as `planning`) | anyone who can see the project |
+  | `scheduled` | change or cancel the schedule | owner (who scheduled it) or admin |
   | started | pause, cancel, take an issue out, edit the description | owner or admin |
   | started | resume, add issues, reorder, retry an issue | owner only |
   | `cancelled` | delete | owner or admin |
@@ -357,8 +362,8 @@ scheduled starts (#21) come later. Single runs are unaffected and still merge in
   The owner is the user who started the release. Admins are refused the owner-only actions because those make
   agents run on the owner's credentials (§4: admins may stop, never drive). Anyone else gets 403 `forbidden` "Only
   <owner>, who started this release, can do this" ("…, or an admin can do this" where admins are allowed).
-- **Starting** (`POST /api/releases/{id}/start`). Checked in this order: visible (404); `planning` (409
-  `release_not_planning`); the caller has a Claude credential (422 `claude_credential_required`) and a GitHub token
+- **Starting** (`POST /api/releases/{id}/start`, "start now"). Checked in this order: visible (404); `planning` (409
+  `release_not_planning`; a `scheduled` release: "cancel the scheduled start to start it now"); the caller has a Claude credential (422 `claude_credential_required`) and a GitHub token
   (403, as for every GitHub action); at least one issue (409 `release_empty`); no other release of the project is
   `building` or `paused` (409 `release_already_building`, naming it). Then the release is claimed with an update
   guarded by `status = 'planning'` (`building`, owner, `branch = release/<name>`, `started_at`; a violation of the
@@ -368,6 +373,46 @@ scheduled starts (#21) come later. Single runs are unaffected and still merge in
   `github_push_denied`. On any failure the claim is rolled back to `planning` with no owner, branch or start time,
   and nothing else changes. Then every issue is skip-checked and the first run starts. All later GitHub calls use
   the owner's token.
+- **Scheduled start.**
+  - *Owner.* The user who schedules a release becomes its `owner`; the start and the whole build use the owner's
+    Claude credential and GitHub token (the owner of the started release is that user). An admin who changes the time does not become the owner. Cancelling clears the owner: the
+    release is a shared plan again.
+  - *Set* (`PUT /api/releases/{id}/schedule`, `planning` → `scheduled`): the time must be in the future and at
+    most 366 days ahead (stored at millisecond precision); the caller needs a Claude credential (422
+    `claude_credential_required`) and a GitHub token (403). Clears an earlier start failure. Creates no branch,
+    no run and makes no GitHub write; a release without issues may be scheduled. *Change* (same route while
+    `scheduled`): owner or admin. *Cancel* (`DELETE …/schedule`): owner or admin, back to `planning`; the start
+    failure, if any, is kept. Any other state: 409 (`release_not_schedulable` / `release_not_scheduled`).
+  - *Due* means `scheduled` and `scheduled_at <= now`. The scheduler (`ReleaseScheduler`) ticks at server start
+    and then every 15 seconds; each tick handles the due releases oldest first (`scheduled_at`, `created_at`,
+    `id`), re-reading each. One failing release does not stop the others. Set, change, cancel and the handling
+    of each due release are serialised by one mutex: a cancel that arrives during a start waits, then answers 409
+    `release_not_scheduled`. All time comparisons use an injectable `java.time.Clock` (`Services.clock`, the
+    system UTC clock by default); start precision is about 15 seconds.
+  - *Waiting.* While another release of the same project is `building` or `paused`, a due release stays
+    `scheduled` with `waiting_for` naming that release (a feed frame only when the value changes). The first
+    tick after the project is free continues; of two due releases in one project the earlier starts and the
+    later waits behind it. Releases of other projects are not held back.
+  - *Credential check*, as the owner, afresh at due time: the owner's account, a Claude credential, a GitHub token
+    and a fresh `getRepo` of the project with that token (not the 60-second visibility cache). A missing
+    credential or a token GitHub rejects (401/403/404, or the repository not readable) is a **start failure**
+    with a fixed reason naming the user and what to do. Any other GitHub error (5xx, I/O) is not: the release
+    stays scheduled and due, a warning is logged, and the next tick retries.
+  - *Start.* The scheduler calls `ReleaseStarter`, bound to `ReleaseService.startScheduled`: **the same start as
+    "start now"** (above), as the owner, except that the release must be `scheduled` and the claim is guarded by
+    `status = 'scheduled'` (it clears `scheduled_at` and `waiting_for`; the owner stays). Every refusal of that start
+    (`release_empty`, `release_branch_exists`, `github_push_denied`, …) is a start failure with its message; if the
+    branch cannot be created the claim rolls back to `scheduled` first, so the failure is recorded. 409
+    `release_already_building` (another release took the slot by "start now" in the meantime) is not a failure:
+    the release stays `scheduled` and waits behind it. Still `scheduled` after the call is a start failure ("The
+    release did not start."); any other exception is logged and one with "Internal error while starting the
+    release; see the server log." Tests may substitute the starter.
+  - *Start failure*: back to `planning` (owner, time and waiting cleared) with `start_failed_at/_owner/_reason`
+    set and a feed frame; the owner sees it on the release page, the project page and in `/factory releases`.
+    There is no automatic retry; the failure stays until the release is scheduled again. Reasons are fixed
+    texts or `ApiException` messages, never tokens or raw exception text.
+  - *Restart.* All state is in the database. A time that passed while the server was down is handled at the
+    first tick, not skipped; `waiting_for` is recomputed by ticks.
 - **Building.** Issues are built one at a time, lowest position first among `waiting` issues; no second run of a
   release starts while one of its issues is `running`. The builder (`ReleaseBuilder`) is event-driven — start, a
   run settling, resume, retry, adding an issue, restart and the resume ticker each call `advance`, which runs under
@@ -424,12 +469,14 @@ scheduled starts (#21) come later. Single runs are unaffected and still merge in
   run: `merged` → `merged`, `needs_human` → `held`, anything else → `waiting` ("Interrupted by a server restart; it is
   built again"); every `building` release continues, paused releases stay paused, and a due `resumeAt` is honoured.
   A run that failed in the instant before a restart, before its outcome was recorded, is rebuilt rather than held.
-- **Deleting** a planned release removes the plan and its assignments only; the issues stay open on GitHub. A
-  `building` or `paused` release cannot be deleted (409 `release_active`, "Cancel the release first"); a cancelled
+- **Deleting** a release in preparation removes the plan and its assignments only; the issues stay open on GitHub.
+  A `scheduled` release cannot be deleted (409 `release_scheduled`, "Cancel the scheduled start before deleting
+  this release"). A `building` or `paused` release cannot be deleted (409 `release_active`, "Cancel the release first"); a cancelled
   one can (owner or admin): the plan and its assignments go, the branch stays on GitHub and its runs keep existing
   with `releaseId` null.
 - **Live.** Every change, including every state change of a release or of one of its issues, emits a `release`
-  feed frame per affected release (a move: source and target), deletion `release_deleted` (§8). `updatedAt`
+  feed frame per affected release (a move: source and target; also set, change and cancel of a schedule, waiting
+  set or cleared, and a start failure), deletion `release_deleted` (§8). `updatedAt`
   strictly increases on every change at millisecond resolution.
 - **Fake-GitHub mode.** The local clone has no remote: the release branch is created locally from the clone's
   `HEAD` when first needed, and merges are not applied to it, so each run starts from the same local release
@@ -466,12 +513,15 @@ is rejected with 422 `attachments_not_allowed`; they stay unsent so the owner ca
 `/factory releases`, `/factory release create <name> [description…]`, `/factory release add <name> <issue>…`,
 `/factory release remove <issue>…`, `/factory help`. The reply is appended to the transcript as a `system` event.
 Release commands act in the chat's project as its owner: `releases` lists each release with its status ("in
-preparation" with the issue count; for started ones "building", "paused" or "cancelled", "k of n merged", the owner
+preparation" with the issue count, plus " (scheduled start failed: <reason>)" after a failed scheduled start;
+"scheduled for <ISO time, UTC> by <owner>" plus ", waiting for release "<name>"" when due and waiting; for started ones "building", "paused" or "cancelled", "k of n merged", the owner
 and the branch, and a paused release's note) and the issues in order (`#n title`, with ` — <state>` when not
-`waiting`, plus the note for held and skipped issues); starting, pausing, resuming, cancelling and retrying are
+`waiting`, plus the note for held and skipped issues); starting, scheduling, pausing, resuming, cancelling and retrying are
 web-only in this step; `add` assigns or moves and says what happened (e.g. `Release "1.4": added
 #5, #6 (now 4 issues).`, plus issues moved from another release); `remove` takes issues out of whatever release
-they are in. Issue tokens accept `5`, `#5` and `#5,`; an unknown release name gets a reply naming the existing
+they are in. The state is `in preparation` (plus ` (scheduled start failed: <reason>)` after a failed scheduled
+start), `scheduled for <ISO time, UTC> by <username>` (plus `, waiting for release "<name>"`), or the raw status
+(`building`, `paused`). Scheduling has no command or tool. Issue tokens accept `5`, `#5` and `#5,`; an unknown release name gets a reply naming the existing
 ones; a missing or invalid argument gets a one-line usage reply. Renaming, deleting and reordering are web-only.
 
 ## 8. HTTP API
@@ -511,14 +561,18 @@ type ReleaseIssue = { number: number; title: string; kind: IssueKind;   // title
   runId: string | null;                     // the issue's latest release run
   note: string | null };                    // why it is held or skipped, or that it will be built again
 type Release = { id: string; repo: string; name: string; description: string;
-  status: 'planning' | 'building' | 'paused' | 'cancelled';   // planning is shown as "in preparation"
+  status: 'planning' | 'scheduled' | 'building' | 'paused' | 'cancelled';   // planning is shown as "in preparation"
   createdBy: { username: string; displayName: string };
   createdAt: string; updatedAt: string;     // updatedAt strictly increases on every change
   issues: ReleaseIssue[];                   // in build order
-  owner: { username: string; displayName: string } | null;   // who started it
+  owner: { username: string; displayName: string } | null;   // who scheduled or started it
   branch: string | null;                    // 'release/<name>' once started
   startedAt: string | null; endedAt: string | null;
-  pause: { reason: 'manual' | 'usage_limit' | 'credentials'; note: string | null; resumeAt: string | null } | null };
+  pause: { reason: 'manual' | 'usage_limit' | 'credentials'; note: string | null; resumeAt: string | null } | null;
+  scheduledAt: string | null;               // ISO instant; set exactly while scheduled
+  waitingFor: { id: string; name: string } | null;          // only while scheduled and due
+  startFailure: { at: string; owner: { username: string; displayName: string }; reason: string } | null };
+                                            // the last scheduled start that did not happen
 
 type SessionKind = 'chat' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
 type SessionStatus = 'starting' | 'running' | 'idle' | 'done' | 'failed' | 'stopped';
@@ -622,8 +676,10 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `POST /api/projects/{repo}/releases` | `{ name, description? }` → 201 `Release` | 400 invalid name or description; 409 `release_name_taken`. Starts nothing |
 | `GET /api/releases/{id}` | → `Release` | 404 unknown or invisible |
 | `PUT /api/releases/{id}` | `{ name, description }` → `Release` | rename or edit; same validation as create. Started: owner or admin, and a different name → 409 `release_name_locked` |
-| `DELETE /api/releases/{id}` | → 204 | removes the plan and its assignments; the issues are untouched on GitHub. `building`/`paused` → 409 `release_active`; `cancelled`: owner or admin, the branch stays and its runs keep existing with `releaseId` null |
-| `POST /api/releases/{id}/start` | → `Release` | the caller becomes the owner; creates `release/<name>` and builds (§6 "Releases"). 409 `release_not_planning`, 422 `claude_credential_required`, 409 `release_empty`, 409 `release_already_building`, 409 `release_branch_exists`, 422 `github_push_denied` |
+| `DELETE /api/releases/{id}` | → 204 | removes the plan and its assignments; the issues are untouched on GitHub. `scheduled` → 409 `release_scheduled`; `building`/`paused` → 409 `release_active`; `cancelled`: owner or admin, the branch stays and its runs keep existing with `releaseId` null |
+| `POST /api/releases/{id}/start` | → `Release` | the caller becomes the owner; creates `release/<name>` and builds (§6 "Releases"). 409 `release_not_planning` (also while scheduled), 422 `claude_credential_required`, 409 `release_empty`, 409 `release_already_building`, 409 `release_branch_exists`, 422 `github_push_denied` |
+| `PUT /api/releases/{id}/schedule` | `{ startAt: string }` → `Release` | set (`planning`, caller becomes owner) or change (`scheduled`, owner or admin, owner unchanged) the scheduled start. In order: 404 invisible; 400 "startAt must be an ISO-8601 time" (an instant with `Z` or offset), "The start time must be in the future", "The start time is too far ahead (at most a year)" (> 366 days); set: 422 `claude_credential_required`, 403 without a GitHub token; change: 403 "Only <owner> or an admin can change this schedule"; other states: 409 `release_not_schedulable`. Stored at millisecond precision |
+| `DELETE /api/releases/{id}/schedule` | → `Release` | cancel: back to `planning`, `owner`/`scheduledAt`/`waitingFor` null, `startFailure` kept. 409 `release_not_scheduled` when not scheduled (also once the start has begun), else 403 unless owner or admin |
 | `POST /api/releases/{id}/pause` | → `Release` | owner or admin; `building` → `paused` (else 409 `release_not_building`); the running issue finishes |
 | `POST /api/releases/{id}/resume` | → `Release` | owner only; `paused` → `building` (else 409 `release_not_paused`); 422 `claude_credential_required` |
 | `POST /api/releases/{id}/cancel` | → `Release` | owner or admin; `building`/`paused` → `cancelled` (else 409 `release_not_building`); cancels the release's active runs |
@@ -678,7 +734,8 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   "Releases"). Building: `release_not_planning`, `release_empty`, `release_already_building`,
   `release_branch_exists`, `release_not_building`, `release_not_paused`, `release_issue_not_held`,
   `release_issue_started`, `release_closed`, `release_active`, `release_name_locked` (409);
-  `github_push_denied`, `claude_credential_required` (422).
+  `github_push_denied`, `claude_credential_required` (422);
+  scheduling: `release_not_schedulable`, `release_not_scheduled`, `release_scheduled` (409).
 - "Needs Claude credential" → 422 `claude_credential_required`; too many agents → 409
   `too_many_agents`; issue already has an active run → 409 `active_run_exists`; missing CSRF header
   → 403 `csrf`; foreign `Origin` → 403 `bad_origin`.
@@ -920,8 +977,9 @@ is cleared and the page falls back to another chat or the empty state. Others wa
 "This chat was closed" with a Dismiss button instead of an error.
 
 **Releases.** The activity pane has a "Releases" section above "Runs": one row per release (name, the status pill
-— "in preparation", "building", "paused" or "cancelled" — and "N issues", or for started releases "k of n merged"
-plus "· h held" when h > 0) linking to its page, and "+ New" (accessible name "New release") opening the dialog
+— "in preparation", "scheduled", "building", "paused" or "cancelled" — and "N issues", or for started releases
+"k of n merged" plus "· h held" when h > 0; for a scheduled release "· starts <local date and time>" or "· waiting
+for <name>", for one in preparation whose scheduled start failed "· start failed") linking to its page, and "+ New" (accessible name "New release") opening the dialog
 "New release in <repo>" (Name with the naming rule, optional Description). Once the project has at least one
 release, the issues panel adds: a "Release" filter (All issues · No release · each release) combined with the kind
 and state filters; the release name as a tag on assigned issues, linking to the release page; on open issues a
@@ -939,6 +997,21 @@ ordered list with "Move #n up", "Move #n down" and "Remove #n from release" butt
 "Add an open issue" select listing open issues not in this release (those in another release are marked
 "(in <name>)" and moved). It updates live; if someone else deletes the release, the page says so.
 
+Scheduled start on the release page: in preparation, "Schedule start…" opens the dialog "Schedule release <name>"
+with "Start at" (`datetime-local`, required, `min` now, default today 22:00 local time if still ahead, otherwise
+tomorrow 22:00) and the hint "Your local time (<IANA zone>). The release is built with your Claude and GitHub
+credentials. If another release of this project is still building at that time, this one waits for it."; it sends
+`new Date(value).toISOString()`, keeps server errors in the dialog (`role="alert"`) and disables its buttons while
+the request runs. Scheduled, the pill reads "scheduled" and the plan note becomes "Scheduled to start <local date
+and time> by <owner>."; when due and waiting, a `role="status"` line "Its time has come. Waiting for release <name,
+linked> to finish building." The owner and admins get "Change time" (the same dialog titled "Change scheduled
+start", prefilled, "Save") and "Cancel schedule" (at once, no confirmation); others read "Only <owner> or an admin
+can change the schedule.". "Delete" is disabled with the hint "Cancel the scheduled start to delete this
+release."; editing and the issue list stay enabled. After a failed scheduled start an error notice "The scheduled
+start did not happen" shows the reason and "Scheduled by <user> · tried <local date and time>". A 409
+`release_not_scheduled`/`release_not_schedulable` reloads the release and shows the server's message. Times are
+shown in the browser's time zone in `<time dateTime>`. The status pill shows unknown states as their raw text.
+
 For building, the release page also shows (owner = `me.username === release.owner.username`,
 admin = `me.isAdmin`): for started releases "started by <owner> · <time ago>", the branch in monospace linking to
 `<project.htmlUrl>/tree/release/<name>`, and the progress "k of n merged" (plus "· h held", "· s skipped"); the
@@ -946,7 +1019,8 @@ note "This release is a plan…" only while planning. A plain-text status line (
 <title>." · "Nothing left to build." (plus " h held issue(s) need attention.") · the pause note (plus " #n is
 finishing; no further issue starts." while one runs; for a usage limit "Resumes automatically <time>.") ·
 "Cancelled <time ago>. What was merged stays on release/<name>.". Only the buttons the user may use are rendered:
-planning "▶ Start release" (disabled with the hint "Add an issue first" when empty), Edit, Delete; building
+planning "▶ Start release" (disabled with the hint "Add an issue first" when empty), "Schedule start…", Edit,
+Delete; scheduled "Change time" and "Cancel schedule" (owner or admin), Edit, Delete (disabled); building
 "Pause", "Cancel release", Edit; paused "Resume" (owner), "Cancel release", Edit; cancelled Delete (owner or
 admin). In a started release Edit shows the name disabled ("The name is fixed once the release is started"). Users
 who may change nothing see "Only <owner>, who started this release, and admins can change it." The dialog "Start
