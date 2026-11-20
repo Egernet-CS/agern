@@ -169,7 +169,8 @@ class ReleaseApprovalTest {
         val prs = r.issues.associate { it.number to it.prNumber!! }
         assertTrue(body.contains("- #$a Alpha (pull request #${prs[a]})\n- #$b Beta (pull request #${prs[b]})"), body)
         assertFalse(Regex("(?i)\\b(close[sd]?|fix(es|ed)?|resolve[sd]?) #").containsMatchIn(body), body)
-        assertTrue(body.contains("/p/demo-app/releases/${r.id}"), body)
+        // The test installation has an internal address (localhost): GitHub text names the page, it does not link to it.
+        assertTrue(body.contains("the page of release `1.0` in Agern") && !body.contains("localhost"), body)
         assertEquals("Release 1.0", gh.pullMeta[pr]!!.title)
         // The ready comment, once, on the pull request.
         eventually("ready comment") { comments(pr).any { it.contains("is ready to release") } }
