@@ -69,6 +69,8 @@ class Services(
     val clock: java.time.Clock = java.time.Clock.systemUTC(),
     /** What a scheduled start calls; null = the real start ([ReleaseService.startScheduled]). Tests may replace it. */
     releaseStarter: ReleaseStarter? = null,
+    /** Whether a project allows automatic releases: the seam for #24 (every project does until it exists). */
+    val releaseModePolicy: dk.egernet.factory.pipeline.ReleaseModePolicy = dk.egernet.factory.pipeline.ReleaseModePolicy.ALLOW_ALL,
 ) {
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     val box = SecretBox(cfg.masterKey)
@@ -107,7 +109,9 @@ class Services(
     val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes)
     val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
     val releaseLocks = dk.egernet.factory.pipeline.ReleaseLocks()
-    val releaseMerger = dk.egernet.factory.pipeline.ReleaseMerger(cfg, releaseStore, users, access, workspaces, bus, releaseLocks, scope)
+    val releaseMerger = dk.egernet.factory.pipeline.ReleaseMerger(
+        cfg, releaseStore, users, access, workspaces, bus, releaseLocks, scope, releaseModePolicy,
+    )
     val releaseBuilder = dk.egernet.factory.pipeline.ReleaseBuilder(
         cfg, releaseStore, runs, users, access, orchestrator, bus, scope, releaseLocks, releaseMerger,
     )
@@ -116,7 +120,7 @@ class Services(
         cfg, clock, releaseStore, users, access, bus,
         releaseStarter ?: ReleaseStarter { release, owner -> releases.startScheduled(owner, release.id) },
     )
-    val releases: ReleaseService = ReleaseService(cfg, access, releaseStore, bus, releaseBuilder, releaseScheduler, releaseMerger)
+    val releases: ReleaseService = ReleaseService(cfg, access, releaseStore, bus, releaseBuilder, releaseScheduler, releaseMerger, releaseModePolicy)
     val factory = FactoryService(cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases)
     val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes)
 
@@ -156,6 +160,7 @@ class Services(
         releaseScheduler.start(scope)
         agents.startIdleReaper()
         releaseBuilder.startTicker()
+        releaseMerger.startTicker()
         attachments.startReaper(scope)
     }
 

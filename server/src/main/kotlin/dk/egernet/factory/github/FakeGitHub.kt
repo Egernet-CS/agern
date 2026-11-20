@@ -59,6 +59,33 @@ class FakeGitHub(private val org: String) : GitHub {
     /** Lets tests make opening pull requests fail. */
     @Volatile var failCreatePull = false
 
+    /**
+     * Checks per head branch (`"<repo>:<branch>"`), as GitHub reports them for the branch's current head commit:
+     * commit statuses by context (`success`, `pending`, `failure`, `error`) and check runs by name (status, conclusion).
+     * A branch with neither has no checks at all.
+     */
+    val statuses = java.util.concurrent.ConcurrentHashMap<String, MutableMap<String, String>>()
+    val checkRunsByBranch = java.util.concurrent.ConcurrentHashMap<String, MutableMap<String, GhCheckRun>>()
+    /** Lets tests make reading checks fail with this HTTP status (e.g. 403 for a token without the permission). */
+    @Volatile var checksFailure: Int? = null
+    /** How often the checks were read (combined status reads). */
+    val checkReads = java.util.concurrent.atomic.AtomicInteger()
+
+    /** Sets (or with null removes) the commit status [context] on [branch]'s head. */
+    fun setStatus(repo: String, branch: String, context: String, state: String?) {
+        val m = statuses.getOrPut("$repo:$branch") { java.util.concurrent.ConcurrentHashMap() }
+        if (state == null) m.remove(context) else m[context] = state
+    }
+
+    /** Sets (or with null [status] removes) the check run [name] on [branch]'s head. */
+    fun setCheckRun(repo: String, branch: String, name: String, status: String?, conclusion: String? = null) {
+        val m = checkRunsByBranch.getOrPut("$repo:$branch") { java.util.concurrent.ConcurrentHashMap() }
+        if (status == null) m.remove(name) else m[name] = GhCheckRun(name, status, conclusion)
+    }
+
+    /** The head branch of a fake head commit `sha-<branch>-<n>` (as [Client.getPull] reports it). */
+    private fun branchOfSha(sha: String): String = sha.removePrefix("sha-").substringBeforeLast('-')
+
     /** As if a person merged pull request [number] on GitHub (rebase), outside Agern. */
     fun mergeOnGitHub(number: Int) = synchronized(this) { applyMerge(pullMeta.getValue(number), number, "rebase") }
 
@@ -318,6 +345,26 @@ class FakeGitHub(private val org: String) : GitHub {
             pullMeta.forEach { (n, m) -> if (m.repo == repo && m.head == branch && m.state == "open") { m.state = "closed"; closePullList(n) } }
             actions += "delete-branch $repo $branch"
             Unit
+        }
+
+        override fun combinedStatus(org: String, repo: String, sha: String): GhCombinedStatus = synchronized(this@FakeGitHub) {
+            repo(org, repo)
+            checksFailure?.let { throw GitHubException(it, "GitHub GET commit status failed: $it Resource not accessible by personal access token") }
+            checkReads.incrementAndGet()
+            val list = statuses["$repo:${branchOfSha(sha)}"].orEmpty().map { (c, st) -> GhCommitStatus(c, st) }.sortedBy { it.context }
+            val state = when {
+                list.isEmpty() -> "pending" // as GitHub: no statuses at all reads as pending with total_count 0
+                list.any { it.state == "failure" || it.state == "error" } -> "failure"
+                list.any { it.state == "pending" } -> "pending"
+                else -> "success"
+            }
+            GhCombinedStatus(state, list.size, list)
+        }
+
+        override fun checkRuns(org: String, repo: String, sha: String): List<GhCheckRun> = synchronized(this@FakeGitHub) {
+            repo(org, repo)
+            checksFailure?.let { throw GitHubException(it, "GitHub GET check runs failed: $it Resource not accessible by personal access token") }
+            checkRunsByBranch["$repo:${branchOfSha(sha)}"].orEmpty().values.sortedBy { it.name }
         }
 
         private fun closePullList(number: Int) =

@@ -133,11 +133,20 @@ data class ReleaseDto(
     val notice: String? = null,
     val readyAt: String? = null,
     val releasedAt: String? = null,
-    /** Who approved the release; null when its pull request was merged on GitHub outside Agern. */
+    /** Who approved the release (for an automatic release: its owner); null when merged on GitHub outside Agern. */
     val releasedBy: OwnerDto? = null,
     /** The default branch's commit after the release merge. */
     val mergeCommit: String? = null,
+    /** [ReleaseMode]: `manual` (waits for the owner's approval) or `automatic` (Agern merges it once it is green). */
+    val mode: String = ReleaseMode.MANUAL,
+    /** True when Agern merged it by itself (automatic mode); [releasedBy] is then the owner. */
+    val releasedAutomatically: Boolean = false,
+    /** The checks on the release pull request's head commit, as last read; null until a pull request exists. */
+    val checks: ReleaseChecksDto? = null,
 )
+
+/** [state]: [ReleaseChecksState]; [detail] e.g. "Failed: build, lint"; [sha] the head commit they were read for. */
+@Serializable data class ReleaseChecksDto(val state: String, val detail: String?, val sha: String?)
 
 @Serializable data class ReleaseStartFailureDto(val at: String, val owner: OwnerDto, val reason: String)
 
@@ -418,6 +427,25 @@ object ReleaseStatus {
     val ACTIVE = setOf(BUILDING, PAUSED)
     /** Final: kept as history. */
     val FINISHED = setOf(RELEASED, CANCELLED)
+}
+
+/** How a `ready` release reaches the default branch (docs/ARCHITECTURE.md §6 "Releasing", "Release mode"). */
+object ReleaseMode {
+    /** Waits in `ready` for its owner's approval (the default). */
+    const val MANUAL = "manual"
+    /** Merged by Agern with the owner's token once it is complete, conflict-free and its checks are green. */
+    const val AUTOMATIC = "automatic"
+    val ALL = setOf(MANUAL, AUTOMATIC)
+}
+
+/** The checks (commit statuses and check runs) on the release pull request's head commit. */
+object ReleaseChecksState {
+    /** Not read yet, or could not be read. */
+    const val UNKNOWN = "unknown"
+    /** The head commit has no checks at all: counts as green. */
+    const val NONE = "none"
+    const val PENDING = "pending"; const val PASSED = "passed"; const val FAILED = "failed"
+    val GREEN = setOf(NONE, PASSED)
 }
 
 /** Whether the release pull request merges cleanly into the default branch, as last checked. */
