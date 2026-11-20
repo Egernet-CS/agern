@@ -181,9 +181,10 @@ Launch rules:
   `stream_event` deltas are broadcast live but not persisted.
 
 Workspaces: `$FACTORY_DATA_DIR/workspaces/<username>/<repo>/main` is the owner's clone used by
-chat. A pipeline run works in a git worktree `…/<repo>/runs/<runId>` on branch
-`factory/issue-<number>-<slug>`; a release run (§6 "Releases") on `factory/release-<name>/issue-<number>-<slug>`,
-so it never reuses the open pull request of an earlier single run of the same issue.
+chat. A pipeline run works in a git worktree `…/<repo>/runs/<runId>` on its own branch
+`factory/issue-<number>-<slug>-<run>`; a release run (§6 "Releases") on
+`factory/release-<name>/issue-<number>-<slug>-<run>`, where `<run>` is the first 8 hex digits of the run id. How
+worktrees and branches are cleaned up is in §6 "Worktrees and branches".
 
 **Known limitation (v1).** All agents run under the server's OS user with permissions bypassed.
 The factory must run on a dedicated machine or VM. Per-user OS accounts or containers are the
@@ -276,6 +277,26 @@ issue → spec-writer (opus) → builder (opus) ─┬→ security  (opus)   ┐
 - Orchestration is a deterministic state machine in the server, not something an LLM decides. On
   server restart, unfinished runs are marked `failed` with a clear reason (v1); a building release then builds
   the interrupted issue again (§6 "Releases").
+- **Worktrees and branches.** Rule: **every run has its own branch** (`…-<first 8 hex digits of the run id>`, §5)
+  and its own worktree `runs/<runId>`, so no run ever reuses, resets or force-pushes the branch, pull request or
+  worktree of an earlier run — a leftover can never collide with a new run. At most one run per issue is active
+  (`queued` … `approving`, `needs_human`); a second start is 409 `active_run_exists`.
+  - *When a run ends* its worktree is removed before its final status is shown: `merged` (approver or owner
+    approve) also deletes the local branch; `failed` (any stage, the time limit, no commits, set-up errors) and
+    `cancelled` (also from `needs_human`, or through a release) delete the local branch unless it holds commits
+    found on no other branch and no remote-tracking branch (never pushed), which are kept rather than lost. A
+    `needs_human` run is still alive and keeps its worktree until it is approved or cancelled.
+  - *GitHub:* the remote branch and the open pull request of a failed or cancelled run are left untouched — they
+    may hold useful commits, and only a human decides to close them. The issue gets a comment "run … failed: <reason>"
+    or "… was cancelled by …", which names that pull request. A later run of the issue opens its own pull request,
+    whose body lists the earlier runs' unmerged pull requests ("close them if this one supersedes them").
+  - *No commits.* When the builder makes no commits, the stage summary and the run error carry the first paragraph of
+    the builder's final message (e.g. why the issue cannot be built yet), and so does the issue comment.
+  - *Leftovers* (e.g. after a crash or a failed clean-up) are reaped: when a run starts, under the per-clone lock,
+    every worktree of that user's clone whose run is not live (no coroutine in this server and not in an active
+    status) is removed — registered with git or only a directory under `runs/` — and stale entries are pruned
+    (`git worktree prune`); at server start, after unfinished runs are failed, the same is done for every clone on
+    disk. The worktree of a live run, `needs_human` included, is never touched.
 
 Run `status`: `queued`, `spec`, `building`, `reviewing`, `approving`, `merged`, `needs_human`,
 `failed`, `cancelled`.
@@ -402,7 +423,7 @@ into the default branch (#20) come later. Single runs are unaffected and still m
   another reason, the issue is `held` with the message and the build goes on.
 - **Release runs** are created as the release owner, with the owner's preferences as for single runs, with
   `releaseId` and `baseBranch = release/<name>`, and go through the unchanged pipeline except: the branch is
-  `factory/release-<name>/issue-<n>-<slug>`; the worktree is created from the current tip of the release branch
+  `factory/release-<name>/issue-<n>-<slug>-<run>`; the worktree is created from the current tip of the release branch
   (fetched first), so it builds on the issues merged before it; the pull request targets the release branch and its
   body starts with "Issue #n · release `<name>`" with no closing keyword; build, review and approver prompts name
   the release branch as the merge target; on merge the issue is **not** closed and the comment reads "**Agern:

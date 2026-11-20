@@ -83,6 +83,9 @@ class ReleaseScheduledStartTest {
         val run = s.runs.get(get(r).issues.single().runId!!)!!
         assertEquals(r.id, run.releaseId)
         assertEquals("release/1.4", run.baseBranch)
+        // The run's own branch (one per run, docs/ARCHITECTURE.md §6 "Worktrees and branches").
+        val branch = s.runs.get(run.id)!!.branch
+        assertTrue(branch == null || branch.matches(Regex("factory/release-1\\.4/issue-$n-.+-${run.id.toString().take(8)}")), branch)
         assertEquals("alice", run.ownerUsername)
         // Further ticks do nothing.
         tick()

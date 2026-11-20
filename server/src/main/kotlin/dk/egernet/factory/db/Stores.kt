@@ -393,6 +393,13 @@ class RunStore(private val db: Db) {
         releaseId, map = ::map,
     )
 
+    /** Pull request numbers of earlier runs of the issue that ended without merging (their PRs may still be open). */
+    fun earlierUnmergedPulls(repo: String, issueNumber: Int, exceptRunId: UUID): List<Int> = db.query(
+        """SELECT DISTINCT pr_number FROM runs WHERE repo = ? AND issue_number = ? AND id <> ? AND pr_number IS NOT NULL
+           AND status IN ('failed','cancelled') ORDER BY pr_number""",
+        repo, issueNumber, exceptRunId,
+    ) { it.getInt("pr_number") }
+
     fun activeRunsByIssue(repo: String): Map<Int, UUID> = db.query(
         "SELECT issue_number, id FROM runs WHERE repo = ? AND status IN ('queued','spec','building','reviewing','approving','needs_human')",
         repo,

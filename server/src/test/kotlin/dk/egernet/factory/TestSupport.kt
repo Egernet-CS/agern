@@ -174,7 +174,8 @@ class FakeGitOps : GitOps {
     }
     override fun commitsAhead(worktree: Path, baseRef: String, home: Path) = commits
     override fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path) { pushes += branch }
-    override fun removeWorktree(mainDir: Path, worktree: Path, home: Path) {}
+    override fun listWorktrees(mainDir: Path, home: Path): List<dk.egernet.factory.git.WorktreeInfo> = emptyList()
+    override fun removeWorktree(mainDir: Path, worktree: Path, home: Path, keepUnpushed: Boolean) {}
 }
 
 fun testConfig(dataDir: Path, twoFactor: Boolean = true, devUsers: Map<String, String> = mapOf("alice" to "pw-a", "bob" to "pw-b", "root" to "pw-r")) = Config(
@@ -202,13 +203,19 @@ class TestWorld(
     loginThrottle: dk.egernet.factory.auth.LoginThrottle = dk.egernet.factory.auth.LoginThrottle(stepDelay = java.time.Duration.ZERO),
     clock: java.time.Clock = java.time.Clock.systemUTC(),
     releaseStarter: ReleaseStarter? = null,
+    /** Use the real git CLI in fake-GitHub mode (local clone, no pushes) instead of [FakeGitOps]. */
+    realGit: Boolean = false,
 ) {
     val dataDir: Path = Files.createTempDirectory("agern-test")
     val cfg = tweak(testConfig(dataDir, twoFactor))
     val github = FakeGitHub.seeded("test-org")
     val git = FakeGitOps()
+    val cliGit: dk.egernet.factory.git.CliGitOps? =
+        if (realGit) dk.egernet.factory.git.CliGitOps(System.getenv("PATH") ?: "/usr/bin:/bin", "https://github.invalid/", localOnly = true) else null
     val launcher = FakeLauncher()
-    val services = Services(cfg, TestDb.fresh(), github, git, launcher, loginThrottle = loginThrottle, clock = clock, releaseStarter = releaseStarter)
+    val services = Services(
+        cfg, TestDb.fresh(), github, cliGit ?: git, launcher, loginThrottle = loginThrottle, clock = clock, releaseStarter = releaseStarter,
+    )
 
     /** Creates a user with credentials registered, as if they had logged in and filled in Settings. */
     fun user(name: String, admin: Boolean = false, claude: Boolean = true, github: Boolean = true): UserRecord {
