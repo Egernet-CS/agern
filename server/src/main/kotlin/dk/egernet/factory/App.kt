@@ -90,6 +90,11 @@ class Services(
     fun recoverAfterRestart() {
         val failed = runs.failUnfinishedAfterRestart()
         if (failed.isNotEmpty()) LoggerFactory.getLogger("dk.egernet.factory").warn("Marked {} unfinished run(s) as failed after restart", failed.size)
+        // Worktrees of runs that have ended (including the ones just failed); needs_human runs keep theirs.
+        val reaped = runCatching { orchestrator.reapWorktrees() }
+            .onFailure { LoggerFactory.getLogger("dk.egernet.factory").warn("Reaping run worktrees failed: {}", it.message) }
+            .getOrDefault(emptyList())
+        if (reaped.isNotEmpty()) LoggerFactory.getLogger("dk.egernet.factory").info("Removed {} worktree(s) of ended runs", reaped.size)
         releaseBuilder.recoverAfterRestart()
         sessions.recoverAfterRestart()
         webSessions.purgeExpired()
