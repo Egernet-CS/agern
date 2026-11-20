@@ -105,6 +105,10 @@ class McpServer(
                 required = listOf("release", "issueNumbers"))),
         Tool("factory_unassign_issues", "Take issues out of whatever release of this project they are in.",
             schema(Triple("issueNumbers", "integers", "Issue numbers"), required = listOf("issueNumbers"))),
+        Tool("factory_approve_release", "Merge a release that is ready to release into the default branch (one commit per " +
+            "issue), close its issues and delete its branch. Only the release's owner may do this. Call it only when the person " +
+            "explicitly tells you to release that specific release.",
+            schema(Triple("release", "string", "Release name or id"), required = listOf("release"))),
         Tool("factory_sandbox_info", "Whether this run has a sandbox (a container with the project's toolchain and services, " +
             "defined in .agern/sandbox.yml and approved by an admin) and, if not, why. When it has one: image, platforms (other " +
             "images to test on), the user commands run as, services with their host names, ports and readiness, caches and limits.",
@@ -248,6 +252,11 @@ class McpServer(
                     val out = releases.assign(owner, repo, numbers, null)
                     if (out.removed.isEmpty()) "None of these issues is in a release."
                     else "Removed ${out.removed.joinToString(", ") { "#$it" }} from their release."
+                }
+                "factory_approve_release" -> {
+                    if (grant.runId != null) return toolError("Not available to pipeline agents")
+                    val key = str("release")?.takeIf { it.isNotBlank() } ?: return toolError("release is required")
+                    FactoryService.approvedReply(releases.approve(owner, releases.find(owner, repo, key).id))
                 }
                 "factory_sandbox_info" -> {
                     val runId = grant.runId ?: return toolError("Sandboxes belong to pipeline runs; chats have none")

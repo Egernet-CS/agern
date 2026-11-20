@@ -500,6 +500,15 @@ private fun Route.releaseRoutes(s: Services) {
         val u = call.requireUser(s)
         call.respond(s.releases.cancel(u, uuidParam("id")).toDto())
     }
+    // Releasing (docs/ARCHITECTURE.md §6 "Releasing"): owner only; each answers the release after the change.
+    post("/releases/{id}/approve") {
+        val u = call.requireUser(s)
+        call.respond(s.releases.approve(u, uuidParam("id")).toDto())
+    }
+    post("/releases/{id}/check") {
+        val u = call.requireUser(s)
+        call.respond(s.releases.check(u, uuidParam("id")).toDto())
+    }
     post("/releases/{id}/issues/{number}/retry") {
         val u = call.requireUser(s)
         val id = uuidParam("id")

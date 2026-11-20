@@ -133,6 +133,8 @@ export const httpApi: Api = {
   resumeRelease: (id) => post(`/api/releases/${enc(id)}/resume`),
   cancelRelease: (id) => post(`/api/releases/${enc(id)}/cancel`),
   retryReleaseIssue: (id, issueNumber) => post(`/api/releases/${enc(id)}/issues/${issueNumber}/retry`),
+  approveRelease: (id) => post(`/api/releases/${enc(id)}/approve`),
+  checkRelease: (id) => post(`/api/releases/${enc(id)}/check`),
   scheduleRelease: (id, startAt) => put(`/api/releases/${enc(id)}/schedule`, { startAt }),
   cancelReleaseSchedule: (id) => del(`/api/releases/${enc(id)}/schedule`),
 

@@ -52,6 +52,9 @@ data class GhRepo(
     @SerialName("html_url") val htmlUrl: String,
     @SerialName("clone_url") val cloneUrl: String = "",
     val archived: Boolean = false,
+    /** Merge settings; GitHub may leave them out (e.g. for tokens without push access): null counts as allowed. */
+    @SerialName("allow_rebase_merge") val allowRebaseMerge: Boolean? = null,
+    @SerialName("allow_merge_commit") val allowMergeCommit: Boolean? = null,
 )
 
 @Serializable
@@ -74,6 +77,25 @@ data class GhIssue(
 data class GhComment(val user: GhLogin? = null, val body: String? = null, @SerialName("created_at") val createdAt: String = "")
 
 @Serializable data class GhPull(val number: Int, @SerialName("html_url") val htmlUrl: String, val state: String = "open")
+
+@Serializable data class GhRef(val ref: String = "", val sha: String = "")
+
+/**
+ * One pull request as `GET /repos/{o}/{r}/pulls/{n}` returns it. [mergeable] is null while GitHub is still computing
+ * it; [state] is `open` or `closed` (a merged pull request is `closed` with [merged] true).
+ */
+@Serializable
+data class GhPullInfo(
+    val number: Int,
+    @SerialName("html_url") val htmlUrl: String,
+    val state: String = "open",
+    val merged: Boolean = false,
+    val mergeable: Boolean? = null,
+    @SerialName("mergeable_state") val mergeableState: String? = null,
+    val head: GhRef = GhRef(),
+    val base: GhRef = GhRef(),
+    @SerialName("merge_commit_sha") val mergeCommitSha: String? = null,
+)
 
 /** Everything the factory needs from GitHub, always acting with one user's token. */
 interface GitHubClient {
@@ -98,7 +120,23 @@ interface GitHubClient {
     fun branchSha(org: String, repo: String, branch: String): String?
     /** Creates [branch] at [sha]. An existing branch surfaces as [GitHubException] 422. */
     fun createBranch(org: String, repo: String, branch: String, sha: String)
+    /** One pull request with its mergeability; null when it does not exist. */
+    fun getPull(org: String, repo: String, number: Int): GhPullInfo?
+    /** Replaces a pull request's title and body. */
+    fun updatePull(org: String, repo: String, number: Int, title: String, body: String)
+    /**
+     * Merges a pull request without squashing: [method] is `rebase` or `merge` (a merge commit titled [commitTitle]).
+     * [expectedHeadSha], when given, makes GitHub refuse (409) if the head branch moved since it was read. Returns the
+     * resulting commit's SHA when GitHub reports it. Refusals surface as [GitHubException] (405 not mergeable or method
+     * not allowed, 409 head moved).
+     */
+    fun mergePull(org: String, repo: String, number: Int, method: String, commitTitle: String?, expectedHeadSha: String?): String?
+    /** Deletes [branch]. A branch that does not exist is not an error. */
+    fun deleteBranch(org: String, repo: String, branch: String)
 }
+
+/** The merge methods [GitHubClient.mergePull] accepts: never `squash`. */
+val NON_SQUASH_MERGE_METHODS = setOf("rebase", "merge")
 
 /** Creates clients per token. Real implementation talks to the REST API; tests and dev mode use [FakeGitHub]. */
 interface GitHub {
@@ -242,6 +280,37 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
         override fun createBranch(org: String, repo: String, branch: String, sha: String) {
             ok(send("POST", "/repos/${enc(org)}/${enc(repo)}/git/refs",
                 buildJsonObject { put("ref", "refs/heads/$branch"); put("sha", sha) }), "create branch")
+        }
+
+        override fun getPull(org: String, repo: String, number: Int): GhPullInfo? {
+            val r = send("GET", "/repos/${enc(org)}/${enc(repo)}/pulls/$number")
+            if (r.statusCode() == 404) return null
+            return AppJson.decodeFromString(GhPullInfo.serializer(), ok(r, "GET pull request"))
+        }
+
+        override fun updatePull(org: String, repo: String, number: Int, title: String, body: String) {
+            ok(send("PATCH", "/repos/${enc(org)}/${enc(repo)}/pulls/$number",
+                buildJsonObject { put("title", title); put("body", body) }), "update pull request")
+        }
+
+        override fun mergePull(org: String, repo: String, number: Int, method: String, commitTitle: String?, expectedHeadSha: String?): String? {
+            require(method in NON_SQUASH_MERGE_METHODS) { "Unsupported merge method $method" }
+            val payload = buildJsonObject {
+                put("merge_method", method)
+                if (method == "merge" && commitTitle != null) put("commit_title", commitTitle)
+                if (expectedHeadSha != null) put("sha", expectedHeadSha)
+            }
+            val body = ok(send("PUT", "/repos/${enc(org)}/${enc(repo)}/pulls/$number/merge", payload), "merge pull request")
+            return runCatching {
+                ((AppJson.parseToJsonElement(body) as JsonObject)["sha"] as? kotlinx.serialization.json.JsonPrimitive)?.content
+            }.getOrNull()
+        }
+
+        override fun deleteBranch(org: String, repo: String, branch: String) {
+            val r = send("DELETE", "/repos/${enc(org)}/${enc(repo)}/git/refs/heads/${encBranch(branch)}")
+            // Already gone: 404, or 422 "Reference does not exist".
+            if (r.statusCode() == 404 || (r.statusCode() == 422 && r.body().contains("Reference does not exist"))) return
+            ok(r, "delete branch")
         }
     }
 }

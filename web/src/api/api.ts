@@ -88,6 +88,14 @@ export interface Api {
   /** Owner only: a held or skipped issue is built again. 409 `release_not_building` / `release_issue_not_held`. */
   retryReleaseIssue(id: string, issueNumber: number): Promise<Release>;
   /**
+   * Owner only (403 for everyone else, admins included): merges a `ready` release into the default branch, one commit per
+   * issue, closes its issues and deletes its branch. 409 `release_not_ready` / `release_incomplete` / `release_empty` /
+   * `release_conflict` / `release_merge_failed` / `release_merge_method_unavailable`.
+   */
+  approveRelease(id: string): Promise<Release>;
+  /** Owner only: "Check again" — re-reads (or opens) the release pull request and its mergeability. 409 `release_not_ready`. */
+  checkRelease(id: string): Promise<Release>;
+  /**
    * Sets (caller becomes the owner) or changes (owner or admin) the scheduled start; `startAt` is an ISO instant.
    * 400 past or more than a year ahead, 422 `claude_credential_required`, 403 not owner/admin, 409 `release_not_schedulable`.
    */

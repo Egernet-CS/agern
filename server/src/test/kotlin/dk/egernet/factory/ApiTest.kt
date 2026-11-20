@@ -485,7 +485,7 @@ class ApiTest {
         assertEquals("agern", init["result"]!!.jsonObject["serverInfo"]!!.jsonObject["name"]!!.jsonPrimitive.content)
         assertEquals(202, rpc(chatToken, """{"jsonrpc":"2.0","method":"notifications/initialized"}""").status.value)
         val tools = json(rpc(chatToken, """{"jsonrpc":"2.0","id":2,"method":"tools/list"}""").bodyAsText()).jsonObject["result"]!!.jsonObject["tools"]!!.jsonArray
-        assertEquals(14, tools.size)
+        assertEquals(15, tools.size)
         assertTrue(tools.any { it.jsonObject["name"]!!.jsonPrimitive.content == "factory_send_to_agent" })
         val stageTools = json(rpc(stageToken, """{"jsonrpc":"2.0","id":2,"method":"tools/list"}""").bodyAsText()).jsonObject["result"]!!.jsonObject["tools"]!!.jsonArray
         assertEquals(setOf("factory_get_issue", "factory_request_software"), stageTools.map { it.jsonObject["name"]!!.jsonPrimitive.content }.toSet())

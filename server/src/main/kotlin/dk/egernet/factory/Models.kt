@@ -93,6 +93,8 @@ data class IssueDto(
 data class ReleaseIssueDto(
     val number: Int, val title: String, val kind: String,
     val state: String = ReleaseIssueState.WAITING, val runId: String? = null, val note: String? = null,
+    /** The pull request of [runId] (into the release branch), if it has one. */
+    val prNumber: Int? = null, val prUrl: String? = null,
 )
 
 /** Why a release is paused; [resumeAt] is set only for an automatic resume after a usage limit. */
@@ -118,6 +120,23 @@ data class ReleaseDto(
     val waitingFor: IssueReleaseDto? = null,
     /** The last scheduled start that did not happen; kept until the release is scheduled again. */
     val startFailure: ReleaseStartFailureDto? = null,
+    /** The release pull request (`release/<name>` → [targetBranch]); opened when the release is ready and complete. */
+    val prNumber: Int? = null,
+    val prUrl: String? = null,
+    /** The default branch the release pull request merges into; null until it is known. */
+    val targetBranch: String? = null,
+    /** `unknown`, `clean` or `conflict`: whether the release pull request merges cleanly, as last checked. */
+    val mergeState: String = ReleaseMergeState.UNKNOWN,
+    /** `rebase`, `merge` or `unavailable` (only squash merges allowed): how approval will merge, or how it merged. */
+    val mergeMethod: String? = null,
+    /** The last problem to show on the release page (opening or merging the pull request, closing issues). */
+    val notice: String? = null,
+    val readyAt: String? = null,
+    val releasedAt: String? = null,
+    /** Who approved the release; null when its pull request was merged on GitHub outside Agern. */
+    val releasedBy: OwnerDto? = null,
+    /** The default branch's commit after the release merge. */
+    val mergeCommit: String? = null,
 )
 
 @Serializable data class ReleaseStartFailureDto(val at: String, val owner: OwnerDto, val reason: String)
@@ -383,16 +402,32 @@ object RunStatus {
     val ALL = ACTIVE + TERMINAL
 }
 
-/** Release states (docs/ARCHITECTURE.md §6 "Releases"). Later steps add `ready` and `released`. */
+/** Release states (docs/ARCHITECTURE.md §6 "Releases"). */
 object ReleaseStatus {
     const val PLANNING = "planning"; const val SCHEDULED = "scheduled"
     const val BUILDING = "building"; const val PAUSED = "paused"; const val CANCELLED = "cancelled"
+    /** Nothing is left to build (every issue merged, held or skipped); waits for its owner's approval. */
+    const val READY = "ready"
+    /** Merged into the default branch; final and read-only (history). */
+    const val RELEASED = "released"
     /** Not started yet: planning rules apply (a scheduled release is still a plan with a start time). */
     val PLANNED = setOf(PLANNING, SCHEDULED)
     /** Started: has an owner and a branch. */
-    val STARTED = setOf(BUILDING, PAUSED, CANCELLED)
+    val STARTED = setOf(BUILDING, PAUSED, READY, RELEASED, CANCELLED)
     /** Holds the project's one building slot; a due scheduled release of the same project waits behind it. */
     val ACTIVE = setOf(BUILDING, PAUSED)
+    /** Final: kept as history. */
+    val FINISHED = setOf(RELEASED, CANCELLED)
+}
+
+/** Whether the release pull request merges cleanly into the default branch, as last checked. */
+object ReleaseMergeState {
+    const val UNKNOWN = "unknown"; const val CLEAN = "clean"; const val CONFLICT = "conflict"
+}
+
+/** How a release is merged into the default branch: never squashed, so each issue stays one commit. */
+object ReleaseMergeMethod {
+    const val REBASE = "rebase"; const val MERGE = "merge"; const val UNAVAILABLE = "unavailable"
 }
 
 /** The state of an issue within a release. */

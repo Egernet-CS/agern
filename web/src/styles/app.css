@@ -2760,7 +2760,84 @@ html.app-locked #root {
   .ro-item {
     flex-wrap: wrap;
   }
+  /* The title keeps most of the row; state, run and PR links wrap below it. */
+  .ro-main {
+    flex: 1 1 60%;
+  }
   .ro-actions {
     margin-left: auto;
   }
+}
+
+/* Releases, releasing: the release pull request, approval, history. */
+.release-pr {
+  max-width: 900px;
+  margin: 0 0 20px;
+  display: grid;
+  gap: 8px;
+}
+.release-pr .section-head {
+  margin: 0;
+}
+.release-pr-link {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+}
+.release-pr-link .mono {
+  overflow-wrap: anywhere;
+}
+.release-pr .release-status {
+  margin: 0;
+}
+.release-pr > .muted {
+  margin: 0;
+}
+.release-status--ready {
+  border-color: rgba(90, 214, 160, 0.35);
+  background: var(--pass-wash);
+}
+.release-status--blocked {
+  border-color: rgba(255, 120, 174, 0.35);
+  background: var(--escalate-wash);
+}
+.release-status code {
+  overflow-wrap: anywhere;
+}
+.release-pr-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.release-notice {
+  max-width: 900px;
+  margin: 0 0 14px;
+  overflow-wrap: anywhere;
+}
+.release-released {
+  display: grid;
+  gap: 2px;
+  margin-top: 6px;
+}
+.release-released p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.release-history {
+  margin: 0 0 6px;
+}
+.release-history > summary {
+  cursor: pointer;
+  padding: 6px 16px;
+  font: 600 0.8rem var(--font-mono);
+  color: var(--text-2);
+}
+.release-history > summary:hover {
+  color: var(--text);
+}
+.release-history > summary:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
 }

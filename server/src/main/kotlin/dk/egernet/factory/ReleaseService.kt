@@ -8,9 +8,11 @@ import dk.egernet.factory.db.ReleaseRecord
 import dk.egernet.factory.db.ReleaseStore
 import dk.egernet.factory.db.UserRecord
 import dk.egernet.factory.db.releaseForbidden
+import dk.egernet.factory.db.releasedNotEditable
 import dk.egernet.factory.github.Access
 import dk.egernet.factory.github.GitHubException
 import dk.egernet.factory.pipeline.ReleaseBuilder
+import dk.egernet.factory.pipeline.ReleaseMerger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.time.Instant
@@ -31,6 +33,7 @@ class ReleaseService(
     private val bus: EventBus,
     private val builder: ReleaseBuilder,
     private val scheduler: ReleaseScheduler,
+    private val merger: ReleaseMerger,
 ) {
     companion object {
         /** Safe as the git branch `release/<name>` and in URLs. */
@@ -125,6 +128,7 @@ class ReleaseService(
 
     suspend fun update(user: UserRecord, id: UUID, name: String, description: String): ReleaseRecord {
         val r = visible(user, id)
+        if (r.status == ReleaseStatus.RELEASED) throw releasedNotEditable(r.name)
         if (r.started) requireOwnerOrAdmin(user, r)
         val n = validName(name)
         val d = validDescription(description)
@@ -132,6 +136,8 @@ class ReleaseService(
         io { store.update(id, n, d) }
         val after = io { store.get(id) } ?: throw notFound("Release not found")
         bus.emitFeed(FeedItem.Release(after.toDto()))
+        // The release pull request's body shows the description.
+        if (after.status == ReleaseStatus.READY) builder.advance(id)
         return after
     }
 
@@ -141,7 +147,8 @@ class ReleaseService(
         val scheduled = conflict("Cancel the scheduled start before deleting this release", "release_scheduled")
         val active = conflict("Cancel the release first", "release_active")
         if (r.status == ReleaseStatus.SCHEDULED) throw scheduled
-        if (r.status in ReleaseStatus.ACTIVE) throw active
+        if (r.status == ReleaseStatus.RELEASED) throw releasedNotEditable(r.name)
+        if (r.status in ReleaseStatus.ACTIVE || r.status == ReleaseStatus.READY) throw active
         if (r.status == ReleaseStatus.CANCELLED) requireOwnerOrAdmin(user, r)
         if (io { store.delete(id) }) {
             bus.emitFeed(FeedItem.ReleaseDeleted(r.repo, r.id.toString()))
@@ -149,7 +156,7 @@ class ReleaseService(
             // Scheduled or started in the meantime.
             val now = io { store.get(id) }?.status
             if (now == ReleaseStatus.SCHEDULED) throw scheduled
-            if (now in ReleaseStatus.ACTIVE) throw active
+            if (now in ReleaseStatus.ACTIVE || now == ReleaseStatus.READY) throw active
         }
     }
 
@@ -207,7 +214,8 @@ class ReleaseService(
     suspend fun cancel(user: UserRecord, id: UUID): ReleaseRecord {
         val r = visible(user, id)
         if (r.started) requireOwnerOrAdmin(user, r)
-        if (r.status !in ReleaseStatus.ACTIVE) throw conflict("The release is not building", "release_not_building")
+        if (r.status == ReleaseStatus.RELEASED) throw releasedNotEditable(r.name)
+        if (r.status !in ReleaseStatus.ACTIVE && r.status != ReleaseStatus.READY) throw conflict("The release is not building", "release_not_building")
         builder.cancel(user, id)
         return io { store.get(id) } ?: throw notFound("Release not found")
     }
@@ -215,9 +223,34 @@ class ReleaseService(
     suspend fun retry(user: UserRecord, id: UUID, number: Int): ReleaseRecord {
         val r = visible(user, id)
         if (r.started) requireOwner(user, r)
-        if (r.status !in ReleaseStatus.ACTIVE) throw conflict("The release is not building", "release_not_building")
+        if (r.status == ReleaseStatus.RELEASED) throw releasedNotEditable(r.name)
+        if (r.status !in ReleaseStatus.ACTIVE && r.status != ReleaseStatus.READY) throw conflict("The release is not building", "release_not_building")
         builder.retry(user, id, number)
         return io { store.get(id) } ?: throw notFound("Release not found")
+    }
+
+    // ------------------------------------------------------------ releasing (§6 "Releasing")
+
+    /**
+     * Approves a `ready` release: merges its pull request into the default branch (one commit per issue), closes its
+     * issues and deletes its branch. Only the release's owner, admins included in the refusal (§4: they may stop, never
+     * drive); visibility first (404).
+     */
+    suspend fun approve(user: UserRecord, id: UUID): ReleaseRecord {
+        val r = visible(user, id)
+        if (!r.started) throw conflict("Release is ${ReleaseMerger.statusLabel(r.status)}, not ready to release", "release_not_ready")
+        requireOwner(user, r)
+        access.requireClient(user)
+        return merger.approve(user, id)
+    }
+
+    /** "Check again": re-reads the release pull request (and opens it when missing). Owner only, `ready` only. */
+    suspend fun check(user: UserRecord, id: UUID): ReleaseRecord {
+        val r = visible(user, id)
+        if (!r.started) throw conflict("Release is ${ReleaseMerger.statusLabel(r.status)}, not ready to release", "release_not_ready")
+        requireOwner(user, r)
+        access.requireClient(user)
+        return merger.check(user, id)
     }
 
     /** Sets or changes the scheduled start (§6 "Scheduled start"); [startAt] is an ISO-8601 instant. */
@@ -255,12 +288,15 @@ class ReleaseService(
             val res = io { store.unassign(repo, nums, actor(user)) }
             publish(res.changed)
             builder.cancelRuns(user, res.leftRuns)
+            // A building release may now have nothing left to build; a ready one is re-evaluated (it may be complete now).
+            for (id in res.changed) builder.advance(id)
             return AssignOutcome(null, emptyList(), emptyMap(), nums.filter { it in before })
         }
         val target = io { store.get(releaseId) }?.takeIf { it.repo == repo } ?: throw notFound("Release not found")
         // Checked again with the sources inside the store's transaction; here only to answer before any GitHub call.
         if (target.status == ReleaseStatus.CANCELLED) throw conflict("The release is cancelled; no issues can be added", "release_closed")
-        if (target.status in ReleaseStatus.ACTIVE) requireOwner(user, target)
+        if (target.status == ReleaseStatus.RELEASED) throw releasedNotEditable(target.name)
+        if (target.status in ReleaseStatus.ACTIVE || target.status == ReleaseStatus.READY) requireOwner(user, target)
         val client = access.requireClient(user)
         val issues = nums.map { n ->
             val i = gh { client.getIssue(cfg.githubOrg, repo, n) } ?: throw notFound("Issue #$n not found")
@@ -271,7 +307,8 @@ class ReleaseService(
         val res = io { store.assign(repo, target.id, issues, actor(user)) }
         publish(res.changed)
         builder.cancelRuns(user, res.leftRuns)
-        if (res.added.isNotEmpty() && target.status == ReleaseStatus.BUILDING) builder.advance(target.id)
+        // New issues of a building (or reopened ready) release are built; sources may have nothing left to build.
+        for (id in res.changed) builder.advance(id)
         return AssignOutcome(
             io { store.get(target.id) }, res.added,
             res.movedFrom.mapKeys { (id, _) -> names[id] ?: id.toString() }, emptyList(),
@@ -300,10 +337,7 @@ class ReleaseService(
         else -> r.status
     }
 
-    private fun statusText(status: String) = when (status) {
-        ReleaseStatus.PLANNING -> "in preparation"
-        else -> status
-    }
+    private fun statusText(status: String) = ReleaseMerger.statusLabel(status)
 
     /** Plain-text overview for `/factory releases` and `factory_list_releases`. */
     suspend fun describe(user: UserRecord, repo: String, withIds: Boolean): String {
@@ -320,7 +354,17 @@ class ReleaseService(
                 } else {
                     append("• ${r.name} — ${state(r)}, $n issue${if (n == 1) "" else "s"}")
                 }
+                if (r.status == ReleaseStatus.READY) {
+                    r.prUrl?.let { append(", pull request $it") }
+                    if (r.held.isNotEmpty()) append(" — ${r.held.size} held")
+                    else if (r.mergeState == ReleaseMergeState.CONFLICT) append(" — conflicts with ${r.targetBranch ?: "the default branch"}")
+                }
+                if (r.status == ReleaseStatus.RELEASED) {
+                    r.prUrl?.let { append(", pull request $it") }
+                    r.releasedAt?.let { append(", released $it") }
+                }
                 if (withIds) append(" (id ${r.id})")
+                r.notice?.takeIf { r.status == ReleaseStatus.READY || r.status == ReleaseStatus.RELEASED }?.let { append("\n    Notice: $it") }
                 if (r.status == ReleaseStatus.PAUSED) r.pauseNote?.let { append("\n    Paused: $it") }
                 r.issues.forEach {
                     append("\n    #${it.number} ${it.title}")

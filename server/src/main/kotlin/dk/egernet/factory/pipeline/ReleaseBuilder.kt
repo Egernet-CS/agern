@@ -25,7 +25,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
@@ -34,7 +33,6 @@ import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.time.temporal.ChronoUnit
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Builds started releases (docs/ARCHITECTURE.md §6 "Releases"): one release run at a time on `release/<name>`,
@@ -52,12 +50,13 @@ class ReleaseBuilder(
     private val orchestrator: Orchestrator,
     private val bus: EventBus,
     private val scope: CoroutineScope,
+    private val locks: ReleaseLocks,
+    private val merger: ReleaseMerger,
 ) {
     private val log = LoggerFactory.getLogger(ReleaseBuilder::class.java)
-    private val locks = ConcurrentHashMap<UUID, Mutex>()
     private val org get() = cfg.githubOrg
 
-    private fun lock(id: UUID) = locks.computeIfAbsent(id) { Mutex() }
+    private fun lock(id: UUID) = locks.of(id)
     private suspend fun <T> io(block: () -> T): T = withContext(Dispatchers.IO) { block() }
 
     /** Announces the release's current state on the feed. */
@@ -130,8 +129,9 @@ class ReleaseBuilder(
     }
 
     /**
-     * `building` or `paused` → `cancelled`: the running issue is held, every active run of the release is cancelled
-     * (as [user]), waiting issues stay waiting and nothing starts afterwards. The branch is left alone.
+     * `building`, `paused` or `ready` → `cancelled`: the running issue is held, every active run of the release is
+     * cancelled (as [user]), waiting issues stay waiting and nothing starts afterwards. The branch, and the release pull
+     * request if there is one, are left alone; the pull request gets a comment saying Agern will not merge it.
      */
     suspend fun cancel(user: UserRecord, id: UUID) {
         lock(id).withLock {
@@ -140,18 +140,23 @@ class ReleaseBuilder(
             io { store.setIssuesInState(id, ReleaseIssueState.RUNNING, ReleaseIssueState.HELD, "Cancelled with the release") }
         }
         publish(id)
+        merger.commentCancelled(id, user)
         for (run in io { runs.activeByRelease(id) }) cancelRun(user, run.id)
     }
 
-    /** A held or skipped issue is built again: back to `waiting`, its active run (if any) cancelled. */
+    /**
+     * A held or skipped issue is built again: back to `waiting`, its active run (if any) cancelled. A `ready` release
+     * builds again for it (409 `release_already_building` while another release of the project holds the slot).
+     */
     suspend fun retry(owner: UserRecord, id: UUID, number: Int) {
         val oldRun = lock(id).withLock {
             val r = io { store.get(id) } ?: throw dk.egernet.factory.notFound("Release not found")
-            if (r.status !in ReleaseStatus.ACTIVE) throw conflict("The release is not building", "release_not_building")
+            if (r.status !in ReleaseStatus.ACTIVE && r.status != ReleaseStatus.READY) throw conflict("The release is not building", "release_not_building")
             val issue = r.issues.firstOrNull { it.number == number } ?: throw dk.egernet.factory.notFound("Issue #$number is not in this release")
             if (issue.state != ReleaseIssueState.HELD && issue.state != ReleaseIssueState.SKIPPED) {
                 throw conflict("Issue #$number is ${issue.state}; only held or skipped issues can be retried", "release_issue_not_held")
             }
+            if (r.status == ReleaseStatus.READY) io { store.reopen(id) }
             io { store.setIssue(id, number, ReleaseIssueState.WAITING, null, null) }
             issue.runId
         }
@@ -186,15 +191,22 @@ class ReleaseBuilder(
 
     /**
      * Starts the next waiting issue when the release is `building` and none is running. Skipped issues and issues
-     * whose run cannot start are passed over; a missing credential pauses the release.
+     * whose run cannot start are passed over; a missing credential pauses the release. When nothing is left to build
+     * (every issue merged, held or skipped) the release becomes `ready`; a `ready` release is then re-evaluated by
+     * [ReleaseMerger.evaluate] (pull request, mergeability, notifications).
      */
     suspend fun advance(id: UUID) {
+        var becameReady = false
         lock(id).withLock {
             while (true) {
                 val r = io { store.get(id) } ?: return
-                if (r.status != ReleaseStatus.BUILDING) return
+                if (r.status != ReleaseStatus.BUILDING) break
                 if (r.issues.any { it.state == ReleaseIssueState.RUNNING }) return
-                val next = r.issues.firstOrNull { it.state == ReleaseIssueState.WAITING } ?: return
+                val next = r.issues.firstOrNull { it.state == ReleaseIssueState.WAITING }
+                if (next == null) {
+                    becameReady = io { store.markReady(id) }
+                    break
+                }
                 val owner = r.ownerId?.let { io { users.byId(it) } }
                 if (owner?.claudeCredEnc == null) {
                     pauseForCredentials(r.id)
@@ -227,6 +239,11 @@ class ReleaseBuilder(
                 }
             }
         }
+        if (becameReady) {
+            log.info("Release {} has nothing left to build: ready to release", id)
+            publish(id)
+        }
+        if (io { store.get(id) }?.status == ReleaseStatus.READY) merger.evaluate(id, becameReady)
     }
 
     private suspend fun holdUnstarted(id: UUID, number: Int, reason: String) {
@@ -271,7 +288,10 @@ class ReleaseBuilder(
                         outcome.usageLimit != null && run.status == RunStatus.FAILED -> {
                             io { store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.WAITING, USAGE_LIMIT_ISSUE_NOTE, run.id) }
                             val (pauseNote, resumeAt) = usageLimitPause(outcome.usageLimit, Instant.now())
-                            pauseLocked(ref.releaseId, PauseReason.USAGE_LIMIT, pauseNote, resumeAt)
+                            if (io { store.pause(ref.releaseId, PauseReason.USAGE_LIMIT, pauseNote, resumeAt) }) {
+                                publish(ref.releaseId)
+                                commentPaused(ref.releaseId, ref.number, pauseNote, resumeAt)
+                            }
                         }
                         outcome.credentialRejected && run.status == RunStatus.FAILED -> {
                             io { store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.WAITING, CREDENTIALS_ISSUE_NOTE, run.id) }
@@ -292,6 +312,26 @@ class ReleaseBuilder(
         }
         publish(releaseId)
         advance(releaseId)
+    }
+
+    /**
+     * The owner will look at the issue the next morning (§6 "Notifications"): one comment on the interrupted issue when
+     * the release pauses on the usage limit. Best effort, with the owner's token.
+     */
+    private suspend fun commentPaused(id: UUID, number: Int, note: String, resumeAt: Instant) {
+        val r = io { store.get(id) } ?: return
+        val client = r.ownerId?.let { io { users.byId(it) } }?.let { access.client(it) } ?: return
+        try {
+            io {
+                client.comment(
+                    org, r.repo, number,
+                    "**Agern:** release `${r.name}` is paused. $note It resumes by itself at ${TIME.format(resumeAt)} and builds this issue again; " +
+                        "the owner can also resume it on ${cfg.publicUrl.trimEnd('/')}/p/${r.repo}/releases/${r.id}",
+                )
+            }
+        } catch (e: Exception) {
+            log.warn("Release {}: could not comment on the pause: {}", id, e.message)
+        }
     }
 
     // ------------------------------------------------------------ restart and automatic resume
@@ -322,6 +362,7 @@ class ReleaseBuilder(
             }
             resumeDue()
         }
+        merger.recoverAfterRestart()
     }
 
     /** Resumes paused releases whose automatic resume time has passed. */

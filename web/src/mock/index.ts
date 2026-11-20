@@ -20,6 +20,8 @@ import {
   resumeRelease,
   cancelRelease,
   retryReleaseIssue,
+  approveRelease,
+  checkRelease,
   approveRun,
   approveSandbox,
   cancelRun,
@@ -344,6 +346,8 @@ export const mockApi: Api = {
   resumeRelease: (id) => ok(() => withRelease(id, (r) => resumeRelease(r, me()))),
   cancelRelease: (id) => ok(() => withRelease(id, (r) => cancelRelease(r, me()))),
   retryReleaseIssue: (id, n) => ok(() => withRelease(id, (r) => retryReleaseIssue(r, n, me()))),
+  approveRelease: (id) => ok(() => withRelease(id, (r) => approveRelease(r, me()))),
+  checkRelease: (id) => ok(() => withRelease(id, (r) => checkRelease(r, me()))),
 
   projectRuns: (repo) => ok(() => (project(repo), [...db.runs.values()].filter((r) => r.repo === repo).sort(byNewest))),
   startRun: (repo, n) =>

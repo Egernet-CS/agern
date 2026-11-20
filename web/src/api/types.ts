@@ -61,10 +61,17 @@ export type Issue = {
 };
 
 /**
- * `planning` until started (`scheduled` while a start time is set); then `building` / `paused` until it is
- * `cancelled` (docs/ARCHITECTURE.md §6 "Releases"). Later steps may add states: render unknown ones as text.
+ * `planning` until started (`scheduled` while a start time is set); then `building` / `paused`; `ready` when nothing
+ * is left to build (waits for the owner's approval); `released` once merged into the default branch, or `cancelled`
+ * (docs/ARCHITECTURE.md §6 "Releases"). Unknown states (from a newer server) render as text.
  */
-export type ReleaseStatus = 'planning' | 'scheduled' | 'building' | 'paused' | 'cancelled';
+export type ReleaseStatus = 'planning' | 'scheduled' | 'building' | 'paused' | 'ready' | 'released' | 'cancelled';
+
+/** Whether the release pull request merges cleanly into the default branch, as last checked. */
+export type ReleaseMergeState = 'unknown' | 'clean' | 'conflict';
+
+/** How approval merges the release (never squashed): `unavailable` when the repository only allows squash merges. */
+export type ReleaseMergeMethod = 'rebase' | 'merge' | 'unavailable';
 
 /** A scheduled start that did not happen (docs/ARCHITECTURE.md §6 "Scheduled start"). */
 export type ReleaseStartFailure = { at: string; owner: Owner; reason: string };
@@ -82,6 +89,9 @@ export type ReleaseIssue = {
   runId: string | null;
   /** Why it is held or skipped, or that it will be built again. */
   note: string | null;
+  /** The pull request of its run into the release branch. */
+  prNumber: number | null;
+  prUrl: string | null;
 };
 
 export type ReleasePauseReason = 'manual' | 'usage_limit' | 'credentials';
@@ -113,10 +123,41 @@ export type Release = {
   waitingFor: { id: string; name: string } | null;
   /** The last scheduled start that did not happen; kept until the release is scheduled again. */
   startFailure: ReleaseStartFailure | null;
+  /** The release pull request (`release/<name>` → `targetBranch`), opened when the release is ready and complete. */
+  prNumber: number | null;
+  prUrl: string | null;
+  /** The default branch the release pull request merges into. */
+  targetBranch: string | null;
+  mergeState: ReleaseMergeState;
+  /** How approval will merge (while `ready`) or how it merged (`released`); null until known. */
+  mergeMethod: ReleaseMergeMethod | null;
+  /** The last problem to show on the release page. */
+  notice: string | null;
+  readyAt: string | null;
+  releasedAt: string | null;
+  /** Who approved it; null when its pull request was merged on GitHub outside Agern. */
+  releasedBy: Owner | null;
+  /** The default branch's commit after the release merge. */
+  mergeCommit: string | null;
 };
 
 /** Building or paused: at most one per project. */
 export const isReleaseActive = (r: Release) => r.status === 'building' || r.status === 'paused';
+
+/** Released or cancelled: kept as history. */
+export const isReleaseFinished = (r: Release) => r.status === 'released' || r.status === 'cancelled';
+
+/** Can take issues (owner-only once started): not released or cancelled. A `ready` one builds again for them. */
+export const isReleaseOpen = (r: Release) => !isReleaseFinished(r);
+
+/**
+ * A `ready` release: `complete` (something merged, nothing held — only this can be approved), `incomplete` (held
+ * issues) or `empty` (nothing merged, nothing held).
+ */
+export function releaseReadiness(r: Release): 'complete' | 'incomplete' | 'empty' {
+  if (r.issues.some((i) => i.state === 'held')) return 'incomplete';
+  return r.issues.some((i) => i.state === 'merged') ? 'complete' : 'empty';
+}
 
 export type SessionKind = 'chat' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
 export type StageRole = Exclude<SessionKind, 'chat'>;

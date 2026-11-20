@@ -164,7 +164,7 @@ class ReleaseBuildTest {
         val empty = release("empty", emptyList())
         assertEquals("release_empty", code { start(empty.id) })
 
-        val a = issue("First")
+        val a = issue("First", "gate")
         val r = release("1.4", listOf(a))
         val carol = world.user("carol", claude = false)
         assertEquals("claude_credential_required", code { start(r.id, carol) })
@@ -187,6 +187,7 @@ class ReleaseBuildTest {
         assertTrue(busy.message.contains("1.4"), busy.message)
         val lab = release("lab", listOf(1), repo = "private-lab")
         assertEquals(ReleaseStatus.BUILDING, start(lab.id).status)
+        gates["First"] = true
         awaitStates(r.id, a to "merged")
         runBlocking { s.releases.cancel(alice, r.id); s.releases.cancel(alice, lab.id) }
 
@@ -238,8 +239,8 @@ class ReleaseBuildTest {
         assertTrue(world.launcher.byRole("approver").all { (it.spec.prompt ?: "").contains("squash-merged into `release/2.0`") })
         assertTrue(world.launcher.byRole("builder").all { (it.spec.prompt ?: "").contains("release branch `release/2.0`") })
 
-        // Idle: still building; a single run in the same world targets main and closes its issue.
-        assertEquals(ReleaseStatus.BUILDING, s.releaseStore.get(r.id)!!.status)
+        // Nothing left to build: ready to release (step 3); a single run in the same world targets main and closes its issue.
+        awaitRelease(r.id, "ready") { it.status == ReleaseStatus.READY }
         val single = issue("Single")
         val run = runBlocking { s.orchestrator.start(alice, "demo-app", single, null) }
         val merged = world.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
@@ -252,7 +253,7 @@ class ReleaseBuildTest {
         assertTrue("close demo-app#$single" in world.github.actions)
         assertEquals("${merged.branch} <- main", world.git.worktrees.last())
 
-        // Adding an issue to an idle building release continues it.
+        // Adding an issue to a ready release builds again.
         val late = issue("Late")
         runBlocking { s.releases.assign(alice, "demo-app", listOf(late), r.id) }
         awaitStates(r.id, late to "merged")

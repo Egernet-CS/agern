@@ -83,6 +83,8 @@ const RELEASE_LABEL: Record<ReleaseStatus, string> = {
   scheduled: 'scheduled',
   building: 'building',
   paused: 'paused',
+  ready: 'ready to release',
+  released: 'released',
   cancelled: 'cancelled',
 };
 const RELEASE_TONE: Record<ReleaseStatus, string> = {
@@ -90,6 +92,9 @@ const RELEASE_TONE: Record<ReleaseStatus, string> = {
   scheduled: 'active',
   building: 'active',
   paused: 'escalate',
+  // As a run waiting for a person, and a merged run.
+  ready: 'escalate',
+  released: 'pass',
   cancelled: 'idle',
 };
 /** A state this version does not know yet (from a newer server) shows as its raw text. */
