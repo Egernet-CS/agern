@@ -102,7 +102,8 @@ class Services(
     )
     val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes)
     val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
-    val releases = ReleaseService(cfg, access, releaseStore, bus)
+    val releaseBuilder = dk.egernet.factory.pipeline.ReleaseBuilder(cfg, releaseStore, runs, users, access, orchestrator, bus, scope)
+    val releases = ReleaseService(cfg, access, releaseStore, bus, releaseBuilder)
     val factory = FactoryService(cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases)
     val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes)
 
@@ -111,12 +112,17 @@ class Services(
 
     init {
         agents.commandHandler = { session, owner, text -> factory.handleCommand(session, owner, text) }
+        orchestrator.onReleaseRunSettled = releaseBuilder::onRunSettled
     }
 
-    /** v1 restart semantics: no process survives; unfinished runs fail with a clear reason. */
+    /**
+     * v1 restart semantics: no process survives; unfinished runs fail with a clear reason. Building releases continue
+     * with the interrupted issue (docs/ARCHITECTURE.md §6 "Releases").
+     */
     fun recoverAfterRestart() {
         val failed = runs.failUnfinishedAfterRestart()
         if (failed.isNotEmpty()) LoggerFactory.getLogger("dk.egernet.factory").warn("Marked {} unfinished run(s) as failed after restart", failed.size)
+        releaseBuilder.recoverAfterRestart()
         sessions.recoverAfterRestart()
         webSessions.purgeExpired()
     }
@@ -126,6 +132,7 @@ class Services(
         // After the restart recovery: sandboxes of runs that are no longer active are leftovers.
         if (sandboxes.enabled) sandboxReaper = scope.launch { sandboxes.reapOrphans() }
         agents.startIdleReaper()
+        releaseBuilder.startTicker()
         attachments.startReaper(scope)
     }
 

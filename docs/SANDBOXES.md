@@ -43,7 +43,9 @@ host as before. Projects without an (approved, valid) file keep working exactly 
 The server reads `.agern/sandbox.yml` from the commit a run starts from (the default branch) and uses
 it only if an admin approved **exactly that content** (its SHA-256). Every change to the file needs a
 new approval; until then runs proceed without a sandbox and the run page says why. A run that edits the
-file still uses the approved version it started from, so a change can never approve itself.
+file still uses the approved version it started from, so a change can never approve itself. Runs of a
+release read the file from the default branch too, not from the release branch they build on, so changes merged into
+the release cannot change its sandbox.
 
 The project's **Sandbox** page (from the project's activity panel) shows the file, its validation
 errors, a diff against the approved version and, for admins, *Approve* and *Revoke*. Approve only what

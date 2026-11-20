@@ -94,6 +94,10 @@ interface GitHubClient {
     fun squashMerge(org: String, repo: String, number: Int, title: String)
     /** A file's raw content on [ref] (a branch name), or null when it does not exist there. */
     fun getFile(org: String, repo: String, path: String, ref: String): String?
+    /** The commit a branch points at; null when the branch does not exist. */
+    fun branchSha(org: String, repo: String, branch: String): String?
+    /** Creates [branch] at [sha]. An existing branch surfaces as [GitHubException] 422. */
+    fun createBranch(org: String, repo: String, branch: String, sha: String)
 }
 
 /** Creates clients per token. Real implementation talks to the REST API; tests and dev mode use [FakeGitHub]. */
@@ -223,6 +227,21 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
         override fun squashMerge(org: String, repo: String, number: Int, title: String) {
             ok(send("PUT", "/repos/${enc(org)}/${enc(repo)}/pulls/$number/merge",
                 buildJsonObject { put("merge_method", "squash"); put("commit_title", title) }), "merge pull request")
+        }
+
+        /** A branch name in a URL path: each segment encoded, the `/` between them kept. */
+        private fun encBranch(branch: String) = branch.split('/').joinToString("/") { enc(it) }
+
+        override fun branchSha(org: String, repo: String, branch: String): String? {
+            val r = send("GET", "/repos/${enc(org)}/${enc(repo)}/git/ref/heads/${encBranch(branch)}")
+            if (r.statusCode() == 404) return null
+            val o = AppJson.parseToJsonElement(ok(r, "get branch")) as? JsonObject ?: return null
+            return ((o["object"] as? JsonObject)?.get("sha") as? kotlinx.serialization.json.JsonPrimitive)?.content
+        }
+
+        override fun createBranch(org: String, repo: String, branch: String, sha: String) {
+            ok(send("POST", "/repos/${enc(org)}/${enc(repo)}/git/refs",
+                buildJsonObject { put("ref", "refs/heads/$branch"); put("sha", sha) }), "create branch")
         }
     }
 }
