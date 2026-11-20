@@ -52,7 +52,19 @@ class ClaudeUsageTest {
     private val alice = world.user("alice")
     private val bob = world.user("bob")
 
-    @AfterTest fun tearDown() = world.close()
+    /**
+     * Chats are still live at the end of most tests: stop them and let their background bookkeeping finish before the
+     * pool is closed (the embedded PostgreSQL allows only so many connections, so the pool must go).
+     */
+    @AfterTest fun tearDown() {
+        s.agents.shutdown()
+        runBlocking {
+            kotlinx.coroutines.withTimeoutOrNull(5_000) {
+                while (s.scope.coroutineContext[kotlinx.coroutines.Job]!!.children.any { it.isActive }) delay(10)
+            }
+        }
+        world.closeAndReleaseDb()
+    }
 
     private fun json(r: String) = AppJson.parseToJsonElement(r).jsonObject
     private val resets = Instant.parse("2026-03-15T15:00:00Z")
