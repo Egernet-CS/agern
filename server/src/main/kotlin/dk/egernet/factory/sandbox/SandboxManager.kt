@@ -540,10 +540,19 @@ class SandboxManager(
 
     /** Removes the run's sandbox (containers, network) and frees its slots. Idempotent; never throws. */
     suspend fun release(runId: UUID) {
+        if (!sandboxes.containsKey(runId)) return
+        withContext(NonCancellable + Dispatchers.IO) { releaseNow(runId) }
+    }
+
+    /**
+     * [release], blocking: what the worktree cleanup calls first, so a run's containers are always gone before its
+     * worktree — which they bind-mount — is deleted (docs/ARCHITECTURE.md §5 "Lifecycle").
+     */
+    fun releaseNow(runId: UUID) {
         val rs = sandboxes.remove(runId) ?: return
         rs.released = true
         val had = rs.created
-        withContext(NonCancellable + Dispatchers.IO) { teardown(rs) }
+        teardown(rs)
         if (had) announce(rs, "removed")
     }
 

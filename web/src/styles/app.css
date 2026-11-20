@@ -2621,6 +2621,27 @@ html.app-locked #root {
   margin: 4px 0 6px;
   max-width: 72ch;
 }
+.release-schedule {
+  margin: 6px 0 0;
+  color: var(--text);
+}
+.release-waiting {
+  margin: 0;
+  color: var(--amber-hi);
+}
+.release-waiting a {
+  font-family: var(--font-mono);
+}
+.releasepage .notice-text p {
+  margin: 0 0 4px;
+  overflow-wrap: anywhere;
+}
+.releasepage .notice-text p:last-child {
+  margin-bottom: 0;
+}
+.rr-failed {
+  color: var(--fail);
+}
 .release-head h1 {
   font-family: var(--font-mono);
   overflow-wrap: anywhere;

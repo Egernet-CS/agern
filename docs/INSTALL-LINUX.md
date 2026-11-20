@@ -1,8 +1,14 @@
 # Installing Agern on Debian or Ubuntu
 
-From an empty virtual machine to a running Agern, using the Debian package. Supported:
-**Debian 12 (bookworm), Debian 13 (trixie) and Ubuntu 24.04 LTS**, with systemd. The package is
-`Architecture: all` (amd64 and arm64 alike). The tarball installer (`install.sh`, also for macOS)
+From an empty virtual machine to a running Agern, using the Debian package, on a host with systemd:
+
+| Distribution | Status |
+|---|---|
+| **Debian 13 (trixie)** | **Recommended.** Tested on a real machine before each release, including sandboxes. |
+| Ubuntu 24.04 LTS | Supported. Tested by CI on every pull request, including sandboxes. |
+| Debian 12 (bookworm) | Not tested any more. The package installs (CI still checks that), and sandboxes passed on it once (Podman 4.3), but nothing is verified for new releases: use Debian 13 for a new machine. |
+
+The package is `Architecture: all` (amd64 and arm64 alike). The tarball installer (`install.sh`, also for macOS)
 is described in the [README](../README.md#production-install); do not mix the two on one host.
 
 - [1. The machine](#1-the-machine)
@@ -348,7 +354,7 @@ sudo apt install podman uidmap netavark aardvark-dns crun slirp4netns
 sudo agern sandbox enable
 ```
 
-The same package names exist on Debian 12, Debian 13 and Ubuntu 24.04:
+The same package names exist on Debian 13, Ubuntu 24.04 and Debian 12 (the last one is no longer tested, see the top of this guide):
 
 | | Podman | crun | netavark / aardvark-dns | rootless network |
 |---|---|---|---|---|
@@ -474,8 +480,8 @@ subordinate ids.
 
 ### Testing a host
 
-The checks CI runs on Ubuntu 24.04 can be run on any machine with the package (Debian 12 and 13
-included). On a **throwaway** VM — it installs packages, starts services, and purges Agern at the
+The checks CI runs on Ubuntu 24.04 can be run on any machine with the package; this is how
+Debian 13 is verified before a release. On a **throwaway** VM — it installs packages, starts services, and purges Agern at the
 end — from a checkout of the repository:
 
 ```sh
@@ -502,10 +508,10 @@ server" and "standard system utilities", then `apt install qemu-guest-agent` and
 
 ```sh
 # on the Proxmox host; VM id 9000, storage local-lvm, bridge vmbr0 — adjust
-wget https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2
+wget https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
 qm create 9000 --name agern --memory 16384 --cores 8 --cpu host --net0 virtio,bridge=vmbr0 \
   --scsihw virtio-scsi-single --agent enabled=1 --ostype l26
-qm importdisk 9000 debian-12-genericcloud-amd64.qcow2 local-lvm
+qm importdisk 9000 debian-13-genericcloud-amd64.qcow2 local-lvm
 qm set 9000 --scsi0 local-lvm:vm-9000-disk-0,discard=on,iothread=1 --boot order=scsi0 \
   --ide2 local-lvm:cloudinit --serial0 socket --vga serial0
 qm resize 9000 scsi0 128G

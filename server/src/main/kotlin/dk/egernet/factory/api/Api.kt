@@ -94,6 +94,7 @@ private val log = LoggerFactory.getLogger("dk.egernet.factory.api")
 @Serializable data class CreateRunReq(val issueNumber: Int)
 @Serializable data class CreateReleaseReq(val name: String, val description: String = "")
 @Serializable data class UpdateReleaseReq(val name: String, val description: String = "")
+@Serializable data class ScheduleReq(val startAt: String)
 @Serializable data class AssignReq(val issueNumbers: List<Int>, val releaseId: String? = null)
 @Serializable data class OrderReq(val issueNumbers: List<Int>)
 @Serializable data class CreateSessionReq(val model: String? = null)
@@ -471,6 +472,16 @@ private fun Route.releaseRoutes(s: Services) {
         val u = call.requireUser(s)
         s.releases.delete(u, uuidParam("id"))
         call.respond(HttpStatusCode.NoContent)
+    }
+    put("/releases/{id}/schedule") {
+        val u = call.requireUser(s)
+        val id = uuidParam("id")
+        val req = call.receive<ScheduleReq>()
+        call.respond(s.releases.schedule(u, id, req.startAt).toDto())
+    }
+    delete("/releases/{id}/schedule") {
+        val u = call.requireUser(s)
+        call.respond(s.releases.cancelSchedule(u, uuidParam("id")).toDto())
     }
     // Building (docs/ARCHITECTURE.md §6 "Releases"): each answers the release after the change.
     post("/releases/{id}/start") {

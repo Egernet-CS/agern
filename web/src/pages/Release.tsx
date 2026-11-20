@@ -1,13 +1,24 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api, ApiError, isReleaseActive, type Release, type ReleaseIssue } from '../api';
-import { Dialog, Empty, ErrorBox, IssueStateBadge, KindBadge, Loading, ReleaseStatusPill } from '../components/ui/ui';
+import { Dialog, Empty, ErrorBox, IssueStateBadge, KindBadge, Loading, Notice, ReleaseStatusPill } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
-import { timeAgo } from '../lib/format';
+import { dateTime, timeAgo, toDateTimeLocal } from '../lib/format';
 import { useFeed, useFeedReconnects, useLiveRelease, useProjectReleases } from '../lib/realtime';
 
-/** One release: its issues in build order, editable while planned, built one at a time once started (docs/ARCHITECTURE.md §10). */
+/** Codes after which the page's copy of the release is stale: reload it and show the server's message. */
+const STALE_SCHEDULE = new Set(['release_not_scheduled', 'release_not_schedulable', 'release_scheduled']);
+
+/** A time in the browser's time zone, machine-readable in `dateTime`. */
+function LocalTime({ iso }: { iso: string }) {
+  return <time dateTime={iso}>{dateTime(iso)}</time>;
+}
+
+/**
+ * One release: its issues in build order, editable while planned (in preparation or scheduled), built one at a time
+ * once started (docs/ARCHITECTURE.md §10).
+ */
 export function ReleasePage() {
   const { repo = '', releaseId = '' } = useParams();
   const nav = useNavigate();
@@ -24,6 +35,7 @@ export function ReleasePage() {
   const [toAdd, setToAdd] = useState('');
   const [editing, setEditing] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [scheduling, setScheduling] = useState(false);
   const [confirmStart, setConfirmStart] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
   // Set before this user's own delete request, so they are not told "This release was deleted".
@@ -78,7 +90,10 @@ export function ReleasePage() {
       if (e instanceof ApiError && e.code === 'release_issues_changed') {
         releaseQ.reload();
         setErr('The release changed in the meantime; try again.');
-      } else setErr((e as Error).message);
+      } else {
+        if (e instanceof ApiError && STALE_SCHEDULE.has(e.code)) releaseQ.reload();
+        setErr((e as Error).message);
+      }
       return false;
     } finally {
       setBusy(false);
@@ -86,22 +101,23 @@ export function ReleasePage() {
   };
 
   const status = release.status;
-  const started = status !== 'planning';
+  const planned = status === 'planning' || status === 'scheduled';
+  const started = !planned;
   const active = isReleaseActive(release);
-  const ownerName = release.owner?.username ?? '';
+  const ownerName = release.owner?.username ?? 'its owner';
   const isOwner = !!release.owner && release.owner.username === me.username;
   const ownerOrAdmin = isOwner || me.isAdmin;
   // What this user may do (the server checks the same rules; see docs/ARCHITECTURE.md §6 "Releases").
   const may = {
     start: status === 'planning',
-    edit: !started || ownerOrAdmin,
+    edit: planned || ownerOrAdmin,
     delete: status === 'planning' || (status === 'cancelled' && ownerOrAdmin),
     pause: status === 'building' && ownerOrAdmin,
     resume: status === 'paused' && isOwner,
     cancel: active && ownerOrAdmin,
-    reorder: status === 'planning' || (active && isOwner),
-    add: status === 'planning' || (active && isOwner),
-    remove: (i: ReleaseIssue) => status === 'planning' || (ownerOrAdmin && (status === 'cancelled' || i.state === 'waiting' || i.state === 'held' || i.state === 'skipped')),
+    reorder: planned || (active && isOwner),
+    add: planned || (active && isOwner),
+    remove: (i: ReleaseIssue) => planned || (ownerOrAdmin && (status === 'cancelled' || i.state === 'waiting' || i.state === 'held' || i.state === 'skipped')),
     retry: (i: ReleaseIssue) => active && isOwner && (i.state === 'held' || i.state === 'skipped'),
   };
   const mayNothing = started && !ownerOrAdmin;
@@ -115,7 +131,7 @@ export function ReleasePage() {
   const canMove = (index: number, delta: -1 | 1) => {
     const other = release.issues[index + delta];
     if (!other) return false;
-    return status === 'planning' || (release.issues[index].state === 'waiting' && other.state === 'waiting');
+    return planned || (release.issues[index].state === 'waiting' && other.state === 'waiting');
   };
   const remove = (n: number) => void change(() => api.assignIssues(repo, [n], null));
   const retry = (n: number) => void change(() => api.retryReleaseIssue(release.id, n));
@@ -134,6 +150,7 @@ export function ReleasePage() {
     } catch (e) {
       if (!(e instanceof ApiError && e.status === 404)) {
         deletedByMe.current = false;
+        if (e instanceof ApiError && STALE_SCHEDULE.has(e.code)) releaseQ.reload();
         setErr((e as Error).message);
         setBusy(false);
         setConfirmDelete(false);
@@ -149,6 +166,10 @@ export function ReleasePage() {
   };
 
   const n = release.issues.length;
+  const scheduled = status === 'scheduled';
+  const mayChangeSchedule = scheduled && ownerOrAdmin;
+  const cancelSchedule = () => void change(() => api.cancelReleaseSchedule(release.id));
+  const failure = status === 'planning' ? release.startFailure : null;
   const count = (state: ReleaseIssue['state']) => release.issues.filter((i) => i.state === state).length;
   const merged = count('merged');
   const held = count('held');
@@ -198,13 +219,34 @@ export function ReleasePage() {
               Cancel release
             </button>
           )}
+          {release.status === 'planning' && (
+            <button type="button" className="btn btn--ghost" onClick={() => setScheduling(true)} disabled={busy}>
+              Schedule start…
+            </button>
+          )}
+          {mayChangeSchedule && (
+            <>
+              <button type="button" className="btn btn--ghost" onClick={() => setScheduling(true)} disabled={busy}>
+                Change time
+              </button>
+              <button type="button" className="btn btn--ghost" onClick={cancelSchedule} disabled={busy}>
+                Cancel schedule
+              </button>
+            </>
+          )}
           {may.edit && status !== 'cancelled' && (
             <button type="button" className="btn btn--ghost" onClick={() => setEditing(true)} disabled={busy}>
               Edit
             </button>
           )}
-          {may.delete && (
-            <button type="button" className="btn btn--ghost btn--danger" onClick={() => setConfirmDelete(true)} disabled={busy}>
+          {(may.delete || scheduled) && (
+            <button
+              type="button"
+              className="btn btn--ghost btn--danger"
+              onClick={() => setConfirmDelete(true)}
+              disabled={busy || scheduled}
+              aria-describedby={scheduled ? 'release-delete-hint' : undefined}
+            >
               Delete
             </button>
           )}
@@ -237,7 +279,23 @@ export function ReleasePage() {
               </p>
             </>
           )}
-          {status === 'planning' && <p className="muted small">This release is a plan. Nothing is built until it is started.</p>}
+          {scheduled && release.scheduledAt ? (
+            <>
+              <p className="release-schedule">
+                Scheduled to start <LocalTime iso={release.scheduledAt} /> by {ownerName}.
+              </p>
+              {release.waitingFor && (
+                <p className="release-waiting" role="status">
+                  Its time has come. Waiting for release{' '}
+                  <Link to={`/p/${repo}/releases/${release.waitingFor.id}`}>{release.waitingFor.name}</Link> to finish building.
+                </p>
+              )}
+              {!mayChangeSchedule && <p className="muted small">Only {ownerName} or an admin can change the schedule.</p>}
+              <p id="release-delete-hint" className="muted small">Cancel the scheduled start to delete this release.</p>
+            </>
+          ) : (
+            status === 'planning' && <p className="muted small">This release is a plan. Nothing is built until it is started.</p>
+          )}
           {mayNothing && <p className="muted small">Only {ownerName}, who started this release, and admins can change it.</p>}
         </div>
       </header>
@@ -248,6 +306,15 @@ export function ReleasePage() {
         </p>
       )}
       {err && <p className="form-error" role="alert">{err}</p>}
+
+      {failure && (
+        <Notice tone="error" title="The scheduled start did not happen">
+          <p>{failure.reason}</p>
+          <p className="muted small">
+            Scheduled by {failure.owner.username} · tried <LocalTime iso={failure.at} />
+          </p>
+        </Notice>
+      )}
 
       <section className="release-issues" aria-labelledby="release-issues-h">
         <div className="section-head">
@@ -262,7 +329,7 @@ export function ReleasePage() {
         ) : (
           <ol className="release-order">
             {release.issues.map((i, idx) => {
-              const movable = may.reorder && (status === 'planning' || i.state === 'waiting');
+              const movable = may.reorder && (planned || i.state === 'waiting');
               return (
                 <li key={i.number} className={`ro-item ro-item--${started ? i.state : 'planned'}`}>
                   <span className="ro-pos mono" aria-hidden>{idx + 1}</span>
@@ -338,6 +405,13 @@ export function ReleasePage() {
       </section>
 
       <EditReleaseDialog release={release} open={editing} onClose={() => setEditing(false)} onSaved={(r) => noteReleases([r])} />
+      <ScheduleDialog
+        release={release}
+        open={scheduling}
+        onClose={() => setScheduling(false)}
+        onSaved={(r) => noteReleases([r])}
+        onStale={() => releaseQ.reload()}
+      />
       <StartReleaseDialog
         release={release}
         defaultBranch={project.data?.defaultBranch}
@@ -403,6 +477,7 @@ function releaseStatusLine(release: Release, running: ReleaseIssue | undefined, 
   const branch = release.branch ?? `release/${release.name}`;
   switch (release.status) {
     case 'planning':
+    case 'scheduled':
       return null;
     case 'building': {
       if (running) return `Building #${running.number} ${running.title}.`;
@@ -492,7 +567,7 @@ function EditReleaseDialog({ release, open, onClose, onSaved }: { release: Relea
     setErr(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
-  const locked = release.status !== 'planning';
+  const locked = release.status !== 'planning' && release.status !== 'scheduled';
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     setBusy(true);
@@ -539,6 +614,100 @@ function EditReleaseDialog({ release, open, onClose, onSaved }: { release: Relea
           </button>
           <button className="btn btn--primary" disabled={busy || (!locked && !name.trim())}>
             {busy ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </form>
+    </Dialog>
+  );
+}
+
+/** Today 22:00 local time if that is still ahead, otherwise tomorrow 22:00. */
+function defaultStart(now = new Date()): Date {
+  const d = new Date(now);
+  d.setHours(22, 0, 0, 0);
+  if (d.getTime() <= now.getTime()) d.setDate(d.getDate() + 1);
+  return d;
+}
+
+/** Sets the start of a release in preparation, or changes the time of a scheduled one. */
+function ScheduleDialog({
+  release,
+  open,
+  onClose,
+  onSaved,
+  onStale,
+}: {
+  release: Release;
+  open: boolean;
+  onClose: () => void;
+  onSaved: (r: Release) => void;
+  onStale: () => void;
+}) {
+  const changing = release.status === 'scheduled';
+  const [value, setValue] = useState('');
+  const [min, setMin] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  // Start from the current schedule (or the default) each time the dialog opens.
+  useEffect(() => {
+    if (!open) return;
+    const now = new Date();
+    setMin(toDateTimeLocal(now));
+    setValue(toDateTimeLocal(changing && release.scheduledAt ? new Date(release.scheduledAt) : defaultStart(now)));
+    setErr(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    const at = new Date(value);
+    if (Number.isNaN(at.getTime())) {
+      setErr('Enter a date and time.');
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    try {
+      onSaved(await api.scheduleRelease(release.id, at.toISOString()));
+      onClose();
+    } catch (e2) {
+      if (e2 instanceof ApiError && STALE_SCHEDULE.has(e2.code)) onStale();
+      setErr((e2 as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Dialog open={open} onClose={onClose} title={changing ? 'Change scheduled start' : `Schedule release ${release.name}`}>
+      <form className="form" onSubmit={submit}>
+        <div className="field">
+          <label htmlFor="rs-at">Start at</label>
+          <input
+            id="rs-at"
+            type="datetime-local"
+            required
+            min={min}
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            autoFocus
+            aria-describedby="rs-at-hint"
+          />
+          <p id="rs-at-hint" className="muted small">
+            Your local time ({zone}). The release is built with your Claude and GitHub credentials. If another release of this
+            project is still building at that time, this one waits for it.
+          </p>
+        </div>
+        {err && (
+          <p className="form-error" role="alert">
+            {err}
+          </p>
+        )}
+        <div className="dialog-actions">
+          <button type="button" className="btn btn--ghost" onClick={onClose} disabled={busy}>
+            Cancel
+          </button>
+          <button className="btn btn--primary" disabled={busy || !value}>
+            {busy ? 'Saving…' : changing ? 'Save' : 'Schedule'}
           </button>
         </div>
       </form>

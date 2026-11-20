@@ -825,8 +825,11 @@ function runSandboxFor(repo: string): RunSandbox {
 
 function makeRun(repo: string, issue: Issue, owner: User, createdMs: number, startedBy: string | null, release: Release | null): Run {
   const slug = issue.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 30);
+  const id = uid();
+  // Like the server: every run has its own branch, suffixed with the first 8 characters of its id.
+  const suffix = id.replace(/[^a-z0-9]/gi, '').slice(0, 8).toLowerCase();
   const r: Run = {
-    id: uid(),
+    id,
     repo,
     issueNumber: issue.number,
     issueTitle: issue.title,
@@ -834,7 +837,9 @@ function makeRun(repo: string, issue: Issue, owner: User, createdMs: number, sta
     status: 'queued',
     round: 0,
     maxRounds: effective(owner.username).maxFixRounds,
-    branch: release ? `factory/release-${release.name}/issue-${issue.number}-${slug}` : `factory/issue-${issue.number}-${slug}`,
+    branch: release
+      ? `factory/release-${release.name}/issue-${issue.number}-${slug}-${suffix}`
+      : `factory/issue-${issue.number}-${slug}-${suffix}`,
     prNumber: null,
     prUrl: null,
     owner: ownerOf(owner),
@@ -954,21 +959,31 @@ export function createRelease(repo: string, body: { name: string; description: s
     startedAt: null,
     endedAt: null,
     pause: null,
+    scheduledAt: null,
+    waitingFor: null,
+    startFailure: null,
   };
   db.releases.set(r.id, r);
   feed({ type: 'release', repo, release: r });
   return r;
 }
 
-const RELEASE_STATUS_TEXT: Record<Release['status'], string> = { planning: 'in preparation', building: 'building', paused: 'paused', cancelled: 'cancelled' };
+const RELEASE_STATUS_TEXT: Record<Release['status'], string> = {
+  planning: 'in preparation',
+  scheduled: 'scheduled',
+  building: 'building',
+  paused: 'paused',
+  cancelled: 'cancelled',
+};
 
 /** One release for `/factory releases`: status, progress, and each issue's state when it is not waiting. */
 function releaseSummary(r: Release): string {
   const n = r.issues.length;
   const merged = r.issues.filter((i) => i.state === 'merged').length;
-  const progress = r.status === 'planning' ? `${n} issue${n === 1 ? '' : 's'}` : `${merged} of ${n} merged`;
+  const planned = r.status === 'planning' || r.status === 'scheduled';
+  const progress = planned ? `${n} issue${n === 1 ? '' : 's'}` : `${merged} of ${n} merged`;
   const lines = r.issues.map((i) => `    #${i.number} ${i.title}${i.state === 'waiting' ? '' : ` — ${i.state}`}${(i.state === 'held' || i.state === 'skipped') && i.note ? ` (${i.note})` : ''}`);
-  return [`• ${r.name} — ${RELEASE_STATUS_TEXT[r.status]}, ${progress}`, ...lines].join('\n');
+  return [`• ${r.name} — ${planned ? releaseState(r) : RELEASE_STATUS_TEXT[r.status]}, ${progress}`, ...lines].join('\n');
 }
 
 const isActiveRelease = (r: Release) => r.status === 'building' || r.status === 'paused';
@@ -978,7 +993,7 @@ const isActiveRelease = (r: Release) => r.status === 'building' || r.status === 
  * started it; `ownerOrAdmin`: admins too. Same 403 message as the server.
  */
 function guardRelease(r: Release, by: User, who: 'owner' | 'ownerOrAdmin') {
-  if (r.status === 'planning' || !r.owner) return;
+  if (r.status === 'planning' || r.status === 'scheduled' || !r.owner) return;
   if (r.owner.username === by.username || (who === 'ownerOrAdmin' && by.isAdmin)) return;
   throw new MockError(403, 'forbidden', `Only ${r.owner.username}, who started this release, ${who === 'ownerOrAdmin' ? 'or an admin ' : ''}can do this`);
 }
@@ -986,13 +1001,14 @@ function guardRelease(r: Release, by: User, who: 'owner' | 'ownerOrAdmin') {
 export function updateRelease(r: Release, body: { name: string; description: string }, by: User) {
   guardRelease(r, by, 'ownerOrAdmin');
   const v = validRelease(r.repo, body.name, body.description ?? '', r.id);
-  if (r.status !== 'planning' && v.name !== r.name) throw new MockError(409, 'release_name_locked', 'The name is fixed once the release is started');
+  if (r.status !== 'planning' && r.status !== 'scheduled' && v.name !== r.name) throw new MockError(409, 'release_name_locked', 'The name is fixed once the release is started');
   Object.assign(r, v);
   touchRelease(r);
   return r;
 }
 
 export function deleteRelease(r: Release, by: User) {
+  if (r.status === 'scheduled') throw new MockError(409, 'release_scheduled', 'Cancel the scheduled start before deleting this release');
   if (isActiveRelease(r)) throw new MockError(409, 'release_active', 'Cancel the release first');
   guardRelease(r, by, 'ownerOrAdmin');
   db.releases.delete(r.id);
@@ -1045,13 +1061,107 @@ export function assignIssues(repo: string, numbers: number[], releaseId: string 
   return releasesOf(repo);
 }
 
+// Scheduled start (docs/ARCHITECTURE.md §6 "Scheduled start"): a release whose time comes starts through the same
+// start as "start now", as its owner; a refusal returns it to planning with the reason as its start failure.
+
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})$/i;
+const scheduleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** `/factory releases` state text, as the server's `ReleaseService.describe`. */
+export function releaseState(r: Release): string {
+  if (r.status === 'scheduled') {
+    const at = r.scheduledAt ? new Date(r.scheduledAt).toISOString().replace('.000Z', 'Z') : '?';
+    return `scheduled for ${at} by ${r.owner?.username ?? 'unknown'}${r.waitingFor ? `, waiting for release "${r.waitingFor.name}"` : ''}`;
+  }
+  if (r.status === 'planning') return `in preparation${r.startFailure ? ` (scheduled start failed: ${r.startFailure.reason})` : ''}`;
+  return r.status;
+}
+
+function armSchedule(r: Release) {
+  clearTimeout(scheduleTimers.get(r.id));
+  scheduleTimers.delete(r.id);
+  if (r.status !== 'scheduled' || !r.scheduledAt) return;
+  // setTimeout holds at most ~24.8 days; longer waits re-arm when they fire.
+  const wait = Math.min(Math.max(0, Date.parse(r.scheduledAt) - Date.now()), 2 ** 31 - 1);
+  scheduleTimers.set(r.id, setTimeout(() => releaseDue(r.id), wait));
+}
+
+function releaseDue(id: string) {
+  scheduleTimers.delete(id);
+  const r = db.releases.get(id);
+  if (!r || r.status !== 'scheduled' || !r.scheduledAt) return;
+  if (Date.parse(r.scheduledAt) > Date.now()) return armSchedule(r);
+  const busy = releasesOf(r.repo).find((x) => x.id !== r.id && (x.status === 'building' || x.status === 'paused'));
+  if (busy) {
+    if (r.waitingFor?.id !== busy.id) {
+      r.waitingFor = { id: busy.id, name: busy.name };
+      touchRelease(r);
+    }
+    scheduleTimers.set(r.id, setTimeout(() => releaseDue(r.id), 15_000));
+    return;
+  }
+  if (r.waitingFor) r.waitingFor = null;
+  const owner = r.owner ?? r.createdBy;
+  const user = userNamed(owner.username);
+  let reason: string | null = null;
+  if (!user) reason = "The owner's account no longer exists.";
+  else if (!user.hasClaudeCredential) reason = `${user.username} has no Claude credential registered. Register one in Settings and schedule the release again.`;
+  else if (!user.hasGithubToken) reason = `${user.username} has no GitHub token registered. Register one in Settings and schedule the release again.`;
+  else {
+    try {
+      startReleaseAs(r, user, 'scheduled');
+      return;
+    } catch (e) {
+      reason = e instanceof MockError ? e.message : 'Internal error while starting the release; see the server log.';
+    }
+  }
+  Object.assign(r, { status: 'planning', owner: null, scheduledAt: null, waitingFor: null, startFailure: { at: iso(Date.now()), owner, reason } });
+  touchRelease(r);
+}
+
+function requireScheduleOwner(r: Release, by: User) {
+  if (!by.isAdmin && r.owner?.username !== by.username)
+    throw new MockError(403, 'forbidden', `Only ${r.owner?.username ?? 'its owner'} or an admin can change this schedule`);
+}
+
+/** Sets (caller becomes the owner) or changes (owner or admin) the scheduled start. */
+export function scheduleRelease(r: Release, startAt: string, by: User): Release {
+  const ms = Date.parse(startAt);
+  if (!ISO_INSTANT.test(startAt.trim()) || Number.isNaN(ms)) throw new MockError(400, 'bad_request', 'startAt must be an ISO-8601 time');
+  if (ms <= Date.now()) throw new MockError(400, 'bad_request', 'The start time must be in the future');
+  if (ms > Date.now() + 366 * 86400_000) throw new MockError(400, 'bad_request', 'The start time is too far ahead (at most a year)');
+  if (r.status === 'planning') {
+    if (!by.hasClaudeCredential) throw new MockError(422, 'claude_credential_required', 'Register a Claude credential in Settings first');
+    if (!by.hasGithubToken) throw new MockError(403, 'forbidden', 'Register a GitHub token in Settings first');
+    Object.assign(r, { status: 'scheduled', owner: ownerOf(by), scheduledAt: iso(ms), waitingFor: null, startFailure: null });
+  } else if (r.status === 'scheduled') {
+    requireScheduleOwner(r, by);
+    Object.assign(r, { scheduledAt: iso(ms), waitingFor: null });
+  } else {
+    throw new MockError(409, 'release_not_schedulable', `Release is ${r.status}; only a release in preparation can be scheduled`);
+  }
+  armSchedule(r);
+  touchRelease(r);
+  return r;
+}
+
+/** Back to a shared plan: owner, time and waiting cleared; an earlier start failure is kept. */
+export function cancelReleaseSchedule(r: Release, by: User): Release {
+  if (r.status !== 'scheduled') throw new MockError(409, 'release_not_scheduled', 'This release has no scheduled start');
+  requireScheduleOwner(r, by);
+  Object.assign(r, { status: 'planning', owner: null, scheduledAt: null, waitingFor: null });
+  armSchedule(r);
+  touchRelease(r);
+  return r;
+}
+
 export function reorderRelease(r: Release, numbers: number[], by: User) {
   if (r.status === 'cancelled') throw new MockError(409, 'release_closed', `Release "${r.name}" is cancelled`);
   guardRelease(r, by, 'owner');
   const current = r.issues.map((i) => i.number);
   const same = numbers.length === current.length && new Set(numbers).size === numbers.length && numbers.every((n) => current.includes(n));
   if (!same) throw new MockError(409, 'release_issues_changed', "The release's issues changed in the meantime; reload and try again.");
-  if (r.status !== 'planning') {
+  if (isActiveRelease(r)) {
     const moved = r.issues.find((i, idx) => i.state !== 'waiting' && numbers[idx] !== i.number);
     if (moved) throw new MockError(409, 'release_issue_started', `Issue #${moved.number} is ${moved.state}; only waiting issues can be moved`);
   }
@@ -1119,7 +1229,14 @@ function releaseRunEnded(run: Run) {
 }
 
 export function startRelease(r: Release, by: User) {
-  if (r.status !== 'planning') throw new MockError(409, 'release_not_planning', `Release "${r.name}" has already been started`);
+  if (r.status === 'scheduled')
+    throw new MockError(409, 'release_not_planning', `Release "${r.name}" is scheduled; cancel the scheduled start to start it now`);
+  return startReleaseAs(r, by, 'planning');
+}
+
+/** "Start now" (`planning`) and the scheduled start (`scheduled`, as the owner) share this path, as on the server. */
+function startReleaseAs(r: Release, by: User, from: 'planning' | 'scheduled') {
+  if (r.status !== from) throw new MockError(409, 'release_not_planning', `Release "${r.name}" has already been started`);
   if (!by.hasClaudeCredential) throw new MockError(422, 'claude_credential_required', 'Register a Claude credential in Settings first');
   if (!by.hasGithubToken) throw new MockError(403, 'forbidden', 'Register a GitHub token in Settings first');
   if (r.issues.length === 0) throw new MockError(409, 'release_empty', 'Add an issue before starting the release');
@@ -1128,7 +1245,7 @@ export function startRelease(r: Release, by: User) {
   const branch = `release/${r.name}`;
   if (releaseBranches.has(`${r.repo}:${branch}`)) throw new MockError(409, 'release_branch_exists', `The branch ${branch} already exists on GitHub`);
   releaseBranches.add(`${r.repo}:${branch}`);
-  Object.assign(r, { status: 'building', owner: ownerOf(by), branch, startedAt: iso(Date.now()), endedAt: null, pause: null });
+  Object.assign(r, { status: 'building', owner: ownerOf(by), branch, startedAt: iso(Date.now()), endedAt: null, pause: null, scheduledAt: null, waitingFor: null });
   for (const it of r.issues) skipIfUnbuildable(r, it);
   touchRelease(r);
   advanceRelease(r);
@@ -1336,7 +1453,13 @@ function seed() {
     return { number: n, title: i.title, kind: i.kind, state: 'waiting', runId: null, note: null };
   };
   spring.issues = [51, 55, 57].map((n) => planned('web-shop', n));
-  createRelease('web-shop', { name: 'chat-cleanup', description: '' }, bob, Date.now() - 86400_000);
+  const cleanup = createRelease('web-shop', { name: 'chat-cleanup', description: '' }, bob, Date.now() - 86400_000);
+  // Scheduled by its creator for tomorrow 22:00 local time.
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  tomorrow.setHours(22, 0, 0, 0);
+  Object.assign(cleanup, { status: 'scheduled', owner: ownerOf(bob), scheduledAt: iso(tomorrow.getTime()) });
+  armSchedule(cleanup);
 
   // Historical runs (instant).
   const never = () => false;

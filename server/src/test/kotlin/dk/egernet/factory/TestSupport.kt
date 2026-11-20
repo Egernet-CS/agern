@@ -182,7 +182,15 @@ class FakeGitOps : GitOps {
     }
     override fun commitsAhead(worktree: Path, baseRef: String, home: Path) = commits
     override fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path) { pushes += branch }
-    override fun removeWorktree(mainDir: Path, worktree: Path, home: Path) {}
+    override fun listWorktrees(mainDir: Path, home: Path): List<dk.egernet.factory.git.WorktreeInfo> = emptyList()
+    /** When set, [removeWorktree] deletes the directory (like the real one) and records it in [removedWorktrees]. */
+    @Volatile var deleteWorktrees = false
+    val removedWorktrees = CopyOnWriteArrayList<Path>()
+    override fun removeWorktree(mainDir: Path, worktree: Path, home: Path, keepUnpushed: Boolean) {
+        if (!deleteWorktrees) return
+        worktree.toFile().deleteRecursively()
+        removedWorktrees.add(worktree)
+    }
 }
 
 fun testConfig(dataDir: Path, twoFactor: Boolean = true, devUsers: Map<String, String> = mapOf("alice" to "pw-a", "bob" to "pw-b", "root" to "pw-r")) = Config(
@@ -196,6 +204,14 @@ fun testConfig(dataDir: Path, twoFactor: Boolean = true, devUsers: Map<String, S
     chatIdleMinutes = 30,
 )
 
+/** A clock whose instant the test sets and advances. */
+class MutableClock(@Volatile var now: java.time.Instant = java.time.Instant.parse("2026-01-01T12:00:00Z")) : java.time.Clock() {
+    override fun instant(): java.time.Instant = now
+    override fun getZone(): java.time.ZoneId = java.time.ZoneOffset.UTC
+    override fun withZone(zone: java.time.ZoneId?): java.time.Clock = this
+    fun advance(d: java.time.Duration) { now = now.plus(d) }
+}
+
 class TestWorld(
     twoFactor: Boolean = true,
     tweak: (Config) -> Config = { it },
@@ -203,16 +219,22 @@ class TestWorld(
     /** Sandboxes on (FACTORY_SANDBOX=podman) with [sandboxRuntime] as the container runtime. */
     sandbox: Boolean = false,
     launcher: dk.egernet.factory.agent.AgentLauncher? = null,
+    clock: java.time.Clock = java.time.Clock.systemUTC(),
+    releaseStarter: ReleaseStarter? = null,
+    /** Use the real git CLI in fake-GitHub mode (local clone, no pushes) instead of [FakeGitOps]. */
+    realGit: Boolean = false,
 ) {
     val dataDir: Path = Files.createTempDirectory("agern-test")
     val cfg = tweak(testConfig(dataDir, twoFactor).let { if (sandbox) it.copy(sandbox = it.sandbox.copy(mode = "podman")) else it })
     val github = FakeGitHub.seeded("test-org")
     val git = FakeGitOps()
+    val cliGit: dk.egernet.factory.git.CliGitOps? =
+        if (realGit) dk.egernet.factory.git.CliGitOps(System.getenv("PATH") ?: "/usr/bin:/bin", "https://github.invalid/", localOnly = true) else null
     val launcher = FakeLauncher()
     val sandboxRuntime = FakeSandboxRuntime()
     val services = Services(
-        cfg, TestDb.fresh(), github, git, launcher ?: this.launcher, loginThrottle = loginThrottle,
-        sandboxRuntime = if (sandbox) sandboxRuntime else null,
+        cfg, TestDb.fresh(), github, cliGit ?: git, launcher ?: this.launcher, loginThrottle = loginThrottle, clock = clock,
+        releaseStarter = releaseStarter, sandboxRuntime = if (sandbox) sandboxRuntime else null,
     )
 
     /** Puts `.agern/sandbox.yml` on the default branch (GitHub API and git alike); null removes it. */
@@ -317,7 +339,14 @@ class FakeSandboxRuntime : dk.egernet.factory.sandbox.SandboxRuntime {
     }
     override fun logs(name: String, lines: Int) = "LOG: database system is starting up ($name)"
     override fun restartContainer(name: String) { calls += "restart $name" }
+    /** Each container removed that bind-mounted a worktree: (name, whether that directory still existed then). */
+    val removedWithWorktree = CopyOnWriteArrayList<Pair<String, Boolean>>()
     override fun removeContainers(names: List<String>) {
+        for (n in names) {
+            if (!containers.containsKey(n)) continue
+            val wt = started.lastOrNull { it.name == n }?.mounts?.firstOrNull { !it.volume && it.target == "/workspace" }?.source ?: continue
+            removedWithWorktree += n to java.nio.file.Files.exists(java.nio.file.Path.of(wt))
+        }
         calls += "rm ${names.joinToString(" ")}"
         names.forEach { containers.remove(it) }
     }

@@ -133,6 +133,8 @@ export const httpApi: Api = {
   resumeRelease: (id) => post(`/api/releases/${enc(id)}/resume`),
   cancelRelease: (id) => post(`/api/releases/${enc(id)}/cancel`),
   retryReleaseIssue: (id, issueNumber) => post(`/api/releases/${enc(id)}/issues/${issueNumber}/retry`),
+  scheduleRelease: (id, startAt) => put(`/api/releases/${enc(id)}/schedule`, { startAt }),
+  cancelReleaseSchedule: (id) => del(`/api/releases/${enc(id)}/schedule`),
 
   sandboxStatus: (repo) => get(`/api/projects/${enc(repo)}/sandbox`),
   approveSandbox: (repo, sha256) => post(`/api/projects/${enc(repo)}/sandbox/approval`, { sha256 }),
