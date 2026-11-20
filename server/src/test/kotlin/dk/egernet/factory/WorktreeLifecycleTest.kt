@@ -95,7 +95,11 @@ class WorktreeLifecycleTest {
         // The builder's own explanation reaches the run and the issue.
         assertTrue(failed.error!!.contains("no commits") && failed.error!!.contains("Blocked on #19"), failed.error)
         assertTrue(s.runs.stages(failed.id).single { it.role == "builder" }.summary!!.contains("Blocked on #19"))
-        assertTrue(world.github.actions.any { it.contains("run `${failed.id}` failed") && it.contains("Blocked on #19") })
+        // The comment on the issue follows the status change.
+        val commented = { world.github.actions.any { it.contains("run `${failed.id}` failed") && it.contains("Blocked on #19") } }
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+        while (!commented() && System.nanoTime() < deadline) Thread.sleep(20)
+        assertTrue(commented())
         assertTrue(runWorktrees().isEmpty(), runWorktrees().toString())
         assertFalse(failed.branch in localBranches(), "a branch without own commits is deleted")
 

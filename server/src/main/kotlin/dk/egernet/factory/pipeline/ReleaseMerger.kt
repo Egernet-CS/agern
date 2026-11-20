@@ -255,8 +255,9 @@ class ReleaseMerger(
             false -> ReleaseMergeState.CONFLICT
             else -> ReleaseMergeState.UNKNOWN
         }
-        recordMergeState(withPr, state, client)
+        // The method first: whoever sees the merge state also sees how it would be merged.
         io { store.setMergeMethod(id, methodFor(repo)) }
+        recordMergeState(withPr, state, client)
         setNotice(id, null)
 
         if (withPr.complete && state != ReleaseMergeState.CONFLICT && io { store.claimReadyAnnouncement(id) }) {
