@@ -177,7 +177,10 @@ class Services(
             else cfg.githubApiUrl.substringBefore("/api/").trimEnd('/') + "/"
             val github: GitHub = if (cfg.fakeGithub) {
                 LoggerFactory.getLogger("dk.egernet.factory").warn("!!!!!!!! FACTORY_DEV_FAKE_GITHUB: using an in-memory fake GitHub. Tokens 'fake-<login>' are accepted. !!!!!!!!")
-                FakeGitHub.seeded(cfg.githubOrg).apply { filesDir = cfg.dataDir.resolve("fake-github") }
+                FakeGitHub.seeded(cfg.githubOrg).apply {
+                    filesDir = cfg.dataDir.resolve("fake-github")
+                    checksDir = cfg.dataDir.resolve("fake-github-checks")
+                }
             } else {
                 HttpGitHub(cfg.githubApiUrl, gitHost.trimEnd('/'))
             }

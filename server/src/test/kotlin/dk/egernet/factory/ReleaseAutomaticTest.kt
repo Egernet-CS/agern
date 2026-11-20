@@ -570,6 +570,28 @@ class ReleaseAutomaticTest {
         assertEquals(ChecksSummary("failed", "Failed: commit status"), of(listOf("a" to "success"), emptyList(), total = 150, state = "failure"))
     }
 
+    @Test
+    fun `the fake GitHub reads checks from its development directory`() {
+        val dir = java.nio.file.Files.createTempDirectory("agern-checks")
+        try {
+            gh.checksDir = dir
+            java.nio.file.Files.createDirectories(dir.resolve("demo-app/release"))
+            java.nio.file.Files.writeString(
+                dir.resolve("demo-app/release/x.json"),
+                """{"statuses":{"ci/e2e":"pending"},"checkRuns":[{"name":"build","status":"completed","conclusion":"failure"}]}""",
+            )
+            val c = gh.client("fake-alice")
+            val sha = "sha-release/x-3"
+            assertEquals(ChecksSummary("failed", "Failed: build"), ChecksSummary.of(c.combinedStatus("test-org", "demo-app", sha), c.checkRuns("test-org", "demo-app", sha)))
+            assertEquals("none", ChecksSummary.of(c.combinedStatus("test-org", "demo-app", "sha-release/y-1"), c.checkRuns("test-org", "demo-app", "sha-release/y-1")).state)
+            // Set in memory, the test's own checks win.
+            gh.setStatus("demo-app", "release/x", "ci/e2e", "success")
+            assertEquals(listOf(GhCommitStatus("ci/e2e", "success")), c.combinedStatus("test-org", "demo-app", sha).statuses)
+        } finally {
+            dir.toFile().deleteRecursively()
+        }
+    }
+
     // ------------------------------------------------------------ HTTP helpers
 
     private fun json(r: String) = AppJson.parseToJsonElement(r)

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, ApiError, isReleaseFinished, isReleaseOpen, isRunWorking, isSessionActive, type AgentSession, type Issue, type IssueKind, type Release, type Run } from '../api';
+import { api, ApiError, isReleaseFinished, isReleaseOpen, isRunWorking, isSessionActive, type AgentSession, type Issue, type IssueKind, type Release, type ReleaseMode, type Run } from '../api';
 import { ChatView } from '../components/chat/ChatView';
 import { REVIEWERS, roundName } from '../components/pipeline/model';
 import { sandboxSummary } from '../components/sandbox/SandboxBits';
@@ -623,14 +623,15 @@ function NewIssueDialog({ repo, open, onClose, onCreated }: { repo: string; open
   );
 }
 
-/** "N issues" while planning; "k of n merged" (plus "· h held") once started. */
+/** "N issues" while planning; "k of n merged" (plus "· h held") once started; "· automatic" until it is finished. */
 function releaseProgress(r: Release): string {
   const n = r.issues.length;
-  if (r.status === 'planning' || r.status === 'scheduled') return `${n} issue${n === 1 ? '' : 's'}`;
+  const auto = r.mode === 'automatic' && !isReleaseFinished(r) ? ' · automatic' : '';
+  if (r.status === 'planning' || r.status === 'scheduled') return `${n} issue${n === 1 ? '' : 's'}${auto}`;
   const merged = r.issues.filter((i) => i.state === 'merged').length;
   const held = r.issues.filter((i) => i.state === 'held').length;
   const conflict = r.status === 'ready' && held === 0 && r.mergeState === 'conflict';
-  return `${merged} of ${n} merged${held > 0 ? ` · ${held} held` : ''}${conflict ? ' · conflict' : ''}`;
+  return `${merged} of ${n} merged${held > 0 ? ` · ${held} held` : ''}${conflict ? ' · conflict' : ''}${auto}`;
 }
 
 /** Released and cancelled releases, newest first (by release time, else last change). */
@@ -675,6 +676,7 @@ function NewReleaseDialog({ repo, open, onClose }: { repo: string; open: boolean
   const { noteReleases } = useFeed();
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
+  const [mode, setMode] = useState<ReleaseMode>('manual');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   useEffect(() => {
@@ -685,9 +687,10 @@ function NewReleaseDialog({ repo, open, onClose }: { repo: string; open: boolean
     setBusy(true);
     setErr(null);
     try {
-      noteReleases([await api.createRelease(repo, { name: name.trim(), description })]);
+      noteReleases([await api.createRelease(repo, { name: name.trim(), description, mode })]);
       setName('');
       setDescription('');
+      setMode('manual');
       onClose();
     } catch (e2) {
       setErr((e2 as Error).message);
@@ -711,6 +714,25 @@ function NewReleaseDialog({ repo, open, onClose }: { repo: string; open: boolean
           </label>
           <textarea id="rd" rows={4} value={description} onChange={(e) => setDescription(e.target.value)} maxLength={2000} />
         </div>
+        <fieldset className="field mode-choice">
+          <legend>When it is ready</legend>
+          <label>
+            <input type="radio" name="release-mode" value="manual" checked={mode === 'manual'} onChange={() => setMode('manual')} />
+            <span>
+              Manual approval <span className="muted small">— it waits until whoever starts it approves the release.</span>
+            </span>
+          </label>
+          <label>
+            <input type="radio" name="release-mode" value="automatic" checked={mode === 'automatic'} onChange={() => setMode('automatic')} />
+            <span>
+              Release automatically{' '}
+              <span className="muted small">
+                — once everything is built, merges cleanly and all checks on the release pull request have passed, Agern merges it with the
+                owner&apos;s GitHub token.
+              </span>
+            </span>
+          </label>
+        </fieldset>
         {err && (
           <p className="form-error" role="alert">
             {err}

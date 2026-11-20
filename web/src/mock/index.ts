@@ -22,6 +22,7 @@ import {
   retryReleaseIssue,
   approveRelease,
   checkRelease,
+  setReleaseMode,
   approveRun,
   approveSandbox,
   cancelRun,
@@ -348,6 +349,7 @@ export const mockApi: Api = {
   retryReleaseIssue: (id, n) => ok(() => withRelease(id, (r) => retryReleaseIssue(r, n, me()))),
   approveRelease: (id) => ok(() => withRelease(id, (r) => approveRelease(r, me()))),
   checkRelease: (id) => ok(() => withRelease(id, (r) => checkRelease(r, me()))),
+  setReleaseMode: (id, mode) => ok(() => withRelease(id, (r) => setReleaseMode(r, mode, me()))),
 
   projectRuns: (repo) => ok(() => (project(repo), [...db.runs.values()].filter((r) => r.repo === repo).sort(byNewest))),
   startRun: (repo, n) =>

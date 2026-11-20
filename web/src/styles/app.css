@@ -2841,3 +2841,53 @@ html.app-locked #root {
   outline: none;
   box-shadow: var(--focus);
 }
+
+/* Releases: release mode and the checks on the release pull request (#41). */
+.release-mode {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  margin: 6px 0 2px;
+  max-width: 900px;
+}
+.release-mode-pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.release-mode .muted {
+  overflow-wrap: anywhere;
+}
+.release-checks {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  overflow-wrap: anywhere;
+}
+.release-warning {
+  margin: 0;
+  padding: 8px 12px;
+  border-radius: var(--r);
+  border: 1px solid rgba(255, 177, 74, 0.35);
+  background: var(--amber-wash);
+  overflow-wrap: anywhere;
+}
+.mode-choice {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 6px;
+}
+.mode-choice legend {
+  padding: 0;
+  margin-bottom: 4px;
+}
+.mode-choice label {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
