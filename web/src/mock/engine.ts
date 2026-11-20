@@ -12,6 +12,8 @@ import type {
   PreferenceOverrides,
   Project,
   Release,
+  ReleaseChecks,
+  ReleaseMode,
   Run,
   PendingSandbox,
   RunSandbox,
@@ -1029,8 +1031,20 @@ export function getRelease(id: string): Release {
   return r;
 }
 
-export function createRelease(repo: string, body: { name: string; description: string }, by: User, createdMs = Date.now()): Release {
+function validMode(raw: string | undefined): ReleaseMode {
+  const m = (raw ?? '').trim().toLowerCase() || 'manual';
+  if (m !== 'manual' && m !== 'automatic') throw new MockError(400, 'bad_request', 'The release mode must be "manual" or "automatic"');
+  return m;
+}
+
+export function createRelease(
+  repo: string,
+  body: { name: string; description: string; mode?: ReleaseMode },
+  by: User,
+  createdMs = Date.now(),
+): Release {
   const { name, description } = validRelease(repo, body.name, body.description ?? '');
+  const mode = validMode(body.mode);
   const r: Release = {
     id: uid(),
     repo,
@@ -1059,6 +1073,9 @@ export function createRelease(repo: string, body: { name: string; description: s
     releasedAt: null,
     releasedBy: null,
     mergeCommit: null,
+    mode,
+    releasedAutomatically: false,
+    checks: null,
   };
   db.releases.set(r.id, r);
   feed({ type: 'release', repo, release: r });
@@ -1101,6 +1118,22 @@ function guardRelease(r: Release, by: User, who: 'owner' | 'ownerOrAdmin') {
   if (r.status === 'planning' || r.status === 'scheduled' || !r.owner) return;
   if (r.owner.username === by.username || (who === 'ownerOrAdmin' && by.isAdmin)) return;
   throw new MockError(403, 'forbidden', `Only ${r.owner.username}, who started this release, ${who === 'ownerOrAdmin' ? 'or an admin ' : ''}can do this`);
+}
+
+/**
+ * Manual or automatic (as the server: planned → anyone; scheduled or started → automatic owner only, manual owner or
+ * admin; released or cancelled → 409). Switched to automatic, a ready release that is green goes out at once.
+ */
+export function setReleaseMode(r: Release, rawMode: string, by: User) {
+  const mode = validMode(rawMode);
+  if (r.status === 'released') notEditable(r);
+  if (r.status === 'cancelled') throw new MockError(409, 'release_closed', 'The release is cancelled');
+  if (r.status !== 'planning') guardRelease(r, by, mode === 'automatic' ? 'owner' : 'ownerOrAdmin');
+  if (r.mode === mode) return r;
+  r.mode = mode;
+  touchRelease(r);
+  evaluateRelease(r);
+  return r;
 }
 
 export function updateRelease(r: Release, body: { name: string; description: string }, by: User) {
@@ -1341,6 +1374,8 @@ function advanceRelease(r: Release) {
 export const conflictingReleases = new Set<string>();
 /** Repositories that only allow squash merges (no rebase, no merge commit). */
 export const squashOnlyRepos = new Set<string>();
+/** The checks on each release branch's pull request (`<repo>:<branch>`); none listed: no checks at all. */
+export const releaseChecks = new Map<string, Omit<ReleaseChecks, 'sha'>>();
 let nextReleasePr = 120;
 
 /** A ready release: open its pull request when complete, then check mergeability and the merge method. */
@@ -1355,9 +1390,21 @@ function evaluateRelease(r: Release) {
   if (r.prNumber) {
     r.mergeState = conflictingReleases.has(`${r.repo}:${r.branch}`) ? 'conflict' : 'clean';
     r.mergeMethod = squashOnlyRepos.has(r.repo) ? 'unavailable' : 'rebase';
+    const checks = releaseChecks.get(`${r.repo}:${r.branch}`) ?? { state: 'none', detail: 'No checks' };
+    r.checks = { ...checks, sha: `${r.name.length}f3a9c1e7b2d4${r.prNumber}`.slice(0, 40) };
   } else r.mergeState = 'unknown';
   r.notice = null;
   touchRelease(r);
+  // Automatic release: the same merge as an approval by the owner, once complete, clean and green; blockers wait.
+  if (r.mode !== 'automatic' || !complete || !r.prNumber || r.mergeState !== 'clean' || r.mergeMethod === 'unavailable') return;
+  if (r.checks?.state === 'failed') {
+    r.notice = `Checks failed on pull request #${r.prNumber} (${r.checks.detail}), so it is not released automatically. Fix the release branch or re-run the checks; the owner can also approve it by hand.`;
+    touchRelease(r);
+    return;
+  }
+  if (r.checks?.state !== 'none' && r.checks?.state !== 'passed') return;
+  const owner = r.owner && userNamed(r.owner.username);
+  if (owner) finishRelease(r, owner, true);
 }
 
 const slotTaken = () =>
@@ -1389,6 +1436,13 @@ export function approveRelease(r: Release, by: User) {
   if (r.mergeState === 'conflict') throw new MockError(409, 'release_conflict', `\`${r.branch}\` no longer merges cleanly into \`main\`. Nothing was merged.`);
   if (r.mergeMethod === 'unavailable')
     throw new MockError(409, 'release_merge_method_unavailable', 'This repository only allows squash merges. Allow rebase merging or merge commits in its GitHub settings to release.');
+  return finishRelease(r, by, false);
+}
+
+/** The merge and its clean-up, shared by an approval and an automatic release. */
+function finishRelease(r: Release, by: User, automatic: boolean) {
+  if (r.status !== 'ready') return r;
+  const merged = r.issues.filter((i) => i.state === 'merged');
   for (const it of merged) {
     const issue = db.issues[r.repo]?.find((i) => i.number === it.number);
     if (issue) issue.state = 'closed';
@@ -1400,6 +1454,7 @@ export function approveRelease(r: Release, by: User) {
     releasedAt: now,
     endedAt: now,
     releasedBy: ownerOf(by),
+    releasedAutomatically: automatic,
     mergeCommit: Array.from({ length: 40 }, (_, i) => '0123456789abcdef'[(i * 7 + r.name.length) % 16]).join(''),
     mergeState: 'clean',
     notice: null,
@@ -1757,12 +1812,15 @@ function seed() {
     });
     return r;
   };
-  // Ready, complete and clean: alice may approve it.
+  // Ready, complete and clean, its checks still running: alice may approve it (with a warning) or let them finish.
+  releaseChecks.set('web-shop:release/1.2', { state: 'pending', detail: 'Pending: e2e' });
   const ready = finished('1.2', 'Footer and receipt fixes.', alice, [[61, {}], [62, {}]], 300);
   advanceRelease(ready);
-  // Ready, but main moved on and the release branch conflicts.
+  // Ready, but main moved on and the release branch conflicts; set to release automatically, so it waits.
   conflictingReleases.add('web-shop:release/cart-fixes');
+  releaseChecks.set('web-shop:release/cart-fixes', { state: 'failed', detail: 'Failed: unit-tests' });
   const conflicting = finished('cart-fixes', '', alice, [[63, {}], [64, {}]], 500);
+  conflicting.mode = 'automatic';
   advanceRelease(conflicting);
   // Ready but incomplete: one issue is held (bob's release).
   const incomplete = finished('payments', 'MobilePay and refunds.', bob, [[65, {}], [66, { approver: 'ESCALATE' }]], 700);

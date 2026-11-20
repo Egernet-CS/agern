@@ -2,8 +2,10 @@ package dk.egernet.factory.pipeline
 
 import dk.egernet.factory.ApiException
 import dk.egernet.factory.Config
+import dk.egernet.factory.ReleaseChecksState
 import dk.egernet.factory.ReleaseMergeMethod
 import dk.egernet.factory.ReleaseMergeState
+import dk.egernet.factory.ReleaseMode
 import dk.egernet.factory.ReleaseStatus
 import dk.egernet.factory.agent.EventBus
 import dk.egernet.factory.agent.FeedItem
@@ -14,6 +16,7 @@ import dk.egernet.factory.db.ReleaseStore
 import dk.egernet.factory.db.UserRecord
 import dk.egernet.factory.db.UserStore
 import dk.egernet.factory.github.Access
+import dk.egernet.factory.github.ChecksSummary
 import dk.egernet.factory.github.GhPullInfo
 import dk.egernet.factory.github.GhRepo
 import dk.egernet.factory.github.GitHubClient
@@ -21,15 +24,31 @@ import dk.egernet.factory.github.GitHubException
 import dk.egernet.factory.notFound
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
 import java.security.MessageDigest
+import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Whether a project allows automatic releases (docs/ARCHITECTURE.md §6 "Release mode"). The seam for #24: a project
+ * that requires a human approval refuses automatic here, both when the mode is set and before an automatic merge.
+ * Until #24 exists every project allows it.
+ */
+fun interface ReleaseModePolicy {
+    fun allowsAutomatic(repo: String): Boolean
+
+    companion object {
+        val ALLOW_ALL = ReleaseModePolicy { true }
+    }
+}
 
 /** One mutex per release, shared by [ReleaseBuilder] and [ReleaseMerger]: every state change of a release is serialised. */
 class ReleaseLocks {
@@ -52,12 +71,23 @@ class ReleaseMerger(
     private val bus: EventBus,
     private val locks: ReleaseLocks,
     private val scope: CoroutineScope,
+    private val policy: ReleaseModePolicy = ReleaseModePolicy.ALLOW_ALL,
+    private val clock: java.time.Clock = java.time.Clock.systemUTC(),
 ) {
     private val log = LoggerFactory.getLogger(ReleaseMerger::class.java)
     private val org get() = cfg.githubOrg
 
     /** Pause between reads while GitHub is still computing mergeability (tests shorten it). */
     @Volatile var mergeablePollMillis = 1000L
+
+    /**
+     * How long a head commit must have had no checks before "no checks" counts as green
+     * (FACTORY_RELEASE_CHECKS_SETTLE_SECONDS; tests change it).
+     */
+    @Volatile var checksSettleSeconds = cfg.releaseChecksSettleSeconds
+
+    /** Interval of the periodic re-evaluation ([startTicker]); tests shorten it before starting the ticker. */
+    @Volatile var periodicMillis = 60_000L
 
     private suspend fun <T> io(block: () -> T): T = withContext(Dispatchers.IO) { block() }
 
@@ -78,22 +108,91 @@ class ReleaseMerger(
      */
     suspend fun evaluate(id: UUID, becameReady: Boolean = false) {
         try {
-            locks.of(id).withLock { evaluateLocked(id, becameReady) }
+            locks.of(id).withLock { evaluateLocked(id, becameReady, Trigger.EVENT) }
         } catch (e: Exception) {
             log.warn("Release {} could not be evaluated: {}", id, e.message)
         }
         publish(id)
     }
 
-    /** "Check again" by the owner ([owner] is the caller, already checked): [evaluate], answering the release. */
+    /** [evaluate] in the background (after a change whose caller should not wait for GitHub). */
+    fun evaluateLater(id: UUID) {
+        scope.launch { evaluate(id) }
+    }
+
+    /**
+     * "Check again" by the owner ([owner] is the caller, already checked): [evaluate], answering the release. An
+     * automatic release whose automatic merge GitHub refused for the current head commit is tried again.
+     */
     suspend fun check(owner: UserRecord, id: UUID): ReleaseRecord {
         locks.of(id).withLock {
             val r = current(id)
             if (r.status != ReleaseStatus.READY) throw notReady(r)
-            evaluateLocked(id, becameReady = false)
+            evaluateLocked(id, becameReady = false, Trigger.CHECK)
         }
         publish(id)
         return current(id)
+    }
+
+    /**
+     * Sets the release mode under the release's mutex, so no automatic merge starts after a switch to manual has
+     * returned. False when the release is finished. A `ready` release is re-evaluated afterwards (its pull request body
+     * names the mode; switched to automatic it may be merged at once). Permission checks are the caller's.
+     */
+    suspend fun setMode(id: UUID, mode: String): Boolean {
+        val changed = locks.of(id).withLock {
+            val ok = io { store.setMode(id, mode) }
+            // Switching to automatic is an explicit decision: an earlier refused automatic merge is tried again.
+            if (ok && mode == ReleaseMode.AUTOMATIC) io { store.setAutoMergeFailed(id, null) }
+            ok
+        }
+        if (!changed) return false
+        publish(id)
+        if (io { store.get(id) }?.status == ReleaseStatus.READY) evaluateLater(id)
+        return true
+    }
+
+    /**
+     * The periodic re-evaluation: every [periodicMillis], each `ready` release that is automatic (it may have become
+     * green: there is no webhook) or whose checks are pending (so the page shows when they finish). A release is only
+     * published when something changed. Runs in [scope], so stopping the services cancels it.
+     */
+    fun startTicker(): Job = scope.launch {
+        while (isActive) {
+            delay(periodicMillis)
+            try {
+                tick()
+            } catch (e: Exception) {
+                log.warn("Periodic release re-evaluation failed: {}", e.message)
+            }
+        }
+    }
+
+    /** One round of the periodic re-evaluation (see [startTicker]). */
+    suspend fun tick() {
+        for (id in io { store.periodicIds() }) {
+            try {
+                val (before, after) = locks.of(id).withLock {
+                    val b = io { store.get(id) }
+                    evaluateLocked(id, becameReady = false, Trigger.PERIODIC)
+                    b to io { store.get(id) }
+                }
+                if (before?.copy(updatedAt = Instant.EPOCH) != after?.copy(updatedAt = Instant.EPOCH)) publish(id)
+            } catch (e: Exception) {
+                log.warn("Release {} could not be re-evaluated: {}", id, e.message)
+            }
+        }
+    }
+
+    /** What started an evaluation: decides whether it may merge an automatic release. */
+    private enum class Trigger {
+        /** A state change, a restart or the periodic re-evaluation: may merge an automatic release. */
+        EVENT,
+        PERIODIC,
+        /** The owner's "Check again": may merge, and retries an automatic merge GitHub refused for the same commit. */
+        CHECK,
+        /** Inside an approval: never merges by itself (the approval does). */
+        APPROVAL,
     }
 
     /**
@@ -154,7 +253,7 @@ class ReleaseMerger(
 
     private suspend fun setNotice(id: UUID, notice: String?) = io { store.setNotice(id, notice?.take(2000)) }
 
-    private suspend fun evaluateLocked(id: UUID, becameReady: Boolean) {
+    private suspend fun evaluateLocked(id: UUID, becameReady: Boolean, trigger: Trigger) {
         val r = io { store.get(id) } ?: return
         if (r.status != ReleaseStatus.READY) return
         val owner = io { ownerOf(r) }
@@ -260,15 +359,121 @@ class ReleaseMerger(
         io { store.setMergeMethod(id, methodFor(repo)) }
         recordMergeState(withPr, state, client)
         setNotice(id, null)
+        val headSha = if (info != null && info.state == "open") info.head.sha.takeIf { it.isNotEmpty() } else null
+        val checks = headSha?.let { readChecks(withPr, client, it) }
 
         if (withPr.complete && state != ReleaseMergeState.CONFLICT && io { store.claimReadyAnnouncement(id) }) {
             bestEffort("comment on the release pull request") {
                 io {
                     client.comment(
                         org, withPr.repo, prNumber,
-                        "**Agern: release `${withPr.name}` is ready to release.** ${withPr.merged.size} issue(s) merged. " +
-                            "@${login(owner)} can approve it on ${pageUrl(withPr)} or with `/factory release approve ${withPr.name}`.",
+                        "**Agern: release `${withPr.name}` is ready to release.** ${withPr.merged.size} issue(s) merged. " + if (withPr.automatic) {
+                            "It is set to release automatically: Agern merges it for @${login(owner)} once it merges cleanly and all " +
+                                "checks on this pull request have passed. It can be switched to manual approval on ${pageUrl(withPr)}."
+                        } else {
+                            "@${login(owner)} can approve it on ${pageUrl(withPr)} or with `/factory release approve ${withPr.name}`."
+                        },
                     )
+                }
+            }
+        }
+        if (trigger != Trigger.APPROVAL && owner != null && headSha != null && checks != null) {
+            automaticLocked(id, owner, client, prNumber, state, headSha, checks, retry = trigger == Trigger.CHECK)
+        }
+    }
+
+    /**
+     * Reads and stores the checks on head commit [sha]; a read GitHub refuses is `unknown` with the reason. No checks
+     * on a head first seen less than [checksSettleSeconds] ago is `awaiting` (CI registers its checks some seconds after
+     * a push, so "none" right after opening the pull request or a new commit means nothing yet), not `none`.
+     */
+    private suspend fun readChecks(r: ReleaseRecord, client: GitHubClient, sha: String): ChecksSummary {
+        // The database keeps microseconds: compare at that precision, or a rounded-up "seen" lies after "now".
+        val now = clock.instant().truncatedTo(java.time.temporal.ChronoUnit.MICROS)
+        val seen = io { store.headSeenAt(r.id, sha, now) }
+        var summary = try {
+            io { ChecksSummary.of(client.combinedStatus(org, r.repo, sha), client.checkRuns(org, r.repo, sha)) }
+        } catch (e: GitHubException) {
+            ChecksSummary(ReleaseChecksState.UNKNOWN, "Could not read the checks: ${e.message}".take(500))
+        }
+        val settled = seen.plusSeconds(checksSettleSeconds)
+        if (summary.state == ReleaseChecksState.NONE && now.isBefore(settled)) {
+            summary = ChecksSummary(
+                ReleaseChecksState.AWAITING,
+                "No checks yet; waiting for them to appear until ${settled.truncatedTo(java.time.temporal.ChronoUnit.SECONDS)} " +
+                    "(after that, no checks counts as green)",
+            )
+        }
+        io { store.setChecks(r.id, summary.state, sha, summary.detail) }
+        return summary
+    }
+
+    /**
+     * Automatic release (docs/ARCHITECTURE.md §6 "Release mode"): merges the release exactly as an approval by its
+     * [owner] would — same token, method and clean-up — when it is automatic, complete, clean, has a usable method and
+     * its checks on [headSha] are green. Every blocker leaves it `ready`; nothing here overrides one. Decided by these
+     * rules alone, never by an agent.
+     */
+    private suspend fun automaticLocked(
+        id: UUID, owner: UserRecord, client: GitHubClient, pr: Int, state: String, headSha: String, checks: ChecksSummary, retry: Boolean,
+    ) {
+        val r = current(id)
+        if (r.status != ReleaseStatus.READY || !r.automatic || !r.complete) return
+        if (!policy.allowsAutomatic(r.repo)) {
+            setNotice(id, "This project requires a human approval: the release is not merged automatically. Approve it by hand.")
+            return
+        }
+        // A conflict has its own comment and banner; unknown mergeability (GitHub still computing) waits.
+        if (state != ReleaseMergeState.CLEAN) return
+        val method = r.mergeMethod?.takeIf { it == ReleaseMergeMethod.REBASE || it == ReleaseMergeMethod.MERGE } ?: return
+        when (checks.state) {
+            ReleaseChecksState.FAILED -> {
+                setNotice(
+                    id, "Checks failed on pull request #$pr (${checks.detail}), so it is not released automatically. Fix the " +
+                        "release branch or re-run the checks; the owner can also approve it by hand.",
+                )
+                if (io { store.claimChecksFailure(id, headSha) }) {
+                    bestEffort("comment on the failed checks") {
+                        io {
+                            client.comment(
+                                org, r.repo, pr,
+                                "**Agern:** checks failed on this release pull request (${checks.detail}). Release `${r.name}` is set " +
+                                    "to release automatically, so Agern will not merge it while a check fails. Fix the release branch or " +
+                                    "re-run the checks; @${login(owner)} can also approve it by hand on ${pageUrl(r)}",
+                            )
+                        }
+                    }
+                }
+                return
+            }
+            ReleaseChecksState.UNKNOWN -> {
+                setNotice(id, "${checks.detail} It is not released automatically until they can be read.")
+                return
+            }
+            !in ReleaseChecksState.GREEN -> return // pending: the periodic re-evaluation looks again
+        }
+        if (r.autoMergeFailedSha == headSha && !retry) {
+            setNotice(
+                id, "GitHub refused the automatic merge of the release branch's current commit; Agern does not try it again " +
+                    "for this commit. Use \"Check again\" to retry, or approve it.",
+            )
+            return
+        }
+        log.info("Release {} is ready, clean and green: merging it automatically for {}", id, owner.username)
+        try {
+            mergeLocked(owner, r, pr, method, headSha, client, automatic = true)
+        } catch (e: ApiException) {
+            io { store.setAutoMergeFailed(id, headSha) }
+            log.warn("Release {}: the automatic merge was refused: {}", id, e.message)
+            if (e.code != "release_conflict") {
+                bestEffort("comment on the refused automatic merge") {
+                    io {
+                        client.comment(
+                            org, r.repo, pr,
+                            "**Agern:** merging release `${r.name}` automatically failed: ${e.message} Agern will not try again for " +
+                                "this commit; @${login(owner)} can use \"Check again\" or approve it on ${pageUrl(r)}",
+                        )
+                    }
                 }
             }
         }
@@ -327,10 +532,17 @@ class ReleaseMerger(
             if (r.merged.isEmpty()) append("(none merged yet)\n")
             if (r.held.isNotEmpty()) append("\nHeld (not in the release branch yet): ${r.held.joinToString(", ") { "#${it.number}" }}\n")
             if (r.skipped.isNotEmpty()) append("\nNot included (skipped): ${r.skipped.joinToString(", ") { "#${it.number}" }}\n")
-            append(
-                "\nApproved and merged from Agern by the release owner: ${pageUrl(r)}. " +
-                    "Each issue stays one commit on `$target`.\n",
-            )
+            if (r.automatic) {
+                append(
+                    "\nRelease mode: **automatic**. Agern merges this pull request for the release owner once it merges cleanly and " +
+                        "all checks on it have passed: ${pageUrl(r)}. Each issue stays one commit on `$target`.\n",
+                )
+            } else {
+                append(
+                    "\nRelease mode: **manual**. Approved and merged from Agern by the release owner: ${pageUrl(r)}. " +
+                        "Each issue stays one commit on `$target`.\n",
+                )
+            }
         }
         return "Release ${r.name}" to body
     }
@@ -354,7 +566,7 @@ class ReleaseMerger(
         if (r.merged.isEmpty()) throw conflict("Nothing was merged into the release branch, so there is nothing to release.", "release_empty")
         val client = access.client(owner) ?: throw dk.egernet.factory.unprocessable("Register a GitHub token in Settings first", "github_token_missing")
 
-        evaluateLocked(id, becameReady = false)
+        evaluateLocked(id, becameReady = false, Trigger.APPROVAL)
         val now = current(id)
         if (now.status == ReleaseStatus.RELEASED) return // it had been merged on GitHub; the check finished it
         if (now.status != ReleaseStatus.READY) throw notReady(now)
@@ -375,17 +587,26 @@ class ReleaseMerger(
             recordMergeState(now, ReleaseMergeState.CONFLICT, client)
             throw conflict(conflictMsg, "release_conflict")
         }
+        mergeLocked(owner, now, pr, method, head?.head?.sha?.takeIf { it.isNotEmpty() }, client, automatic = false)
+    }
+
+    /**
+     * The merge itself, shared by an approval and an automatic release: [method] (never squash), refused by GitHub if
+     * the head moved from [headSha], then [finishLocked]. A refusal throws the [ApiException] an approval answers.
+     */
+    private suspend fun mergeLocked(
+        owner: UserRecord, now: ReleaseRecord, pr: Int, method: String, headSha: String?, client: GitHubClient, automatic: Boolean,
+    ) {
         val sha = try {
             io {
                 client.mergePull(
-                    org, now.repo, pr, method, if (method == ReleaseMergeMethod.MERGE) "Release ${now.name} (#$pr)" else null,
-                    head?.head?.sha?.takeIf { it.isNotEmpty() },
+                    org, now.repo, pr, method, if (method == ReleaseMergeMethod.MERGE) "Release ${now.name} (#$pr)" else null, headSha,
                 )
             }
         } catch (e: GitHubException) {
             throw mergeRefused(now, pr, method, e, client)
         }
-        finishLocked(id, method, sha, owner)
+        finishLocked(now.id, method, sha, owner, automatic)
     }
 
     private fun methodUnavailable(msg: String) = conflict(msg, "release_merge_method_unavailable")
@@ -417,9 +638,16 @@ class ReleaseMerger(
     // ------------------------------------------------------------ after the merge
 
     /** `ready` → `released` (once), then [cleanupLocked]. */
-    private suspend fun finishLocked(id: UUID, method: String?, sha: String?, by: UserRecord?) {
-        if (!io { store.markReleased(id, method, sha, by?.id) }) return
-        log.info("Release {} was merged into the default branch{}", id, if (by == null) " on GitHub" else " by ${by.username}")
+    private suspend fun finishLocked(id: UUID, method: String?, sha: String?, by: UserRecord?, automatic: Boolean = false) {
+        if (!io { store.markReleased(id, method, sha, by?.id, automatic) }) return
+        log.info(
+            "Release {} was merged into the default branch{}", id,
+            when {
+                by == null -> " on GitHub"
+                automatic -> " automatically for ${by.username}"
+                else -> " by ${by.username}"
+            },
+        )
         cleanupLocked(id)
     }
 
@@ -445,7 +673,12 @@ class ReleaseMerger(
             else -> "merged into `$target`"
         }
         val commit = r.mergeSha?.let { " (`$target` at $it)" } ?: ""
-        val approval = r.releasedByUsername?.let { u -> " Approved by @${r.releasedById?.let { users.byId(it) }?.githubLogin ?: u}." } ?: " It was merged on GitHub."
+        val releaser = r.releasedByUsername?.let { u -> r.releasedById?.let { users.byId(it) }?.githubLogin ?: u }
+        val approval = when {
+            releaser == null -> " It was merged on GitHub."
+            r.releasedAutomatically -> " Released automatically by Agern for @$releaser (the release was set to automatic)."
+            else -> " Approved by @$releaser."
+        }
         for (i in r.merged) {
             try {
                 io {

@@ -5,7 +5,10 @@ import dk.egernet.factory.OwnerDto
 import dk.egernet.factory.ReleaseDto
 import dk.egernet.factory.ReleaseIssueDto
 import dk.egernet.factory.ReleaseIssueState
+import dk.egernet.factory.ReleaseChecksDto
+import dk.egernet.factory.ReleaseChecksState
 import dk.egernet.factory.ReleaseMergeState
+import dk.egernet.factory.ReleaseMode
 import dk.egernet.factory.ReleasePauseDto
 import dk.egernet.factory.ReleaseStartFailureDto
 import dk.egernet.factory.ReleaseStatus
@@ -42,7 +45,12 @@ data class ReleaseRecord(
     val readyAt: Instant? = null, val readyAnnounced: Boolean = false,
     val releasedAt: Instant? = null, val releasedById: UUID? = null, val releasedByUsername: String? = null,
     val releasedByDisplayName: String? = null, val mergeSha: String? = null, val cleanupPending: Boolean = false,
+    val mode: String = ReleaseMode.MANUAL, val releasedAutomatically: Boolean = false,
+    val checksState: String = ReleaseChecksState.UNKNOWN, val checksSha: String? = null, val checksDetail: String? = null,
+    val checksFailureSha: String? = null, val autoMergeFailedSha: String? = null,
 ) {
+    val automatic: Boolean get() = mode == ReleaseMode.AUTOMATIC
+
     val started: Boolean get() = status in ReleaseStatus.STARTED
 
     val merged: List<ReleaseIssueRecord> get() = issues.filter { it.state == ReleaseIssueState.MERGED }
@@ -71,6 +79,8 @@ data class ReleaseRecord(
         notice = notice, readyAt = readyAt?.iso(), releasedAt = releasedAt?.iso(),
         releasedBy = if (releasedById != null && releasedByUsername != null) OwnerDto(releasedByUsername, releasedByDisplayName ?: releasedByUsername) else null,
         mergeCommit = mergeSha,
+        mode = mode, releasedAutomatically = releasedAutomatically,
+        checks = if (prNumber != null || checksSha != null) ReleaseChecksDto(checksState, checksDetail, checksSha) else null,
     )
 }
 
@@ -127,6 +137,9 @@ class ReleaseStore(private val db: Db) {
         releasedAt = rs.instantOrNull("released_at"), releasedById = rs.uuidOrNull("released_by"),
         releasedByUsername = rs.getString("released_by_username"), releasedByDisplayName = rs.getString("released_by_display_name"),
         mergeSha = rs.getString("merge_sha"), cleanupPending = rs.getBoolean("cleanup_pending"),
+        mode = rs.getString("release_mode"), releasedAutomatically = rs.getBoolean("released_automatically"),
+        checksState = rs.getString("checks_state"), checksSha = rs.getString("checks_sha"), checksDetail = rs.getString("checks_detail"),
+        checksFailureSha = rs.getString("checks_failure_sha"), autoMergeFailedSha = rs.getString("auto_merge_failed_sha"),
     )
 
     private fun mapIssue(rs: ResultSet) = ReleaseIssueRecord(
@@ -159,12 +172,12 @@ class ReleaseStore(private val db: Db) {
         throw e
     }
 
-    fun create(repo: String, name: String, description: String, createdBy: UUID): ReleaseRecord {
+    fun create(repo: String, name: String, description: String, createdBy: UUID, mode: String = ReleaseMode.MANUAL): ReleaseRecord {
         val id = UUID.randomUUID()
         uniqueName(name) {
             db.update(
-                "INSERT INTO releases(id, repo, name, description, status, created_by) VALUES (?, ?, ?, ?, ?, ?)",
-                id, repo, name, description, ReleaseStatus.PLANNING, createdBy,
+                "INSERT INTO releases(id, repo, name, description, status, created_by, release_mode) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                id, repo, name, description, ReleaseStatus.PLANNING, createdBy, mode,
             )
         }
         return get(id)!!
@@ -270,14 +283,52 @@ class ReleaseStore(private val db: Db) {
     )
 
     fun setPull(id: UUID, number: Int, url: String, bodySha: String, targetBranch: String) = db.update(
-        "UPDATE releases SET pr_number = ?, pr_url = ?, pr_body_sha = ?, target_branch = ?, merge_state = 'unknown' WHERE id = ?",
+        """UPDATE releases SET pr_number = ?, pr_url = ?, pr_body_sha = ?, target_branch = ?, merge_state = 'unknown',
+           checks_state = 'unknown', checks_sha = NULL, checks_detail = NULL, checks_head_seen_at = NULL WHERE id = ?""",
         number, url, bodySha, targetBranch, id,
     )
 
     /** Forgets a release pull request that was closed on GitHub without being merged. */
     fun clearPull(id: UUID) = db.update(
-        "UPDATE releases SET pr_number = NULL, pr_url = NULL, pr_body_sha = NULL, merge_state = 'unknown', ready_announced = false WHERE id = ?", id,
+        """UPDATE releases SET pr_number = NULL, pr_url = NULL, pr_body_sha = NULL, merge_state = 'unknown', ready_announced = false,
+           checks_state = 'unknown', checks_sha = NULL, checks_detail = NULL, checks_head_seen_at = NULL WHERE id = ?""", id,
     )
+
+    /**
+     * Sets the release mode while the release is not finished; false when it is `released` or `cancelled` (or gone).
+     * Callers hold the release's mutex, so an automatic merge never starts after a switch to manual has returned.
+     */
+    fun setMode(id: UUID, mode: String): Boolean = db.update(
+        "UPDATE releases SET release_mode = ? WHERE id = ? AND status NOT IN ('released', 'cancelled')", mode, id,
+    ) == 1
+
+    /** The checks on the pull request's head commit [sha] as last read; true when the state or detail changed. */
+    fun setChecks(id: UUID, state: String, sha: String?, detail: String?): Boolean = db.update(
+        """UPDATE releases SET checks_state = ?, checks_sha = ?, checks_detail = ? WHERE id = ?
+           AND (checks_state <> ? OR checks_sha IS DISTINCT FROM ? OR checks_detail IS DISTINCT FROM ?)""",
+        state, sha, detail, id, state, sha, detail,
+    ) == 1
+
+    /**
+     * When Agern first saw [sha] as the release pull request's head: recorded as [now] the first time (a new head, or a
+     * new pull request, starts again), so the settle period survives restarts.
+     */
+    fun headSeenAt(id: UUID, sha: String, now: Instant): Instant {
+        db.update(
+            """UPDATE releases SET checks_sha = ?, checks_head_seen_at = ? WHERE id = ?
+               AND (checks_sha IS DISTINCT FROM ? OR checks_head_seen_at IS NULL)""",
+            sha, now, id, sha,
+        )
+        return db.queryOne("SELECT checks_head_seen_at FROM releases WHERE id = ?", id) { it.instantOrNull("checks_head_seen_at") } ?: now
+    }
+
+    /** Claims the one "checks failed" comment for head commit [sha]; true for exactly one caller per commit. */
+    fun claimChecksFailure(id: UUID, sha: String): Boolean = db.update(
+        "UPDATE releases SET checks_failure_sha = ? WHERE id = ? AND checks_failure_sha IS DISTINCT FROM ?", sha, id, sha,
+    ) == 1
+
+    /** Records that an automatic merge of head commit [sha] was refused (it is not tried again for that commit). */
+    fun setAutoMergeFailed(id: UUID, sha: String?) = db.update("UPDATE releases SET auto_merge_failed_sha = ? WHERE id = ?", sha, id)
 
     fun setPullBody(id: UUID, bodySha: String) = db.update("UPDATE releases SET pr_body_sha = ? WHERE id = ?", bodySha, id)
 
@@ -299,11 +350,12 @@ class ReleaseStore(private val db: Db) {
      * `ready` → `released` after the merge: true for exactly one caller, who then closes the issues and deletes the
      * branch ([cleanupPending] until [finishCleanup]). [by] is null when the pull request was merged on GitHub.
      */
-    fun markReleased(id: UUID, method: String?, sha: String?, by: UUID?): Boolean = db.update(
+    fun markReleased(id: UUID, method: String?, sha: String?, by: UUID?, automatic: Boolean = false): Boolean = db.update(
         """UPDATE releases SET status = 'released', released_at = now(), ended_at = now(), released_by = CAST(? AS uuid),
+           released_automatically = ?,
            merge_method = COALESCE(CAST(? AS text), merge_method), merge_sha = ?, merge_state = 'clean', notice = NULL, cleanup_pending = true
            WHERE id = ? AND status = 'ready'""",
-        by, method, sha, id,
+        by, automatic, method, sha, id,
     ) == 1
 
     fun finishCleanup(id: UUID, notice: String?) =
@@ -311,6 +363,14 @@ class ReleaseStore(private val db: Db) {
 
     /** Ids of `ready` releases (re-checked after a restart). */
     fun readyIds(): List<UUID> = db.query("SELECT id FROM releases WHERE status = 'ready'") { it.uuid("id") }
+
+    /**
+     * Ids of the `ready` releases the periodic re-evaluation looks at: every automatic one (it may become green), and
+     * manual ones whose checks are pending (so the release page shows when they finish).
+     */
+    fun periodicIds(): List<UUID> = db.query(
+        "SELECT id FROM releases WHERE status = 'ready' AND (release_mode = 'automatic' OR checks_state IN ('pending', 'awaiting')) ORDER BY ready_at, id",
+    ) { it.uuid("id") }
 
     /** Ids of released releases whose clean-up did not finish (a restart in between). */
     fun cleanupPending(): List<UUID> =

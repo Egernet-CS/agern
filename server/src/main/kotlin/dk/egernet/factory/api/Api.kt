@@ -92,7 +92,8 @@ private val log = LoggerFactory.getLogger("dk.egernet.factory.api")
 @Serializable data class GithubTokenReq(val token: String)
 @Serializable data class CreateIssueReq(val title: String, val body: String = "", val kind: String = "task")
 @Serializable data class CreateRunReq(val issueNumber: Int)
-@Serializable data class CreateReleaseReq(val name: String, val description: String = "")
+@Serializable data class CreateReleaseReq(val name: String, val description: String = "", val mode: String? = null)
+@Serializable data class ReleaseModeReq(val mode: String? = null)
 @Serializable data class UpdateReleaseReq(val name: String, val description: String = "")
 @Serializable data class ScheduleReq(val startAt: String)
 @Serializable data class AssignReq(val issueNumbers: List<Int>, val releaseId: String? = null)
@@ -452,7 +453,7 @@ private fun Route.releaseRoutes(s: Services) {
     post("/projects/{repo}/releases") {
         val u = call.requireUser(s)
         val req = call.receive<CreateReleaseReq>()
-        call.respond(HttpStatusCode.Created, s.releases.create(u, repoParam(), req.name, req.description).toDto())
+        call.respond(HttpStatusCode.Created, s.releases.create(u, repoParam(), req.name, req.description, req.mode).toDto())
     }
     post("/projects/{repo}/releases/assign") {
         val u = call.requireUser(s)
@@ -508,6 +509,13 @@ private fun Route.releaseRoutes(s: Services) {
     post("/releases/{id}/approve") {
         val u = call.requireUser(s)
         call.respond(s.releases.approve(u, uuidParam("id")).toDto())
+    }
+    // Release mode (docs/ARCHITECTURE.md §6 "Release mode"): manual or automatic, until the release is finished.
+    put("/releases/{id}/mode") {
+        val u = call.requireUser(s)
+        val id = uuidParam("id")
+        val req = call.receive<ReleaseModeReq>()
+        call.respond(s.releases.setMode(u, id, req.mode).toDto())
     }
     post("/releases/{id}/check") {
         val u = call.requireUser(s)

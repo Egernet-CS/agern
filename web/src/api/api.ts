@@ -14,6 +14,7 @@ import type {
   IssueKind,
   Project,
   Release,
+  ReleaseMode,
   Run,
   RunStatus,
   PendingSandbox,
@@ -65,7 +66,7 @@ export interface Api {
   releases(repo: string): Promise<Release[]>;
   release(id: string): Promise<Release>;
   /** 400 invalid name or description, 409 `release_name_taken`. */
-  createRelease(repo: string, body: { name: string; description: string }): Promise<Release>;
+  createRelease(repo: string, body: { name: string; description: string; mode?: ReleaseMode }): Promise<Release>;
   updateRelease(id: string, body: { name: string; description: string }): Promise<Release>;
   /** Removes the plan only; the issues are untouched. */
   deleteRelease(id: string): Promise<void>;
@@ -98,6 +99,11 @@ export interface Api {
   approveRelease(id: string): Promise<Release>;
   /** Owner only: "Check again" — re-reads (or opens) the release pull request and its mergeability. 409 `release_not_ready`. */
   checkRelease(id: string): Promise<Release>;
+  /**
+   * Manual or automatic release. Planned: anyone who can see the project; scheduled or started: automatic is the owner's
+   * alone, manual also an admin's (403 otherwise). 409 `release_not_editable` (released) / `release_closed` (cancelled).
+   */
+  setReleaseMode(id: string, mode: ReleaseMode): Promise<Release>;
   /**
    * Sets (caller becomes the owner) or changes (owner or admin) the scheduled start; `startAt` is an ISO instant.
    * 400 past or more than a year ahead, 422 `claude_credential_required`, 403 not owner/admin, 409 `release_not_schedulable`.

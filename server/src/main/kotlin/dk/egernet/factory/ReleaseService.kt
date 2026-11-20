@@ -13,6 +13,7 @@ import dk.egernet.factory.github.Access
 import dk.egernet.factory.github.GitHubException
 import dk.egernet.factory.pipeline.ReleaseBuilder
 import dk.egernet.factory.pipeline.ReleaseMerger
+import dk.egernet.factory.pipeline.ReleaseModePolicy
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.time.Instant
@@ -34,6 +35,7 @@ class ReleaseService(
     private val builder: ReleaseBuilder,
     private val scheduler: ReleaseScheduler,
     private val merger: ReleaseMerger,
+    private val modePolicy: ReleaseModePolicy = ReleaseModePolicy.ALLOW_ALL,
 ) {
     companion object {
         /** Safe as the git branch `release/<name>` and in URLs. */
@@ -47,6 +49,12 @@ class ReleaseService(
             val name = raw.trim()
             if (!NAME_RE.matches(name) || name.contains("..") || name.endsWith(".") || name.endsWith(".lock")) throw badRequest(NAME_RULE)
             return name
+        }
+
+        fun validMode(raw: String?): String {
+            val m = raw?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return ReleaseMode.MANUAL
+            if (m !in ReleaseMode.ALL) throw badRequest("The release mode must be \"manual\" or \"automatic\"")
+            return m
         }
 
         fun validDescription(raw: String): String {
@@ -117,11 +125,13 @@ class ReleaseService(
         )
     }
 
-    suspend fun create(user: UserRecord, repo: String, name: String, description: String): ReleaseRecord {
+    suspend fun create(user: UserRecord, repo: String, name: String, description: String, mode: String? = null): ReleaseRecord {
         requireVisible(user, repo)
         val n = validName(name)
         val d = validDescription(description)
-        val r = io { store.create(repo, n, d, user.id) }
+        val m = validMode(mode)
+        if (m == ReleaseMode.AUTOMATIC) requireAutomaticAllowed(repo)
+        val r = io { store.create(repo, n, d, user.id, m) }
         bus.emitFeed(FeedItem.Release(r.toDto()))
         return r
     }
@@ -158,6 +168,41 @@ class ReleaseService(
             if (now == ReleaseStatus.SCHEDULED) throw scheduled
             if (now in ReleaseStatus.ACTIVE || now == ReleaseStatus.READY) throw active
         }
+    }
+
+    /**
+     * The seam for #24: a project that requires a human approval refuses automatic releases (409
+     * `release_mode_not_allowed`). Every project allows them until #24 adds that setting.
+     */
+    private fun requireAutomaticAllowed(repo: String) {
+        if (!modePolicy.allowsAutomatic(repo)) {
+            throw conflict("This project requires a human approval; its releases cannot be released automatically.", "release_mode_not_allowed")
+        }
+    }
+
+    /**
+     * Sets the release mode (docs/ARCHITECTURE.md §6 "Release mode"). Planned (`planning`): anyone who can see the
+     * project, as for every part of the plan — whoever starts it sees the mode and starts it with their own token.
+     * Scheduled or started: switching to automatic is for the owner only (it merges with the owner's token); switching
+     * back to manual is for the owner or an admin (it only stops something). `released`: 409 `release_not_editable`;
+     * `cancelled`: 409 `release_closed`. Never offered to agents: there is no MCP tool for it.
+     */
+    suspend fun setMode(user: UserRecord, id: UUID, rawMode: String?): ReleaseRecord {
+        val r = visible(user, id)
+        val mode = validMode(rawMode ?: throw badRequest("mode is required"))
+        if (r.status == ReleaseStatus.RELEASED) throw releasedNotEditable(r.name)
+        if (r.status == ReleaseStatus.CANCELLED) throw conflict("The release is cancelled", "release_closed")
+        if (r.status != ReleaseStatus.PLANNING) {
+            if (mode == ReleaseMode.AUTOMATIC) requireOwner(user, r) else requireOwnerOrAdmin(user, r)
+        }
+        if (mode == ReleaseMode.AUTOMATIC) requireAutomaticAllowed(r.repo)
+        if (r.mode == mode) return r
+        if (!merger.setMode(id, mode)) {
+            val now = io { store.get(id) } ?: throw notFound("Release not found")
+            if (now.status == ReleaseStatus.RELEASED) throw releasedNotEditable(now.name)
+            throw conflict("The release is cancelled", "release_closed")
+        }
+        return io { store.get(id) } ?: throw notFound("Release not found")
     }
 
     // ------------------------------------------------------------ building
@@ -363,6 +408,8 @@ class ReleaseService(
                     r.prUrl?.let { append(", pull request $it") }
                     r.releasedAt?.let { append(", released $it") }
                 }
+                if (r.automatic && r.status !in ReleaseStatus.FINISHED) append(", releases automatically when ready")
+                if (r.status == ReleaseStatus.RELEASED && r.releasedAutomatically) append(", released automatically")
                 if (withIds) append(" (id ${r.id})")
                 r.notice?.takeIf { r.status == ReleaseStatus.READY || r.status == ReleaseStatus.RELEASED }?.let { append("\n    Notice: $it") }
                 if (r.status == ReleaseStatus.PAUSED) r.pauseNote?.let { append("\n    Paused: $it") }

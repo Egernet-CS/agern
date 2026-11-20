@@ -97,6 +97,66 @@ data class GhPullInfo(
     @SerialName("merge_commit_sha") val mergeCommitSha: String? = null,
 )
 
+/** One commit status (`GET /repos/{o}/{r}/commits/{ref}/status`, the latest per context): [state] is `success`, `pending`, `failure` or `error`. */
+@Serializable data class GhCommitStatus(val context: String = "", val state: String = "pending")
+
+/** The combined commit status. GitHub answers `state: pending` with [totalCount] 0 when there are no statuses at all. */
+@Serializable
+data class GhCombinedStatus(
+    val state: String = "pending",
+    @SerialName("total_count") val totalCount: Int = 0,
+    val statuses: List<GhCommitStatus> = emptyList(),
+)
+
+/**
+ * One check run (GitHub Actions and other apps). [status] is `queued`, `in_progress`, `completed` (or `waiting`,
+ * `requested`, `pending`); once completed, [conclusion] is `success`, `neutral`, `skipped`, `failure`, `cancelled`,
+ * `timed_out`, `action_required` or `stale`.
+ */
+@Serializable data class GhCheckRun(val name: String = "", val status: String = "queued", val conclusion: String? = null)
+
+@Serializable
+private data class GhCheckRunPage(@SerialName("total_count") val totalCount: Int = 0, @SerialName("check_runs") val checkRuns: List<GhCheckRun> = emptyList())
+
+/** What the checks on one commit add up to (docs/ARCHITECTURE.md §6 "Releasing", "Checks"). */
+data class ChecksSummary(val state: String, val detail: String) {
+    companion object {
+        private val PASSING_CONCLUSIONS = setOf("success", "neutral", "skipped")
+
+        /**
+         * `failed` if any status is `failure`/`error` or any completed check run did not pass; else `pending` if any
+         * status is `pending` or any check run is not completed; else `passed`, or `none` when there are no checks.
+         */
+        fun of(status: GhCombinedStatus, runs: List<GhCheckRun>): ChecksSummary {
+            val failing = mutableListOf<String>()
+            val pending = mutableListOf<String>()
+            var passed = 0
+            for (st in status.statuses) when (st.state) {
+                "success" -> passed++
+                "failure", "error" -> failing += st.context
+                else -> pending += st.context
+            }
+            for (run in runs) when {
+                run.status != "completed" -> pending += run.name
+                run.conclusion in PASSING_CONCLUSIONS -> passed++
+                else -> failing += run.name
+            }
+            // More statuses than were listed: the combined state still covers them.
+            if (status.totalCount > status.statuses.size) when (status.state) {
+                "failure", "error" -> if (failing.isEmpty()) failing += "commit status"
+                "pending" -> if (pending.isEmpty()) pending += "commit status"
+            }
+            fun names(l: List<String>) = l.distinct().joinToString(", ").take(500)
+            return when {
+                failing.isNotEmpty() -> ChecksSummary("failed", "Failed: ${names(failing)}")
+                pending.isNotEmpty() -> ChecksSummary("pending", "Pending: ${names(pending)}")
+                passed == 0 -> ChecksSummary("none", "No checks")
+                else -> ChecksSummary("passed", "$passed check${if (passed == 1) "" else "s"} passed")
+            }
+        }
+    }
+}
+
 /** Everything the factory needs from GitHub, always acting with one user's token. */
 interface GitHubClient {
     fun currentUser(): GhUser
@@ -133,6 +193,10 @@ interface GitHubClient {
     fun mergePull(org: String, repo: String, number: Int, method: String, commitTitle: String?, expectedHeadSha: String?): String?
     /** Deletes [branch]. A branch that does not exist is not an error. */
     fun deleteBranch(org: String, repo: String, branch: String)
+    /** The combined commit status of [sha] (the latest status per context). */
+    fun combinedStatus(org: String, repo: String, sha: String): GhCombinedStatus
+    /** The latest check runs of [sha] (at most a few hundred). */
+    fun checkRuns(org: String, repo: String, sha: String): List<GhCheckRun>
 }
 
 /** The merge methods [GitHubClient.mergePull] accepts: never `squash`. */
@@ -311,6 +375,25 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
             // Already gone: 404, or 422 "Reference does not exist".
             if (r.statusCode() == 404 || (r.statusCode() == 422 && r.body().contains("Reference does not exist"))) return
             ok(r, "delete branch")
+        }
+
+        override fun combinedStatus(org: String, repo: String, sha: String): GhCombinedStatus {
+            // per_page caps the statuses listed; the combined state itself covers every context.
+            val r = send("GET", "/repos/${enc(org)}/${enc(repo)}/commits/${enc(sha)}/status?per_page=100")
+            return AppJson.decodeFromString(GhCombinedStatus.serializer(), ok(r, "GET commit status"))
+        }
+
+        override fun checkRuns(org: String, repo: String, sha: String): List<GhCheckRun> {
+            val out = mutableListOf<GhCheckRun>()
+            var page = 1
+            while (page <= 5) {
+                val r = send("GET", "/repos/${enc(org)}/${enc(repo)}/commits/${enc(sha)}/check-runs?filter=latest&per_page=100&page=$page")
+                val p = AppJson.decodeFromString(GhCheckRunPage.serializer(), ok(r, "GET check runs"))
+                out += p.checkRuns
+                if (p.checkRuns.isEmpty() || out.size >= p.totalCount) break
+                page++
+            }
+            return out
         }
     }
 }

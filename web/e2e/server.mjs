@@ -95,6 +95,8 @@ export async function startServer({ log = false } = {}) {
     // GitHub's default branches (e.g. .agern/sandbox.yml, written by the sandbox spec).
     FACTORY_SANDBOX: 'fake',
     FACTORY_WEB_DIR: webDir,
+    // The fake GitHub has no CI that registers checks late: "no checks" is green at once (the default waits 120 s).
+    FACTORY_RELEASE_CHECKS_SETTLE_SECONDS: '0',
   };
   const proc = spawn(serverBin, [], { env, stdio: log ? 'inherit' : ['ignore', 'pipe', 'pipe'] });
   let output = '';
