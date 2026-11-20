@@ -573,9 +573,10 @@ builds it unattended on the branch `release/<name>`: one issue at a time, each r
 into the release branch, without closing its issue. When nothing is left to build the release is **ready to
 release**: Agern opens one pull request from `release/<name>` to the default branch, and its owner approves it,
 which merges it so that each issue stays one commit, closes the issues and deletes the branch ("Releasing" below).
-Delivered in steps (issue #13): planning (#17), starting and building (#19), scheduled starts (#21, "Scheduled
-start" below), the release pull request, approval and merge (#20). Single runs are unaffected and still merge into
-the default branch.
+A release set to **automatic** is merged the same way without the approval, once it is complete, clean and its
+checks are green ("Release mode" below). Delivered in steps (issue #13): planning (#17), starting and building
+(#19), scheduled starts (#21, "Scheduled start" below), the release pull request, approval and merge (#20), and the
+release mode (#41). Single runs are unaffected and still merge into the default branch.
 
 - **Model.** Tables `releases` (`id`, `repo`, `name`, `description`, `status`, `created_by`, timestamps; once
   started also `owner_id`, `branch`, `started_at`, `ended_at`, and while paused `pause_reason`, `pause_note`,
@@ -583,7 +584,9 @@ the default branch.
   (`ON DELETE SET NULL`), `start_failed_at`, `start_failed_owner`, `start_failed_reason`, with the partial index
   `releases_due` on `scheduled_at` for `status = 'scheduled'`; migrations V7 and V8; for releasing (V10) `pr_number`,
   `pr_url`, `pr_body_sha`, `target_branch`, `merge_state`, `merge_method`, `notice`, `ready_at`, `ready_announced`,
-  `released_at`, `released_by`, `merge_sha`, `cleanup_pending`) and `release_issues` (`release_id`, `repo`, `issue_number`, `position`, `issue_title`, `issue_kind`,
+  `released_at`, `released_by`, `merge_sha`, `cleanup_pending`; for the release mode (V11) `release_mode` (`manual` |
+  `automatic`, checked), `released_automatically`, `checks_state`, `checks_sha`, `checks_detail`, `checks_failure_sha`,
+  `auto_merge_failed_sha`) and `release_issues` (`release_id`, `repo`, `issue_number`, `position`, `issue_title`, `issue_kind`,
   `added_by`, `added_at`, `state`, `run_id` = the issue's latest release run, `note`). `runs` carry `release_id`
   (`ON DELETE SET NULL`) and `base_branch` (null = the default branch). Several releases may exist per project.
   Creating one creates no branch, no run and makes no GitHub write.
@@ -605,7 +608,7 @@ the default branch.
      │ nothing left to build
      ▼
   ready ──(an issue added or retried)──▶ building
-     │ owner approves (or the pull request was merged on GitHub)
+     │ owner approves, or automatic and green (or the pull request was merged on GitHub)
      ▼
   released
   ```
@@ -645,6 +648,9 @@ the default branch.
   | started | pause, cancel, take an issue out, edit the description | owner or admin |
   | started | resume, add issues, reorder, retry an issue | owner only |
   | `ready` | check again, approve and release | owner only |
+  | `planning` | release mode (manual ⇄ automatic) | anyone who can see the project |
+  | `scheduled`, started | release mode → automatic | owner only |
+  | `scheduled`, started | release mode → manual | owner or admin |
   | `cancelled` | delete | owner or admin |
   | `released` | nothing (read-only history) | — |
 
@@ -765,7 +771,7 @@ the default branch.
   A run that failed in the instant before a restart, before its outcome was recorded, is rebuilt rather than held.
   A `building` release found with nothing left to build becomes `ready`. Every `ready` release is re-evaluated (its
   pull request opened if that had failed or not happened yet, reconciled with GitHub — merged there while the
-  server was down finishes the release — and checked), and a `released` release whose clean-up did not finish
+  server was down finishes the release — and checked; an automatic one that is now green is merged), and a `released` release whose clean-up did not finish
   (`cleanup_pending`) is cleaned up again; closing skips issues that are already closed, so nothing is posted twice.
 - **Deleting** a release in preparation removes the plan and its assignments only; the issues stay open on GitHub.
   A `scheduled` release cannot be deleted (409 `release_scheduled`, "Cancel the scheduled start before deleting
@@ -807,12 +813,17 @@ the default branch.
   @<owner's GitHub login>.", the description as written, "## Issues" with one line per merged issue in build order
   ("- #n <title> (pull request #p)"), "Held (not in the release branch yet): …" and "Not included (skipped): …" when
   there are any, and "Approved and merged from Agern by the release owner: <release page URL>. Each issue stays one
-  commit on `<default branch>`." It contains no closing keyword ("Closes", "Fixes"): Agern closes the issues itself,
-  only after the merge. It is never merged automatically. Stored as `prNumber`/`prUrl`.
+  commit on `<default branch>`." — preceded by "Release mode: **manual**." — or, for an automatic release, "Release
+  mode: **automatic**. Agern merges this pull request for the release owner once it merges cleanly and all checks on
+  it have passed: <release page URL>. Each issue stays one commit on `<default branch>`." Changing the mode rewrites
+  the body. It contains no closing keyword ("Closes", "Fixes"): Agern closes the issues itself, only after the merge.
+  It is merged by Agern only on the owner's approval or, for an automatic release, under the rules of "Release mode"
+  below. Stored as `prNumber`/`prUrl`.
 - **Mergeability.** `mergeState` is `unknown` until a pull request exists and has been read; then `clean` when
   GitHub's `mergeable` is true and `conflict` when it is false. While GitHub is still computing (`null`) it is read
   up to four more times, one second apart, then left `unknown` (approval then leaves the decision to GitHub's own
-  refusal). There is no background polling: it is checked at the moments listed under re-evaluation.
+  refusal). It is checked at the moments listed under re-evaluation, and by the periodic re-evaluation ("Release
+  mode" below).
 - **Conflicts.** If the default branch moved (another release or a single run merged) and the release branch no
   longer merges cleanly, `mergeState` is `conflict`, the release stays `ready`, the release page says so, and the
   pull request gets one comment "**Agern:** `release/<name>` no longer merges cleanly into `<default>`. Agern will not
@@ -845,6 +856,69 @@ the default branch.
   commits in its GitHub settings to release."). A setting GitHub leaves out counts as allowed; if GitHub then
   refuses the chosen method ("… merges are not allowed on this repository"), approval answers the same 409 with
   GitHub's message and a notice, and **never retries with another method**.
+- **Release mode** (#41). Every release has `mode` `manual` (the default) or `automatic`, chosen when it is created
+  (`POST …/releases { mode }`, the creation dialog) and changed with `PUT /api/releases/{id}/mode` or `/factory release
+  mode <name> manual|automatic` until it is finished (`released`: 409 `release_not_editable`; `cancelled`: 409
+  `release_closed`; an unknown value: 400). Who may change it: while `planning`, anyone who can see the project, as
+  for every other part of the plan — whoever starts the release becomes its owner and the start dialog says that an
+  automatic release will be merged with their token without asking them; once `scheduled` or started, switching to
+  automatic is the **owner's alone** (it merges with the owner's token), switching back to manual is the owner's or
+  an admin's (it only stops something; admins may stop, never drive). The mode is set under the release's mutex, so
+  once a switch to manual has returned no automatic merge starts. **Agents cannot set it:** there is no MCP tool for
+  it and `factory_create_release` always creates a manual release, so text in issues or chats can never make a
+  release merge itself. `factory_approve_release` stays: it acts only on an explicit instruction in the owner's own
+  chat and is the same owner-only approval as the button; the explicit, human-only mode setting is the stronger
+  authorisation for unattended merging.
+  - *Manual*: as before — the release waits in `ready` for its owner's approval; nothing merges it otherwise.
+  - *Automatic*: at the end of every re-evaluation (not the one inside an approval), the server merges the release
+    when **all** of these hold: status `ready`; complete (something merged, nothing held); a pull request exists;
+    `mergeState` is `clean` (unknown waits, GitHub may still be computing); `mergeMethod` is `rebase` or `merge`; the
+    checks on the pull request's head commit are green (`passed` or `none`, see "Checks"); the project allows it
+    (`ReleaseModePolicy`, below). The merge is **the approval's own code path** (`mergeLocked`): the owner's token, the
+    same method, the head commit the checks were read for passed as `sha` (a branch that moved meanwhile is refused,
+    not merged unseen), and the same "After the merge". No language-model agent takes part in the decision.
+  - *Blockers are never overridden*: held issues, a conflict, no usable merge method, an owner without a GitHub token
+    and failed or unreadable checks all leave the release `ready` with the usual banner or notice. The owner can
+    still approve by hand at any time (approval is never blocked by checks).
+  - *Failed checks*: `notice` "Checks failed on pull request #n (<detail>), so it is not released automatically. …"
+    and **one** comment on the pull request per head commit (`checks_failure_sha`): "**Agern:** checks failed on this
+    release pull request (<detail>). Release `<name>` is set to release automatically, so Agern will not merge it while
+    a check fails. …". Checks that cannot be read (e.g. a fine-grained token without the Checks / Commit statuses read
+    permission): notice "Could not read the checks: … It is not released automatically until they can be read."
+  - *GitHub refuses the automatic merge* (branch protection, a required review, the head moved): the release stays
+    `ready` with the approval's notice, the pull request gets one comment "**Agern:** merging release `<name>`
+    automatically failed: … Agern will not try again for this commit; …" (none for a conflict, which has its own), and
+    the head commit is remembered (`auto_merge_failed_sha`): later re-evaluations do not try that commit again ("GitHub
+    refused the automatic merge of the release branch's current commit; …"). "Check again" by the owner, switching to
+    automatic again, or a new commit on the release branch tries again.
+  - *Periodic re-evaluation.* GitHub sends Agern no webhook, so `ReleaseMerger.startTicker` re-evaluates every 60 s
+    (`periodicMillis`; tests shorten it) each `ready` release that is automatic or whose checks are `pending` (so a
+    manual release's page also shows when they finish), oldest first, each under its mutex; a release is published
+    on the feed only when something changed. It runs in the services' scope and stops with them. Each round costs a
+    handful of GitHub calls per such release with the owner's token (repository, pull request, combined status, check
+    runs), well within the rate limit for the few releases a project has ready at once.
+  - *Released by.* `released_by` is the owner and `released_automatically` is true; the release page says "Released
+    automatically <time> for <owner>", and each closed issue's comment ends "Released automatically by Agern for
+    @<owner> (the release was set to automatic)." instead of "Approved by @<owner>.".
+  - *Exactly once.* Automatic merges, approvals, checks and the periodic re-evaluation all run under the release's
+    mutex and finish through the one conditional `ready` → `released` update, so concurrent triggers merge once.
+  - *Human approval required (#24, not implemented).* `ReleaseModePolicy.allowsAutomatic(repo)` is the seam (today
+    every project allows it). A project that requires a human approval must refuse automatic: creating or switching a
+    release to automatic answers 409 `release_mode_not_allowed`, and an automatic release made before the project
+    became strict is not merged automatically (notice "This project requires a human approval: …"); the owner
+    approves it by hand. #24 only has to supply the policy from the project setting.
+- **Checks.** Each re-evaluation that reads an open pull request also reads the checks on its head commit with the
+  owner's token: the combined commit status (`GET /repos/{o}/{r}/commits/{sha}/status`, the latest status per
+  context) and the latest check runs (`GET …/commits/{sha}/check-runs?filter=latest`, GitHub Actions and other
+  apps). `checksState`: `failed` if any status is `failure`/`error` or any completed check run did not end
+  `success`, `neutral` or `skipped` (so `failure`, `cancelled`, `timed_out`, `action_required`, `stale` fail);
+  otherwise `pending` if any status is `pending` or any check run is not `completed`; otherwise `passed`, or `none`
+  when there are no statuses and no check runs at all (GitHub reports `state: pending` with `total_count: 0` then —
+  that is not pending). `none` and `passed` are green. A read GitHub refuses is `unknown` with the reason. Stored as
+  `checks_state`, `checks_sha` and `checks_detail` ("Failed: build, lint", "Pending: ci/e2e", "3 checks passed", "No
+  checks") and shown on the release page in both modes; for a manual release they are information only. Agern does
+  not read branch protection: a required check that has not reported yet is invisible to it, and GitHub's own
+  refusal of the merge covers that case.
 - **GitHub refuses the merge** for another reason (branch protection, required checks, the head moved): the release
   stays `ready`, the pull request is read again (not mergeable → `conflict`, its comment, 409 `release_conflict`),
   otherwise `notice` = "Merging pull request #n failed: <GitHub's message>" and 409 `release_merge_failed` (a moved
@@ -855,7 +929,8 @@ the default branch.
   = 'ready'`), and only its winner goes on. Then, best effort and each independently: every `merged` issue that is
   still open gets the comment "**Agern: released** in release `<name>`: pull request <url> was rebased onto
   `<default>`, one commit per issue (`<default>` at <sha>). Approved by @<login>." (or "…merged into `<default>` with
-  a merge commit…", or "It was merged on GitHub.") and is closed; skipped issues and issues moved out are not
+  a merge commit…", "Released automatically by Agern for @<login> (the release was set to automatic).", or "It was
+  merged on GitHub.") and is closed; skipped issues and issues moved out are not
   touched. The branch `release/<name>` is deleted on GitHub (`deleteBranch` only ever gets the stored branch, which
   must be `release/<the release's name>`; an already missing branch is fine) — its commits are all on the default
   branch now, so nothing is lost. The owner's clone forgets the branch (its remote-tracking ref, and a local branch
@@ -881,7 +956,9 @@ the default branch.
 
   | When | Where |
   |---|---|
-  | ready and complete (also again after building again) | the pull request: "**Agern: release `<name>` is ready to release.** k issue(s) merged. @<owner> can approve it on <URL> or with `/factory release approve <name>`." (not while it conflicts; posted once the conflict is resolved) |
+  | ready and complete (also again after building again) | the pull request: "**Agern: release `<name>` is ready to release.** k issue(s) merged. @<owner> can approve it on <URL> or with `/factory release approve <name>`." — automatic: "… It is set to release automatically: Agern merges it for @<owner> once it merges cleanly and all checks on this pull request have passed. It can be switched to manual approval on <URL>." (not while it conflicts; posted once the conflict is resolved) |
+  | automatic, checks failed (once per head commit) | the pull request (see "Release mode") |
+  | automatic, GitHub refused the merge (once per head commit) | the pull request (see "Release mode") |
   | ready with held issues | each held issue: "**Agern:** release `<name>` has finished building, but this issue is held. The release cannot be released until its run is approved or retried, or the issue is moved out: <URL>" |
   | paused on the usage limit | the interrupted issue (see "Usage limit") |
   | `mergeState` becomes `conflict` | the pull request (see "Conflicts") |
@@ -903,7 +980,11 @@ the default branch.
   requests remember head and base; commits per branch (a squash merge adds one, a rebase merge replays the head's
   own commits, a merge commit adds them plus the merge commit), so tests can count commits per issue on `main`;
   `conflicting` head branches (not mergeable, merging fails); mergeability "still computing"; the repository's
-  merge settings; deleting a branch closes its open pull requests, as on GitHub.
+  merge settings; deleting a branch closes its open pull requests, as on GitHub; commit statuses and check runs per
+  head branch (`setStatus`, `setCheckRun`; none: no checks), and a failure to read them. In development
+  (`FACTORY_DEV_FAKE_GITHUB`) `<dataDir>/fake-github-checks/<repo>/<branch>.json` (`{"statuses": {"ci": "pending"},
+  "checkRuns": [{"name", "status", "conclusion"}]}`) sets the checks of a branch while the server runs; the e2e suite
+  uses it.
 
 ## 7. Chat agent ↔ factory (MCP)
 
@@ -942,6 +1023,8 @@ or id of a release of this project; `issueNumbers`: an array of integers, `"#5"`
 `ready` release as the chat's owner, with the same checks and refusals as the HTTP endpoint (§6 "Releasing") as tool
 errors, and answers `Release "<name>" is released: pull request <url> merged into <default>, N issue(s) closed.`;
 the chat prompt tells the agent to call it only when the person explicitly tells it to release that specific release.
+There is deliberately no tool for the release mode (§6 "Release mode"), and `factory_create_release` ignores any
+`mode` argument: a release created by the chat agent is manual, and only a person can make one release by itself.
 
 `factory_send_to_agent` `{ runId?, role?, sessionId?, message }` passes the person's message to a running
 spec-writer or builder of a run in this project (§6 "Messages to running agents"): by `runId` + `role`
@@ -954,7 +1037,8 @@ Chat input starting with `/factory` is handled by the server and not sent to Cla
 is rejected with 422 `attachments_not_allowed`; they stay unsent so the owner can send them in a normal message):
 `/factory run <issue>`, `/factory status`, `/factory approve [runId]`, `/factory cancel <runId>`,
 `/factory releases`, `/factory release create <name> [description…]`, `/factory release add <name> <issue>…`,
-`/factory release remove <issue>…`, `/factory release approve <name>`, `/factory help`. The reply is appended to the transcript as a `system` event.
+`/factory release remove <issue>…`, `/factory release approve <name>`, `/factory release mode <name>
+manual|automatic`, `/factory help`. The reply is appended to the transcript as a `system` event.
 Release commands act in the chat's project as its owner: `releases` lists each release with its status ("in
 preparation" with the issue count, plus " (scheduled start failed: <reason>)" after a failed scheduled start;
 "scheduled for <ISO time, UTC> by <owner>" plus ", waiting for release "<name>"" when due and waiting; for started ones "building", "paused" or "cancelled", "k of n merged", the owner
@@ -969,7 +1053,13 @@ ones; a missing or invalid argument gets a one-line usage reply. Renaming, delet
 `release approve <name>` approves a ready release (owner only, §6 "Releasing"; without a name: "Usage: /factory
 release approve <name>") and answers like `factory_approve_release`; refusals are shown as their message. In
 `releases`, ready and released releases show "ready to release" / "released", the pull request URL, and for ready
-ones " — N held" or " — conflicts with <default>" when that applies, plus a notice line when there is one.
+ones " — N held" or " — conflicts with <default>" when that applies, plus a notice line when there is one. An
+automatic release that is not finished shows ", releases automatically when ready", a released one ", released
+automatically". `release mode <name> manual|automatic` sets the release mode with the HTTP rules (§6 "Release mode";
+anything else: "Usage: /factory release mode <name> manual|automatic") and answers `Release "<name>" is released
+automatically: once it is ready, complete and merges cleanly, and all checks on its pull request have passed, Agern
+merges it with the owner's GitHub token.` or `Release "<name>" waits for its owner's approval once it is ready
+(manual).`
 
 ## 8. HTTP API
 
@@ -1028,8 +1118,12 @@ type Release = { id: string; repo: string; name: string; description: string;
   mergeMethod: 'rebase' | 'merge' | 'unavailable' | null;  // how approval will merge (once released: how it did)
   notice: string | null;                    // the last problem (opening or merging the pull request, clean-up)
   readyAt: string | null; releasedAt: string | null;
-  releasedBy: { username: string; displayName: string } | null;   // null: merged on GitHub outside Agern
-  mergeCommit: string | null };             // the default branch's commit after the merge
+  releasedBy: { username: string; displayName: string } | null;   // null: merged on GitHub outside Agern; automatic: the owner
+  mergeCommit: string | null;               // the default branch's commit after the merge
+  mode: 'manual' | 'automatic';             // §6 "Release mode"
+  releasedAutomatically: boolean;           // merged by Agern for the owner (automatic mode)
+  checks: { state: 'unknown' | 'none' | 'pending' | 'passed' | 'failed';   // on the pull request's head commit
+            detail: string | null; sha: string | null } | null };         // null until there is a pull request
 
 type SessionKind = 'chat' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
 type SessionStatus = 'starting' | 'running' | 'idle' | 'done' | 'failed' | 'stopped';
@@ -1181,7 +1275,7 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `GET /api/projects/{repo}/issues/{number}` | → `Issue` (with `body`) | |
 | `POST /api/projects/{repo}/issues` | `{ title, body, kind }` → `Issue` | |
 | `GET /api/projects/{repo}/releases` | → `Release[]` | newest first (`createdAt` desc), each with its issues in order |
-| `POST /api/projects/{repo}/releases` | `{ name, description? }` → 201 `Release` | 400 invalid name or description; 409 `release_name_taken`. Starts nothing |
+| `POST /api/projects/{repo}/releases` | `{ name, description?, mode? }` → 201 `Release` | 400 invalid name, description or mode (`manual` default, `automatic`); 409 `release_name_taken`; 409 `release_mode_not_allowed` (#24 seam). Starts nothing |
 | `GET /api/releases/{id}` | → `Release` | 404 unknown or invisible |
 | `PUT /api/releases/{id}` | `{ name, description }` → `Release` | rename or edit; same validation as create. Started: owner or admin, and a different name → 409 `release_name_locked`; released: 409 `release_not_editable`. Editing a ready release updates its pull request's body |
 | `DELETE /api/releases/{id}` | → 204 | removes the plan and its assignments; the issues are untouched on GitHub. `scheduled` → 409 `release_scheduled`; `building`/`paused`/`ready` → 409 `release_active`; `released` → 409 `release_not_editable`; `cancelled`: owner or admin, the branch stays and its runs keep existing with `releaseId` null |
@@ -1192,6 +1286,7 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `POST /api/releases/{id}/resume` | → `Release` | owner only; `paused` → `building` (else 409 `release_not_paused`); 422 `claude_credential_required` |
 | `POST /api/releases/{id}/cancel` | → `Release` | owner or admin; `building`/`paused`/`ready` → `cancelled` (else 409 `release_not_building`; released: 409 `release_not_editable`); cancels the release's active runs; a release pull request is left open with a comment |
 | `POST /api/releases/{id}/approve` | → `Release` | owner only (admins included in the refusal: 403); merges the ready release's pull request (rebase, or a merge commit where rebase merging is disabled; never squash), closes its merged issues and deletes `release/<name>` (§6 "Releasing"). 409 `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`, `release_merge_method_unavailable`, `release_merge_failed`; nothing changes on GitHub with any of them |
+| `PUT /api/releases/{id}/mode` | `{ mode: 'manual' \| 'automatic' }` → `Release` | §6 "Release mode": `planning` anyone; `scheduled`/started: automatic owner only, manual owner or admin (403); 400 missing or unknown mode; 409 `release_not_editable` (released), `release_closed` (cancelled), `release_mode_not_allowed`. A `ready` release is re-evaluated in the background (switched to automatic and green, it is merged) |
 | `POST /api/releases/{id}/check` | → `Release` | owner only; `ready` only (409 `release_not_ready`): re-reads the pull request (opens it when the release is complete and has none, replaces one closed without merging, finishes the release when it was merged on GitHub) and its mergeability |
 | `POST /api/releases/{id}/issues/{number}/retry` | → `Release` | owner only; release `building`/`paused`/`ready` (else 409 `release_not_building`; released: 409 `release_not_editable`), issue `held`/`skipped` (else 409 `release_issue_not_held`); it is built again (a `ready` release builds again: 409 `release_already_building` while another release of the project builds) |
 | `POST /api/projects/{repo}/releases/assign` | `{ issueNumbers: number[], releaseId: string \| null }` → `Release[]` | assigns or moves the issues to that release of `{repo}` (404 otherwise), or takes them out with `releaseId: null` (numbers in no release are ignored, no GitHub calls). 1–100 positive numbers, duplicates collapsed (400 otherwise; an invalid `releaseId` is 400). Every issue is fetched with the caller's token: unknown → 404 "Issue #n not found", closed → 409 `issue_closed`; all-or-nothing. Target `building`/`paused`/`ready`: owner only, appended as `waiting` (a `ready` target builds again: 409 `release_already_building` while another release of the project builds); target `cancelled`: 409 `release_closed`; target `released`: 409 `release_not_editable`. An issue leaving a `building`/`paused`/`ready` release: owner or admin, and only `waiting`, `held` or `skipped` (else 409 `release_issue_started`); leaving a `cancelled` one: owner or admin; leaving a `released` one: 409 `release_not_editable`. A still active run of an issue that leaves is cancelled. Answers all releases of the project after the change |
@@ -1692,6 +1787,28 @@ in `ready` (adding builds again); there is no Pause. Each issue with a run pull 
 "Released <time ago> by <owner> · pull request #n" (or "Merged on GitHub <time ago> · …"), the method in words, the
 default branch's commit (7 characters) and that the issues were closed and the branch deleted. The note "This release
 is a plan…" is shown only while planning.
+
+Release mode on the release page (§6 "Release mode"): except when released or cancelled, the header shows the mode —
+for whoever may change it a select labelled "Release mode" ("Manual approval" / "Automatic"; "Automatic" is disabled
+for an admin who is not the owner), for everyone else "Release mode: Manual approval|Automatic" — with a muted hint
+(`#release-mode-hint`): manual "It waits as “ready to release” until <owner, or “whoever starts it”> approves it.";
+automatic "Once everything is built, merges cleanly and all checks on the release pull request have passed, Agern
+merges it with <owner>'s GitHub token. Held issues, conflicts and failed checks stop it.". The "Release pull request"
+section shows the checks as a pill ("checks passed", "checks pending", "checks failed", "no checks", "checks
+unknown") with the detail ("This pull request has no checks; that counts as green." for none) and, for an automatic
+release that could be approved, a line `.release-auto`: "Set to release automatically: Agern merges it once all
+checks have passed." (pending, unknown), "…: Agern is merging it." (green) or "…, but a check failed: Agern will not
+merge it until the checks pass.". Approval stays available in both modes and is never blocked by checks; the
+confirmation dialog warns "Checks failed on this pull request (<detail>). Approving merges it anyway.", "Some checks
+have not finished yet (<detail>). Approving merges it without waiting for them." or "The checks on this pull request
+could not be read. Approving merges it without them.". A released automatic release reads "Released automatically
+<time ago> for <owner>". The start dialog adds "It is set to release automatically: … Agern merges it into the
+default branch with your GitHub token, without asking you." (manual: "When everything is built, it waits for your
+approval before anything reaches the default branch."), and the schedule dialog's hint a similar sentence. The
+"New release" dialog has a radio group "When it is ready": "Manual approval" (default) and "Release automatically",
+each with a one-line explanation. On the project page an automatic release that is not finished adds "· automatic"
+to its row. The mock implements the mode with the server's rules and seeds `1.2` with pending checks and
+`cart-fixes` as automatic with failed checks.
 
 Project page, releasing: a `ready` row shows the pill "ready to release" and "k of n merged", plus "· h held" or "·
 conflict". Released and cancelled releases leave the list and appear in a collapsed `<details>` "History (N)" below it
