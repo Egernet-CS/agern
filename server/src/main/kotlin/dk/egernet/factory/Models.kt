@@ -346,6 +346,18 @@ data class EffectiveRoundsDto(
 @Serializable
 data class PreferencesDto(val overrides: PreferenceOverridesDto, val effective: EffectivePreferencesDto, val suggestions: List<String>)
 
+/** One Claude limit window of the caller (`GET /api/me/usage`); [utilization] is a fraction, may exceed 1. */
+@Serializable
+data class UsageWindowDto(val type: String, val utilization: Double?, val status: String?, val resetsAt: String?, val observedAt: String)
+
+/** What the caller's agents cost through Agern: today and this calendar month, UTC ([day] `YYYY-MM-DD`, [month] `YYYY-MM`). */
+@Serializable
+data class UsageSpendDto(val todayUsd: Double, val monthUsd: Double, val day: String, val month: String)
+
+/** The caller's own Claude usage; [windows] is empty unless [credentialKind] is `oauth_token`. */
+@Serializable
+data class ClaudeUsageDto(val credentialKind: String?, val windows: List<UsageWindowDto>, val spend: UsageSpendDto)
+
 /** A file or image attached to a chat message (also the upload response). */
 @Serializable
 data class AttachmentDto(

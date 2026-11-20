@@ -4,6 +4,7 @@ import type {
   AgentMessage,
   AgentSession,
   Attachment,
+  ClaudeUsage,
   FactoryEvent,
   FeedFrame,
   Issue,
@@ -26,6 +27,7 @@ import type {
   Stage,
   StageRole,
   User,
+  UsageWindow,
   Verdict,
 } from '../api/types';
 import { approverScript, builderScript, chatReplies, reviewerScript, sandboxBuilderScript, seededChat, specScript, type Step } from './scripts';
@@ -145,7 +147,84 @@ export const db = {
   softwareRequests: [] as SoftwareRequest[],
   /** Personal choices per username (like the backend's user_preferences). */
   prefs: new Map<string, PreferenceOverrides>(),
+  /** Claude usage per username (like the backend's claude_usage_windows and claude_spend_daily). */
+  usage: new Map<string, MockUsage>(),
 };
+
+// ---------------------------------------------------------------- Claude usage (docs/ARCHITECTURE.md §5)
+
+type MockUsage = { windows: UsageWindow[]; spend: Map<string, number> };
+
+const utcDay = (ms: number) => iso(ms).slice(0, 10);
+
+function seedUsage() {
+  const now = Date.now();
+  const window = (type: string, utilization: number, status: string, resetsInMin: number, observedMinAgo: number): UsageWindow => ({
+    type, utilization, status, resetsAt: iso(now + resetsInMin * 60_000), observedAt: iso(now - observedMinAgo * 60_000),
+  });
+  // Scenarios: ?mock=usage-none (no windows yet), usage-high (5-hour window at 86 %), usage-limit (5-hour limit reached).
+  const fiveHour =
+    scenario === 'usage-high' ? window('five_hour', 0.86, 'allowed_warning', 125, 4)
+    : scenario === 'usage-limit' ? window('five_hour', 1.0, 'rejected', 80, 2)
+    : window('five_hour', 0.42, 'allowed', 125, 4);
+  const earlier = new Date(now);
+  earlier.setUTCDate(1);
+  const spend = (today: number, earlierInMonth: number) => {
+    const m = new Map([[utcDay(now), today]]);
+    if (utcDay(earlier.getTime()) !== utcDay(now)) m.set(utcDay(earlier.getTime()), earlierInMonth);
+    return m;
+  };
+  db.usage.set('alice', { windows: scenario === 'usage-none' ? [] : [fiveHour, window('seven_day', 0.18, 'allowed', 3 * 24 * 60 + 200, 4)], spend: spend(1.84, 21.3) });
+  db.usage.set('bob', { windows: [], spend: spend(0.62, 11.72) });
+}
+seedUsage();
+
+const usageState = (u: User) => {
+  let st = db.usage.get(u.username);
+  if (!st) db.usage.set(u.username, (st = { windows: [], spend: new Map() }));
+  return st;
+};
+
+/** `GET /api/me/usage` for [u]. */
+export function usageOf(u: User): ClaudeUsage {
+  const st = usageState(u);
+  const kind = u.hasClaudeCredential ? u.claudeCredentialKind : null;
+  const day = utcDay(Date.now());
+  const month = day.slice(0, 7);
+  let monthUsd = 0;
+  for (const [d, v] of st.spend) if (d.startsWith(month)) monthUsd += v;
+  return {
+    credentialKind: kind,
+    windows: kind === 'oauth_token' ? [...st.windows].sort((a, b) => a.type.localeCompare(b.type)) : [],
+    spend: { todayUsd: st.spend.get(day) ?? 0, monthUsd, day, month },
+  };
+}
+
+/** A result of one of [owner]'s agents cost [usd]: adds the spend and, on an OAuth token, nudges the 5-hour window. */
+function recordUsage(owner: { username: string }, usd: number) {
+  const u = db.users.find((x) => x.username === owner.username);
+  if (!u || !u.hasClaudeCredential) return;
+  const st = usageState(u);
+  const now = Date.now();
+  if (usd > 0) st.spend.set(utcDay(now), (st.spend.get(utcDay(now)) ?? 0) + usd);
+  if (u.claudeCredentialKind === 'oauth_token') {
+    const w = st.windows.find((x) => x.type === 'five_hour');
+    if (w) {
+      if (w.status !== 'rejected') w.utilization = Math.round(((w.utilization ?? 0) + 0.01) * 100) / 100;
+      w.observedAt = iso(now);
+    } else {
+      st.windows.push({ type: 'five_hour', utilization: 0.03, status: 'allowed', resetsAt: iso(now + 5 * 3600_000), observedAt: iso(now) });
+    }
+  }
+  // The frame is private to the user: in the mock the only listener is the signed-in user.
+  if (u.username === db.me.username) feed({ type: 'usage' });
+}
+
+/** The credential was replaced or removed: its limit windows go, the spend stays. */
+export function clearUsageWindows(u: User) {
+  usageState(u).windows = [];
+  if (u.username === db.me.username) feed({ type: 'usage' });
+}
 
 /** Same rule as the backend: the user's choice, else the admin default; fix rounds capped by the admin value. */
 export function effective(username: string) {
@@ -328,6 +407,8 @@ function play(
   p.after(200, (ts) => {
     const cost = Math.round((0.02 + turns * (s.model === 'opus' ? 0.031 : 0.009)) * 10000) / 10000;
     s.costUsd = Math.round(((s.costUsd ?? 0) + cost) * 10000) / 10000;
+    // Only live turns count: the seeded history is already part of the seeded usage.
+    if (p.mode === 'live') recordUsage(s.owner, cost);
     s.numTurns = (s.numTurns ?? 0) + turns;
     const last = [...steps].reverse().find((x) => x.kind === 'text');
     emit(sid, 'claude', {

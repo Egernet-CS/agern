@@ -114,6 +114,7 @@ export const httpApi: Api = {
   deleteGithubToken: () => del('/api/me/github-token'),
   preferences: () => get('/api/me/preferences'),
   putPreferences: (p) => put('/api/me/preferences', p),
+  usage: () => get('/api/me/usage'),
 
   projects: () => get('/api/projects'),
   project: (repo) => get(`/api/projects/${enc(repo)}`),

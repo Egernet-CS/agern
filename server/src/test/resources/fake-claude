@@ -23,6 +23,11 @@ Behaviour
       "[Attachments]" text block's paths are checked on disk ("FILE ok name 123 bytes" / "FILE missing ...").
       Trigger words are only looked for in the user's own text, not in that listing.
     - control_request {subtype: interrupt} stops the current turn
+    - only with an OAuth token (CLAUDE_CODE_OAUTH_TOKEN), one rate_limit_event (the shape of the CLI 2.1.328 schema,
+      utilization a fraction, resetsAt epoch seconds in the future) is emitted before the reply when the text contains:
+        "usage-ok"    -> unifiedWindows five_hour 0.42 and seven_day 0.18, both "allowed"
+        "usage-high"  -> unifiedWindows five_hour 0.86 "allowed_warning" and seven_day 0.18 "allowed"
+        "usage-limit" -> top-level status "rejected", rateLimitType "five_hour", utilization 1.0, resetsAt now + 2 h
   Conversations are remembered under $HOME/.fake-claude/sessions/<id>. Like the real CLI,
   --resume <id> of an unknown conversation fails at once ("No conversation found with session ID").
   A Claude credential containing "invalid" is rejected like a bad key ("Invalid API key").
@@ -168,6 +173,28 @@ def result(text, subtype="success", is_error=False, structured=None, turns=1, co
     if structured is not None:
         r["structured_output"] = structured
     emit(r)
+
+
+def rate_limit_event(content):
+    """Emits a rate_limit_event for the usage-* trigger words in [content] (OAuth token only, like the real CLI)."""
+    if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return
+    now = int(time.time())
+    if "usage-limit" in content:
+        info = {"status": "rejected", "rateLimitType": "five_hour", "utilization": 1.0, "resetsAt": now + 2 * 3600}
+    elif "usage-high" in content:
+        info = {"status": "allowed_warning", "rateLimitType": "five_hour", "utilization": 0.86, "resetsAt": now + 3 * 3600,
+                "unifiedWindows": {
+                    "five_hour": {"utilization": 0.86, "resetsAt": now + 3 * 3600, "status": "allowed_warning"},
+                    "seven_day": {"utilization": 0.18, "resetsAt": now + 4 * 86400, "status": "allowed"}}}
+    elif "usage-ok" in content:
+        info = {"status": "allowed", "rateLimitType": "five_hour", "utilization": 0.42, "resetsAt": now + 2 * 3600 + 300,
+                "unifiedWindows": {
+                    "five_hour": {"utilization": 0.42, "resetsAt": now + 2 * 3600 + 300, "status": "allowed"},
+                    "seven_day": {"utilization": 0.18, "resetsAt": now + 4 * 86400, "status": "allowed"}}}
+    else:
+        return
+    emit({"type": "rate_limit_event", "rate_limit_info": info, "uuid": str(uuid.uuid4()), "session_id": session_id})
 
 
 def mcp_call(method, params, req_id):
@@ -345,6 +372,7 @@ def chat_mode():
         if "crash" in content:
             sys.stderr.write("fake-claude: crashing as requested\n")
             sys.exit(3)
+        rate_limit_event(content)
         if "tool" in content:
             tool_roundtrip("echo hello from fake-claude && pwd")
         reply = "You said: " + content

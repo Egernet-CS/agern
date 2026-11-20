@@ -3,6 +3,7 @@ import { useLocation } from 'react-router-dom';
 import { api, type CredentialKind, type PreferenceOverrides, type Preferences, type StageRole } from '../api';
 import { CodeInput } from '../components/ui/CodeInput';
 import { RecoveryCodes } from '../components/ui/RecoveryCodes';
+import { UsageBlock } from '../components/ui/UsageBlock';
 import { CopyButton, Dialog, Notice } from '../components/ui/ui';
 import { useAuth, useMe } from '../lib/auth';
 
@@ -277,6 +278,8 @@ const same = (a: PreferenceOverrides, b: PreferenceOverrides) =>
   ROLES.every((r) => (a.pipelineModels[r] ?? null) === (b.pipelineModels[r] ?? null));
 
 function ModelsSection() {
+  const { me } = useAuth();
+  const usage = me?.hasClaudeCredential ? <UsageBlock /> : null;
   const [prefs, setPrefs] = useState<Preferences | null>(null);
   const [draft, setDraft] = useState<PreferenceOverrides>(EMPTY);
   const [busy, setBusy] = useState(false);
@@ -296,6 +299,7 @@ function ModelsSection() {
       <section className="card settings-card" id="models" aria-labelledby="models-h">
         <header className="sc-head"><h2 id="models-h">Models &amp; cost</h2></header>
         {err ? <p className="form-error" role="alert">{err}</p> : <p className="muted">Loading…</p>}
+        {usage}
       </section>
     );
   }
@@ -357,6 +361,7 @@ function ModelsSection() {
         Every chat and pipeline run you start runs on <strong>your</strong> Claude account and is billed to it. Choose cheaper models here — an alias
         ({prefs.suggestions.join(', ')}) or a full model id. Empty means the factory default. A run keeps the models and fix rounds it started with.
       </p>
+      {usage}
       <div className="row pref-presets" role="group" aria-label="Presets">
         {presets(max).map((p) => (
           <button key={p.name} type="button" className="btn btn--sm" title={p.help} disabled={busy} onClick={() => void save(p.value, p.name)}>
