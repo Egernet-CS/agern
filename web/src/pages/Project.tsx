@@ -7,7 +7,7 @@ import { sandboxSummary } from '../components/sandbox/SandboxBits';
 import { Dialog, Empty, ErrorBox, KindBadge, Loading, Notice, ReleaseStatusPill, RoleBadge, RunStatusPill, SessionStatusPill } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
-import { modelLabel, timeAgo } from '../lib/format';
+import { dateTime, modelLabel, timeAgo } from '../lib/format';
 import { useFeed, useFeedReconnects, useIssueFeed, useLiveRuns, useLiveSessions, useProjectReleases, useSandboxApprovalFeed, withApproval } from '../lib/realtime';
 import { useNow } from '../lib/useNow';
 
@@ -626,7 +626,7 @@ function NewIssueDialog({ repo, open, onClose, onCreated }: { repo: string; open
 /** "N issues" while planning; "k of n merged" (plus "· h held") once started. */
 function releaseProgress(r: Release): string {
   const n = r.issues.length;
-  if (r.status === 'planning') return `${n} issue${n === 1 ? '' : 's'}`;
+  if (r.status === 'planning' || r.status === 'scheduled') return `${n} issue${n === 1 ? '' : 's'}`;
   const merged = r.issues.filter((i) => i.state === 'merged').length;
   const held = r.issues.filter((i) => i.state === 'held').length;
   return `${merged} of ${n} merged${held > 0 ? ` · ${held} held` : ''}`;
@@ -828,7 +828,20 @@ function ActivityPanel({
               </div>
               <div className="rr-bot">
                 <ReleaseStatusPill status={r.status} />
-                <span className="rr-line">{releaseProgress(r)}</span>
+                <span className="rr-line">
+                  {releaseProgress(r)}
+                  {r.status === 'scheduled' &&
+                    (r.waitingFor ? (
+                      <> · waiting for {r.waitingFor.name}</>
+                    ) : (
+                      r.scheduledAt && (
+                        <>
+                          {' '}· starts <time dateTime={r.scheduledAt}>{dateTime(r.scheduledAt)}</time>
+                        </>
+                      )
+                    ))}
+                  {r.status === 'planning' && r.startFailure && <span className="rr-failed"> · start failed</span>}
+                </span>
               </div>
             </Link>
           </li>

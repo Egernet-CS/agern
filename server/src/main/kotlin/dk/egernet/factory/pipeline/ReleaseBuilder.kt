@@ -70,13 +70,15 @@ class ReleaseBuilder(
     // ------------------------------------------------------------ commands
 
     /**
-     * Claims the planned release [r] for [owner], creates `release/<name>` from [defaultBranch] with [client] (the
-     * owner's token), skip-checks every issue and starts the first run. Any failure before the branch exists rolls the
-     * claim back, so the release is `planning` again with no owner.
+     * Claims the planned release [r] (`planning`, or `scheduled` for a scheduled start) for [owner], creates
+     * `release/<name>` from [defaultBranch] with [client] (the owner's token), skip-checks every issue and starts the
+     * first run. Any failure before the branch exists rolls the claim back to [r]'s state: `planning` with no owner,
+     * or still `scheduled` (the scheduler then records the failed start).
      */
     suspend fun start(owner: UserRecord, r: ReleaseRecord, client: GitHubClient, defaultBranch: String): ReleaseRecord {
         val branch = "release/${r.name}"
-        if (!io { store.claim(r.id, owner.id, branch) }) {
+        if (!io { store.claim(r.id, owner.id, branch, from = r.status) }) {
+            if (r.status == ReleaseStatus.SCHEDULED) throw conflict("The release is no longer scheduled", "release_not_scheduled")
             throw conflict("The release is no longer in preparation", "release_not_planning")
         }
         try {
@@ -87,7 +89,7 @@ class ReleaseBuilder(
                 client.createBranch(org, r.repo, branch, sha)
             }
         } catch (e: Exception) {
-            io { store.unclaim(r.id) }
+            io { store.unclaim(r.id, r) }
             throw when {
                 e is GitHubException && e.status == 422 -> branchExists(branch)
                 e is GitHubException && e.status in setOf(401, 403, 404) ->

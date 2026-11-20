@@ -24,7 +24,8 @@ import kotlin.test.assertTrue
 
 /** Releases (docs/ARCHITECTURE.md §6 "Releases") and sandboxes (§5 "Sandboxes") together. */
 class ReleaseSandboxTest {
-    private val world = TestWorld(twoFactor = false, sandbox = true)
+    private val clock = MutableClock(java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS))
+    private val world = TestWorld(twoFactor = false, sandbox = true, clock = clock)
     private val s = world.services
     private val alice = world.user("alice")
     private val rt = world.sandboxRuntime
@@ -142,5 +143,32 @@ class ReleaseSandboxTest {
         assertFalse(rt.networks.containsKey("agern-run-$runId"))
         assertEquals(0, s.sandboxes.inUse())
         assertTrue(seen.none { it.first == "Never" }, "no further issue started after the cancel")
+    }
+
+    @Test
+    fun `a release started by the scheduler gets sandboxes exactly like one started by hand`() {
+        val a = world.github.addIssue("demo-app", "Scheduled one", "body").number
+        val b = world.github.addIssue("demo-app", "Scheduled two", "body").number
+        val r = runBlocking {
+            val r = s.releases.create(alice, "demo-app", "3.0", "")
+            s.releases.assign(alice, "demo-app", listOf(a, b), r.id)
+            s.releases.schedule(alice, r.id, clock.instant().plus(java.time.Duration.ofHours(1)).toString())
+        }
+        assertEquals("scheduled", r.status)
+        assertTrue(rt.started.isEmpty(), "nothing runs before the start time")
+        clock.advance(java.time.Duration.ofHours(2))
+        runBlocking { s.releaseScheduler.tick() }
+        val done = awaitRelease(r.id) { rel -> rel.issues.all { it.state == "merged" } }
+        assertEquals("release/3.0", done.branch)
+        val runIds = listOf(a, b).map { n -> done.issues.single { it.number == n }.runId!! }
+        for (id in runIds) {
+            val sb = s.runs.toDto(s.runs.get(id)!!).sandbox!!
+            assertEquals("approved", sb.state, sb.reason)
+        }
+        assertEquals(listOf("origin/main:$SANDBOX_FILE", "origin/main:$SANDBOX_FILE"), world.git.reads.toList(), "definition from the default branch")
+        assertEquals(runIds.map { "agern-run-$it" }, rt.execs.filter { it.second.startsWith("make test") }.map { it.first })
+        assertTrue(seen.single { it.first == "Scheduled two" }.second.none { it.contains(runIds[0].toString()) })
+        assertTrue(rt.containers.isEmpty() && rt.networks.isEmpty(), rt.calls.toString())
+        assertEquals(0, s.sandboxes.inUse())
     }
 }

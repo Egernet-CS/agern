@@ -5,7 +5,9 @@ import { isRunActive, isSessionActive, type AgentSession, type Attachment, type 
 import {
   announceIssue,
   assignIssues,
+  cancelReleaseSchedule,
   createRelease,
+  scheduleRelease,
   deleteRelease,
   effective,
   getRelease,
@@ -319,6 +321,18 @@ export const mockApi: Api = {
       deleteRelease(r, me());
     }),
   assignIssues: (repo, numbers, releaseId) => ok(() => (project(repo), assignIssues(repo, numbers, releaseId, me()))),
+  scheduleRelease: (id, startAt) =>
+    ok(() => {
+      const r = getRelease(id);
+      project(r.repo);
+      return scheduleRelease(r, startAt, me());
+    }),
+  cancelReleaseSchedule: (id) =>
+    ok(() => {
+      const r = getRelease(id);
+      project(r.repo);
+      return cancelReleaseSchedule(r, me());
+    }),
   reorderRelease: (id, numbers) =>
     ok(() => {
       const r = getRelease(id);

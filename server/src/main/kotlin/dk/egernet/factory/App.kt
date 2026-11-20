@@ -65,6 +65,10 @@ class Services(
         "fake" -> dk.egernet.factory.sandbox.DevFakeSandboxRuntime()
         else -> null
     },
+    /** Time source of the release scheduler (tests use a controllable clock). */
+    val clock: java.time.Clock = java.time.Clock.systemUTC(),
+    /** What a scheduled start calls; null = the real start ([ReleaseService.startScheduled]). Tests may replace it. */
+    releaseStarter: ReleaseStarter? = null,
 ) {
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     val box = SecretBox(cfg.masterKey)
@@ -103,12 +107,16 @@ class Services(
     val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes)
     val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
     val releaseBuilder = dk.egernet.factory.pipeline.ReleaseBuilder(cfg, releaseStore, runs, users, access, orchestrator, bus, scope)
-    val releases = ReleaseService(cfg, access, releaseStore, bus, releaseBuilder)
+    // A scheduled start goes through the same start as "start now" (ReleaseService.startScheduled), as the owner.
+    val releaseScheduler: ReleaseScheduler = ReleaseScheduler(
+        cfg, clock, releaseStore, users, access, bus,
+        releaseStarter ?: ReleaseStarter { release, owner -> releases.startScheduled(owner, release.id) },
+    )
+    val releases: ReleaseService = ReleaseService(cfg, access, releaseStore, bus, releaseBuilder, releaseScheduler)
     val factory = FactoryService(cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases)
     val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes)
 
     /** The start-up removal of leftover sandboxes (runs in the background; tests wait for it). */
-    @Volatile var sandboxReaper: Job? = null
 
     init {
         agents.commandHandler = { session, owner, text -> factory.handleCommand(session, owner, text) }
@@ -122,6 +130,18 @@ class Services(
     fun recoverAfterRestart() {
         val failed = runs.failUnfinishedAfterRestart()
         if (failed.isNotEmpty()) LoggerFactory.getLogger("dk.egernet.factory").warn("Marked {} unfinished run(s) as failed after restart", failed.size)
+        // Order matters: first the sandboxes of runs that are no longer active (their containers bind-mount the worktrees),
+        // then those worktrees, then the releases (which may start new runs). Bounded, so a hanging Podman cannot keep
+        // the server from starting; what is left is removed by the next start or `agern sandbox prune`.
+        if (sandboxes.enabled) {
+            runCatching { runBlocking { withTimeoutOrNull(120_000) { sandboxes.reapOrphans() } } }
+                .onFailure { LoggerFactory.getLogger("dk.egernet.factory").warn("Reaping sandboxes failed: {}", it.message) }
+        }
+        // Worktrees of runs that have ended (including the ones just failed); needs_human runs keep theirs.
+        val reaped = runCatching { orchestrator.reapWorktrees() }
+            .onFailure { LoggerFactory.getLogger("dk.egernet.factory").warn("Reaping run worktrees failed: {}", it.message) }
+            .getOrDefault(emptyList())
+        if (reaped.isNotEmpty()) LoggerFactory.getLogger("dk.egernet.factory").info("Removed {} worktree(s) of ended runs", reaped.size)
         releaseBuilder.recoverAfterRestart()
         sessions.recoverAfterRestart()
         webSessions.purgeExpired()
@@ -129,8 +149,7 @@ class Services(
 
     fun start() {
         recoverAfterRestart()
-        // After the restart recovery: sandboxes of runs that are no longer active are leftovers.
-        if (sandboxes.enabled) sandboxReaper = scope.launch { sandboxes.reapOrphans() }
+        releaseScheduler.start(scope)
         agents.startIdleReaper()
         releaseBuilder.startTicker()
         attachments.startReaper(scope)

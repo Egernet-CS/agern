@@ -37,4 +37,48 @@ class Workspaces(private val cfg: Config, val git: GitOps, private val github: G
 
     fun <T> withRepoLock(username: String, repo: String, block: () -> T): T =
         synchronized(locks.computeIfAbsent("$username/$repo") { Any() }) { block() }
+
+    /**
+     * Removes every run worktree of [username]'s clone of [repo] whose run is not [live] — registered with git or
+     * only left on disk — and prunes stale worktree entries (docs/ARCHITECTURE.md §6 "Worktrees and branches").
+     * Local branches holding commits that exist nowhere else are kept. Blocking; returns the run ids removed.
+     */
+    fun reapRunWorktrees(username: String, repo: String, live: (UUID) -> Boolean): List<UUID> = withRepoLock(username, repo) {
+        val main = mainDir(username, repo)
+        val home = home(username)
+        val removed = mutableListOf<UUID>()
+        val registered = runCatching { git.listWorktrees(main, home) }.getOrDefault(emptyList())
+            .mapNotNull { wt -> runIdOf(wt.path)?.let { it to wt } }
+        val onDisk = runCatching {
+            Files.list(repoDir(username, repo).resolve("runs")).use { s -> s.toList().mapNotNull { p -> runIdOf(p) } }
+        }.getOrDefault(emptyList())
+        for (id in (registered.map { it.first } + onDisk).distinct()) {
+            if (live(id)) continue
+            git.removeWorktree(main, runDir(username, repo, id), home)
+            removed += id
+        }
+        removed
+    }
+
+    /** [reapRunWorktrees] for every user's clone of every repository on disk (at server start). */
+    fun reapAllRunWorktrees(live: (UUID) -> Boolean): List<UUID> {
+        val root = cfg.dataDir.resolve("workspaces")
+        if (!Files.isDirectory(root)) return emptyList()
+        val removed = mutableListOf<UUID>()
+        for (userDir in Files.list(root).use { it.toList() }) {
+            val user = userDir.fileName.toString()
+            if (!Files.isDirectory(userDir) || runCatching { requireSafeSegment(user, "username") }.isFailure) continue
+            for (repoDir in Files.list(userDir).use { it.toList() }) {
+                val repo = repoDir.fileName.toString()
+                if (!Files.isDirectory(repoDir) || runCatching { requireSafeSegment(repo, "repository") }.isFailure) continue
+                removed += reapRunWorktrees(user, repo, live)
+            }
+        }
+        return removed
+    }
+
+    /** The run id of a worktree path `…/runs/<runId>`, else null. */
+    private fun runIdOf(p: Path): UUID? =
+        if (p.parent?.fileName?.toString() != "runs") null
+        else runCatching { UUID.fromString(p.fileName.toString()) }.getOrNull()?.takeIf { it.toString() == p.fileName.toString() }
 }

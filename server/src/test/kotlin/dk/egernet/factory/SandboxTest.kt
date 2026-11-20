@@ -481,7 +481,7 @@ class SandboxTest {
         }
         rt.containers["agern-run-junk"] = "not-a-run-id"
         w.services.start()
-        runBlocking { withTimeout(10_000) { w.services.sandboxReaper!!.join() } }
+        // The sandbox reaper runs synchronously in start(), before the worktree reaper.
         assertEquals(setOf("agern-run-${active.id}", "agern-run-${active.id}-postgres"), rt.containers.keys)
         assertEquals(setOf("agern-run-${active.id}"), rt.networks.keys)
         assertEquals(RunStatus.FAILED, w.services.runs.get(inProgress.id)!!.status)
@@ -674,8 +674,66 @@ class SandboxTest {
         for (n in listOf("agern-run-$orphan", "agern-run-$orphan--jdk17", "agern-run-$orphan-postgres")) rt.containers[n] = orphan.toString()
         rt.networks["agern-run-$orphan"] = orphan.toString()
         w.services.start()
-        runBlocking { withTimeout(10_000) { w.services.sandboxReaper!!.join() } }
+        // The sandbox reaper runs synchronously in start(), before the worktree reaper.
         assertTrue(rt.containers.isEmpty() && rt.networks.isEmpty(), rt.calls.toString())
         assertTrue(rt.calls.any { it.startsWith("rm ") && it.contains("agern-run-$orphan--jdk17") }, rt.calls.toString())
+    }
+
+    @Test
+    fun `a run's sandbox is always removed before its worktree, also by the reapers at server start`() {
+        val w = world()
+        w.git.deleteWorktrees = true
+        w.sandboxFile(definition)
+        approve(w)
+        val rt = w.sandboxRuntime
+        w.launcher.stage = { p ->
+            p.init()
+            when (p.spec.kind) {
+                "spec-writer" -> { p.result("spec"); p.exit(0) }
+                "builder" -> {
+                    exec(w, p, "make")
+                    when {
+                        p.spec.prompt.orEmpty().contains("<issue_body>\nfail\n</issue_body>") -> p.exit(1)
+                        p.spec.prompt.orEmpty().contains("<issue_body>\nhang\n</issue_body>") -> while (!p.killed) Thread.sleep(10)
+                        else -> { p.result("built"); p.exit(0) }
+                    }
+                }
+                "approver" -> { p.result(null, buildJsonObject { put("verdict", "APPROVE"); put("summary", "ok") }); p.exit(0) }
+                else -> { p.result(null, buildJsonObject { put("verdict", "PASS"); put("summary", "ok"); put("findings", buildJsonArray { }) }); p.exit(0) }
+            }
+        }
+        val issues = w.github.repos["demo-app"]!!.issues
+        issues.replaceAll { when (it.number) { 2 -> it.copy(body = "fail"); 3 -> it.copy(body = "hang"); else -> it } }
+        val merged = start(w, 1)
+        assertEquals(RunStatus.MERGED, w.awaitRun(merged.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
+        val failed = start(w, 2)
+        assertEquals(RunStatus.FAILED, w.awaitRun(failed.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
+        val cancelled = start(w, 3)
+        waitFor { w.sandboxRuntime.execs.any { it.first == "agern-run-${cancelled.id}" } }
+        runBlocking { w.services.orchestrator.cancel(w.user("alice"), cancelled.id) }
+
+        for (run in listOf(merged, failed, cancelled)) {
+            val worktree = w.services.workspaces.runDir("alice", "demo-app", run.id)
+            assertTrue(worktree in w.git.removedWorktrees, "${run.id}: worktree not removed")
+            assertEquals(listOf("agern-run-${run.id}" to true), rt.removedWithWorktree.filter { it.first == "agern-run-${run.id}" },
+                "the sandbox of ${run.id} must be removed while its worktree still exists")
+        }
+        // Names and labels use the run id, never the (per-run) branch name.
+        assertTrue(rt.started.all { c -> c.labels["agern.run"]?.let { id -> c.name.startsWith("agern-run-$id") } == true }, rt.started.map { it.name }.toString())
+
+        // Server start: a leftover sandbox of a run that is no longer active, and its worktree on disk.
+        val t = world()
+        t.git.deleteWorktrees = true
+        val alice = t.user("alice")
+        val old = t.services.runs.createIfNoActive("demo-app", 1, "x", "task", 2, alice.id, null)!!
+        t.services.runs.setStatus(old.id, RunStatus.BUILDING) // failed by the restart recovery
+        val wt = java.nio.file.Files.createDirectories(t.services.workspaces.runDir("alice", "demo-app", old.id))
+        val def = (SandboxDefinitions.parse(definition, SandboxConfig()) as dk.egernet.factory.sandbox.ParsedDefinition.Valid).definition
+        t.sandboxRuntime.createNetwork("agern-run-${old.id}", SandboxManager.labels(old.id, "demo-app", "network"))
+        t.sandboxRuntime.startContainer(SandboxManager.mainSpec(old.id, "demo-app", wt, def))
+        t.services.start()
+        assertEquals(RunStatus.FAILED, t.services.runs.get(old.id)!!.status)
+        assertEquals(listOf("agern-run-${old.id}" to true), t.sandboxRuntime.removedWithWorktree.toList(), "sandbox reaper before worktree reaper")
+        assertTrue(wt in t.git.removedWorktrees && !java.nio.file.Files.exists(wt), t.git.removedWorktrees.toString())
     }
 }
