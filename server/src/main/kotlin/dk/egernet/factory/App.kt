@@ -110,7 +110,7 @@ class Services(
     val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
     val releaseLocks = dk.egernet.factory.pipeline.ReleaseLocks()
     val releaseMerger = dk.egernet.factory.pipeline.ReleaseMerger(
-        cfg, releaseStore, users, access, workspaces, bus, releaseLocks, scope, releaseModePolicy,
+        cfg, releaseStore, users, access, workspaces, bus, releaseLocks, scope, releaseModePolicy, clock,
     )
     val releaseBuilder = dk.egernet.factory.pipeline.ReleaseBuilder(
         cfg, releaseStore, runs, users, access, orchestrator, bus, scope, releaseLocks, releaseMerger,

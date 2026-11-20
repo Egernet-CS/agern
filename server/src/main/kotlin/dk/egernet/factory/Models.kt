@@ -442,7 +442,12 @@ object ReleaseMode {
 object ReleaseChecksState {
     /** Not read yet, or could not be read. */
     const val UNKNOWN = "unknown"
-    /** The head commit has no checks at all: counts as green. */
+    /**
+     * The head commit has no checks yet, but was first seen less than the settle period ago: CI may not have registered
+     * its checks yet. Not green.
+     */
+    const val AWAITING = "awaiting"
+    /** The head commit has had no checks at all for the whole settle period: counts as green. */
     const val NONE = "none"
     const val PENDING = "pending"; const val PASSED = "passed"; const val FAILED = "failed"
     val GREEN = setOf(NONE, PASSED)

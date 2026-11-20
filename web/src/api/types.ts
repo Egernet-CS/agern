@@ -74,8 +74,11 @@ export type ReleaseMergeState = 'unknown' | 'clean' | 'conflict';
 export type ReleaseMergeMethod = 'rebase' | 'merge' | 'unavailable';
 /** How a ready release reaches the default branch: the owner's approval, or Agern by itself once it is green. */
 export type ReleaseMode = 'manual' | 'automatic';
-/** The checks on the release pull request's head commit; `none` (no checks at all) counts as green. */
-export type ReleaseChecksState = 'unknown' | 'none' | 'pending' | 'passed' | 'failed';
+/**
+ * The checks on the release pull request's head commit. `awaiting`: none yet, but the commit is younger than the settle
+ * period (CI may not have registered its checks); `none` (no checks for the whole period) counts as green.
+ */
+export type ReleaseChecksState = 'unknown' | 'awaiting' | 'none' | 'pending' | 'passed' | 'failed';
 export type ReleaseChecks = { state: ReleaseChecksState; detail: string | null; sha: string | null };
 
 /** A scheduled start that did not happen (docs/ARCHITECTURE.md §6 "Scheduled start"). */

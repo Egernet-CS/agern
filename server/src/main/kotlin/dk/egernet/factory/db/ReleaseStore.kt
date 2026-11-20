@@ -284,14 +284,14 @@ class ReleaseStore(private val db: Db) {
 
     fun setPull(id: UUID, number: Int, url: String, bodySha: String, targetBranch: String) = db.update(
         """UPDATE releases SET pr_number = ?, pr_url = ?, pr_body_sha = ?, target_branch = ?, merge_state = 'unknown',
-           checks_state = 'unknown', checks_sha = NULL, checks_detail = NULL WHERE id = ?""",
+           checks_state = 'unknown', checks_sha = NULL, checks_detail = NULL, checks_head_seen_at = NULL WHERE id = ?""",
         number, url, bodySha, targetBranch, id,
     )
 
     /** Forgets a release pull request that was closed on GitHub without being merged. */
     fun clearPull(id: UUID) = db.update(
         """UPDATE releases SET pr_number = NULL, pr_url = NULL, pr_body_sha = NULL, merge_state = 'unknown', ready_announced = false,
-           checks_state = 'unknown', checks_sha = NULL, checks_detail = NULL WHERE id = ?""", id,
+           checks_state = 'unknown', checks_sha = NULL, checks_detail = NULL, checks_head_seen_at = NULL WHERE id = ?""", id,
     )
 
     /**
@@ -308,6 +308,19 @@ class ReleaseStore(private val db: Db) {
            AND (checks_state <> ? OR checks_sha IS DISTINCT FROM ? OR checks_detail IS DISTINCT FROM ?)""",
         state, sha, detail, id, state, sha, detail,
     ) == 1
+
+    /**
+     * When Agern first saw [sha] as the release pull request's head: recorded as [now] the first time (a new head, or a
+     * new pull request, starts again), so the settle period survives restarts.
+     */
+    fun headSeenAt(id: UUID, sha: String, now: Instant): Instant {
+        db.update(
+            """UPDATE releases SET checks_sha = ?, checks_head_seen_at = ? WHERE id = ?
+               AND (checks_sha IS DISTINCT FROM ? OR checks_head_seen_at IS NULL)""",
+            sha, now, id, sha,
+        )
+        return db.queryOne("SELECT checks_head_seen_at FROM releases WHERE id = ?", id) { it.instantOrNull("checks_head_seen_at") } ?: now
+    }
 
     /** Claims the one "checks failed" comment for head commit [sha]; true for exactly one caller per commit. */
     fun claimChecksFailure(id: UUID, sha: String): Boolean = db.update(
@@ -356,7 +369,7 @@ class ReleaseStore(private val db: Db) {
      * manual ones whose checks are pending (so the release page shows when they finish).
      */
     fun periodicIds(): List<UUID> = db.query(
-        "SELECT id FROM releases WHERE status = 'ready' AND (release_mode = 'automatic' OR checks_state = 'pending') ORDER BY ready_at, id",
+        "SELECT id FROM releases WHERE status = 'ready' AND (release_mode = 'automatic' OR checks_state IN ('pending', 'awaiting')) ORDER BY ready_at, id",
     ) { it.uuid("id") }
 
     /** Ids of released releases whose clean-up did not finish (a restart in between). */

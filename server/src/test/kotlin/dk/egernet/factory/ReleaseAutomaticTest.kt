@@ -51,7 +51,8 @@ import kotlin.test.assertTrue
  * (docs/ARCHITECTURE.md §6 "Releasing", "Release mode", "Checks").
  */
 class ReleaseAutomaticTest {
-    private val world = TestWorld(twoFactor = false)
+    private val clock = MutableClock(java.time.Instant.now())
+    private val world = TestWorld(twoFactor = false, clock = clock)
     private val s = world.services
     private val gh = world.github
     private val alice = world.user("alice")
@@ -74,6 +75,8 @@ class ReleaseAutomaticTest {
 
     init {
         s.releaseMerger.mergeablePollMillis = 20
+        // Most tests are about other rules: "no checks" is green at once. The settle tests set it themselves.
+        s.releaseMerger.checksSettleSeconds = 0
         world.launcher.stage = { p ->
             val title = Regex("Issue #\\d+: (.+)").find(p.spec.prompt ?: "")?.groupValues?.get(1)?.trim() ?: ""
             val b = behaviour[title] ?: "ok"
@@ -391,6 +394,99 @@ class ReleaseAutomaticTest {
         assertTrue(done.releasedAutomatically)
     }
 
+    // ------------------------------------------------------------ the settle period for "no checks"
+
+    @Test
+    fun `no checks right after the pull request opens is not green until the settle period has passed`() {
+        s.releaseMerger.checksSettleSeconds = 120
+        val r0 = release("settle", listOf(issue("No CI yet")), mode = ReleaseMode.AUTOMATIC)
+        start(r0.id)
+        val r = awaitChecked(r0.id, ReleaseChecksState.AWAITING)
+        assertTrue(r.checksDetail!!.startsWith("No checks yet; waiting for them to appear until "), r.checksDetail)
+        assertEquals("awaiting", r.toDto().checks!!.state)
+        clock.advance(java.time.Duration.ofSeconds(119))
+        repeat(2) { tick() }
+        assertEquals(ReleaseStatus.READY, s.releaseStore.get(r.id)!!.status)
+        assertEquals(ReleaseChecksState.AWAITING, s.releaseStore.get(r.id)!!.checksState)
+        assertEquals(0, merges())
+        assertNull(s.releaseStore.get(r.id)!!.notice, "waiting is not a problem")
+        // Still no checks once the period is over: none, green, merged by the periodic re-evaluation.
+        clock.advance(java.time.Duration.ofSeconds(2))
+        tick()
+        val done = awaitReleased(r.id)
+        assertTrue(done.releasedAutomatically)
+        assertEquals(ReleaseChecksState.NONE, done.checksState)
+    }
+
+    @Test
+    fun `the settle period is configured in seconds`() {
+        val base = mapOf("FACTORY_MASTER_KEY" to java.util.Base64.getEncoder().encodeToString(ByteArray(32)), "FACTORY_GITHUB_ORG" to "o")
+        assertEquals(120L, Config.fromEnv(base).releaseChecksSettleSeconds)
+        assertEquals(0L, Config.fromEnv(base + ("FACTORY_RELEASE_CHECKS_SETTLE_SECONDS" to "0")).releaseChecksSettleSeconds)
+        kotlin.test.assertFailsWith<IllegalArgumentException> { Config.fromEnv(base + ("FACTORY_RELEASE_CHECKS_SETTLE_SECONDS" to "-1")) }
+        kotlin.test.assertFailsWith<IllegalArgumentException> { Config.fromEnv(base + ("FACTORY_RELEASE_CHECKS_SETTLE_SECONDS" to "soon")) }
+    }
+
+    @Test
+    fun `checks that appear during the settle period are waited for and merged on green`() {
+        s.releaseMerger.checksSettleSeconds = 120
+        val r0 = release("appear", listOf(issue("CI starts late")), mode = ReleaseMode.AUTOMATIC)
+        start(r0.id)
+        awaitChecked(r0.id, ReleaseChecksState.AWAITING)
+        clock.advance(java.time.Duration.ofSeconds(10))
+        gh.setCheckRun("demo-app", "release/appear", "build", "queued")
+        tick()
+        assertEquals(ReleaseChecksState.PENDING, s.releaseStore.get(r0.id)!!.checksState)
+        // Long after the period: pending still waits (only "no checks at all" settles).
+        clock.advance(java.time.Duration.ofMinutes(10))
+        tick()
+        assertEquals(ReleaseStatus.READY, s.releaseStore.get(r0.id)!!.status)
+        assertEquals(0, merges())
+        gh.setCheckRun("demo-app", "release/appear", "build", "completed", "success")
+        tick()
+        assertTrue(awaitReleased(r0.id).releasedAutomatically)
+    }
+
+    @Test
+    fun `the settle period is measured from when the head was first seen, across a restart`() {
+        s.releaseMerger.checksSettleSeconds = 120
+        val r0 = release("settle-rs", listOf(issue("Restarted while waiting")), mode = ReleaseMode.AUTOMATIC)
+        start(r0.id)
+        val first = awaitChecked(r0.id, ReleaseChecksState.AWAITING)
+        tick()
+        clock.advance(java.time.Duration.ofSeconds(100))
+        s.stop()
+        val s2 = Services(world.cfg, s.db, gh, world.git, world.launcher, clock = clock)
+        extraServices += s2
+        s2.releaseMerger.mergeablePollMillis = 20
+        s2.releaseMerger.checksSettleSeconds = 120
+        s2.start()
+        // The recovery re-evaluates: 100 s after the head was first seen, still waiting.
+        awaitRelease(r0.id, "re-evaluated after the restart", s2) { it.checksState == ReleaseChecksState.AWAITING }
+        tick(s2)
+        assertEquals(ReleaseStatus.READY, s.releaseStore.get(r0.id)!!.status)
+        assertEquals(first.checksSha, s.releaseStore.get(r0.id)!!.checksSha)
+        // 130 s after it was first seen (not 30 s after the restart): settled and merged.
+        clock.advance(java.time.Duration.ofSeconds(30))
+        tick(s2)
+        assertTrue(awaitReleased(r0.id, s2).releasedAutomatically)
+        assertEquals(1, merges())
+    }
+
+    @Test
+    fun `a manual release shows that its checks have not appeared yet`() {
+        s.releaseMerger.checksSettleSeconds = 120
+        val r0 = release("settle-m", listOf(issue("Manual, no CI yet")))
+        start(r0.id)
+        awaitChecked(r0.id, ReleaseChecksState.AWAITING)
+        assertTrue(r0.id in s.releaseStore.periodicIds(), "polled so the page shows when the period ends")
+        clock.advance(java.time.Duration.ofSeconds(121))
+        tick()
+        assertEquals(ReleaseChecksState.NONE, s.releaseStore.get(r0.id)!!.checksState)
+        assertEquals(ReleaseStatus.READY, s.releaseStore.get(r0.id)!!.status, "manual: never merged by itself")
+        assertEquals(ReleaseStatus.RELEASED, runBlocking { s.releases.approve(alice, r0.id) }.status)
+    }
+
     // ------------------------------------------------------------ restart and concurrency
 
     @Test
@@ -402,7 +498,7 @@ class ReleaseAutomaticTest {
         tick()
         s.stop()
         gh.setStatus("demo-app", "release/rs", "ci", "success")
-        val s2 = Services(world.cfg, s.db, gh, world.git, world.launcher)
+        val s2 = Services(world.cfg, s.db, gh, world.git, world.launcher, clock = clock)
         extraServices += s2
         s2.releaseMerger.mergeablePollMillis = 20
         s2.start()
@@ -534,9 +630,10 @@ class ReleaseAutomaticTest {
 
     @Test
     fun `a project that requires a human approval refuses automatic releases (the seam for #24)`() {
-        val strict = Services(world.cfg, s.db, gh, world.git, world.launcher, releaseModePolicy = ReleaseModePolicy { false })
+        val strict = Services(world.cfg, s.db, gh, world.git, world.launcher, clock = clock, releaseModePolicy = ReleaseModePolicy { false })
         extraServices += strict
         strict.releaseMerger.mergeablePollMillis = 20
+        strict.releaseMerger.checksSettleSeconds = 0
         assertEquals("release_mode_not_allowed", code { runBlocking { strict.releases.create(alice, "demo-app", "no", "", "automatic") } })
         val planned = runBlocking { strict.releases.create(alice, "demo-app", "no", "") }
         assertEquals("release_mode_not_allowed", code { runBlocking { strict.releases.setMode(alice, planned.id, "automatic") } })

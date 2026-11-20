@@ -711,12 +711,20 @@ function ReleaseModeField({
 
 const CHECKS_LABEL: Record<ReleaseChecks['state'], string> = {
   unknown: 'checks unknown',
+  awaiting: 'waiting for checks to appear',
   none: 'no checks',
   pending: 'checks pending',
   passed: 'checks passed',
   failed: 'checks failed',
 };
-const CHECKS_TONE: Record<ReleaseChecks['state'], string> = { unknown: 'idle', none: 'idle', pending: 'active', passed: 'pass', failed: 'fail' };
+const CHECKS_TONE: Record<ReleaseChecks['state'], string> = {
+  unknown: 'idle',
+  awaiting: 'active',
+  none: 'idle',
+  pending: 'active',
+  passed: 'pass',
+  failed: 'fail',
+};
 
 /** The checks on the release pull request's head commit (GitHub Actions and other status checks). */
 function ChecksLine({ checks }: { checks: ReleaseChecks }) {
@@ -740,6 +748,8 @@ function automaticLine(checks: ReleaseChecks | null): string {
     case 'none':
     case 'passed':
       return 'Set to release automatically: Agern is merging it.';
+    case 'awaiting':
+      return 'Set to release automatically: Agern waits for checks to appear before merging it.';
     default:
       return 'Set to release automatically: Agern merges it once all checks have passed.';
   }
@@ -808,7 +818,9 @@ function ApproveReleaseDialog({
       ? `Checks failed on this pull request (${checks.detail ?? 'a check failed'}). Approving merges it anyway.`
       : checks?.state === 'pending'
         ? `Some checks have not finished yet (${checks.detail ?? 'pending'}). Approving merges it without waiting for them.`
-        : checks?.state === 'unknown'
+        : checks?.state === 'awaiting'
+          ? 'No checks have appeared on this pull request yet; CI may not have started. Approving merges it without waiting for them.'
+          : checks?.state === 'unknown'
           ? 'The checks on this pull request could not be read. Approving merges it without them.'
           : null;
   return (

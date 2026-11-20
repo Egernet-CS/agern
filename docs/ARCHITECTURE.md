@@ -64,6 +64,7 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_MAX_AGENTS_PER_USER` | `8` | Concurrent agent processes per user |
 | `FACTORY_CHAT_IDLE_MINUTES` | `30` | Idle chat processes are stopped and resumed on next input |
 | `FACTORY_STAGE_TIMEOUT_MINUTES` | `60` | Wall-clock limit for one pipeline stage agent (1–1440). On timeout the agent is stopped, the stage is `failed` and the run `failed` with an error that says so |
+| `FACTORY_RELEASE_CHECKS_SETTLE_SECONDS` | `120` | How long the head commit of a release pull request must have had no checks at all before "no checks" counts as green for an automatic release (0–3600; §6 "Checks"). Measured from when Agern first saw that head commit, persisted across restarts |
 | `FACTORY_AGENT_PATH` | the server's `PATH` | `PATH` value handed to agent and git processes (the only value taken from the server environment) |
 | `FACTORY_GITHUB_API_URL` | `https://api.github.com` | GitHub REST base URL (GitHub Enterprise: `https://host/api/v3`) |
 | `FACTORY_ATTACHMENT_MAX_MB` | `20` | Largest single chat attachment (1–512) |
@@ -586,7 +587,7 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   `pr_url`, `pr_body_sha`, `target_branch`, `merge_state`, `merge_method`, `notice`, `ready_at`, `ready_announced`,
   `released_at`, `released_by`, `merge_sha`, `cleanup_pending`; for the release mode (V11) `release_mode` (`manual` |
   `automatic`, checked), `released_automatically`, `checks_state`, `checks_sha`, `checks_detail`, `checks_failure_sha`,
-  `auto_merge_failed_sha`) and `release_issues` (`release_id`, `repo`, `issue_number`, `position`, `issue_title`, `issue_kind`,
+  `auto_merge_failed_sha`, `checks_head_seen_at`) and `release_issues` (`release_id`, `repo`, `issue_number`, `position`, `issue_title`, `issue_kind`,
   `added_by`, `added_at`, `state`, `run_id` = the issue's latest release run, `note`). `runs` carry `release_id`
   (`ON DELETE SET NULL`) and `base_branch` (null = the default branch). Several releases may exist per project.
   Creating one creates no branch, no run and makes no GitHub write.
@@ -873,7 +874,7 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   - *Automatic*: at the end of every re-evaluation (not the one inside an approval), the server merges the release
     when **all** of these hold: status `ready`; complete (something merged, nothing held); a pull request exists;
     `mergeState` is `clean` (unknown waits, GitHub may still be computing); `mergeMethod` is `rebase` or `merge`; the
-    checks on the pull request's head commit are green (`passed` or `none`, see "Checks"); the project allows it
+    checks on the pull request's head commit are green (`passed`, or `none` after the settle period, see "Checks"); the project allows it
     (`ReleaseModePolicy`, below). The merge is **the approval's own code path** (`mergeLocked`): the owner's token, the
     same method, the head commit the checks were read for passed as `sha` (a branch that moved meanwhile is refused,
     not merged unseen), and the same "After the merge". No language-model agent takes part in the decision.
@@ -893,7 +894,7 @@ release mode (#41). Single runs are unaffected and still merge into the default 
     automatic again, or a new commit on the release branch tries again.
   - *Periodic re-evaluation.* GitHub sends Agern no webhook, so `ReleaseMerger.startTicker` re-evaluates every 60 s
     (`periodicMillis`; tests shorten it) each `ready` release that is automatic or whose checks are `pending` (so a
-    manual release's page also shows when they finish), oldest first, each under its mutex; a release is published
+    manual release's page also shows when they finish; likewise `awaiting`), oldest first, each under its mutex; a release is published
     on the feed only when something changed. It runs in the services' scope and stops with them. Each round costs a
     handful of GitHub calls per such release with the owner's token (repository, pull request, combined status, check
     runs), well within the rate limit for the few releases a project has ready at once.
@@ -914,7 +915,16 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   `success`, `neutral` or `skipped` (so `failure`, `cancelled`, `timed_out`, `action_required`, `stale` fail);
   otherwise `pending` if any status is `pending` or any check run is not `completed`; otherwise `passed`, or `none`
   when there are no statuses and no check runs at all (GitHub reports `state: pending` with `total_count: 0` then —
-  that is not pending). `none` and `passed` are green. A read GitHub refuses is `unknown` with the reason. Stored as
+  that is not pending). **Settle period:** GitHub Actions and other CI register their checks only some seconds after
+  the push or pull request event, so a head commit with no checks right after Agern opened the pull request (or the
+  branch moved) says nothing yet. "No checks" is therefore `awaiting` ("No checks yet; waiting for them to appear
+  until <time> …"), not green, until the head commit has had no checks for `FACTORY_RELEASE_CHECKS_SETTLE_SECONDS`
+  (default 120), measured from when Agern first saw that SHA as the pull request's head (`checks_head_seen_at`,
+  persisted, so a restart does not restart the period; a new head or a new pull request starts again; times use
+  `Services.clock`). Only then is it `none`. Checks that appear meanwhile are `pending` and waited for as usual;
+  `awaiting` releases are re-evaluated periodically, so the automatic merge follows on its own once the period ends.
+  Comparing with the default branch's checks was considered and left out: workflows that run only on pushes, or
+  only on pull requests, make it an unreliable signal. `none` and `passed` are green. A read GitHub refuses is `unknown` with the reason. Stored as
   `checks_state`, `checks_sha` and `checks_detail` ("Failed: build, lint", "Pending: ci/e2e", "3 checks passed", "No
   checks") and shown on the release page in both modes; for a manual release they are information only. Agern does
   not read branch protection: a required check that has not reported yet is invisible to it, and GitHub's own
@@ -1122,7 +1132,7 @@ type Release = { id: string; repo: string; name: string; description: string;
   mergeCommit: string | null;               // the default branch's commit after the merge
   mode: 'manual' | 'automatic';             // §6 "Release mode"
   releasedAutomatically: boolean;           // merged by Agern for the owner (automatic mode)
-  checks: { state: 'unknown' | 'none' | 'pending' | 'passed' | 'failed';   // on the pull request's head commit
+  checks: { state: 'unknown' | 'awaiting' | 'none' | 'pending' | 'passed' | 'failed';   // on the pull request's head commit
             detail: string | null; sha: string | null } | null };         // null until there is a pull request
 
 type SessionKind = 'chat' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
@@ -1795,13 +1805,14 @@ for an admin who is not the owner), for everyone else "Release mode: Manual appr
 automatic "Once everything is built, merges cleanly and all checks on the release pull request have passed, Agern
 merges it with <owner>'s GitHub token. Held issues, conflicts and failed checks stop it.". The "Release pull request"
 section shows the checks as a pill ("checks passed", "checks pending", "checks failed", "no checks", "checks
-unknown") with the detail ("This pull request has no checks; that counts as green." for none) and, for an automatic
+unknown", "waiting for checks to appear") with the detail ("This pull request has no checks; that counts as green." for none) and, for an automatic
 release that could be approved, a line `.release-auto`: "Set to release automatically: Agern merges it once all
 checks have passed." (pending, unknown), "…: Agern is merging it." (green) or "…, but a check failed: Agern will not
 merge it until the checks pass.". Approval stays available in both modes and is never blocked by checks; the
 confirmation dialog warns "Checks failed on this pull request (<detail>). Approving merges it anyway.", "Some checks
 have not finished yet (<detail>). Approving merges it without waiting for them." or "The checks on this pull request
-could not be read. Approving merges it without them.". A released automatic release reads "Released automatically
+could not be read. Approving merges it without them." or, while `awaiting`, "No checks have appeared on this pull request
+yet; CI may not have started. Approving merges it without waiting for them.". A released automatic release reads "Released automatically
 <time ago> for <owner>". The start dialog adds "It is set to release automatically: … Agern merges it into the
 default branch with your GitHub token, without asking you." (manual: "When everything is built, it waits for your
 approval before anything reaches the default branch."), and the schedule dialog's hint a similar sentence. The

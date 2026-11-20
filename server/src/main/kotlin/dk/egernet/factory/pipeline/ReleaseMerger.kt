@@ -72,12 +72,19 @@ class ReleaseMerger(
     private val locks: ReleaseLocks,
     private val scope: CoroutineScope,
     private val policy: ReleaseModePolicy = ReleaseModePolicy.ALLOW_ALL,
+    private val clock: java.time.Clock = java.time.Clock.systemUTC(),
 ) {
     private val log = LoggerFactory.getLogger(ReleaseMerger::class.java)
     private val org get() = cfg.githubOrg
 
     /** Pause between reads while GitHub is still computing mergeability (tests shorten it). */
     @Volatile var mergeablePollMillis = 1000L
+
+    /**
+     * How long a head commit must have had no checks before "no checks" counts as green
+     * (FACTORY_RELEASE_CHECKS_SETTLE_SECONDS; tests change it).
+     */
+    @Volatile var checksSettleSeconds = cfg.releaseChecksSettleSeconds
 
     /** Interval of the periodic re-evaluation ([startTicker]); tests shorten it before starting the ticker. */
     @Volatile var periodicMillis = 60_000L
@@ -374,12 +381,26 @@ class ReleaseMerger(
         }
     }
 
-    /** Reads and stores the checks on head commit [sha]; a read GitHub refuses is `unknown` with the reason. */
+    /**
+     * Reads and stores the checks on head commit [sha]; a read GitHub refuses is `unknown` with the reason. No checks
+     * on a head first seen less than [checksSettleSeconds] ago is `awaiting` (CI registers its checks some seconds after
+     * a push, so "none" right after opening the pull request or a new commit means nothing yet), not `none`.
+     */
     private suspend fun readChecks(r: ReleaseRecord, client: GitHubClient, sha: String): ChecksSummary {
-        val summary = try {
+        val now = clock.instant()
+        val seen = io { store.headSeenAt(r.id, sha, now) }
+        var summary = try {
             io { ChecksSummary.of(client.combinedStatus(org, r.repo, sha), client.checkRuns(org, r.repo, sha)) }
         } catch (e: GitHubException) {
             ChecksSummary(ReleaseChecksState.UNKNOWN, "Could not read the checks: ${e.message}".take(500))
+        }
+        val settled = seen.plusSeconds(checksSettleSeconds)
+        if (summary.state == ReleaseChecksState.NONE && now.isBefore(settled)) {
+            summary = ChecksSummary(
+                ReleaseChecksState.AWAITING,
+                "No checks yet; waiting for them to appear until ${settled.truncatedTo(java.time.temporal.ChronoUnit.SECONDS)} " +
+                    "(after that, no checks counts as green)",
+            )
         }
         io { store.setChecks(r.id, summary.state, sha, summary.detail) }
         return summary
