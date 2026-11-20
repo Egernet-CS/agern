@@ -143,6 +143,7 @@ export function useSessionStream(sessionId: string | null): SessionStream {
 type IssueListener = (repo: string, issue: Issue) => void;
 type SandboxApprovalListener = (repo: string, approval: SandboxApproval | null) => void;
 type SandboxesListener = (runId: string, change: 'created' | 'removed' | 'stopped') => void;
+type UsageListener = () => void;
 
 type FeedState = {
   sessions: Map<string, AgentSession>;
@@ -157,6 +158,8 @@ type FeedState = {
   subscribeSandboxApprovals: (fn: SandboxApprovalListener) => () => void;
   /** Registers a listener for `sandboxes` frames (admins only: a sandbox container came or went); returns the unsubscribe function. */
   subscribeSandboxes: (fn: SandboxesListener) => () => void;
+  /** Registers a listener for `usage` frames (the user's own Claude usage changed); returns the unsubscribe function. Stable identity. */
+  subscribeUsage: (fn: UsageListener) => () => void;
   /** Ids of chats closed while this app was open (tombstones: they never reappear). */
   closedSessions: Set<string>;
   /** Records a chat as closed and drops it from the live sessions. Stable identity. */
@@ -184,6 +187,7 @@ const FeedContext = createContext<FeedState>({
   subscribeIssues: () => () => {},
   subscribeSandboxApprovals: () => () => {},
   subscribeSandboxes: () => () => {},
+  subscribeUsage: () => () => {},
   closedSessions: new Set(),
   markSessionClosed: () => {},
   releases: new Map(),
@@ -224,6 +228,13 @@ export function FeedProvider({ enabled, children }: { enabled: boolean; children
     sandboxesListeners.current.add(fn);
     return () => {
       sandboxesListeners.current.delete(fn);
+    };
+  }, []);
+  const usageListeners = useRef(new Set<UsageListener>());
+  const subscribeUsage = useCallback((fn: UsageListener) => {
+    usageListeners.current.add(fn);
+    return () => {
+      usageListeners.current.delete(fn);
     };
   }, []);
   const opened = useRef(false);
@@ -287,6 +298,10 @@ export function FeedProvider({ enabled, children }: { enabled: boolean; children
             for (const fn of sandboxesListeners.current) fn(f.runId, f.change);
             return;
           }
+          if (f.type === 'usage') {
+            for (const fn of usageListeners.current) fn();
+            return;
+          }
           if (f.type === 'session_closed') {
             markSessionClosed(f.sessionId);
             return;
@@ -318,6 +333,7 @@ export function FeedProvider({ enabled, children }: { enabled: boolean; children
       subscribeIssues,
       subscribeSandboxApprovals,
       subscribeSandboxes,
+      subscribeUsage,
       closedSessions: store.current.closed,
       markSessionClosed,
       releases: store.current.releases,
@@ -327,7 +343,7 @@ export function FeedProvider({ enabled, children }: { enabled: boolean; children
       releaseMark,
       releaseSeen: store.current.releaseSeen,
     }),
-    [version, conn, reconnects, subscribeIssues, subscribeSandboxApprovals, subscribeSandboxes, markSessionClosed, noteReleases, markReleaseDeleted, releaseMark],
+    [version, conn, reconnects, subscribeIssues, subscribeSandboxApprovals, subscribeSandboxes, subscribeUsage, markSessionClosed, noteReleases, markReleaseDeleted, releaseMark],
   );
   return createElement(FeedContext.Provider, { value }, children);
 }

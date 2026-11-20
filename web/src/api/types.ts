@@ -462,6 +462,26 @@ export type Preferences = {
   suggestions: string[];
 };
 
+/** One Claude limit window of the caller, as last reported while one of their agents ran (docs/ARCHITECTURE.md §5 "Claude usage"). */
+export type UsageWindow = {
+  /** `five_hour`, `seven_day`, `seven_day_opus`, …; unknown types arrive as they are. */
+  type: string;
+  /** Fraction used (1 = 100 %), may exceed 1; null when unknown. */
+  utilization: number | null;
+  /** `allowed` | `allowed_warning` | `rejected` | something new. */
+  status: string | null;
+  resetsAt: string | null;
+  observedAt: string;
+};
+
+/** `GET /api/me/usage`: the caller's own usage. `windows` is empty unless the credential is an OAuth token. */
+export type ClaudeUsage = {
+  credentialKind: CredentialKind | null;
+  windows: UsageWindow[];
+  /** What the caller's agents cost through Agern; UTC day (`YYYY-MM-DD`) and month (`YYYY-MM`). */
+  spend: { todayUsd: number; monthUsd: number; day: string; month: string };
+};
+
 export type SoftwareRequest = {
   id: string;
   name: string;
@@ -488,7 +508,9 @@ export type FeedFrame =
   /** An admin approved (approval set) or revoked (null) the project's sandbox definition. */
   | { type: 'sandbox_approval'; repo: string; approval: SandboxApproval | null }
   /** Admins only: a container of a run's sandbox was created or removed, or an admin stopped the sandbox. */
-  | { type: 'sandboxes'; runId: string; change: 'created' | 'removed' | 'stopped' };
+  | { type: 'sandboxes'; runId: string; change: 'created' | 'removed' | 'stopped' }
+  /** Private to the receiving user: their own Claude usage changed; reload `GET /api/me/usage`. */
+  | { type: 'usage' };
 
 /** Agents are working on these runs. */
 export const WORKING_RUN_STATUSES: RunStatus[] = ['queued', 'spec', 'building', 'reviewing', 'approving'];

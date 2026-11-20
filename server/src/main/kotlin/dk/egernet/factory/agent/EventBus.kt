@@ -39,6 +39,13 @@ sealed class FeedItem(val repo: String) {
      * `removed`, `stopped`). Sent to admins only (whatever they can see, like the overview), so the admin page updates live.
      */
     class Sandboxes(repo: String, val runId: String, val change: String) : FeedItem(repo)
+
+    /**
+     * The Claude usage of [userId] changed (limit windows recorded, spend added, credential changed). Private to that
+     * user: sent only to their own feed connections, never filtered by repository, and it carries no data (the client
+     * reloads `GET /api/me/usage`).
+     */
+    class Usage(val userId: UUID) : FeedItem("")
 }
 
 /** In-process fan-out of live events. Persisted state is in PostgreSQL; this only carries notifications. */

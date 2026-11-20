@@ -81,8 +81,12 @@ class UserStore(private val db: Db) {
         login, tokenEnc, kind, scopes?.joinToString(","), id,
     )
 
-    fun setClaude(id: UUID, kind: String?, enc: ByteArray?) =
-        db.update("UPDATE users SET claude_cred_kind = ?, claude_cred_enc = ? WHERE id = ?", kind, enc, id)
+    /** Replaces (or with nulls removes) the Claude credential; the recorded limit windows belonged to the old one and go too. */
+    fun setClaude(id: UUID, kind: String?, enc: ByteArray?): Int = db.tx { c ->
+        val n = c.prepare("UPDATE users SET claude_cred_kind = ?, claude_cred_enc = ? WHERE id = ?", arrayOf<Any?>(kind, enc, id)).use { it.executeUpdate() }
+        c.prepare("DELETE FROM claude_usage_windows WHERE user_id = ?", arrayOf<Any?>(id)).use { it.executeUpdate() }
+        n
+    }
 
     fun setTotpPending(id: UUID, enc: ByteArray?) = db.update("UPDATE users SET totp_pending_enc = ? WHERE id = ?", enc, id)
 

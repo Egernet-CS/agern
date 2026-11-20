@@ -188,6 +188,7 @@ class AgentManager(
     private val scope: CoroutineScope,
     private val attachments: Attachments,
     private val preferences: dk.egernet.factory.db.PreferenceStore,
+    private val usageStore: dk.egernet.factory.db.ClaudeUsageStore,
 ) {
     private val log = LoggerFactory.getLogger(AgentManager::class.java)
 
@@ -198,7 +199,11 @@ class AgentManager(
         val sessionId: UUID, val ownerId: UUID, val repo: String, val kind: String,
         val proc: AgentProcess, val mcpToken: String, val interactive: Boolean,
         val baseCost: Double, var turns: Int, var claudeSessionId: String?,
+        /** The owner's encrypted Claude credential this process was launched with (limit windows are recorded only while it is current). */
+        val credEnc: ByteArray?,
     ) {
+        /** The process's `total_cost_usd` at its previous `result` (the CLI reports a running total per process). */
+        @Volatile var procCost = 0.0
         @Volatile var turnActive = false
         @Volatile var lastUse = System.currentTimeMillis()
         @Volatile var stopReason: String? = null
@@ -398,7 +403,7 @@ class AgentManager(
             )
             val proc = withContext(Dispatchers.IO) { launcher.launch(spec) }
             if (s.claudeSessionId != null) systemEvent(sessionId, "info", "Resuming conversation ${s.claudeSessionId}")
-            val l = Live(sessionId, owner.id, s.repo, "chat", proc, token, true, s.costUsd ?: 0.0, s.numTurns ?: 0, s.claudeSessionId)
+            val l = Live(sessionId, owner.id, s.repo, "chat", proc, token, true, s.costUsd ?: 0.0, s.numTurns ?: 0, s.claudeSessionId, owner.claudeCredEnc)
             l.resumedFrom = s.claudeSessionId
             live[sessionId] = l
             scope.launch { pump(l); finishChat(l, slot) }
@@ -685,7 +690,7 @@ class AgentManager(
             for ((level, text) in req.notes) systemEvent(s.id, level, text)
             publish(s.id, "user", buildJsonObject { put("text", req.prompt); put("username", req.owner.username) })
             val proc = withContext(Dispatchers.IO) { launcher.launch(spec) }
-            val lv = Live(s.id, req.owner.id, req.repo, req.role, proc, token, false, 0.0, 0, req.resumeClaudeSessionId)
+            val lv = Live(s.id, req.owner.id, req.repo, req.role, proc, token, false, 0.0, 0, req.resumeClaudeSessionId, req.owner.claudeCredEnc)
             lv.steerable = steerable
             l = lv
             if (steerable) {
@@ -802,6 +807,7 @@ class AgentManager(
         publish(l.sessionId, "claude", obj)
         if (!l.interactive) l.usage.observe(obj)
         when (obj["type"]?.jsonPrimitive?.contentOrNull) {
+            "rate_limit_event" -> recordLimits(l, obj)
             "system" -> if (obj["subtype"]?.jsonPrimitive?.contentOrNull == "init") {
                 l.sawInit = true
                 val cid = obj["session_id"]?.jsonPrimitive?.contentOrNull
@@ -826,6 +832,7 @@ class AgentManager(
                 val cost = obj["total_cost_usd"]?.jsonPrimitive?.doubleOrNull
                 l.turns += obj["num_turns"]?.jsonPrimitive?.intOrNull ?: 0
                 sessions.setUsage(l.sessionId, cost?.let { l.baseCost + it }, l.turns)
+                if (cost != null) recordSpend(l, cost)
                 if (l.interactive) {
                     l.turnActive = false
                     l.lastUse = System.currentTimeMillis()
@@ -851,6 +858,35 @@ class AgentManager(
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Records the limit windows of a `rate_limit_event` for the session's owner (docs/ARCHITECTURE.md §5 "Claude usage").
+     * Never fails the session: a malformed event or a database error is logged and otherwise ignored.
+     */
+    private fun recordLimits(l: Live, obj: JsonObject) {
+        try {
+            val cred = l.credEnc ?: return
+            val info = obj["rate_limit_info"] as? JsonObject ?: return
+            val windows = RateLimitWindows.parse(info)
+            if (windows.isNotEmpty() && usageStore.recordWindows(l.ownerId, cred, windows) > 0) bus.emitFeed(FeedItem.Usage(l.ownerId))
+        } catch (e: Exception) {
+            log.warn("Could not record Claude usage limits of session {}: {}", l.sessionId, e.toString())
+        }
+    }
+
+    /** Adds what this process cost since its previous `result` ([total] is the process's running total) to the owner's spend. */
+    private fun recordSpend(l: Live, total: Double) {
+        try {
+            val delta = total - l.procCost
+            l.procCost = total
+            if (delta > 0.0) {
+                usageStore.addSpend(l.ownerId, delta)
+                bus.emitFeed(FeedItem.Usage(l.ownerId))
+            }
+        } catch (e: Exception) {
+            log.warn("Could not record the Claude spend of session {}: {}", l.sessionId, e.toString())
         }
     }
 

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { BrowserRouter, Navigate, NavLink, Outlet, Route, Routes, useLocation } from 'react-router-dom';
 import { api, isMock, isSessionActive } from './api';
+import { UsageIndicator } from './components/ui/UsageIndicator';
 import { Logo, Wordmark } from './components/ui/ui';
 import { useAsync } from './lib/async';
 import { AuthProvider, useAuth } from './lib/auth';
@@ -135,6 +136,7 @@ function Shell() {
         </nav>
         <div className="topbar-right">
           {isMock && <span className="mock-flag" title="VITE_MOCK=1 — data is simulated in the browser">mock</span>}
+          <UsageIndicator />
           <LiveCount />
           <div className="usermenu">
             <button type="button" className="avatar-btn" aria-haspopup="menu" aria-expanded={menu} onClick={() => setMenu((m) => !m)}>

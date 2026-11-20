@@ -870,6 +870,51 @@ input[type='checkbox'] {
   box-shadow: 0 0 8px var(--amber);
   animation: pulse 1.6s infinite;
 }
+/* Claude usage in the top bar: text and glyph carry the state, colour only reinforces it. */
+.usage-ind {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font: 600 0.8rem/1 var(--font-mono);
+  color: var(--text-3);
+  padding: 7px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  text-decoration: none !important;
+  white-space: nowrap;
+}
+.usage-ind:hover {
+  color: var(--text-2);
+  border-color: var(--line-2);
+}
+.usage-ind[data-level='ok'],
+.usage-ind[data-level='spend'] {
+  color: var(--text-2);
+}
+.usage-ind-sub {
+  font-weight: 500;
+  color: var(--text-3);
+}
+.usage-ind[data-level='high'] {
+  color: var(--amber-hi);
+  border-color: rgba(255, 177, 74, 0.35);
+  background: var(--amber-wash);
+}
+.usage-ind[data-level='limit'] {
+  color: var(--fail);
+  border-color: rgba(255, 100, 100, 0.4);
+  background: var(--fail-wash);
+}
+.usage-ind[data-level='high'] .usage-ind-sub,
+.usage-ind[data-level='limit'] .usage-ind-sub {
+  color: inherit;
+  opacity: 0.85;
+}
+.usage-ind-word {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 0.7rem;
+}
 .usermenu {
   position: relative;
 }
@@ -2346,7 +2391,8 @@ html.app-locked #root {
     display: none;
   }
   .avatar-name,
-  .live-count-label {
+  .live-count-label,
+  .usage-ind-sub {
     display: none;
   }
   :root {
@@ -2542,6 +2588,100 @@ html.app-locked #root {
   }
   .pref-src {
     display: none;
+  }
+}
+
+/* ------------------------------------------------------------------ Claude usage (settings → models & cost) */
+.usage-block {
+  margin: 4px 0 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--bg-2);
+}
+.usage-block h3 {
+  margin: 0 0 10px;
+  font-size: 0.95rem;
+}
+.usage-block p {
+  margin: 8px 0 0;
+}
+.usage-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.usage-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1.1fr) minmax(0, 1.6fr) auto;
+  gap: 6px 14px;
+  align-items: center;
+}
+.usage-row-label {
+  font-weight: 600;
+  color: var(--text-2);
+}
+.usage-row-value {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.usage-row-reset {
+  font: 600 0.8rem var(--font-mono);
+  color: var(--text-3);
+}
+.usage-bar {
+  display: inline-block;
+  width: 110px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  overflow: hidden;
+  flex: none;
+}
+.usage-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--pass);
+}
+.usage-row[data-level='high'] .usage-bar > span {
+  background: var(--amber);
+}
+.usage-row[data-level='limit'] .usage-bar > span {
+  background: var(--fail);
+}
+.usage-badge {
+  font: 700 0.68rem/1 var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 3px 7px;
+  border-radius: 4px;
+  border: 1px solid currentColor;
+}
+.usage-badge--high {
+  color: var(--amber-hi);
+  background: var(--amber-wash);
+}
+.usage-badge--limit {
+  color: var(--fail);
+  background: var(--fail-wash);
+}
+.usage-row-meta {
+  text-align: right;
+}
+.usage-empty {
+  color: var(--text-2);
+}
+@media (max-width: 760px) {
+  .usage-row {
+    grid-template-columns: 1fr;
+  }
+  .usage-row-meta {
+    text-align: left;
   }
 }
 
