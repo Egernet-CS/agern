@@ -73,6 +73,20 @@ export interface Api {
   assignIssues(repo: string, issueNumbers: number[], releaseId: string | null): Promise<Release[]>;
   /** The new complete order; 409 `release_issues_changed` when it is not exactly the release's current issues. */
   reorderRelease(id: string, issueNumbers: number[]): Promise<Release>;
+  /**
+   * Starts building a planned release with the caller's credentials; the caller becomes its owner. 409
+   * `release_not_planning` / `release_empty` / `release_already_building` / `release_branch_exists`, 422
+   * `claude_credential_required` / `github_push_denied`.
+   */
+  startRelease(id: string): Promise<Release>;
+  /** Owner or admin; 409 `release_not_building`. The running issue finishes, no further one starts. */
+  pauseRelease(id: string): Promise<Release>;
+  /** Owner only; 409 `release_not_paused`, 422 `claude_credential_required`. */
+  resumeRelease(id: string): Promise<Release>;
+  /** Owner or admin; 409 `release_not_building`. Stops the running issue; what was merged stays on the branch. */
+  cancelRelease(id: string): Promise<Release>;
+  /** Owner only: a held or skipped issue is built again. 409 `release_not_building` / `release_issue_not_held`. */
+  retryReleaseIssue(id: string, issueNumber: number): Promise<Release>;
 
   /** The project's `.agern/sandbox.yml` on its default branch and its approval (anyone who can see the project). */
   sandboxStatus(repo: string): Promise<SandboxStatus>;

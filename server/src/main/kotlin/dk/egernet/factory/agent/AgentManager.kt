@@ -58,6 +58,80 @@ private val AUTH_FAILURE = Regex(
     "(?i)invalid api key|please run /login|authentication[_ ](error|failed)|unauthori[sz]ed|oauth token (has )?(expired|revoked)|invalid (x-api-key|bearer token)",
 )
 
+/** The owner's Claude usage limit was reached; [resetsAt] when the CLI said when it resets, [type] e.g. `five_hour`. */
+data class UsageLimit(val resetsAt: Instant?, val type: String?)
+
+/**
+ * Recognises a Claude usage limit in a stage's stream-json output (docs/ARCHITECTURE.md §6 "Releases", usage limit).
+ * Signals: a `rate_limit_event` whose `rate_limit_info.status` is `rejected`, an `assistant` line with
+ * `error: "rate_limit"`, or a failing `result` whose text says so. The reset time comes from any
+ * `rate_limit_info.resetsAt` (epoch seconds, epoch milliseconds or ISO-8601). Unknown shapes are ignored, never thrown.
+ */
+class UsageLimitDetector {
+    @Volatile var limited = false
+        private set
+    @Volatile var resetsAt: Instant? = null
+        private set
+    @Volatile var type: String? = null
+        private set
+
+    fun observe(obj: JsonObject) {
+        try {
+            val info = obj["rate_limit_info"] as? JsonObject
+                ?: ((obj["message"] as? JsonObject)?.get("rate_limit_info") as? JsonObject)
+            if (info != null) {
+                parseResetsAt(info["resetsAt"])?.let { resetsAt = it }
+                (info["rateLimitType"] as? JsonPrimitive)?.takeIf { it.isString }?.content?.let { type = it }
+            }
+            when ((obj["type"] as? JsonPrimitive)?.contentOrNull) {
+                "rate_limit_event" -> if ((info?.get("status") as? JsonPrimitive)?.contentOrNull == "rejected") limited = true
+                "assistant" -> if ((obj["error"] as? JsonPrimitive)?.contentOrNull == "rate_limit") limited = true
+                "result" -> {
+                    val failed = (obj["is_error"] as? JsonPrimitive)?.booleanOrNull == true ||
+                        ((obj["subtype"] as? JsonPrimitive)?.contentOrNull ?: "success") != "success"
+                    val text = (obj["result"] as? JsonPrimitive)?.takeIf { it.isString }?.content
+                    if (failed && text != null && LIMIT_TEXT.containsMatchIn(text)) limited = true
+                }
+            }
+        } catch (e: Exception) {
+            // Tolerant by design: the shapes were read from the CLI, not observed in a live limit.
+        }
+    }
+
+    /** The usage limit, when one was seen and the stage [failed]. */
+    fun result(failed: Boolean): UsageLimit? = if (failed && limited) UsageLimit(resetsAt, type) else null
+
+    companion object {
+        private val LIMIT_TEXT = Regex("(?i)usage limit|session limit|weekly limit|hit your limit")
+
+        /** Epoch seconds, epoch milliseconds or an ISO-8601 string; anything else is unknown (null). */
+        fun parseResetsAt(e: JsonElement?): Instant? {
+            val p = e as? JsonPrimitive ?: return null
+            if (p is kotlinx.serialization.json.JsonNull) return null
+            return try {
+                if (p.isString) {
+                    val t = p.content.trim()
+                    t.toLongOrNull()?.let { fromEpoch(it) } ?: Instant.parse(t)
+                } else {
+                    p.content.toDoubleOrNull()?.let { fromEpoch(it.toLong()) }
+                }
+            } catch (ex: Exception) {
+                null
+            }
+        }
+
+        private fun fromEpoch(n: Long): Instant? = when {
+            n <= 0 -> null
+            n >= 100_000_000_000L -> Instant.ofEpochMilli(n)
+            else -> Instant.ofEpochSecond(n)
+        }
+
+        /** Detection over a whole stage output, for tests. */
+        fun detect(lines: List<JsonObject>, failed: Boolean): UsageLimit? =
+            UsageLimitDetector().apply { lines.forEach { observe(it) } }.result(failed)
+    }
+}
+
 /** Input for a one-shot pipeline agent. */
 data class StageAgentRequest(
     val owner: UserRecord,
@@ -87,6 +161,10 @@ data class StageAgentResult(
     val result: JsonObject?,
     val ok: Boolean,
     val error: String?,
+    /** Set only when the stage failed because the owner's Claude usage limit was reached. */
+    val usageLimit: UsageLimit? = null,
+    /** The stage failed because Claude rejected the owner's credential (or there was none). */
+    val credentialRejected: Boolean = false,
 ) {
     val resultText: String? get() = result?.get("result")?.jsonPrimitive?.contentOrNull
     val structuredOutput: JsonElement? get() = result?.get("structured_output")?.takeIf { it !is kotlinx.serialization.json.JsonNull }
@@ -131,6 +209,8 @@ class AgentManager(
         var resumedFrom: String? = null
         @Volatile var sawInit = false
         @Volatile var authFailed = false
+        /** Usage-limit signals of a pipeline stage. */
+        val usage = UsageLimitDetector()
         /** Chat inputs (stream-json `message.content`) written to this process and not yet answered by a `result`. */
         val pending = java.util.Collections.synchronizedList(mutableListOf<JsonElement>())
 
@@ -590,7 +670,7 @@ class AgentManager(
         var l: Live? = null
         try {
             val cred = access.claudeCredential(req.owner)
-                ?: return finishStage(s, null, "Run owner has no Claude credential")
+                ?: return finishStage(s, null, "Run owner has no Claude credential", credentialRejected = true)
             val mayInstall = settings.get().agentsMayInstallSoftware
             val tools = (if (mayInstall) McpRegistry.STAGE_TOOLS - "factory_request_software" else McpRegistry.STAGE_TOOLS) + req.extraTools
             token = mcp.issue(McpGrant(s.id, req.owner.id, req.repo, req.runId, tools))
@@ -630,6 +710,7 @@ class AgentManager(
             val result = lv.lastResult
             val ok = result != null && result["is_error"]?.jsonPrimitive?.booleanOrNull != true &&
                 (result["subtype"]?.jsonPrimitive?.contentOrNull ?: "success") == "success"
+            val credentialRejected = !ok && (lv.authFailed || authProblem(proc.stderrTail()) != null)
             val err = when {
                 lv.stopReason == "stopped" -> "Agent was stopped"
                 lv.stopReason == "timeout" -> "Timed out: the stage ran longer than ${describeTimeout()} " +
@@ -641,7 +722,12 @@ class AgentManager(
                     (result["result"]?.jsonPrimitive?.contentOrNull ?: "").take(500)
                 else -> "Agent exited with code $code without a result. ${scrub(proc.stderrTail(), lv)}".trim()
             }
-            return finishStage(s, lv, err)
+            val stopped = lv.stopReason == "stopped" || lv.stopReason == "timeout"
+            return finishStage(
+                s, lv, err,
+                usageLimit = if (stopped) null else lv.usage.result(failed = err != null),
+                credentialRejected = !stopped && err != null && credentialRejected,
+            )
         } catch (e: CancellationException) {
             withContext(NonCancellable) {
                 l?.let { it.stopReason = "stopped"; it.proc.kill() }
@@ -661,13 +747,15 @@ class AgentManager(
         }
     }
 
-    private fun finishStage(s: SessionRecord, l: Live?, error: String?): StageAgentResult {
+    private fun finishStage(
+        s: SessionRecord, l: Live?, error: String?, usageLimit: UsageLimit? = null, credentialRejected: Boolean = false,
+    ): StageAgentResult {
         closeSteering(l)
         if (error != null) systemEvent(s.id, "error", error)
         val status = if (l?.stopReason == "stopped") SessionStatus.STOPPED else if (error == null) SessionStatus.DONE else SessionStatus.FAILED
         setStatus(s.id, status, ended = true)
         val rec = sessions.get(s.id)!!
-        return StageAgentResult(rec, l?.claudeSessionId ?: rec.claudeSessionId, l?.lastResult, error == null, error)
+        return StageAgentResult(rec, l?.claudeSessionId ?: rec.claudeSessionId, l?.lastResult, error == null, error, usageLimit, credentialRejected)
     }
 
     private fun describeTimeout(): String {
@@ -712,6 +800,7 @@ class AgentManager(
             }
         }
         publish(l.sessionId, "claude", obj)
+        if (!l.interactive) l.usage.observe(obj)
         when (obj["type"]?.jsonPrimitive?.contentOrNull) {
             "system" -> if (obj["subtype"]?.jsonPrimitive?.contentOrNull == "init") {
                 l.sawInit = true

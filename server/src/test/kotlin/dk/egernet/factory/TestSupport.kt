@@ -163,14 +163,22 @@ class FakeLauncher(var stage: (FakeProcess) -> Unit = { it.init(); it.result("ok
 
 class FakeGitOps : GitOps {
     val pushes = CopyOnWriteArrayList<String>()
+    /** Every worktree created, as `"<branch> <- <baseBranch>"`. */
+    val worktrees = CopyOnWriteArrayList<String>()
     @Volatile var commits = 1
     /** Files in every commit, by path (what [readFile] returns). */
     val files = java.util.concurrent.ConcurrentHashMap<String, String>()
-    override fun readFile(dir: Path, ref: String, path: String, home: Path, maxBytes: Int): String? = files[path]
+    /** Every [readFile], as `"<ref>:<path>"`. */
+    val reads = CopyOnWriteArrayList<String>()
+    override fun readFile(dir: Path, ref: String, path: String, home: Path, maxBytes: Int): String? {
+        reads += "$ref:$path"
+        return files[path]
+    }
     override fun ensureClone(id: AgentIdentity, cloneUrl: String, dir: Path, home: Path) { Files.createDirectories(dir) }
-    override fun createWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, defaultBranch: String, home: Path): String {
+    override fun createWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, baseBranch: String, home: Path): String {
         Files.createDirectories(worktree)
-        return "origin/$defaultBranch"
+        worktrees += "$branch <- $baseBranch"
+        return "origin/$baseBranch"
     }
     override fun commitsAhead(worktree: Path, baseRef: String, home: Path) = commits
     override fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path) { pushes += branch }

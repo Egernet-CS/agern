@@ -13,8 +13,11 @@ class GitException(message: String) : RuntimeException(message)
 interface GitOps {
     /** Clones the repo into [dir] or fetches if it is already there. */
     fun ensureClone(id: AgentIdentity, cloneUrl: String, dir: Path, home: Path)
-    /** Creates a worktree on a new branch from the up-to-date default branch. Returns the base ref used. */
-    fun createWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, defaultBranch: String, home: Path): String
+    /**
+     * Creates a worktree on a new branch from the up-to-date [baseBranch] (the default branch, or `release/<name>`
+     * for a release run). Returns the base ref used.
+     */
+    fun createWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, baseBranch: String, home: Path): String
     fun commitsAhead(worktree: Path, baseRef: String, home: Path): Int
     fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path)
     fun removeWorktree(mainDir: Path, worktree: Path, home: Path)
@@ -80,10 +83,16 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
         }
     }
 
-    override fun createWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, defaultBranch: String, home: Path): String {
-        val base = if (localOnly) defaultBranch else {
-            git(mainDir, home, id, "fetch", "origin", defaultBranch)
-            "origin/$defaultBranch"
+    override fun createWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, baseBranch: String, home: Path): String {
+        val base = if (localOnly) {
+            // Fake GitHub: a release branch exists only on the fake; create it locally from the clone's HEAD.
+            if (runCatching { git(mainDir, home, id, "rev-parse", "--verify", "--quiet", "refs/heads/$baseBranch") }.isFailure) {
+                git(mainDir, home, id, "branch", baseBranch, "HEAD")
+            }
+            baseBranch
+        } else {
+            git(mainDir, home, id, "fetch", "origin", baseBranch)
+            "origin/$baseBranch"
         }
         Files.createDirectories(worktree.parent)
         git(mainDir, home, id, "worktree", "add", "-B", branch, worktree.toString(), base)

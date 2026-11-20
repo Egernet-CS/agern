@@ -98,6 +98,14 @@ export function RunPage() {
           <div><dt>owner</dt><dd>{run.owner.displayName || run.owner.username}{isOwner ? ' (you)' : ''}</dd></div>
           <div><dt>round</dt><dd>{run.round === 0 ? 'build' : <>fix round {run.round} <span className="muted">of {run.maxRounds}</span></>}{run.round === 0 && <span className="muted"> · up to {run.maxRounds} fix rounds</span>}</dd></div>
           <div><dt>branch</dt><dd className="mono">{run.branch ?? '—'}</dd></div>
+          {run.baseBranch && (
+            <div>
+              <dt>base</dt>
+              <dd className="mono">
+                {run.releaseId ? <Link to={`/p/${repo}/releases/${run.releaseId}`}>{run.baseBranch}</Link> : run.baseBranch}
+              </dd>
+            </div>
+          )}
           <div><dt>pull request</dt><dd>{run.prUrl ? <a href={run.prUrl} target="_blank" rel="noreferrer">#{run.prNumber} ↗</a> : <span className="muted">after first build</span>}</dd></div>
           <div><dt>{run.endedAt ? 'took' : 'running for'}</dt><dd>{between(run.createdAt, run.endedAt, now)}</dd></div>
           <div><dt>started</dt><dd>{timeAgo(run.createdAt, now)}</dd></div>
