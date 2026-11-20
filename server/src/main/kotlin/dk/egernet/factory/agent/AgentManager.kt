@@ -148,6 +148,10 @@ data class StageAgentRequest(
     val disallowedTools: List<String> = emptyList(),
     val resumeClaudeSessionId: String? = null,
     val title: String? = null,
+    /** MCP tools on top of [McpRegistry.STAGE_TOOLS] (the builder's sandbox tools). */
+    val extraTools: Set<String> = emptySet(),
+    /** `system` events (level, text) put at the top of the stage's transcript, e.g. whether the run has a sandbox. */
+    val notes: List<Pair<String, String>> = emptyList(),
 )
 
 data class StageAgentResult(
@@ -668,7 +672,7 @@ class AgentManager(
             val cred = access.claudeCredential(req.owner)
                 ?: return finishStage(s, null, "Run owner has no Claude credential", credentialRejected = true)
             val mayInstall = settings.get().agentsMayInstallSoftware
-            val tools = if (mayInstall) McpRegistry.STAGE_TOOLS - "factory_request_software" else McpRegistry.STAGE_TOOLS
+            val tools = (if (mayInstall) McpRegistry.STAGE_TOOLS - "factory_request_software" else McpRegistry.STAGE_TOOLS) + req.extraTools
             token = mcp.issue(McpGrant(s.id, req.owner.id, req.repo, req.runId, tools))
             val identity = AgentIdentity(req.owner.username, req.owner.displayName, req.owner.githubLogin, access.githubToken(req.owner), cred)
             val steerable = req.role in STEERABLE_ROLES
@@ -678,6 +682,7 @@ class AgentManager(
                 appendSystemPrompt = req.systemPrompt, prompt = req.prompt, jsonSchema = req.jsonSchema,
                 disallowedTools = req.disallowedTools, mcpConfigJson = mcpConfig(token),
             )
+            for ((level, text) in req.notes) systemEvent(s.id, level, text)
             publish(s.id, "user", buildJsonObject { put("text", req.prompt); put("username", req.owner.username) })
             val proc = withContext(Dispatchers.IO) { launcher.launch(spec) }
             val lv = Live(s.id, req.owner.id, req.repo, req.role, proc, token, false, 0.0, 0, req.resumeClaudeSessionId)

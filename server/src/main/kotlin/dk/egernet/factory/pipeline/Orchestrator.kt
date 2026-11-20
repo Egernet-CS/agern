@@ -32,6 +32,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -92,6 +93,7 @@ class Orchestrator(
     private val bus: EventBus,
     private val scope: CoroutineScope,
     private val preferences: dk.egernet.factory.db.PreferenceStore,
+    private val sandboxes: dk.egernet.factory.sandbox.SandboxManager,
 ) {
     private val log = LoggerFactory.getLogger(Orchestrator::class.java)
     private val jobs = ConcurrentHashMap<UUID, Job>()
@@ -174,6 +176,7 @@ class Orchestrator(
         if (run.ownerId != user.id && !user.isAdmin) throw forbidden("Only the owner or an admin can cancel this run")
         if (run.status in RunStatus.TERMINAL) throw conflict("Run is already ${run.status}")
         jobs[runId]?.let { it.cancel(); it.join() }
+        sandboxes.release(runId)
         val after = runs.get(runId)!!
         if (after.status in RunStatus.TERMINAL) return after
         withContext(Dispatchers.IO) { cleanupWorktree(runId, merged = false) }
@@ -199,13 +202,19 @@ class Orchestrator(
         } catch (e: Exception) {
             log.warn("Run {} failed: {}", runId, e.message)
             val reason = e.message ?: e.javaClass.simpleName
-            // Clean up first, so a run shown as ended has left nothing behind.
+            // Clean up first, so a run shown as ended has left nothing behind: the sandbox (it bind-mounts the worktree),
+            // then the worktree.
+            withContext(NonCancellable) { sandboxes.release(runId) }
             withContext(Dispatchers.IO) { cleanupWorktree(runId, merged = false) }
             fail(runId, reason)
             withContext(Dispatchers.IO) { commentEnded(runId, "**Agern:** run `$runId` failed: $reason") }
             val sf = e as? StageFailed
             settled(runId, sf?.usageLimit, sf?.credentialRejected == true)
             return
+        } finally {
+            // Safety net; normally released already (end of the build/review loop, failure, cancel) — and always before
+            // settled(), so the next run of a release finds the slot free.
+            withContext(NonCancellable) { sandboxes.release(runId) }
         }
         settled(runId)
     }
@@ -232,8 +241,14 @@ class Orchestrator(
     /** Live = has a coroutine in this server or an active status (a `needs_human` run still owns its worktree). */
     private fun isLive(runId: UUID): Boolean = jobs.containsKey(runId) || runs.get(runId)?.status in RunStatus.ACTIVE
 
+    /**
+     * The worktree reapers' test: a run that is not live keeps nothing — and its sandbox (normally long gone) is removed
+     * here, before the reaper deletes the worktree the sandbox would bind-mount.
+     */
+    private fun keepWorktree(runId: UUID): Boolean = isLive(runId).also { live -> if (!live) sandboxes.releaseNow(runId) }
+
     /** At server start: removes the worktrees of runs that have ended (and prunes stale worktree entries). Blocking. */
-    fun reapWorktrees(): List<UUID> = workspaces.reapAllRunWorktrees(::isLive)
+    fun reapWorktrees(): List<UUID> = workspaces.reapAllRunWorktrees(::keepWorktree)
 
     private fun owner(run: RunRecord) = users.byId(run.ownerId) ?: error("Run owner no longer exists")
     private fun gh(owner: UserRecord): GitHubClient =
@@ -269,14 +284,22 @@ class Orchestrator(
             val main = workspaces.ensureMain(id, run.repo)
             workspaces.withRepoLock(owner.username, run.repo) {
                 // Leftovers of runs that have ended (e.g. after a crash) never block a new run; live runs keep theirs.
-                workspaces.reapRunWorktrees(owner.username, run.repo) { it != run.id && isLive(it) }
+                workspaces.reapRunWorktrees(owner.username, run.repo) { it != run.id && keepWorktree(it) }
                 workspaces.git.createWorktree(id, main, worktree, branch, target, workspaces.home(owner.username))
             }
         }
         runs.setBranch(run.id, branch)
+        // The sandbox decision is made once, from the base commit (a run cannot approve its own change to the file). A
+        // release run reads it from the default branch, as fetched with the clone, not from the release branch it starts
+        // from: earlier runs of the release merge into that branch without a human, and approvals are of the default
+        // branch's file (docs/ARCHITECTURE.md §5 "The run's decision"). baseRef is `origin/<target>` (or `<target>` for
+        // the fake GitHub's local clones), so the same form names the default branch.
+        val definitionRef = if (run.baseBranch == null || target == repoInfo.defaultBranch) baseRef
+            else baseRef.removeSuffix(target) + repoInfo.defaultBranch
+        val sandbox = sandboxes.prepare(run.id, run.repo, worktree, definitionRef, workspaces.home(owner.username))
         publish(run.id)
         val ctx = RunContext(
-            run.id, run.repo, issue, issueText(issue, comments), branch, baseRef, target, worktree, releaseName, repoInfo.defaultBranch,
+            run.id, run.repo, issue, issueText(issue, comments), branch, baseRef, target, worktree, releaseName, repoInfo.defaultBranch, sandbox,
         )
 
         // 1. Spec
@@ -306,7 +329,10 @@ class Orchestrator(
             }
             val prompt = if (round == 0) buildPrompt(ctx, spec) else fixPrompt(ctx, round, maxRounds, findingsForBuilder)
             val b = stage(run.id, "builder", round, owner, ctx, prompt,
-                resume = builderClaudeSession, parent = builderSessionId)
+                resume = builderClaudeSession, parent = builderSessionId,
+                extraTools = if (sandboxes.enabled) dk.egernet.factory.sandbox.SandboxManager.TOOLS else emptySet(),
+                notes = ctx.sandbox?.takeIf { sandboxes.enabled }?.let { listOf((if (it.state == "approved") "info" else "warn") to "Sandbox: ${it.reason}") }
+                    ?: emptyList())
             builderClaudeSession = b.claudeSessionId ?: builderClaudeSession
             builderSessionId = b.session.id
             val builderSummary = b.resultText?.trim() ?: ""
@@ -363,6 +389,7 @@ class Orchestrator(
             val changes = lastReviews.filterValues { it.verdict == "CHANGES" }
             if (changes.isEmpty()) break
             if (round >= maxRounds) {
+                sandboxes.release(run.id)
                 skipStage(run.id, "approver")
                 needsHuman(
                     runs.get(run.id)!!, owner,
@@ -373,6 +400,9 @@ class Orchestrator(
             findingsForBuilder = changes
             round++
         }
+
+        // Only the builder uses the sandbox: it is removed as soon as no fix round can follow.
+        sandboxes.release(run.id)
 
         // 3. Approval
         setStatus(run.id, RunStatus.APPROVING)
@@ -398,6 +428,8 @@ class Orchestrator(
         val runId: UUID, val repo: String, val issue: GhIssue, val issueText: String, val branch: String,
         val baseRef: String, val targetBranch: String, val worktree: Path,
         val releaseName: String? = null, val defaultBranch: String = targetBranch,
+        /** The run's sandbox decision; null when sandboxes are switched off. */
+        val sandbox: dk.egernet.factory.RunSandboxDto? = null,
     ) {
         /** For release runs: the sentence that names the release branch as the merge target. */
         val releaseNote: String
@@ -411,6 +443,7 @@ class Orchestrator(
         runId: UUID, role: String, round: Int, owner: UserRecord, ctx: RunContext, prompt: String,
         schema: String? = null, disallowed: List<String> = emptyList(),
         resume: String? = null, parent: UUID? = null,
+        extraTools: Set<String> = emptySet(), notes: List<Pair<String, String>> = emptyList(),
     ): StageAgentResult {
         val st = stageRecord(runId, role, round)
         val s = settings.get()
@@ -422,6 +455,7 @@ class Orchestrator(
                 systemPrompt = prompts.system(role, ctx.repo, s.agentsMayInstallSoftware), prompt = prompt,
                 jsonSchema = schema, disallowedTools = disallowed, resumeClaudeSessionId = resume,
                 title = "$role · #${ctx.issue.number}" + if (round > 0) " · round $round" else "",
+                extraTools = extraTools, notes = notes,
             ),
         ) { session ->
             runs.startStage(st.id, session.id, session.model)
@@ -497,10 +531,12 @@ class Orchestrator(
     }
 
     /**
-     * Removes the run's worktree and its local branch. A merged run's branch always goes (its work is merged); an
+     * Removes the run's sandbox, then its worktree and its local branch. A merged run's branch always goes (its work is merged); an
      * unmerged one's is kept only if it holds commits that exist nowhere else (never pushed). Blocking.
      */
     private fun cleanupWorktree(runId: UUID, merged: Boolean) {
+        // The sandbox bind-mounts the worktree: its containers go first (normally already gone; never recreated after).
+        sandboxes.releaseNow(runId)
         val run = runs.get(runId) ?: return
         val owner = users.byId(run.ownerId) ?: return
         bestEffort {
@@ -580,7 +616,7 @@ class Orchestrator(
         |
         |You are in a git worktree on branch `${c.branch}`, created from `${c.baseRef}`. Commit your work to this branch.
         |Do not push, open pull requests or merge: the factory does that after you finish.
-        |
+        |${sandboxLine(c)}
         |${c.releaseNote}${c.issueText}
         |<spec>
         |$spec
@@ -593,13 +629,28 @@ class Orchestrator(
         append("The reviewers requested changes. This is fix round $round of at most $maxRounds.\n")
         append("Address every finding below on the same branch (`${c.branch}`), re-run the relevant checks, and commit. ")
         append("If you are convinced a finding is wrong, do not change the code for it; explain why in your final summary ")
-        append("so the reviewers see your reasoning.\n\n")
+        append("so the reviewers see your reasoning.\n")
+        append(sandboxLine(c)).append('\n')
         for ((role, v) in changes) {
             append("### Reviewer: $role — ${v.verdict}\n${v.summary}\n")
             v.findings.forEach { f -> append("- [${f.severity}] ${f.file ?: "(general)"}: ${f.detail}\n") }
             append('\n')
         }
         append("End with a short summary of what you changed for each finding.")
+    }
+
+    /** One paragraph for the builder about the run's sandbox (empty line when sandboxes are off). */
+    private fun sandboxLine(c: RunContext): String {
+        val sb = c.sandbox?.takeIf { sandboxes.enabled } ?: return ""
+        return if (sb.state == "approved") {
+            "\nSandbox: this run has one (image `${sb.image}`). Build and test inside it with `factory_sandbox_exec` instead of on the host; " +
+                "`factory_sandbox_info` lists its services and limits.\n" +
+                (if (sb.platforms.isEmpty()) "" else "Platforms: ${sb.platforms.joinToString(", ") { "`$it`" }} (other images; " +
+                    "`factory_sandbox_exec` with `platform`). Run the test suite in the default image and on every platform before you finish, " +
+                    "and report the result per platform in your summary.\n")
+        } else {
+            "\nSandbox: none for this run (${sb.reason}). Build and test on the host as usual.\n"
+        }
     }
 
     private fun reviewPrompt(c: RunContext, role: String, round: Int, spec: String, builderSummary: String) = """

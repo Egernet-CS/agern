@@ -39,12 +39,17 @@ dependencies {
 
     implementation("ch.qos.logback:logback-classic:1.5.18")
 
+    // YAML for `.agern/sandbox.yml` (Apache-2.0; pulls in snakeyaml-engine-kmp and okio, both Apache-2.0)
+    implementation("com.charleskorn.kaml:kaml:0.67.0")
+
     testImplementation(kotlin("test"))
     testImplementation("io.ktor:ktor-server-test-host:$ktorVersion")
     testImplementation("io.ktor:ktor-client-websockets:$ktorVersion")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
     testImplementation("io.zonky.test:embedded-postgres:2.1.0")
     testImplementation(enforcedPlatform("io.zonky.test.postgres:embedded-postgres-binaries-bom:16.6.0"))
+    // Linux on arm64 is not among embedded-postgres' default binaries (e.g. Agern's own sandbox on an arm64 host).
+    testImplementation("io.zonky.test.postgres:embedded-postgres-binaries-linux-arm64v8")
 }
 
 kotlin {

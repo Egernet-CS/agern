@@ -3,7 +3,9 @@
 [Unit]
 Description=Agern - the software factory
 Documentation=https://github.com/Egernet-CS/agern/blob/main/docs/INSTALL-LINUX.md
-After=network-online.target postgresql.service
+# agern-sandbox.socket: listening before the server's sandbox reaper runs at startup (ordering
+# only; sandboxes are off unless 'agern sandbox enable' enabled the socket).
+After=network-online.target postgresql.service agern-sandbox.socket
 Wants=network-online.target
 
 [Service]

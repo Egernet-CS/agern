@@ -43,6 +43,10 @@ Behaviour
     - "fake:slow" makes every stage take ~1.5 s, so the pipeline can be watched advancing
     - "fake:markdown" makes reviewers and the approver write their summaries and findings in Markdown
       (lists, bold, inline code with a long path, a code block, a link and literal HTML)
+    - "fake:sandbox" makes the builder call the MCP tools factory_sandbox_info and factory_sandbox_exec (command
+        "echo built in the sandbox && ls") like a real agent (tool_use + tool_result events) and report both answers
+        in its result ("Sandbox info: ..." / "Sandbox exec: ..."); with "fake:platform=<name>" it then runs the same
+        command once more with that platform ("Sandbox exec on <name>: ...")
     - "fake:busy-<role>" makes that (stream-json) role work in Bash steps of ~0.4 s for up to ~2 minutes,
       until a message from the owner contains "finish"; each picked-up message is acknowledged with
       "Noted the owner's message: ..." and listed in the final result
@@ -176,6 +180,23 @@ def mcp_call(method, params, req_id):
     req = urllib.request.Request(server["url"], data=body, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode())
+
+
+def mcp_tool_roundtrip(tool, arguments, req_id):
+    """Calls a factory MCP tool and shows it in the transcript like the real CLI does. Returns (text, is_error)."""
+    tid = "toolu_fake_" + uuid.uuid4().hex[:12]
+    emit({"type": "assistant", "message": {"id": msg_id(), "type": "message", "role": "assistant", "model": model,
+                                           "content": [{"type": "tool_use", "id": tid, "name": "mcp__factory__" + tool, "input": arguments}]},
+          "parent_tool_use_id": None, "session_id": session_id, "uuid": str(uuid.uuid4())})
+    try:
+        res = mcp_call("tools/call", {"name": tool, "arguments": arguments}, req_id)
+        text = res["result"]["content"][0]["text"]
+        is_error = bool(res["result"].get("isError"))
+    except Exception as e:  # noqa
+        text, is_error = "MCP call failed: %s" % e, True
+    emit({"type": "user", "message": {"role": "user", "content": [{"tool_use_id": tid, "type": "tool_result", "content": text, "is_error": is_error}]},
+          "parent_tool_use_id": None, "session_id": session_id, "uuid": str(uuid.uuid4())})
+    return text, is_error
 
 
 def image_size(data):
@@ -427,12 +448,26 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
     if role == "builder":
         tool_roundtrip("git status --short | head -5")
         checkpoint()
+        sandbox_report = ""
+        if "fake:sandbox" in prompt and mcp_config:
+            try:
+                mcp_call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake-claude", "version": "0"}}, 1)
+                info, _ = mcp_tool_roundtrip("factory_sandbox_info", {}, 2)
+                out, _ = mcp_tool_roundtrip("factory_sandbox_exec", {"command": "echo built in the sandbox && ls"}, 3)
+                sandbox_report = "\nSandbox info: %s\nSandbox exec: %s" % (info, out)
+                m = re.search(r"fake:platform=([a-z][a-z0-9-]*)", prompt)
+                if m:
+                    pout, _ = mcp_tool_roundtrip("factory_sandbox_exec", {"command": "echo built in the sandbox && ls", "platform": m.group(1)}, 4)
+                    sandbox_report += "\nSandbox exec on %s: %s" % (m.group(1), pout)
+            except Exception as e:  # noqa
+                sandbox_report = "\nSandbox MCP calls failed: %s" % e
+            checkpoint()
         if os.path.isdir(".git") or os.path.isfile(".git"):
             with open("AGERN_FAKE.md", "a") as f:
                 f.write("fake build at %s\n" % time.strftime("%Y-%m-%dT%H:%M:%S"))
             subprocess.run(["git", "add", "AGERN_FAKE.md"], check=False)
             subprocess.run(["git", "commit", "-q", "-m", "Fake build commit"], check=False)
-        text = "Implemented the change (fake). Ran no tests because I am a stub."
+        text = "Implemented the change (fake). Ran no tests because I am a stub." + sandbox_report
         if received:
             text += "\nOwner messages handled: " + "; ".join(received)
         stream_text(text)

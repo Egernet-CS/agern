@@ -1,0 +1,13 @@
+# Agern sandboxes: runs agern-sandbox-prune.service once a day. Enabled by `agern sandbox enable`,
+# disabled by `agern sandbox disable`.
+[Unit]
+Description=Agern sandboxes - daily clean-up of unused images and volumes
+Documentation=https://github.com/Egernet-CS/agern/blob/main/docs/INSTALL-LINUX.md#13-sandboxes
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -136,6 +136,13 @@ export const httpApi: Api = {
   scheduleRelease: (id, startAt) => put(`/api/releases/${enc(id)}/schedule`, { startAt }),
   cancelReleaseSchedule: (id) => del(`/api/releases/${enc(id)}/schedule`),
 
+  sandboxStatus: (repo) => get(`/api/projects/${enc(repo)}/sandbox`),
+  approveSandbox: (repo, sha256) => post(`/api/projects/${enc(repo)}/sandbox/approval`, { sha256 }),
+  revokeSandboxApproval: (repo) => del(`/api/projects/${enc(repo)}/sandbox/approval`),
+  sandboxes: () => get('/api/admin/sandboxes'),
+  pendingSandboxes: () => get('/api/admin/sandboxes/pending'),
+  stopSandbox: (runId) => del(`/api/admin/sandboxes/${enc(runId)}`),
+
   projectRuns: (repo) => get(`/api/projects/${enc(repo)}/runs`),
   startRun: (repo, issueNumber) => post(`/api/projects/${enc(repo)}/runs`, { issueNumber }),
   runs: (filter = {}) => {

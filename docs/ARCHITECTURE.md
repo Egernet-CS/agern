@@ -19,10 +19,11 @@ docs/                This document
 docker-compose.dev.yml   PostgreSQL for local development and tests only
 ```
 
-**Docker policy.** In production the factory runs directly on its host and uses a natively
-installed PostgreSQL; nothing in the factory itself is containerised. Docker's role on the factory
-host is as a tool *for the agents*: testing the software they build on different devices and
-platforms. `docker-compose.dev.yml` exists only so a developer can get a throwaway database.
+**Container policy.** In production the factory runs directly on its host and uses a natively
+installed PostgreSQL; nothing in the factory itself is containerised, and nothing depends on Docker.
+Containers exist only to build and test the software the agents work on: per-run *sandboxes* in
+rootless Podman (§5 "Sandboxes"). `docker-compose.dev.yml` exists only so a developer can get a
+throwaway database.
 
 ## 2. Stack
 
@@ -36,7 +37,8 @@ platforms. `docker-compose.dev.yml` exists only so a developer can get a throwaw
 
 All persistent state lives in PostgreSQL. The only things on disk are git workspaces, the
 per-user Claude home directories and the agents' copies of chat attachments (a cache of the database,
-§5), all under `FACTORY_DATA_DIR`.
+§5), all under `FACTORY_DATA_DIR` — plus, with sandboxes on, the service user's Podman storage (images,
+per-run containers, per-project cache volumes; §5 "Sandboxes").
 
 ## 3. Configuration (environment variables)
 
@@ -67,6 +69,16 @@ per-user Claude home directories and the agents' copies of chat attachments (a c
 | `FACTORY_ATTACHMENT_MAX_MB` | `20` | Largest single chat attachment (1–512) |
 | `FACTORY_ATTACHMENT_MAX_MESSAGE_MB` | `50` | All attachments of one message together (1–512, at least the per-file limit) |
 | `FACTORY_ATTACHMENT_MAX_COUNT` | `10` | Attachments per message (1–20) |
+| `FACTORY_SANDBOX` | `off` | `off` or `podman`: per-run build/test sandboxes in rootless Podman (§5 "Sandboxes"). `off`: runs behave as before and the builder gets no sandbox tools; definitions can still be approved. `fake` (development and end-to-end tests only, accepted only with `FACTORY_DEV_FAKE_GITHUB`): an in-memory runtime that only pretends to run commands |
+| `FACTORY_SANDBOX_PODMAN` | `podman` | The podman binary |
+| `FACTORY_SANDBOX_PODMAN_URL` | unset | When set, every call is `podman --url <url> …` (podman-remote against a `podman system service`, e.g. `unix:///run/…/podman.sock`) |
+| `FACTORY_SANDBOX_CGROUP_PARENT` | unset | When set, every container gets `--cgroup-parent <path>` (an absolute cgroup path, not a `.slice`). Needed by rootless Podman with the `cgroupfs` manager — the packaged `agern-sandbox.service` (§9) — which creates no cgroup, and so applies no limits, for a container without one; `agern sandbox enable` sets it to `<unit cgroup>/containers` |
+| `FACTORY_SANDBOX_REGISTRIES` | `docker.io,ghcr.io,quay.io,mcr.microsoft.com` | Registries sandbox and service images may come from (comma list of hosts, `host:port` allowed); images must name one |
+| `FACTORY_SANDBOX_MAX_CPUS` | `2` | Upper limit, and default, of CPUs per container |
+| `FACTORY_SANDBOX_MAX_MEMORY` | `4g` | Upper limit, and default, of memory per container (`k`/`m`/`g`, binary; at least `64m`); swap is not added on top |
+| `FACTORY_SANDBOX_MAX_CONCURRENT` | `2` | Containers that run commands that may exist at the same time, over all runs (1–100): a run's sandbox takes one slot and each platform container it creates one more (sidecars take none). A builder that would exceed it first gives up its run's own idle containers, else gets a "busy" answer |
+| `FACTORY_SANDBOX_MAX_PLATFORMS` | `4` | Platforms a definition may name besides its default image (0–20; `0` forbids them) |
+| `FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES` | `30` | Default and maximum time for one sandbox command (1–1440), also capped by `FACTORY_STAGE_TIMEOUT_MINUTES` |
 | `FACTORY_DEV_FAKE_GITHUB` | `false` | Development only, requires `FACTORY_AUTH=dev`: in-memory fake GitHub (org with `demo-app` and `private-lab`, tokens `fake-<login>` = classic with `repo`, `read:org`; `fake-<login>~<scope>,…` = only those scopes), local `git init` instead of clones, pushes skipped |
 
 ## 4. Identity and secrets
@@ -188,12 +200,257 @@ worktrees and branches are cleaned up is in §6 "Worktrees and branches".
 
 **Known limitation (v1).** All agents run under the server's OS user with permissions bypassed.
 The factory must run on a dedicated machine or VM. Per-user OS accounts or containers are the
-planned hardening and are why `AgentLauncher` is an interface.
+planned hardening and are why `AgentLauncher` is an interface. Sandboxes (below) do not change this:
+the agent process still runs on the host.
 
 **Software installation.** Global setting `agentsMayInstallSoftware` (default `false`). When
 false, agents are instructed not to install system-wide software and are given the MCP tool
 `factory_request_software`, which files a request an admin handles manually. When true the
 instruction is dropped.
+
+### Sandboxes
+
+A project can describe a container in which its builds and tests run: its own toolchain, sidecar
+services such as a database, resource limits and a clean environment, without an admin installing
+anything on the host, and test on more than one image (*platforms*). This is issue #25's "model (a)":
+**the agent process keeps running on the host as before** and gets MCP tools that run commands inside
+its run's sandbox. Project authors: [SANDBOXES.md](SANDBOXES.md).
+
+**What a sandbox is not (yet).** It is *not* a security boundary against the agent. The agent runs
+with permissions bypassed as the same OS user that owns the rootless containers, so it can reach
+everything that user can (including `podman` itself, the other runs' worktrees and the data
+directory). Containing the agent itself — running `claude` inside the sandbox — is a later release.
+What the server does guarantee is that the *definition* cannot widen the container's boundary: the
+server alone chooses mounts, user mapping, capabilities and network (below), and a definition is
+only used after an admin approved its exact content.
+
+**Runtime.** Rootless Podman driven through its CLI (`FACTORY_SANDBOX=podman`), never rootful,
+never Docker. With `FACTORY_SANDBOX_PODMAN_URL` every call is `podman --url <url> …` so a packaged
+setup points the server at the `agern-sandbox` unit's `podman system service` socket (§9 "Sandboxes"). Every
+sub-command and option below exists in Podman 4.3 (Debian 12), the oldest supported version. The runtime is an interface
+(`SandboxRuntime`); tests use an in-memory fake.
+
+**Definition: `.agern/sandbox.yml`** at the repository root, read from the base branch:
+
+```yaml
+image: docker.io/library/eclipse-temurin:21-jdk     # required; fully qualified, from an allowed registry
+setup: |                                             # optional shell script, run once when the sandbox is created
+  apt-get update && apt-get install -y nodejs npm
+env: { CI: "true" }                                  # optional environment of the sandbox
+services:                                            # optional sidecars (at most 5), reachable by name
+  postgres:
+    image: docker.io/library/postgres:17
+    env: { POSTGRES_PASSWORD: dev }
+    ready:                                           # optional readiness check, run inside the service
+      command: pg_isready -h 127.0.0.1 -U postgres
+      timeoutSeconds: 60                             # 1–600, default 60
+caches: [ /root/.gradle, /root/.npm ]                # optional (at most 10): per-project named volumes
+resources: { cpus: 2, memory: 4g }                   # optional, capped by FACTORY_SANDBOX_MAX_CPUS / _MAX_MEMORY
+user: builder                                        # optional: commands run as this user (name or uid), not root
+platforms:                                           # optional (at most FACTORY_SANDBOX_MAX_PLATFORMS): other images
+  jdk17:
+    image: docker.io/library/eclipse-temurin:17-jdk  # validated like `image`
+    setup: |                                         # optional; without the key the top-level setup runs,
+      apt-get update                                 # an empty `setup:` runs none
+```
+
+Validation is strict and lists every problem with its path (`services.db.ports: unknown key …`):
+unknown keys at any level, an image without a registry (`debian:12`) or from a registry not in
+`FACTORY_SANDBOX_REGISTRIES`, malformed image references, service names that are not DNS labels
+(lower-case, start with a letter, ≤ 31 characters; not `localhost`, `sandbox`, `workspace`, `host`,
+`gateway`), invalid environment names, cache paths that are not absolute, contain `..`, overlap, or lie
+in `/workspace` or a system directory, non-positive CPUs, memory below `64m`, platform names that are not
+DNS labels or are `default` (the top-level image's name), more platforms than allowed, a readiness check
+without a command or with a timeout outside 1–600 s, and a `user` that is root (`0`, `root`), a uid
+outside 1–60000 or not a POSIX-style name (`[a-z_][a-z0-9_-]{0,31}`). Definitions written before these
+keys existed are unchanged: without `platforms`, `user` and `ready` everything behaves as before. YAML anchors/aliases and
+duplicate keys are rejected; the file may be at most 64 KiB and `setup` 32 KiB. No Containerfile
+builds in this step (an image plus a setup script only). The image needs a POSIX `sh`.
+
+**Approval by content hash.** A definition is used only if an admin approved exactly that content:
+the SHA-256 of the file's bytes, stored per repository with who approved it, when, and the approved
+content (table `sandbox_approvals`, one row per repository; approving another version replaces it).
+Admins approve what they saw (the request carries the hash; a file that changed meanwhile is refused)
+and can revoke. Approvals can be given while `FACTORY_SANDBOX=off`.
+
+**The run's decision.** When a run has created its worktree, the server reads `.agern/sandbox.yml` with
+git from the run's base commit (`origin/<default branch>` as fetched), validates it and compares its hash
+with the approval. The decision is stored on the run (`Run.sandbox`, below) and never changes during the
+run. Because the file comes from the base commit, a run cannot approve its own change to it: a run that
+edits `.agern/sandbox.yml` still uses the approved base version, and the changed file needs a new
+approval after it is merged. A **release run** (§6 "Releases"; whether the release was started by hand or by the
+scheduler makes no difference) starts from its release branch but reads the
+definition from the default branch (`origin/<default branch>`, fetched with the owner's clone just before), not from the
+release branch: earlier runs of the release squash-merge into that branch without a human, and approvals are always of
+the default branch's file (the sandbox page and the approval endpoint read it there), so a definition changed inside
+the release could never be approved and would silently cost the rest of the release its sandbox. Nothing merged into a
+release branch can therefore change the sandbox of the release's later runs; a release that needs another toolchain gets
+it through a change to the default branch and a new approval. With no file, an invalid one or an unapproved one the run proceeds
+**without** a sandbox, exactly as before; it does not fail. The builder's transcript starts with a
+`system` event saying why (`warn`), or which image it has (`info`), and its task prompt says the same in
+one paragraph.
+
+**Who gets the tools.** Only the builder (initial build and fix rounds), and only when
+`FACTORY_SANDBOX` is not `off`: it gets `factory_sandbox_info` and `factory_sandbox_exec` (§7) on top of
+the stage tools. The spec-writer, the four reviewers (the `code` reviewer included) and the approver get
+neither: they are read-only, and a shared sandbox with the worktree mounted read-write would let them
+change it, so in this step they review as before, on the host. (A read-only or overlay-mounted sandbox
+for the `code` reviewer is possible later.) Chats have no sandbox. A tool call acts on the sandbox of the
+run its bearer token belongs to, so an agent can never reach another run's sandbox through the tools.
+
+**Lifecycle.** One sandbox per run, created lazily by the builder's first `factory_sandbox_exec` and
+shared by all builder rounds of the run. Creation, in order: a private network `agern-run-<runId>`; one
+container per service, `agern-run-<runId>-<service>`, with the service name as its network alias; one
+named volume per cache, `agern-cache-<repo>-<first 12 hex of SHA-256(path)>` (kept across runs, per
+project); the sandbox container `agern-run-<runId>`; the services' readiness checks (below); with `user`,
+the account is prepared (below); then the `setup` script (`sh -lc`, as root, time limit as for commands).
+A failed creation, readiness check or setup removes what was created and frees the slot; the tool answers
+with the error (and the setup output's tail), and a later call tries again. Everything carries the labels
+`agern.run=<runId>`, `agern.repo=<repo>` and `agern.role=sandbox|platform|service|network` (platform
+containers also `agern.platform=<name>`). The sandbox is
+removed (all containers and network, never the cache volumes) as soon as no builder round can follow: before
+the approver starts, before the run goes to `needs_human`, and before it is marked `failed` (stage error,
+stage time limit) or `cancelled`. A `needs_human` run keeps its worktree (§6 "Worktrees and branches") but has no
+sandbox, and nothing creates one again: only a builder can, and none follows. Names and labels use the run id,
+never the run's branch name.
+
+*Sandbox before worktree.* The sandbox bind-mounts the run's worktree, so its containers are always removed
+before the worktree is deleted: the worktree clean-up of every ended run (merged, failed, time limit, cancelled,
+also from `needs_human` or through a release) first removes the run's sandbox if one is left, and so does each
+worktree reaper for every run it reaps. At server start the order is: unfinished runs are marked `failed`; then
+the sandbox reaper removes containers and networks labelled `agern.run` whose run is not active (platform
+containers and services included, since they carry the same label; synchronously, at most 2 minutes, so a hanging
+Podman cannot keep the server from starting); then the worktree reaper removes the worktrees of runs that are not
+live; only then do releases resume and the scheduler start, which may start new runs. A best-effort removal of
+every sandbox also runs at shutdown.
+
+**Platforms.** `platforms:` names other images the builder can run commands in, e.g. another runtime
+version or distribution (issue #25's "test on different platforms"). `factory_sandbox_exec` with
+`platform: <name>` runs in that platform's container, `agern-run-<runId>--<name>` (the `--` cannot clash
+with a service's container, whose name starts with a letter), created on its first command exactly like
+the sandbox container: the same worktree mount at `/workspace`, environment, `user`, limits and network
+(so the same services, reached by the same names; a platform container is not given a network alias).
+Its setup is the platform's own `setup`, or the top-level one when the platform has no `setup` key.
+Caches are **per platform**: the same paths, in volumes `agern-cache-<repo>-<first 12 hex of
+SHA-256(<platform> NUL <path>)>`, because another image's tools (another JDK, another libc, other native
+npm modules) cannot be assumed to share a cache safely. `platform` omitted or `default` is the top-level
+image. Commands stay one at a time per run, whichever container they run in.
+
+**Readiness of services.** A service may name a `ready.command`; after starting the services the server
+runs it with `sh -c` inside the service's container (`exec --workdir /`, each attempt at most 10 s) once
+a second until it exits 0, for at most `ready.timeoutSeconds` (default 60). Commands run only after every
+check passed. When one does not pass in time, the sandbox is removed and the tool answers — and the
+transcript says — which service, the check's last exit code and output, and the service's last 30 log
+lines (`podman logs --tail 30`). Checks run when the services are created, not again for a platform
+container that joins them. A service without a check behaves as before, and `factory_sandbox_info`
+tells the agent that it may still be starting.
+
+**A non-root user.** By default commands run as root inside the container, which rootless Podman maps to
+the service user on the host. Some tools refuse to run as root (PostgreSQL's `initdb`, used by embedded
+PostgreSQL test libraries). With `user: <name>` (uid 1000) or `user: <uid>` the command containers start
+with `--userns keep-id:uid=<n>,gid=<n> --user 0:0`: inside the container's own user namespace the service
+user is uid/gid *n* (so the worktree and what commands write there stay the service user's on the host),
+container root is the first subordinate id, and the keep-alive process and setup run as that root. Before
+setup the server runs `resources/sandbox/prepare-user.sh` as root (POSIX `sh`, busybox is enough): a name
+the image has with uid *n* is used; a missing one is added to `/etc/passwd` and `/etc/group` with home
+`/home/<name>`; a uid the image has is used under the image's name, a free one becomes `sandbox`; a name
+with another uid, or uid *n* taken by another name, fails with a message saying what to write instead.
+It creates the home directory and gives the user the home, every cache directory and the cache paths'
+parents inside the home. After setup, files setup left in the home or `/workspace` that do not belong to
+the user are handed to it (`find <home> /workspace -xdev ! -user <n> -exec chown -h`; `-xdev` keeps it out
+of the cache volumes). Commands then run with `exec --user <n>:<n>` and `HOME`, `USER`, `LOGNAME` set.
+`keep-id` with `uid`/`gid` exists since Podman 4.3; with explicit `uid`/`gid` Podman adds no
+`/etc/passwd` entry of its own. Never `--userns=host`. The first container of an image with a given
+mapping can take longer to start: rootless storage may copy the image's layers once for that mapping.
+
+**Containers.** The server decides every option; the definition only supplies images, environment,
+services and their readiness commands, cache paths, setup, the user and limits within the caps. Never
+`--privileged`, never host network/pid/ipc/userns, no added capabilities (Podman's default rootless set), no devices,
+`no-new-privileges`, a PID limit of 4096, `--memory-swap` equal to `--memory`. The run's worktree is
+bind-mounted read-write at `/workspace` (the working directory); nothing else from the host is mounted.
+Inside the rootless user namespace the container's root is the service user — with `user`, the user's uid
+is — so files the build writes in `/workspace` belong to that user on the host. Limits apply per container
+(sidecars and platform containers get the same limits as the sandbox). The exact command lines (`podman` or
+`podman --url <url>` first):
+
+```
+network create --label agern.run=<id> --label agern.repo=<repo> --label agern.role=network agern-run-<id>
+volume exists <volume>  ;  volume create --label agern.repo=<repo> --label agern.cache=<path> <volume>
+run --detach --name agern-run-<id>-<svc> --label agern.run=<id> --label agern.repo=<repo> --label agern.role=service
+    --label agern.service=<svc> --network agern-run-<id> --network-alias <svc> --security-opt no-new-privileges
+    --pids-limit 4096 --cpus <cpus> --memory <mem> --memory-swap <mem> --stop-timeout 5 --pull=missing
+    [--cgroup-parent <FACTORY_SANDBOX_CGROUP_PARENT>] [--env K=V …] <service image>
+run --detach --name agern-run-<id> --label agern.run=<id> --label agern.repo=<repo> --label agern.role=sandbox
+    --network agern-run-<id> --security-opt no-new-privileges --pids-limit 4096 --cpus <cpus> --memory <mem>
+    --memory-swap <mem> --stop-timeout 5 --pull=missing [--cgroup-parent <FACTORY_SANDBOX_CGROUP_PARENT>]
+    --workdir /workspace --entrypoint sh [--env K=V …]
+    --mount type=bind,source=<worktree>,target=/workspace [--mount type=volume,source=<volume>,target=<path> …]
+    <image> -c "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"
+run … --name agern-run-<id>--<platform> … --label agern.role=platform --label agern.platform=<platform>
+    …(as the sandbox container, with the platform's cache volumes)… <platform image> -c "<keep-alive>"   # platform, on first use
+    # with `user: <n>`, both kinds also get, after --network:  --userns keep-id:uid=<n>,gid=<n> --user 0:0
+exec --workdir / agern-run-<id>-<svc> sh -c <ready.command>                                      # readiness check, until exit 0
+logs --tail 30 agern-run-<id>-<svc>                                                              # when it never passes
+exec --workdir /workspace <container> sh -c <prepare-user.sh> agern-user <n> <name or ''> [<cache path> …]   # with `user`, as root
+exec --workdir /workspace <container> sh -c '{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; exec sh -lc "$1"' sh <setup>   # as root
+exec --workdir /workspace <container> sh -c 'uid=$1; shift; find "$@" -xdev ! -user "$uid" -exec chown -h "$uid:$uid" {} + 2>/dev/null || true' agern-hand-over <n> <home> /workspace   # with `user`, after setup
+exec [--user <n>:<n> --env HOME=<home> --env USER=<name> --env LOGNAME=<name>] --workdir /workspace <container>
+    sh -c '{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; exec sh -lc "$1"' sh <command>   # every command
+restart --time 0 <container>                                       # after a command timed out
+rm --force --ignore --volumes agern-run-<id> [agern-run-<id>--<platform> …] [agern-run-<id>-<svc> …]   # anonymous volumes (an image's VOLUME) too
+rm --force --ignore --volumes agern-run-<id>--<platform>           # a run's idle container, to free its slot (below)
+network rm --force agern-run-<id>
+ps --all --filter label=agern.run --format '{{.Names}}	{{index .Labels "agern.run"}}'          # reaper
+network ls --filter label=agern.run --format json                                               # reaper (name, labels)
+image inspect --format '{{json .Config.ExposedPorts}}' <service image>                          # ports for factory_sandbox_info
+```
+
+The podman process gets an environment built from an allow-list (`PATH`, `HOME`, `USER`, `LOGNAME`,
+`XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `DBUS_SESSION_BUS_ADDRESS`, `TMPDIR`), never the
+server's secrets.
+
+**Commands.** `factory_sandbox_exec` runs `sh -lc <command>` in `/workspace` of the default or the named
+platform's container, as root or the `user` (first raising its own
+`oom_score_adj` to 1000, so that a command over the memory limit is what the kernel kills — never the
+sandbox's keep-alive process, which real Podman showed can otherwise happen when the command's memory is
+not freed before a second OOM, ending the whole sandbox), one command at a time per run
+(concurrent calls wait). Its time limit is `timeoutSeconds` if given, never more than
+`FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES` and the stage time limit. A command that runs out of time is
+stopped and its container restarted (`restart --time 0`: every process in it is killed, files are
+kept), and the answer says `timedOut`. The agent gets the exit code, the last 20,000 characters of the
+interleaved stdout/stderr, whether that is truncated, and the duration. The full output (its last
+1,000,000 characters) of every command and of the setup script is kept as a `system` event in the
+builder's transcript (`payload.sandbox`, §8, with the platform), so the run page can show it; there is no
+separate log store. When the definition has platforms, the run records the ones commands ran in
+(`Run.sandbox.platformsUsed`) and the builder's task prompt asks it to run the test suite on every platform
+and report the result per platform.
+
+**Stopped by an admin.** An admin can remove a run's sandbox while the run is active (`DELETE
+/api/admin/sandboxes/{runId}`, the admin page's "Stop"): its containers — platform containers and services
+included — and network are removed at once (cache volumes are kept) and its slots are freed. The run itself is not touched: a command running at that moment ends with
+a tool error saying the sandbox was stopped, a `system` warn event in the builder's transcript says who stopped it,
+and the builder's next `factory_sandbox_exec` creates a fresh sandbox (setup runs again) like the first one did.
+
+**Concurrency and memory.** `FACTORY_SANDBOX_MAX_CONCURRENT` counts *containers that run commands*, over all
+runs: a run's sandbox container takes a slot when created and each platform container one more; sidecars
+take none (they belong to the run's network, whatever container uses them). A slot is freed when its
+container is removed. This keeps the cap truthful about load — a run that tests on three images really
+runs three containers, each with the full per-container memory limit — without starving single-image runs.
+When a run needs a slot and none is free, it first removes its *own* other command containers, least
+recently used first (they are idle: one command at a time per run; files in `/workspace` stay, the setup
+runs again when that container is used next); a run that holds none is not queued: the tool answers at once
+that the sandboxes are busy and nothing ran; the agent may try again later (its prompt tells it not to fall
+back to installing a toolchain on the host). So even with a cap of 1 a run can test on every platform, one
+container at a time. The memory one run may use is the per-container limit × (its command containers +
+its services); the admin overview shows that sum per run (`memoryTotal`) and `inUse` counts slots.
+
+**Network and credentials.** Each run's containers share a private network; sidecars are reachable by
+service name only from that run's containers (and not published on the host). Outbound network access is
+Podman's default (needed for package registries); access to the host's LAN is not restricted in this
+step. Nothing of the owner's credentials is passed into a container — no GitHub token, no Claude
+credential, no git configuration — and git does not work inside the sandbox (the worktree's `.git` points
+outside the mount): agents commit on the host as before. Builds that need private package registries are
+out of scope for this step.
 
 ## 6. The pipeline
 
@@ -213,7 +470,9 @@ issue → spec-writer (opus) → builder (opus) ─┬→ security  (opus)   ┐
 
 - **spec-writer** reads the issue and the repo and writes a spec; it is posted as an issue comment.
 - **builder** implements the spec on the run branch and commits. The orchestrator pushes the branch
-  and opens a pull request after the first build.
+  and opens a pull request after the first build. When the run has an approved sandbox (§5 "Sandboxes"),
+  the builder builds and tests in it through `factory_sandbox_exec`; the sandbox is removed when the
+  build/review loop ends, before the approver runs.
 - **reviewers** run in parallel, cannot edit files (`--disallowedTools Edit,Write,NotebookEdit`),
   and answer through `--json-schema` with
   `{ "verdict": "PASS" | "CHANGES", "summary": string, "findings": [{ "severity", "file", "detail" }] }`.
@@ -295,8 +554,9 @@ issue → spec-writer (opus) → builder (opus) ─┬→ security  (opus)   ┐
   - *Leftovers* (e.g. after a crash or a failed clean-up) are reaped: when a run starts, under the per-clone lock,
     every worktree of that user's clone whose run is not live (no coroutine in this server and not in an active
     status) is removed — registered with git or only a directory under `runs/` — and stale entries are pruned
-    (`git worktree prune`); at server start, after unfinished runs are failed, the same is done for every clone on
-    disk. The worktree of a live run, `needs_human` included, is never touched.
+    (`git worktree prune`); at server start, after unfinished runs are failed and leftover sandboxes removed (§5
+    "Sandbox before worktree"), the same is done for every clone on disk. The worktree of a live run, `needs_human`
+    included, is never touched. A run's sandbox, which bind-mounts its worktree, is always removed first.
 
 Run `status`: `queued`, `spec`, `building`, `reviewing`, `approving`, `merged`, `needs_human`,
 `failed`, `cancelled`.
@@ -492,7 +752,23 @@ Tools: `factory_list_issues`, `factory_get_issue`, `factory_create_issue`, `fact
 `factory_list_runs`, `factory_get_run`, `factory_approve_run`, `factory_cancel_run`,
 `factory_send_to_agent`, `factory_request_software`, `factory_list_releases`, `factory_create_release`,
 `factory_assign_issues`, `factory_unassign_issues`. Pipeline-stage agents get only `factory_get_issue`
-and `factory_request_software`.
+and `factory_request_software`; with sandboxes switched on (`FACTORY_SANDBOX` not `off`) the builder also
+gets `factory_sandbox_info` and `factory_sandbox_exec`.
+
+Sandbox tools (§5 "Sandboxes"), builder only; they act on the sandbox of the token's run, and a token
+without a run (a chat) is refused:
+- `factory_sandbox_info {}` → JSON `{ available, state, reason }` and, when the run has a sandbox,
+  `image`, `created` (the default container exists), `workdir: "/workspace"`, `user: { name, uid, note }`
+  (only with `user`), `platforms: [{ name, image, setup, created }]` and, when there are any,
+  `platformNote`; `services: [{ name, host, image, ports, readiness }]` (ports from the image's `EXPOSE`,
+  known once created; `readiness`: `unchecked`, `checked on creation` or `ready`) and, when a service has
+  no check, `servicesNote` (it may still be starting); `caches`, `env` (names only), `setup` (boolean),
+  `limits: { cpus, memory, execTimeoutSeconds, outputTailChars }` and `capacity: { inUse, max, heldByThisRun }`.
+- `factory_sandbox_exec { command, timeoutSeconds?, platform? }` → JSON `{ exitCode, output, truncated,
+  durationMs, timedOut }` plus `platform` when the definition has platforms (`exitCode` −1 when timed out;
+  `output` is the tail). `platform` omitted or `default`: the top-level image. No sandbox for the run, an
+  unknown platform, busy, a failed creation, readiness check or setup, an empty command or a non-positive
+  timeout come back as tool errors with the reason.
 
 Release tools (§6 "Releases"), chat agents only; the three mutating ones also refuse run-bound tokens:
 `factory_list_releases {}` (the `/factory releases` text, with release ids), `factory_create_release
@@ -602,8 +878,56 @@ type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; 
   owner: { username: string; displayName: string }; startedBySessionId: string | null;
   error: string | null; createdAt: string; updatedAt: string; endedAt: string | null;
   stages: Stage[];
+  sandbox: RunSandbox | null;  // the run's sandbox decision (§5 "Sandboxes"); null until the workspace is ready / older runs
   releaseId: string | null;  // the release this run builds an issue for (null: a single run, or the release was deleted)
   baseBranch: string | null }; // the branch it starts from and merges into; null = the default branch
+
+type RunSandbox = { state: 'disabled' | 'none' | 'invalid' | 'unapproved' | 'approved';  // only 'approved' gives a sandbox
+  reason: string;            // human-readable, also shown at the top of the builder's transcript
+  sha256: string | null;     // of the definition on the base commit, when there is one
+  image: string | null;
+  platforms: string[];       // the definition's platforms ('approved' only; [] for older runs)
+  platformsUsed: string[] }; // where the builder ran commands, 'default' and platform names in first-use order
+                             // (filled only when there are platforms)
+
+type SandboxDefinition = { image: string; setup: string | null; env: Record<string, string>;
+  services: { name: string; image: string; env: Record<string, string>;
+    ready: { command: string; timeoutSeconds: number } | null }[];
+  caches: string[];
+  limits: { cpus: number; memory: string;                  // effective per container: the request capped by the server
+    requestedCpus: number | null; requestedMemory: string | null; capped: boolean };
+  platforms: { name: string; image: string;
+    setup: string | null;    // effective: the platform's own, or the top-level one when setupInherited
+    setupInherited: boolean }[];
+  user: { name: string | null; uid: number } | null };    // null: commands run as root; name null: given as a uid
+type SandboxApproval = { sha256: string; content: string; approvedBy: { username: string; displayName: string }; approvedAt: string };
+type SandboxStatus = { repo: string;
+  enabled: boolean;          // FACTORY_SANDBOX is not off
+  path: '.agern/sandbox.yml'; branch: string;              // read from the default branch
+  state: 'none' | 'invalid' | 'pending' | 'approved';      // pending: valid, this exact content not approved
+  sha256: string | null; content: string | null;
+  errors: string[];          // state 'invalid'
+  definition: SandboxDefinition | null;                    // when valid
+  approval: SandboxApproval | null;                        // the project's approval, possibly of other content (diff)
+  approvers: { username: string; displayName: string }[] };  // who can approve: the admins (configured or known)
+
+type RunningSandbox = { runId: string; repo: string;
+  visible: boolean;          // false when the admin cannot see the repository: issueTitle is null then
+  issueNumber: number; issueTitle: string | null; runStatus: Run['status'];
+  owner: { username: string; displayName: string };
+  image: string; services: string[]; sha256: string;      // the approved definition's hash
+  createdAt: string; cpus: number; memory: string;         // per-container limits it runs with
+  containers: { platform: string; image: string; createdAt: string }[];  // command containers now: 'default' and/or platforms
+  platforms: string[];       // the definition's platforms, existing or not
+  slots: number;             // slots of FACTORY_SANDBOX_MAX_CONCURRENT held: one per container
+  memoryTotal: string };     // memory × (containers + services): what the run may use together
+type SandboxOverview = { enabled: boolean; runtime: 'off' | 'podman' | 'fake';
+  inUse: number;             // slots in use: command containers over all runs
+  limits: { maxCpus: number; maxMemory: string; maxConcurrent: number; execTimeoutMinutes: number; registries: string[];
+    maxPlatforms: number };
+  sandboxes: RunningSandbox[] };                          // the sandboxes that exist right now, oldest first
+type PendingSandbox = { repo: string; sha256: string; image: string;
+  approvedSha256: string | null };                         // the approved older version, or null when none ever was
 
 type Attachment = { id: string; name: string;   // name: sanitised (no path, control/bidi characters or leading dots; ≤ 120 chars)
   mediaType: string;                 // decided by sniffing the bytes: image/png|jpeg|gif|webp, application/pdf, application/zip,
@@ -621,8 +945,11 @@ type Event = { seq: number; sessionId: string; ts: string;
 //          A message to a running pipeline agent (§6) adds: messageId: string, origin: 'direct' | 'chat',
 //          viaSessionId?: string   // the forwarding chat session when origin is 'chat'
 //  claude: one raw stream-json object from the CLI ({type:'system'|'assistant'|'user'|'result'|'stream_event', …})
-//  system: { level: 'info' | 'warn' | 'error', text: string, messageId?: string }
+//  system: { level: 'info' | 'warn' | 'error', text: string, messageId?: string, sandbox?: SandboxLog }
 //          messageId: the agent picked that message up (info) or stopped before it did (warn)
+//          sandbox: the full log of a sandbox setup script or command (§5 "Sandboxes"):
+//            { kind: 'setup' | 'exec', command, exitCode, timedOut, durationMs, output, outputTruncated,
+//              platform: string | null }   // null when the definition has no platforms, else 'default' or the platform
 
 type AgentMessage = { status: 'queued';          // always: picked up at the agent's next step (§6)
   messageId: string; sessionId: string; runId: string | null;
@@ -686,6 +1013,9 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `POST /api/releases/{id}/issues/{number}/retry` | → `Release` | owner only; release `building`/`paused` (else 409 `release_not_building`), issue `held`/`skipped` (else 409 `release_issue_not_held`); it is built again |
 | `POST /api/projects/{repo}/releases/assign` | `{ issueNumbers: number[], releaseId: string \| null }` → `Release[]` | assigns or moves the issues to that release of `{repo}` (404 otherwise), or takes them out with `releaseId: null` (numbers in no release are ignored, no GitHub calls). 1–100 positive numbers, duplicates collapsed (400 otherwise; an invalid `releaseId` is 400). Every issue is fetched with the caller's token: unknown → 404 "Issue #n not found", closed → 409 `issue_closed`; all-or-nothing. Target `building`/`paused`: owner only, appended as `waiting`; target `cancelled`: 409 `release_closed`. An issue leaving a `building`/`paused` release: owner or admin, and only `waiting`, `held` or `skipped` (else 409 `release_issue_started`); leaving a `cancelled` one: owner or admin. A still active run of an issue that leaves is cancelled. Answers all releases of the project after the change |
 | `PUT /api/releases/{id}/issues/order` | `{ issueNumbers: number[] }` → `Release` | the new complete order; anything but exactly the current issues → 409 `release_issues_changed`, nothing changes. `building`/`paused`: owner only, and every issue that is not `waiting` keeps its index (409 `release_issue_started`); `cancelled`: 409 `release_closed` |
+| `GET /api/projects/{repo}/sandbox` | → `SandboxStatus` | anyone who can see the project; the file is read with the caller's token from the default branch |
+| `POST /api/projects/{repo}/sandbox/approval` | `{ sha256 }` → `SandboxStatus` | admin (403 otherwise; 404 when the admin cannot see the project or there is no file). Approves exactly the content with that hash, replacing the project's earlier approval; 400 malformed hash, 409 `sandbox_definition_changed` when the file now has another hash, 422 `sandbox_definition_invalid` |
+| `DELETE /api/projects/{repo}/sandbox/approval` | → `SandboxStatus` | admin; removes the project's approval (also when there is none). Runs already started keep their decision |
 | `GET /api/projects/{repo}/runs` | → `Run[]` | newest first |
 | `POST /api/projects/{repo}/runs` | `{ issueNumber }` → `Run` | needs Claude credential; 409 if the issue has an active run |
 | `GET /api/runs?active=true&status=<s>` | → `Run[]` | across visible repos, newest first (max 200). `active=true`: not finished, i.e. `queued`, `spec`, `building`, `reviewing`, `approving` or `needs_human`. `status`: only these statuses, repeatable and/or comma list (`?status=needs_human`); unknown status → 400. Both given: both apply |
@@ -707,6 +1037,9 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `DELETE /api/sessions/{id}` | → 204 | **Close a chat**: owner or admin (403 otherwise, 404 if the repo is not visible); chat only (409 `not_a_chat` for pipeline sessions — cancel the run instead). A live process is stopped first (as `stop`, up to 10 s; if it has not exited, 409 `agent_not_stopped` and nothing is deleted). Then the session is deleted permanently with its events, attachment rows and the files under `<dataDir>/attachments/<id>/`; its session sockets are closed with `4404` and the feed announces `session_closed`. Runs started from it keep running (their `startedBySessionId` becomes `null`). Afterwards every route for the id answers 404 |
 | `GET /api/admin/settings` · `PUT /api/admin/settings` | `Settings` | admin |
 | `GET /api/admin/users` | → `User[]` | admin |
+| `GET /api/admin/sandboxes` | → `SandboxOverview` | admin. Every sandbox that exists on this server (also of repositories the admin cannot see, without their issue titles) |
+| `GET /api/admin/sandboxes/pending` | → `PendingSandbox[]` | admin. The projects the admin can see whose valid `.agern/sandbox.yml` on the default branch is not approved in this version (one GitHub read per project; unreadable ones are left out), by name |
+| `DELETE /api/admin/sandboxes/{runId}` | → `SandboxOverview` | admin. Removes that run's sandbox now (platform containers and services included); the run continues (§5 "Stopped by an admin"). 404 when the run has no sandbox right now |
 | `GET /api/admin/software-requests` | → `SoftwareRequest[]` | admin |
 | `POST /api/admin/software-requests/{id}` | `{ status, note? }` → `SoftwareRequest` | admin |
 
@@ -736,6 +1069,8 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   `release_issue_started`, `release_closed`, `release_active`, `release_name_locked` (409);
   `github_push_denied`, `claude_credential_required` (422);
   scheduling: `release_not_schedulable`, `release_not_scheduled`, `release_scheduled` (409).
+- Sandbox approval: stale hash → 409 `sandbox_definition_changed`; invalid definition → 422
+  `sandbox_definition_invalid`.
 - "Needs Claude credential" → 422 `claude_credential_required`; too many agents → 409
   `too_many_agents`; issue already has an active run → 409 `active_run_exists`; missing CSRF header
   → 403 `csrf`; foreign `Origin` → 403 `bad_origin`.
@@ -790,6 +1125,15 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   and one for the target. `{ type: 'release_deleted', repo: string, releaseId: string }` announces a deleted
   release. Both pass the same visibility filter; clients order versions by `updatedAt` and reload their release
   lists after a reconnect.
+  `{ type: 'sandbox_approval', repo: string, approval: SandboxApproval | null }` is sent after an admin approved
+  (`approval` set) or revoked (`null`) a project's sandbox definition, with the same visibility filter. Clients apply it
+  to a loaded `SandboxStatus` (`approved` when the approval's hash is the file's, else `pending`) and reload after a
+  reconnect.
+  `{ type: 'sandboxes', runId: string, change: 'created' | 'removed' | 'stopped' }` is sent **to admins only** (of
+  every project, like the overview) when a container of a run's sandbox was created (the sandbox or a platform
+  container) or removed (one container to free a slot, or the whole sandbox when its run's build/review part ended),
+  or an admin stopped a sandbox. It carries no project data; the admin page reloads `GET /api/admin/sandboxes`
+  (debounced) and keeps a slow fallback poll for missed frames.
 
 ## 9. Deployment and release
 
@@ -801,8 +1145,107 @@ is one specific non-loopback address the server additionally listens on `127.0.0
 at startup) rather than refusing to start. WebSocket and mutating requests are
 rejected when their `Origin` does not match `FACTORY_PUBLIC_URL`.
 
-**Sandboxes (later).** The network has sandbox machines where agents will be able to try things
-out. Not part of v1; they will plug in behind `AgentLauncher` / as agent tools.
+**Sandboxes.** Builds and tests can run in per-run rootless Podman containers (§5 "Sandboxes";
+`FACTORY_SANDBOX`, off by default). The containers belong to the service user; Agern and its
+PostgreSQL stay native. In this release a sandbox provides a toolchain, sidecars, limits and a clean
+environment — it is not a boundary between the agent and the host (see the security boundary below).
+
+*A second unit, not a weaker first one.* Rootless Podman sets up a container's user namespace with
+`newuidmap`/`newgidmap`, which get the right to map the user's subordinate ids from file capabilities;
+under `agern.service`'s `NoNewPrivileges` and empty `CapabilityBoundingSet` they cannot work. Instead of
+relaxing the unit every agent runs in, the package ships `agern-sandbox.socket` + `agern-sandbox.service`
+(disabled until `agern sandbox enable`): `podman system service --time=0`, socket-activated, `User=agern`,
+with only what rootless Podman needs — no `NoNewPrivileges`, systemd's default bounding set (no
+capability is *added*; the unit runs unprivileged), its own `RuntimeDirectory` (`/run/agern-sandbox` as
+`XDG_RUNTIME_DIR`, since the user has no login session and no lingering), root-owned Podman configuration
+(`CONTAINERS_CONF`, `CONTAINERS_STORAGE_CONF` in `/usr/share/agern/podman`: `cgroupfs` manager, `netavark`,
+`crun`, storage in `/var/lib/agern/containers`) and `Delegate=yes`. The unit hides `/run/systemd` (an
+empty tmpfs; the journal socket and systemd-resolved's directory, where `/etc/resolv.conf` points on
+Ubuntu, are bound back in): netavark starts a network's DNS server, aardvark-dns,
+through `systemd-run --user --scope` whenever `/run/systemd/system` exists, which fails without a user
+session bus — and then containers cannot reach each other by name. Hidden, netavark starts it directly as
+a child of the unit (found on the first real-Podman CI run; netavark 1.4 and 1.14 behave the same). Before Podman starts, the unit's one root step
+(`ExecStartPre=+`) creates an empty `/var/lib/cni`: Podman 4.3 (Debian 12) bind-mounts an empty directory over
+it in its rootless network namespace — or, when it is missing, over the nearest existing parent, `/var/lib`,
+which hides the network definitions under `/var/lib/agern/containers` so that every container on a network
+fails with "network not found" (found on a Debian 12 VM; harmless where the directory already exists).
+*Rootless networking: slirp4netns on every version.* Podman 5 (Debian 13) defaults to pasta for the rootless
+network namespace. Debian 13's AppArmor profile for pasta allows it to write only under `/run/user/<uid>` and
+`/tmp`, and has no `local/` include, so pasta cannot create its PID file in `/run/agern-sandbox` and every
+container on a run network fails ("setting up Pasta … Permission denied", audit `profile="pasta"
+operation="mknod"`). The options were: (a) move the runtime directory to `/run/user/<uid>` — but that directory
+belongs to logind, which mounts a fresh tmpfs over it when anybody opens a session as `agern` (`su -`, `runuser
+-l`) and removes it when that session ends, under the running sandboxes; (b) extend the profile — impossible
+without editing a distribution file, since it has no `local/` include, and an edit would be overwritten by
+package upgrades; (c) use slirp4netns, whose AppArmor profile is `flags=(unconfined)` and which confines itself
+(Podman starts it with `--enable-sandbox --enable-seccomp`). (c) is chosen: one key in Agern's own
+`containers.conf` (`default_rootless_network_cmd = "slirp4netns"`), no host file outside the package changed,
+and the same helper on every supported release. Podman 4.3 does not know the key and ignores it (logged at debug
+level only) and 4.3 and 4.9 already default to slirp4netns, so Debian 12 and Ubuntu 24.04 behave exactly as
+before. The cost is throughput: slirp4netns is a user-space TCP/IP stack, slower than pasta, which matters only
+for large downloads during builds. `agern sandbox selftest` and `agern doctor` print the kernel's
+`apparmor="DENIED"` lines for the agern user's processes, so a profile that refuses a path again is named. The server keeps every restriction and
+reaches Podman as a podman-remote client: `FACTORY_SANDBOX_PODMAN_URL=unix:///run/agern-podman/podman.sock`,
+a socket `agern:agern 0600`, so no other user can drive it. `agern.service` is ordered after the socket.
+
+*Limits.* Without a systemd user session Podman uses the `cgroupfs` manager in the unit's delegated cgroup.
+`/usr/lib/agern/sandbox-service` (the unit's `ExecStart`) moves itself into the leaf `<unit cgroup>/service`
+and enables `cpu`, `memory`, `pids` (and `io`) for the children, then execs Podman; the server passes
+`--cgroup-parent <unit cgroup>/containers` (`FACTORY_SANDBOX_CGROUP_PARENT`), so each container gets its own
+cgroup with its limits. Without an explicit parent rootless `cgroupfs` creates no cgroup and crun silently
+drops the limits (crun 1.8 on Debian 12 always; newer crun falls back to a sibling of its own cgroup), which
+is why the option exists. All sandboxes live below the unit: stopping it stops them, `systemctl edit
+agern-sandbox` can cap them together (`MemoryMax=`, `CPUQuota=`), and `OOMScoreAdjust=500`, `CPUWeight=50`,
+`IOWeight=50` make the kernel sacrifice and throttle sandboxes before the server and PostgreSQL.
+
+*Enabling* (`agern sandbox enable`, root): checks the packages (`podman` ≥ 4.3, `uidmap`, `netavark`,
+`aardvark-dns`, `crun`, `slirp4netns` — never installed by Agern;
+the missing ones are named in one `apt install` line and nothing is changed), cgroups v2 and systemd;
+gives `agern` a subordinate uid and gid range of 65536 with `usermod --add-subuids/--add-subgids` (the first
+`100000 + k·65536` block that overlaps no range in `/etc/subuid`/`/etc/subgid` and no uid/gid the name
+service lists; an existing range is kept); creates the storage directory *as `agern`* (root never writes
+inside the data directory); enables the socket; runs a self-test as `agern` through the socket (pull an
+image from an allowed registry, a private network with a sidecar reached by name, a sandbox with the
+server's options and a bind-mounted directory under the data directory, limits read back from the
+container's cgroup, a 200 MB allocation in a 64 MB container killed, all removed afterwards); only then
+writes `FACTORY_SANDBOX=podman`, `FACTORY_SANDBOX_PODMAN_URL` and `FACTORY_SANDBOX_CGROUP_PARENT` into
+`agern.env` (as data, like `setup-db`), enables `agern-sandbox-prune.timer` and restarts the server if it
+is idle (otherwise it says to restart later). A failed self-test leaves `agern.env` unchanged and the units
+off. `disable` (refuses while busy unless `--force`) writes `FACTORY_SANDBOX=off`, removes the two other
+keys, restarts the server, removes containers and networks labelled `agern.run` (and self-test leftovers),
+and stops and disables the units; images, cache volumes and the subordinate ids are kept. `status` shows
+the setting, units, versions, sandboxes, cache volumes and `podman system df`; a user who is neither root
+nor `agern` is told what cannot be read. `agern doctor` (sandboxes on) checks packages and version,
+subordinate ids, cgroups v2, the URL, socket enabled and listening, that `agern` gets an answer, the unit's
+cgroup owned by `agern` with `cpu memory pids` in `cgroup.subtree_control`, the cgroup parent, the prune
+timer, the storage directory (`agern`, `0700`) and free disk space (warn < 10 GB, fail < 2 GB); with
+sandboxes off it prints one line.
+
+*Disk.* `agern-sandbox-prune.timer` (daily, as `agern`, not root) runs `agern sandbox prune`: images no
+container uses whose build time is older than `AGERN_SANDBOX_PRUNE_HOURS` (default 168; Podman records no
+"last used", so an old base image is removed once idle and pulled again on the next run), dangling images,
+unused volumes of that age that are not per-project caches (label `agern.cache`), and self-test leftovers.
+Cache volumes are removed only by `prune --caches`/`--all`. Containers are removed with `--volumes`, so an
+image's anonymous volumes (e.g. PostgreSQL's data) go with the run.
+
+*Packaging.* The Podman stack is in `Suggests:` (`podman (>= 4.3), uidmap, netavark, aardvark-dns, crun,
+slirp4netns`), not `Recommends:`, so an install without sandboxes gets no container runtime.
+Versions checked with `apt-cache` in the distribution images: Debian 12 Podman 4.3.1 (crun 1.8.1, netavark/
+aardvark-dns 1.4.0, slirp4netns 1.2.0), Ubuntu 24.04 Podman 4.9.3 (crun 1.14.1, netavark 1.4.0), Debian 13
+Podman 5.4.2 (crun 1.21, netavark 1.14.0, slirp4netns 1.2.1). An upgrade only reloads systemd: it never disables
+sandboxes, never restarts the sandbox service (that would stop the sandboxes of runs in progress) and never
+touches `/etc/subuid`; `postinst` re-enables the socket and timer when `agern.env` has
+`FACTORY_SANDBOX=podman` (e.g. after `remove` and reinstall). `prerm remove` stops and disables the sandbox
+units; `postrm purge` says so and removes `/var/lib/agern/containers` (`rm -rf --one-file-system`, which
+never follows a symlink; the files belong to subordinate ids only root can delete), and `userdel` drops the
+subordinate ranges.
+
+*Verified* by `packaging/deb/sandbox-host-test.sh`, which CI runs on a GitHub-hosted Ubuntu 24.04 VM (job
+`sandbox`): enable and self-test, doctor, the server under the hardened unit removing a leftover sandbox
+through the socket, the `PodmanIntegrationTest` (real rootless Podman: sidecar DNS, bind mount ownership,
+host paths invisible, not privileged, cache reuse, exec, timeout and restart, memory limit enforced, labels,
+removal) run as `agern` *inside* `agern.service`, upgrade, prune, disable and purge. Debian 12 and 13 run the
+same script on a VM by hand.
 
 **Release artifact.** One self-contained `agern.jar` (server with the built frontend embedded on
 the classpath) — the host needs only Java 17 and PostgreSQL. `FACTORY_WEB_DIR` overrides the
@@ -930,13 +1373,25 @@ with systemd's default `PATH`, `agern.env` is parsed as data (only known keys, s
 in root-only `/var/cache/agern`, and root never runs a program found via the agents' `PATH`
 (`agern doctor` only looks those up). The checksum guards against corrupt downloads, not against
 a compromised GitHub release; the activity answer is advisory (it decides when, never what).
+Sandboxes do not move this boundary: their containers are rootless and owned by `agern`, never
+privileged and never given more than Podman's default rootless capabilities, so they grant nothing
+the `agern` user does not already have — and, since agents run on the host as that user, they also
+take nothing away from it (containing the agent is a later step). The one thing the sandbox unit
+adds is that a process running as `agern` there may use `newuidmap`/`newgidmap` on the range root
+assigned to `agern`: ids that belong to no account (the allocation checks), so mapping them gives
+access to nothing but the containers' own files. An agent can reach the socket and the Podman API
+(it is the same user), and could run its own rootless containers — exactly what `agern` could do
+with `podman` installed and no sandbox unit; no rootful Podman, no `docker` group, no privileged
+helper and no sudo rule exist. Root never runs anything the agent can write on this path: the
+units, `sandbox-service` and the Podman configuration are root-owned package files, `agern sandbox`
+talks to Podman as `agern` (`runuser`), and `agern.env` is parsed as data.
 
 ## 10. Frontend
 
 Routes: `/login`, `/` (projects), `/p/:repo` (issues · CLI chat · agents), `/p/:repo/runs/:runId`
 (pipeline diagram with live stages; selecting a stage shows that agent's transcript),
 `/p/:repo/releases/:releaseId` (a release's plan and build, below),
-`/agents` (everything running), `/settings` (own credentials, and "Models & cost": the user's own model per
+`/p/:repo/sandbox` (the project's sandbox definition and its approval, below), `/agents` (everything running), `/settings` (own credentials, and "Models & cost": the user's own model per
 role and fix rounds, with presets — *Default* clears every choice, *Economy* picks Sonnet for chat and spec,
 Haiku for the four reviewers and one fix round), `/admin` ("Factory settings": the default models and the
 default and maximum fix rounds; installing software stays admin-only).
@@ -1033,5 +1488,34 @@ when cancelled); "Add an open issue" shows while planning and, for the owner, wh
 
 On the run page of a release run the merge node is titled "merge to release" and the header shows the base branch
 linking to the release page (plain text when the release was deleted); single runs still say "merge to main".
+
+**Sandboxes.** The activity pane has a "Sandbox" row (the state as a pill — no definition, invalid, needs approval,
+changed, approved — and a short line) linking to the project's sandbox page `/p/:repo/sandbox`, a normal scrolling page
+for everyone who can see the project: the state with an explanation (switched off on this server; no definition, with
+an example; the validation errors; waiting for approval; changed since the approved version, by whom and when; approved),
+the definition (image, the user commands run as — "setup runs as root" —, setup script, platforms with their image and
+whether their setup is their own or the top-level one, environment, services with their readiness check or "no
+readiness check", caches, resources with the server's caps and that each platform in use is another container with
+these limits), a line diff
+between the approved and the current content when they differ, and the raw file. Admins get "Approve…" — the
+confirmation names every image with its role (default, platform, service) and shows every setup script that will run
+and says plainly that they will run on the factory host for
+every run of the project — and "Revoke…" (confirmation); others see who can approve. The page and the row follow
+`sandbox_approval` frames. The run page shows one line under the run's facts: "sandbox" with the image and the approved
+definition's hash prefix and, when the definition has platforms, each platform (marked ✓ once commands ran in it), or
+"none — <why>" (switched off, no definition, not approved, invalid), and a link to the
+sandbox page. In a builder's transcript every `system` event with `payload.sandbox` is a collapsible command block
+(the platform as a chip when `platform` is set, `$ command` or "setup script", exit code or "timed out", duration,
+"truncated"; failures in red): opened, it shows the
+last 200 lines of the output in the terminal style with "Show all N lines", the full script or multi-line command, and
+nothing of the output is rendered while closed. The `factory_sandbox_exec` tool call itself is summarised as "Exit N in
+X s · full log below". The admin page has a "Sandboxes" card: runtime, containers in use of the maximum (with a note that
+every container that runs commands takes a slot and services take none), the per-container caps, the platform cap, the
+command time limit and the registries; the running sandboxes (run, project, owner, run status, age, each existing
+container as platform chip + image, services, platforms not created yet, slots held, per-container limits and the memory
+the run may use in all, definition hash) with "Stop" (confirmation: the containers go, the run continues and its next sandbox
+command creates a new one); and the projects waiting for an approval, linking to their sandbox pages. The card reloads
+(debounced) on every `sandboxes` frame and otherwise every 60 s. The software
+requests card notes that build and test tools can go in the project's `.agern/sandbox.yml` instead of on the host.
 
 Artwork is served from `web/public/art/` (see `art/README.md`).

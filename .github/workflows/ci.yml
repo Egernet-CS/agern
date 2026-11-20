@@ -55,7 +55,9 @@ jobs:
       - name: shellcheck
         run: |
           shellcheck packaging/agern packaging/install.sh scripts/*.sh \
-            packaging/deb/postinst packaging/deb/prerm packaging/deb/postrm packaging/deb/smoke-test.sh
+            packaging/deb/postinst packaging/deb/prerm packaging/deb/postrm packaging/deb/smoke-test.sh \
+            packaging/deb/sandbox-host-test.sh packaging/deb/sandbox-service \
+            server/src/main/resources/sandbox/prepare-user.sh
 
   deb:
     name: Debian package (build)
@@ -115,10 +117,42 @@ jobs:
           docker run --rm -v "$PWD":/src:ro "$IMAGE" \
             bash /src/packaging/deb/smoke-test.sh "/src/dist/agern_${VERSION}_all.deb" --server
 
+  sandbox:
+    name: Sandboxes (rootless Podman under systemd, Ubuntu 24.04 VM)
+    needs: deb
+    # A hosted runner is a VM with systemd, sudo and a real kernel: the package, its units and
+    # rootless Podman run as they do on a server. Debian 12/13 need a VM of their own: run the same
+    # script there by hand (docs/INSTALL-LINUX.md, "Sandboxes").
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb
+          path: dist
+      # The integration test runs Gradle as the agern user: download its dependencies here first (cached
+      # by setup-gradle) and hand them over, so it does not hit Maven Central again.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      # Maven Central sometimes answers 429/404 to hosted runners: one retry after a pause.
+      - run: ./gradlew --no-daemon :server:testClasses || { sleep 60; ./gradlew --no-daemon --refresh-dependencies :server:testClasses; }
+      # Installs the package, PostgreSQL and Podman with apt; 'agern sandbox enable' and its
+      # self-test; doctor; the server under the hardened unit reaping a leftover sandbox through the
+      # socket; PodmanIntegrationTest as the agern user inside agern.service; upgrade, prune,
+      # disable, purge. Prints PASS/FAIL per check and fails the job on any FAIL.
+      - name: Sandbox host test
+        env:
+          VERSION: ${{ needs.deb.outputs.version }}
+        run: sudo AGERN_IT_GRADLE_CACHE="$HOME/.gradle" bash packaging/deb/sandbox-host-test.sh "dist/agern_${VERSION}_all.deb" --it .
+
   publish-main:
     name: Publish the rolling main pre-release
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [web, server, packaging, deb, deb-smoke]
+    needs: [web, server, packaging, deb, deb-smoke, sandbox]
     runs-on: ubuntu-latest
     permissions:
       contents: write # move the main-latest tag and update its release assets

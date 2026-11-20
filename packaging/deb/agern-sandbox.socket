@@ -1,0 +1,18 @@
+# Agern sandboxes: the Podman API socket of the agern user. Installed by the agern .deb as
+# /usr/lib/systemd/system/agern-sandbox.socket; off until `agern sandbox enable` enables it.
+# Only the agern user can connect (0600): the server reaches it as
+# FACTORY_SANDBOX_PODMAN_URL=unix:///run/agern-podman/podman.sock.
+[Unit]
+Description=Agern sandboxes - Podman API socket (agern user only)
+Documentation=https://github.com/Egernet-CS/agern/blob/main/docs/INSTALL-LINUX.md#13-sandboxes
+
+[Socket]
+ListenStream=/run/agern-podman/podman.sock
+SocketUser=agern
+SocketGroup=agern
+SocketMode=0600
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

@@ -150,10 +150,130 @@ data class RunDto(
     val status: String, val round: Int, val maxRounds: Int, val branch: String?, val prNumber: Int?,
     val prUrl: String?, val owner: OwnerDto, val startedBySessionId: String?, val error: String?,
     val createdAt: String, val updatedAt: String, val endedAt: String?, val stages: List<StageDto>,
+    /** What the run decided about its sandbox when it started; null before that (and for runs from before sandboxes). */
+    val sandbox: RunSandboxDto? = null,
     /** The release this run builds an issue for; null for a single run (or when the release was deleted). */
     val releaseId: String? = null,
     /** The branch the run starts from and merges into; null = the repository's default branch. */
     val baseBranch: String? = null,
+)
+
+/**
+ * A run's sandbox decision (docs/ARCHITECTURE.md §5 "Sandboxes"), fixed when the run starts.
+ * `state`: `disabled` (FACTORY_SANDBOX=off), `none` (no definition file), `invalid`, `unapproved`, `approved`.
+ * Only `approved` gives the builder a sandbox; [reason] says why (not) in words.
+ */
+@Serializable
+data class RunSandboxDto(
+    val state: String, val reason: String, val sha256: String?, val image: String?,
+    /** The definition's platforms besides the default image (`approved` only; empty for older runs). */
+    val platforms: List<String> = emptyList(),
+    /** Where the builder ran commands: `default` and platform names, in first-use order (only when there are platforms). */
+    val platformsUsed: List<String> = emptyList(),
+)
+
+/** A sidecar's readiness check (`ready:`). */
+@Serializable data class SandboxReadyDto(val command: String, val timeoutSeconds: Int)
+
+@Serializable data class SandboxServiceDto(val name: String, val image: String, val env: Map<String, String>, val ready: SandboxReadyDto? = null)
+
+/** A platform: another image the builder can run commands in. [setupInherited]: it uses the top-level `setup`. */
+@Serializable data class SandboxPlatformDto(val name: String, val image: String, val setup: String?, val setupInherited: Boolean)
+
+/** `user:` as written ([name] or [uid]) and the uid commands run as inside the container. */
+@Serializable data class SandboxUserDto(val name: String?, val uid: Int)
+
+@Serializable
+data class SandboxLimitsDto(
+    /** Effective per-container limits: what the file asks for, capped by the server's limits. */
+    val cpus: Double, val memory: String,
+    val requestedCpus: Double?, val requestedMemory: String?,
+    /** The file asked for more than the server allows. */
+    val capped: Boolean,
+)
+
+@Serializable
+data class SandboxDefinitionDto(
+    val image: String, val setup: String?, val env: Map<String, String>, val services: List<SandboxServiceDto>,
+    val caches: List<String>, val limits: SandboxLimitsDto,
+    val platforms: List<SandboxPlatformDto> = emptyList(),
+    /** Null: commands run as root inside the container. */
+    val user: SandboxUserDto? = null,
+)
+
+@Serializable data class SandboxApprovalDto(val sha256: String, val content: String, val approvedBy: OwnerDto, val approvedAt: String)
+
+/** `GET /api/projects/{repo}/sandbox`: the definition on the default branch and its approval. */
+@Serializable
+data class SandboxStatusDto(
+    val repo: String,
+    /** FACTORY_SANDBOX is not `off`. Definitions can be approved either way. */
+    val enabled: Boolean,
+    val path: String,
+    /** The branch the definition is read from (the default branch, which runs start from). */
+    val branch: String,
+    /** `none` (no file), `invalid`, `pending` (valid, this content not approved) or `approved`. */
+    val state: String,
+    val sha256: String?,
+    val content: String?,
+    val errors: List<String>,
+    val definition: SandboxDefinitionDto?,
+    /** The repository's approval, possibly of other content (compare [sha256]); null when none. */
+    val approval: SandboxApprovalDto?,
+    /** Who can approve: the admins (so a non-admin knows whom to ask). */
+    val approvers: List<OwnerDto> = emptyList(),
+)
+
+/** A sandbox that exists right now (`GET /api/admin/sandboxes`). */
+@Serializable
+data class RunningSandboxDto(
+    val runId: String, val repo: String,
+    /** False when the admin cannot see the repository on GitHub: then [issueTitle] is withheld and the UI does not link. */
+    val visible: Boolean,
+    val issueNumber: Int, val issueTitle: String?, val runStatus: String, val owner: OwnerDto,
+    val image: String, val services: List<String>,
+    /** The approved definition's hash. */
+    val sha256: String,
+    val createdAt: String,
+    /** Per-container limits it runs with. */
+    val cpus: Double, val memory: String,
+    /** The containers that run commands right now (the default image and/or platforms), each taking one slot. */
+    val containers: List<SandboxContainerDto> = emptyList(),
+    /** The definition's platforms (whether or not they exist right now). */
+    val platforms: List<String> = emptyList(),
+    /** Slots of FACTORY_SANDBOX_MAX_CONCURRENT this run holds: one per entry of [containers]. */
+    val slots: Int = 0,
+    /** The memory all of the run's containers may use together: [memory] × (command containers + services). */
+    val memoryTotal: String = memory,
+)
+
+/** One container of a run's sandbox that runs commands: `default` (the top-level image) or a platform. */
+@Serializable data class SandboxContainerDto(val platform: String, val image: String, val createdAt: String)
+
+@Serializable
+data class SandboxServerLimitsDto(
+    val maxCpus: Double, val maxMemory: String, val maxConcurrent: Int, val execTimeoutMinutes: Long, val registries: List<String>,
+    val maxPlatforms: Int = 4,
+)
+
+/** `GET /api/admin/sandboxes`: the runtime, its limits and the sandboxes that exist. */
+@Serializable
+data class SandboxOverviewDto(
+    val enabled: Boolean,
+    /** `off`, `podman` or `fake` (development). */
+    val runtime: String,
+    val inUse: Int,
+    val limits: SandboxServerLimitsDto,
+    /** Oldest first. */
+    val sandboxes: List<RunningSandboxDto>,
+)
+
+/** `GET /api/admin/sandboxes/pending`: a project whose valid `.agern/sandbox.yml` is not approved in this exact version. */
+@Serializable
+data class PendingSandboxDto(
+    val repo: String, val sha256: String, val image: String,
+    /** The hash of the version that is approved (the file changed since), or null when none ever was. */
+    val approvedSha256: String?,
 )
 
 @Serializable
@@ -246,6 +366,12 @@ data class AttachmentDto(
     val release: ReleaseDto? = null,
     /** `release_deleted`: the id of the deleted release. */
     val releaseId: String? = null,
+    /** `sandbox_approval`: the project's approval after the change; null when it was revoked. */
+    val approval: SandboxApprovalDto? = null,
+    /** `sandboxes` (admins only): the run whose sandbox changed. */
+    val runId: String? = null,
+    /** `sandboxes`: `created`, `removed` or `stopped`. */
+    val change: String? = null,
 )
 
 object RunStatus {

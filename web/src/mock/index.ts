@@ -1,5 +1,5 @@
 // Mock implementation of the Api interface. Enabled with VITE_MOCK=1 (npm run dev:mock).
-// Scenarios via ?mock=default|fresh|noclaude|observer|loggedout (remembered per tab).
+// Scenarios via ?mock=default|fresh|noclaude|observer|loggedout|nosandbox (remembered per tab; nosandbox: FACTORY_SANDBOX=off).
 import { ApiError, type Api, type Channel } from '../api/api';
 import { isRunActive, isSessionActive, type AgentSession, type Attachment, type ClientConfig, type Issue, type LoginStep, type Preferences, type Release, type Run, type StageRole, type User } from '../api/types';
 import {
@@ -21,7 +21,13 @@ import {
   cancelRelease,
   retryReleaseIssue,
   approveRun,
+  approveSandbox,
   cancelRun,
+  revokeSandboxApproval,
+  pendingSandboxes,
+  sandboxOverview,
+  sandboxStatus,
+  stopSandbox,
   chatInput,
   closeChat,
   createChat,
@@ -287,6 +293,13 @@ export const mockApi: Api = {
       return i;
     }),
 
+  sandboxStatus: (repo) => ok(() => sandboxStatus(repo, project(repo).defaultBranch)),
+  approveSandbox: (repo, sha256) => ok(() => (project(repo), approveSandbox(repo, sha256, me()))),
+  revokeSandboxApproval: (repo) => ok(() => (project(repo), revokeSandboxApproval(repo, me()))),
+  sandboxes: () => ok(() => (needAdmin(), sandboxOverview())),
+  pendingSandboxes: () => ok(() => (needAdmin(), pendingSandboxes())),
+  stopSandbox: (runId) => ok(() => (needAdmin(), stopSandbox(runId, me()))),
+
   releases: (repo) => ok(() => (project(repo), releasesOf(repo))),
   release: (id) =>
     ok(() => {
@@ -513,7 +526,8 @@ export const mockApi: Api = {
   },
   openFeed(handlers): Channel {
     let closed = false;
-    const sub = (f: Parameters<typeof handlers.onFrame>[0]) => !closed && db.loggedIn && db.me.hasGithubToken && handlers.onFrame(f);
+    // Like the backend: `sandboxes` frames go to admins only.
+    const sub = (f: Parameters<typeof handlers.onFrame>[0]) => !closed && db.loggedIn && db.me.hasGithubToken && (f.type !== 'sandboxes' || db.me.isAdmin) && handlers.onFrame(f);
     const t = setTimeout(() => {
       handlers.onOpen?.();
       db.feedSubs.add(sub);

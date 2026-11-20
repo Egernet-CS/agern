@@ -15,6 +15,9 @@ import type {
   Release,
   Run,
   RunStatus,
+  PendingSandbox,
+  SandboxOverview,
+  SandboxStatus,
   Settings,
   SoftwareRequest,
   User,
@@ -91,6 +94,25 @@ export interface Api {
   scheduleRelease(id: string, startAt: string): Promise<Release>;
   /** Back to `planning`; 409 `release_not_scheduled`, 403 not owner/admin. */
   cancelReleaseSchedule(id: string): Promise<Release>;
+
+  /** The project's `.agern/sandbox.yml` on its default branch and its approval (anyone who can see the project). */
+  sandboxStatus(repo: string): Promise<SandboxStatus>;
+  /**
+   * Admin: approves exactly the content with this hash. 409 `sandbox_definition_changed` when the file changed meanwhile,
+   * 422 `sandbox_definition_invalid`, 404 when there is no file, 403 for non-admins.
+   */
+  approveSandbox(repo: string, sha256: string): Promise<SandboxStatus>;
+  /** Admin: removes the project's approval (runs already started keep their decision). */
+  revokeSandboxApproval(repo: string): Promise<SandboxStatus>;
+  /** Admin: the sandbox runtime, its limits and the sandboxes that exist right now. */
+  sandboxes(): Promise<SandboxOverview>;
+  /** Admin: projects (that the admin can see) whose valid definition is not approved in this version. */
+  pendingSandboxes(): Promise<PendingSandbox[]>;
+  /**
+   * Admin: removes a run's sandbox now (containers and network; cache volumes stay). The run continues and the builder's
+   * next sandbox command creates a fresh one. 404 when the run has no sandbox right now. Answers the new overview.
+   */
+  stopSandbox(runId: string): Promise<SandboxOverview>;
 
   projectRuns(repo: string): Promise<Run[]>;
   startRun(repo: string, issueNumber: number): Promise<Run>;

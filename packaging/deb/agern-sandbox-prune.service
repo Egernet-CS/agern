@@ -1,0 +1,18 @@
+# Agern sandboxes: daily clean-up of unused images and volumes (`agern sandbox prune`). Started
+# by agern-sandbox-prune.timer, which `agern sandbox enable` enables. Runs as the agern user, not
+# root: it only talks to the agern user's own Podman service. AGERN_SANDBOX_PRUNE_HOURS in
+# /etc/agern/agern.env sets the age (default 168 hours); per-project cache volumes are kept.
+[Unit]
+Description=Agern sandboxes - remove unused images and volumes
+Documentation=https://github.com/Egernet-CS/agern/blob/main/docs/INSTALL-LINUX.md#13-sandboxes
+After=agern-sandbox.socket
+
+[Service]
+Type=oneshot
+User=agern
+Group=agern
+Environment=HOME=/var/lib/agern
+WorkingDirectory=/var/lib/agern
+ExecStart=/usr/bin/agern sandbox prune
+Nice=10
+IOSchedulingClass=idle

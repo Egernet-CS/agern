@@ -11,7 +11,9 @@ import java.util.concurrent.CopyOnWriteArrayList
  */
 class FakeGitHub(private val org: String) : GitHub {
     data class Repo(val name: String, val description: String?, val private: Boolean, val visibleTo: Set<String>? = null,
-                    val issues: MutableList<GhIssue> = mutableListOf(), val comments: MutableMap<Int, MutableList<GhComment>> = mutableMapOf())
+                    val issues: MutableList<GhIssue> = mutableListOf(), val comments: MutableMap<Int, MutableList<GhComment>> = mutableMapOf(),
+                    /** Files on the default branch, by path (only what tests put there). */
+                    val files: MutableMap<String, String> = mutableMapOf())
 
     val repos = mutableMapOf<String, Repo>()
     val actions = CopyOnWriteArrayList<String>()
@@ -45,6 +47,28 @@ class FakeGitHub(private val org: String) : GitHub {
             r.issues += issue
             issue
         }
+
+    /**
+     * Development (FACTORY_DEV_FAKE_GITHUB): a directory whose `<repo>/<path>` files are on that repository's default
+     * branch too, so a developer or an end-to-end test can add and change files (e.g. `.agern/sandbox.yml`) while the
+     * server runs. Files set with [setFile] take precedence.
+     */
+    @Volatile var filesDir: java.nio.file.Path? = null
+
+    /** The file at [path] on [repo]'s default branch, or null (no visibility check: server-side use only). */
+    fun fileOf(repo: String, path: String): String? = synchronized(this) {
+        repos[repo]?.files?.get(path)
+    } ?: filesDir?.let { dir ->
+        if (path.split('/').any { it == ".." || it.isEmpty() } || repo.contains('/') || repo.startsWith(".")) return@let null
+        val f = dir.resolve(repo).resolve(path)
+        if (java.nio.file.Files.isRegularFile(f)) java.nio.file.Files.readString(f) else null
+    }
+
+    /** Puts (or with null removes) a file on [repo]'s default branch. */
+    fun setFile(repo: String, path: String, content: String?) = synchronized(this) {
+        val r = repos.getValue(repo)
+        if (content == null) r.files.remove(path) else r.files[path] = content
+    }
 
     override fun client(token: String): GitHubClient {
         if (!token.startsWith("fake-") || token.length < 6) throw GitHubException(401, "Bad credentials")
@@ -153,6 +177,11 @@ class FakeGitHub(private val org: String) : GitHub {
                 actions += "pr $repo $head -> $base #$n"
                 pr
             }
+
+        override fun getFile(org: String, repo: String, path: String, ref: String): String? {
+            synchronized(this@FakeGitHub) { repo(org, repo) }
+            return fileOf(repo, path)
+        }
 
         override fun squashMerge(org: String, repo: String, number: Int, title: String) = synchronized(this@FakeGitHub) {
             repo(org, repo)

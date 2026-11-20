@@ -1,6 +1,6 @@
 // Turns raw session events (incl. Claude Code stream-json) into renderable transcript items.
 // Everything here is defensive: unknown shapes become compact "unknown" items, never throws.
-import type { Attachment, FactoryEvent, SessionStatus } from '../../api/types';
+import type { Attachment, FactoryEvent, SandboxLog, SessionStatus } from '../../api/types';
 
 export type ToolResult = { text: string; isError: boolean; images: number };
 
@@ -20,7 +20,7 @@ export type Item =
   | { k: 'tool'; id: string; name: string; input: unknown; inputPartial?: string; result?: ToolResult; streaming?: boolean }
   | { k: 'init'; id: string; model: string; cwd: string | null; tools: number; mcp: { name: string; status: string }[] }
   | { k: 'result'; id: string; ok: boolean; subtype: string; costUsd: number | null; turns: number | null; durationMs: number | null; text: string | null }
-  | { k: 'system'; id: string; level: 'info' | 'warn' | 'error'; text: string }
+  | { k: 'system'; id: string; level: 'info' | 'warn' | 'error'; text: string; sandbox?: SandboxLog }
   | { k: 'status'; id: string; status: string }
   | { k: 'unknown'; id: string; label: string; json: string };
 
@@ -58,6 +58,21 @@ export function attachmentsOf(v: unknown): Attachment[] {
     kind: a.kind === 'image' ? 'image' : 'file',
     size: num(a.size) ?? 0,
   }));
+}
+
+/** The `sandbox` log of a system event, defensively (undefined unless well-formed). */
+export function sandboxLogOf(v: unknown): SandboxLog | undefined {
+  if (!isObj(v) || typeof v.command !== 'string') return undefined;
+  return {
+    kind: v.kind === 'setup' ? 'setup' : 'exec',
+    command: v.command,
+    exitCode: num(v.exitCode) ?? -1,
+    timedOut: v.timedOut === true,
+    durationMs: num(v.durationMs) ?? 0,
+    output: str(v.output) ?? '',
+    outputTruncated: v.outputTruncated === true,
+    platform: str(v.platform) ?? null,
+  };
 }
 
 export function normalizeToolContent(c: unknown): { text: string; images: number } {
@@ -113,7 +128,7 @@ export function buildTranscript(events: FactoryEvent[], partials: unknown[]): { 
           continue;
         }
         const level = s.level === 'warn' || s.level === 'error' ? s.level : 'info';
-        items.push({ k: 'system', id, level, text: str(s.text) ?? compactJson(p) });
+        items.push({ k: 'system', id, level, text: str(s.text) ?? compactJson(p), sandbox: sandboxLogOf(s.sandbox) });
         continue;
       }
       if (ev.type === 'status') {
@@ -276,6 +291,7 @@ export function toolArgs(name: string, input: unknown, partial?: string): string
       out = Array.isArray(input.todos) ? `${input.todos.length} todos` : null;
       break;
   }
+  if (name.endsWith('__factory_sandbox_exec')) out = s('command');
   if (out == null) {
     const entries = Object.entries(input).filter(([, v]) => v !== undefined);
     out = entries
@@ -295,6 +311,18 @@ export function toolSummary(name: string, r: ToolResult): string | null {
   if (name === 'Glob') return `Found ${lines} file${lines === 1 ? '' : 's'}`;
   if (name === 'Grep') return r.text.trim() ? `Found ${lines} match${lines === 1 ? '' : 'es'}` : 'No matches';
   if (name === 'TodoWrite') return 'Updated todos';
+  if (name.endsWith('__factory_sandbox_exec')) {
+    // The agent gets the tail as JSON; the full log is the sandbox block in the transcript.
+    try {
+      const j = JSON.parse(r.text) as { exitCode?: number; durationMs?: number; timedOut?: boolean };
+      if (typeof j.exitCode === 'number') {
+        const secs = typeof j.durationMs === 'number' ? ` in ${(j.durationMs / 1000).toFixed(1)} s` : '';
+        return `${j.timedOut ? 'Timed out' : `Exit ${j.exitCode}`}${secs} · full log below`;
+      }
+    } catch {
+      /* not JSON: show the text */
+    }
+  }
   if (r.images) return `${r.images} image${r.images > 1 ? 's' : ''}${r.text ? ` + ${lines} lines` : ''}`;
   return null;
 }

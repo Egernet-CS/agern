@@ -1,12 +1,13 @@
 // Starts a throwaway Agern server for the end-to-end suite: fake GitHub, fake Claude CLI, dev users,
-// 2FA required, a fresh database in the development PostgreSQL (docker-compose.dev.yml), a free port,
+// 2FA required, fake sandboxes (FACTORY_SANDBOX=fake), a fresh database in the development PostgreSQL (docker-compose.dev.yml), a free port,
 // a temporary data directory and a frontend built into a temporary directory (web/dist is not touched).
 //
 //   node e2e/server.mjs            start it and keep it running (Ctrl-C stops it and drops the database)
 //   npm run e2e                    the Playwright suite starts and stops it by itself (e2e/global-setup.ts)
 //
 // Environment: E2E_PG_CONTAINER_CMD overrides how psql is run (default: docker compose exec on the dev
-// compose file), E2E_DB_HOST_PORT (default 54329), E2E_SKIP_BUILD=1 reuses existing server/frontend builds.
+// compose file), E2E_DB_HOST (default localhost) and E2E_DB_HOST_PORT (default 54329) where the server reaches that
+// PostgreSQL (in Agern's own sandbox: the postgres service), E2E_SKIP_BUILD=1 reuses existing server/frontend builds.
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
@@ -78,7 +79,7 @@ export async function startServer({ log = false } = {}) {
     FACTORY_HOST: '127.0.0.1',
     FACTORY_PORT: String(port),
     FACTORY_PUBLIC_URL: url,
-    FACTORY_DB_URL: `jdbc:postgresql://localhost:${process.env.E2E_DB_HOST_PORT ?? '54329'}/${db}`,
+    FACTORY_DB_URL: `jdbc:postgresql://${process.env.E2E_DB_HOST ?? 'localhost'}:${process.env.E2E_DB_HOST_PORT ?? '54329'}/${db}`,
     FACTORY_DB_USER: 'factory',
     FACTORY_DB_PASSWORD: 'factory',
     FACTORY_MASTER_KEY: randomBytes(32).toString('base64'),
@@ -90,6 +91,9 @@ export async function startServer({ log = false } = {}) {
     FACTORY_DEV_FAKE_GITHUB: 'true',
     FACTORY_CLAUDE_BIN: join(repo, 'server', 'src', 'test', 'resources', 'fake-claude'),
     FACTORY_DATA_DIR: dataDir,
+    // Sandboxes with the in-memory development runtime; files under <dataDir>/fake-github/<repo>/ are on the fake
+    // GitHub's default branches (e.g. .agern/sandbox.yml, written by the sandbox spec).
+    FACTORY_SANDBOX: 'fake',
     FACTORY_WEB_DIR: webDir,
   };
   const proc = spawn(serverBin, [], { env, stdio: log ? 'inherit' : ['ignore', 'pipe', 'pipe'] });
@@ -123,7 +127,7 @@ export async function startServer({ log = false } = {}) {
     await stop();
     throw e;
   }
-  return { url, db, stop, output: () => output };
+  return { url, db, dataDir, stop, output: () => output };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

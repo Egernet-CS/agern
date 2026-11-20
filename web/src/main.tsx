@@ -4,6 +4,7 @@ import './styles/tokens.css';
 import './styles/app.css';
 import './styles/chat.css';
 import './styles/pipeline.css';
+import './styles/sandbox.css';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { installApi } from './api';

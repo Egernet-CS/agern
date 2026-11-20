@@ -100,6 +100,7 @@ private val log = LoggerFactory.getLogger("dk.egernet.factory.api")
 @Serializable data class CreateSessionReq(val model: String? = null)
 @Serializable data class InputReq(val text: String = "", val attachmentIds: List<String> = emptyList())
 @Serializable data class ResolveReq(val status: String, val note: String? = null)
+@Serializable data class ApproveSandboxReq(val sha256: String)
 @Serializable data class HealthDto(val status: String, val version: String, val name: String)
 @Serializable data class ActivityDto(val idle: Boolean, val activeRuns: Int, val busyAgents: Int, val version: String)
 @Serializable data class ProvidersDto(val providers: List<String>, val org: String, val twoFactor: Boolean)
@@ -409,6 +410,16 @@ private fun Route.projectRoutes(s: Services) {
         val req = call.receive<CreateRunReq>()
         call.respond(HttpStatusCode.Created, s.factory.startRun(u, repoParam(), req.issueNumber, null))
     }
+    // Sandbox definition and its approval (docs/ARCHITECTURE.md §5 "Sandboxes", §8).
+    get("/projects/{repo}/sandbox") { call.respond(s.sandboxes.status(call.requireUser(s), repoParam())) }
+    post("/projects/{repo}/sandbox/approval") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        val req = call.receive<ApproveSandboxReq>()
+        if (!Regex("^[0-9a-fA-F]{64}$").matches(req.sha256.trim())) throw badRequest("sha256 must be 64 hex digits")
+        call.respond(s.sandboxes.approve(u, repo, req.sha256))
+    }
+    delete("/projects/{repo}/sandbox/approval") { call.respond(s.sandboxes.revoke(call.requireUser(s), repoParam())) }
 }
 
 private fun Route.runRoutes(s: Services) {
@@ -677,6 +688,15 @@ private fun Route.adminRoutes(s: Services) {
         s.webSessions.deleteAllFor(target.id)
         call.respond(s.users.byId(target.id)!!.toDto())
     }
+    // Sandboxes (docs/ARCHITECTURE.md §5 "Sandboxes", §8).
+    get("/admin/sandboxes") { call.respond(s.sandboxes.overview(call.requireAdmin(s))) }
+    get("/admin/sandboxes/pending") { call.respond(s.sandboxes.pending(call.requireAdmin(s))) }
+    delete("/admin/sandboxes/{runId}") {
+        val admin = call.requireAdmin(s)
+        val runId = uuidParam("runId")
+        s.sandboxes.stop(admin, runId)
+        call.respond(s.sandboxes.overview(admin))
+    }
     get("/admin/software-requests") { call.requireAdmin(s); call.respond(s.softwareRequests.all()) }
     post("/admin/software-requests/{id}") {
         call.requireAdmin(s)
@@ -746,6 +766,11 @@ private fun Route.wsRoutes(s: Services) {
         webSocket("/feed") {
             val u = call.requireUser(s)
             s.bus.feed.collect { item ->
+                if (item is FeedItem.Sandboxes) {
+                    // Admins see every sandbox in the overview, also of projects they cannot see; others get nothing.
+                    if (u.isAdmin) send(Frame.Text(AppJson.encodeToString(FeedFrame.serializer(), FeedFrame(type = "sandboxes", runId = item.runId, change = item.change))))
+                    return@collect
+                }
                 val visible = withContext(Dispatchers.IO) { s.access.canSee(u, item.repo) }
                 if (!visible) return@collect
                 val frame = when (item) {
@@ -755,6 +780,8 @@ private fun Route.wsRoutes(s: Services) {
                     is FeedItem.SessionClosed -> FeedFrame(type = "session_closed", repo = item.repo, sessionId = item.sessionId)
                     is FeedItem.Release -> FeedFrame(type = "release", repo = item.repo, release = item.release)
                     is FeedItem.ReleaseDeleted -> FeedFrame(type = "release_deleted", repo = item.repo, releaseId = item.releaseId)
+                    is FeedItem.SandboxApproval -> FeedFrame(type = "sandbox_approval", repo = item.repo, approval = item.approval)
+                    is FeedItem.Sandboxes -> return@collect
                 }
                 send(Frame.Text(AppJson.encodeToString(FeedFrame.serializer(), frame)))
             }

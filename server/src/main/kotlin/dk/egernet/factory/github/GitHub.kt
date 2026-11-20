@@ -92,6 +92,8 @@ interface GitHubClient {
     fun findOpenPull(org: String, repo: String, branch: String): GhPull?
     fun createPull(org: String, repo: String, head: String, base: String, title: String, body: String): GhPull
     fun squashMerge(org: String, repo: String, number: Int, title: String)
+    /** A file's raw content on [ref] (a branch name), or null when it does not exist there. */
+    fun getFile(org: String, repo: String, path: String, ref: String): String?
     /** The commit a branch points at; null when the branch does not exist. */
     fun branchSha(org: String, repo: String, branch: String): String?
     /** Creates [branch] at [sha]. An existing branch surfaces as [GitHubException] 422. */
@@ -115,11 +117,11 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
     private inner class Client(private val token: String) : GitHubClient {
         private fun enc(s: String) = URLEncoder.encode(s, Charsets.UTF_8).replace("+", "%20")
 
-        private fun send(method: String, path: String, body: JsonObject? = null): HttpResponse<String> {
+        private fun send(method: String, path: String, body: JsonObject? = null, accept: String = "application/vnd.github+json"): HttpResponse<String> {
             val b = HttpRequest.newBuilder(URI.create(if (path.startsWith("http")) path else apiUrl.trimEnd('/') + path))
                 .timeout(Duration.ofSeconds(30))
                 .header("Authorization", "Bearer $token")
-                .header("Accept", "application/vnd.github+json")
+                .header("Accept", accept)
                 .header("X-GitHub-Api-Version", "2022-11-28")
                 .header("User-Agent", "agern")
             val pub = if (body != null) HttpRequest.BodyPublishers.ofString(body.toString()) else HttpRequest.BodyPublishers.noBody()
@@ -213,6 +215,13 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
         override fun createPull(org: String, repo: String, head: String, base: String, title: String, body: String): GhPull {
             val payload = buildJsonObject { put("title", title); put("head", head); put("base", base); put("body", body) }
             return AppJson.decodeFromString(GhPull.serializer(), ok(send("POST", "/repos/${enc(org)}/${enc(repo)}/pulls", payload), "create pull request"))
+        }
+
+        override fun getFile(org: String, repo: String, path: String, ref: String): String? {
+            val p = path.split('/').joinToString("/") { enc(it) }
+            val r = send("GET", "/repos/${enc(org)}/${enc(repo)}/contents/$p?ref=${enc(ref)}", accept = "application/vnd.github.raw+json")
+            if (r.statusCode() == 404) return null
+            return ok(r, "GET contents")
         }
 
         override fun squashMerge(org: String, repo: String, number: Int, title: String) {
