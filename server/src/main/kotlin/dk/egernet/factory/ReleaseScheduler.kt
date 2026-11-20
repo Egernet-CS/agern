@@ -24,17 +24,12 @@ import java.time.Duration
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 
-/** Starts a release now as [owner] (step 2, issue #19). Must move it out of `scheduled`; throws ApiException to refuse. */
+/**
+ * Starts a due scheduled release now as [owner]. Bound to [ReleaseService.startScheduled] (the same start as "start
+ * now", §6 "Releases"); tests may substitute it. Must move the release out of `scheduled`; throws ApiException to refuse.
+ */
 fun interface ReleaseStarter {
     suspend fun start(release: ReleaseRecord, owner: UserRecord)
-
-    /** The binding until step 2 provides a real start: every scheduled start fails with this reason. */
-    object Unavailable : ReleaseStarter {
-        const val MESSAGE = "Building releases is not available in this version of Agern yet (issue #19)."
-        override suspend fun start(release: ReleaseRecord, owner: UserRecord) {
-            throw unprocessable(MESSAGE, "release_start_unavailable")
-        }
-    }
 }
 
 /**
@@ -136,7 +131,7 @@ class ReleaseScheduler(
         if (r.status != ReleaseStatus.SCHEDULED || r.scheduledAt == null || r.scheduledAt.isAfter(now)) return
 
         // 1. Waiting behind a release of the same project that is still building.
-        val other = io { store.occupying(r.repo, r.id) }
+        val other = io { store.activeIn(r.repo) }?.takeIf { it.id != r.id }
         if (other != null) {
             if (io { store.setWaitingFor(r.id, other.id) }) publish(r)
             return
@@ -180,6 +175,8 @@ class ReleaseScheduler(
         } catch (e: CancellationException) {
             throw e
         } catch (e: ApiException) {
+            // Another release took the project's building slot in the meantime ("start now"): wait behind it instead.
+            if (e.code == "release_already_building" && current(r).status == ReleaseStatus.SCHEDULED) return
             e.message
         } catch (e: Exception) {
             log.error("Starting release {} ({}) failed", r.id, r.repo, e)

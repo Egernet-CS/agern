@@ -416,24 +416,6 @@ class ReleaseScheduleTest {
     }
 
     @Test
-    fun `the default starter reports that building is not available yet`() {
-        val w = TestWorld(twoFactor = false, clock = clock)
-        try {
-            val alice = w.user("alice")
-            val r = runBlocking { w.services.releases.create(alice, "demo-app", "1.4", "") }
-            runBlocking { w.services.releases.schedule(alice, r.id, later().toString()) }
-            clock.advance(Duration.ofHours(2))
-            runBlocking { w.services.releaseScheduler.tick() }
-            val after = w.services.releaseStore.get(r.id)!!
-            assertEquals("planning", after.status)
-            assertEquals("Building releases is not available in this version of Agern yet (issue #19).", after.startFailedReason)
-        } finally {
-            w.close()
-            (w.services.db.dataSource as java.io.Closeable).close()
-        }
-    }
-
-    @Test
     fun `a transient GitHub error keeps the release scheduled and retries`() {
         val alice = world.user("alice")
         val r = release(alice, "demo-app", "1.4")
@@ -576,7 +558,7 @@ class ReleaseScheduleTest {
         tick()
         text = s.releases.describe(alice, "demo-app", false)
         assertTrue(text.contains("1.4 — scheduled for 2026-01-01T22:00:00Z by alice, waiting for release \"busy\", 0 issues"), text)
-        assertTrue(text.contains("busy — building, 0 issues"), text)
+        assertTrue(text.contains("busy — building, 0 of 0 merged"), text) // step 2's text for a started release
 
         schedule(alice, failed, at.plusSeconds(60))
         s.users.setClaude(alice.id, null, null)

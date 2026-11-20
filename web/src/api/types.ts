@@ -61,16 +61,30 @@ export type Issue = {
 };
 
 /**
- * `planning` and `scheduled` come from planning and the scheduler; `building` and `paused` (the project is occupied)
- * belong to the next step of releases. Later steps may add states: render unknown ones as text.
+ * `planning` until started (`scheduled` while a start time is set); then `building` / `paused` until it is
+ * `cancelled` (docs/ARCHITECTURE.md §6 "Releases"). Later steps may add states: render unknown ones as text.
  */
-export type ReleaseStatus = 'planning' | 'scheduled' | 'building' | 'paused';
+export type ReleaseStatus = 'planning' | 'scheduled' | 'building' | 'paused' | 'cancelled';
 
 /** A scheduled start that did not happen (docs/ARCHITECTURE.md §6 "Scheduled start"). */
 export type ReleaseStartFailure = { at: string; owner: Owner; reason: string };
 
+/** Where an issue is in its release's build. All issues of a `planning` release are `waiting`. */
+export type ReleaseIssueState = 'waiting' | 'running' | 'merged' | 'held' | 'skipped';
+
 /** An issue as planned in a release: title and kind as they were when it was assigned. */
-export type ReleaseIssue = { number: number; title: string; kind: IssueKind };
+export type ReleaseIssue = {
+  number: number;
+  title: string;
+  kind: IssueKind;
+  state: ReleaseIssueState;
+  /** The issue's latest release run. */
+  runId: string | null;
+  /** Why it is held or skipped, or that it will be built again. */
+  note: string | null;
+};
+
+export type ReleasePauseReason = 'manual' | 'usage_limit' | 'credentials';
 
 /** A named plan of issues for one project (docs/ARCHITECTURE.md §6 "Releases"). */
 export type Release = {
@@ -85,8 +99,14 @@ export type Release = {
   updatedAt: string;
   /** In build order. */
   issues: ReleaseIssue[];
-  /** The user who scheduled the release; set while `scheduled`. */
+  /** Who scheduled or started the release (its runs use this user's credentials); null while `planning`. */
   owner: Owner | null;
+  /** `release/<name>` once started. */
+  branch: string | null;
+  startedAt: string | null;
+  endedAt: string | null;
+  /** Set while `paused`. */
+  pause: { reason: ReleasePauseReason; note: string | null; resumeAt: string | null } | null;
   /** ISO instant of the scheduled start; set exactly while `scheduled`. */
   scheduledAt: string | null;
   /** The release this one waits behind: only while `scheduled` and its time has come. */
@@ -94,6 +114,9 @@ export type Release = {
   /** The last scheduled start that did not happen; kept until the release is scheduled again. */
   startFailure: ReleaseStartFailure | null;
 };
+
+/** Building or paused: at most one per project. */
+export const isReleaseActive = (r: Release) => r.status === 'building' || r.status === 'paused';
 
 export type SessionKind = 'chat' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
 export type StageRole = Exclude<SessionKind, 'chat'>;
@@ -186,6 +209,10 @@ export type Run = {
   updatedAt: string;
   endedAt: string | null;
   stages: Stage[];
+  /** The release this run builds an issue of; null for a single run. */
+  releaseId: string | null;
+  /** The branch the run branches from and merges into (`release/<name>`); null for a single run (default branch). */
+  baseBranch: string | null;
 };
 
 export type EventType = 'user' | 'claude' | 'system' | 'status';

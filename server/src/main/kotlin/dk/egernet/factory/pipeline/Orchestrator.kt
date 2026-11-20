@@ -12,6 +12,7 @@ import dk.egernet.factory.agent.FeedItem
 import dk.egernet.factory.agent.Prompts
 import dk.egernet.factory.agent.StageAgentRequest
 import dk.egernet.factory.agent.StageAgentResult
+import dk.egernet.factory.agent.UsageLimit
 import dk.egernet.factory.agent.Workspaces
 import dk.egernet.factory.conflict
 import dk.egernet.factory.db.RunRecord
@@ -60,7 +61,18 @@ object Schemas {
         """"required":["verdict","summary"]}"""
 }
 
-private class StageFailed(message: String) : RuntimeException(message)
+/** A stage (or the run's set-up) failed; carries what the stage agent reported about usage limits and credentials. */
+private class StageFailed(
+    message: String,
+    val usageLimit: UsageLimit? = null,
+    val credentialRejected: Boolean = false,
+) : RuntimeException(message)
+
+/**
+ * How a release run ended, for the release builder (docs/ARCHITECTURE.md §6 "Releases"): [run] as it is now,
+ * and whether it failed on the owner's usage limit or a rejected (or missing) Claude credential.
+ */
+data class RunOutcome(val run: RunRecord, val usageLimit: UsageLimit? = null, val credentialRejected: Boolean = false)
 
 data class Verdict(val verdict: String, val summary: String, val findings: List<FindingDto>)
 
@@ -87,6 +99,22 @@ class Orchestrator(
 
     fun job(runId: UUID): Job? = jobs[runId]
 
+    /**
+     * Called when a release run settles: at the end of its pipeline (not when its coroutine is cancelled), after
+     * `approve` and after `cancel`. The receiver must not block or call back into the orchestrator inline.
+     */
+    @Volatile var onReleaseRunSettled: ((RunOutcome) -> Unit)? = null
+
+    private fun settled(runId: UUID, usageLimit: UsageLimit? = null, credentialRejected: Boolean = false) {
+        val run = runs.get(runId) ?: return
+        if (run.releaseId == null) return
+        try {
+            onReleaseRunSettled?.invoke(RunOutcome(run, usageLimit, credentialRejected))
+        } catch (e: Exception) {
+            log.warn("Release callback for run {} failed: {}", runId, e.message)
+        }
+    }
+
     fun publish(runId: UUID) {
         runs.touch(runId)
         runs.get(runId)?.let { bus.emitFeed(FeedItem.Run(runs.toDto(it))) }
@@ -95,7 +123,19 @@ class Orchestrator(
     // ------------------------------------------------------------ commands (ownership enforced here)
 
     /** Starts a run as [owner]. The owner's credentials are the only ones the run will ever use. */
-    suspend fun start(owner: UserRecord, repo: String, issueNumber: Int, startedBySession: UUID?): RunRecord {
+    suspend fun start(owner: UserRecord, repo: String, issueNumber: Int, startedBySession: UUID?): RunRecord =
+        create(owner, repo, issueNumber, startedBySession, releaseId = null, baseBranch = null)
+
+    /**
+     * Starts a release run as the release's [owner]: it branches from and merges into [baseBranch] (`release/<name>`)
+     * and does not close its issue (docs/ARCHITECTURE.md §6 "Releases").
+     */
+    suspend fun startReleaseRun(owner: UserRecord, repo: String, issueNumber: Int, releaseId: UUID, baseBranch: String): RunRecord =
+        create(owner, repo, issueNumber, null, releaseId, baseBranch)
+
+    private suspend fun create(
+        owner: UserRecord, repo: String, issueNumber: Int, startedBySession: UUID?, releaseId: UUID?, baseBranch: String?,
+    ): RunRecord {
         if (owner.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
         access.requireVisible(owner, repo)
         val client = access.requireClient(owner)
@@ -104,6 +144,7 @@ class Orchestrator(
         val eff = preferences.effective(owner.id)
         val run = runs.createIfNoActive(
             repo, issueNumber, issue.title, issueKindFromLabels(issue.labels.map { it.name }), eff.maxFixRounds, owner.id, startedBySession,
+            releaseId, baseBranch,
         ) ?: throw conflict("Issue #$issueNumber already has an active run", "active_run_exists")
         for (role in listOf("spec-writer", "builder") + REVIEWER_ROLES + "approver") runs.createStage(run.id, role, 0, eff.model(role))
         publish(run.id)
@@ -123,6 +164,7 @@ class Orchestrator(
         publish(runId)
         withContext(Dispatchers.IO) { merge(runs.get(runId)!!, user, approvedBy = user.username) }
         publish(runId)
+        settled(runId)
         return runs.get(runId)!!
     }
 
@@ -143,6 +185,7 @@ class Orchestrator(
             cleanupWorktree(runs.get(runId)!!, owner)
         }
         publish(runId)
+        settled(runId)
         return runs.get(runId)!!
     }
 
@@ -156,7 +199,11 @@ class Orchestrator(
         } catch (e: Exception) {
             log.warn("Run {} failed: {}", runId, e.message)
             fail(runId, e.message ?: e.javaClass.simpleName)
+            val sf = e as? StageFailed
+            settled(runId, sf?.usageLimit, sf?.credentialRejected == true)
+            return
         }
+        settled(runId)
     }
 
     private fun fail(runId: UUID, reason: String) {
@@ -171,7 +218,7 @@ class Orchestrator(
 
     private fun identity(owner: UserRecord) = AgentIdentity(
         owner.username, owner.displayName, owner.githubLogin, access.githubToken(owner),
-        access.claudeCredential(owner) ?: throw StageFailed("The run owner has no Claude credential"),
+        access.claudeCredential(owner) ?: throw StageFailed("The run owner has no Claude credential", credentialRejected = true),
     )
 
     private fun setStatus(runId: UUID, status: String) {
@@ -190,17 +237,22 @@ class Orchestrator(
         val repoInfo = withContext(Dispatchers.IO) { client.getRepo(org, run.repo) } ?: throw StageFailed("Repository not accessible")
         val issue = withContext(Dispatchers.IO) { client.getIssue(org, run.repo, run.issueNumber) } ?: throw StageFailed("Issue not found")
         val comments = withContext(Dispatchers.IO) { runCatching { client.listComments(org, run.repo, run.issueNumber) }.getOrDefault(emptyList()) }
-        val branch = "factory/issue-${run.issueNumber}-${slug(issue.title)}"
+        // A release run starts from and merges into its release branch; a single run uses the default branch.
+        val target = run.baseBranch ?: repoInfo.defaultBranch
+        val releaseName = run.baseBranch?.takeIf { run.releaseId != null }?.removePrefix("release/")
+        val branch = runBranch(run.issueNumber, issue.title, releaseName)
         val worktree = workspaces.runDir(owner.username, run.repo, run.id)
         val baseRef = withContext(Dispatchers.IO) {
             val main = workspaces.ensureMain(id, run.repo)
             workspaces.withRepoLock(owner.username, run.repo) {
-                workspaces.git.createWorktree(id, main, worktree, branch, repoInfo.defaultBranch, workspaces.home(owner.username))
+                workspaces.git.createWorktree(id, main, worktree, branch, target, workspaces.home(owner.username))
             }
         }
         runs.setBranch(run.id, branch)
         publish(run.id)
-        val ctx = RunContext(run.id, run.repo, issue, issueText(issue, comments), branch, baseRef, repoInfo.defaultBranch, worktree)
+        val ctx = RunContext(
+            run.id, run.repo, issue, issueText(issue, comments), branch, baseRef, target, worktree, releaseName, repoInfo.defaultBranch,
+        )
 
         // 1. Spec
         setStatus(run.id, RunStatus.SPEC)
@@ -244,9 +296,11 @@ class Orchestrator(
                 workspaces.git.push(id, worktree, branch, workspaces.home(owner.username))
                 run = runs.get(run.id)!!
                 if (run.prNumber == null) {
+                    // A release run's pull request must not close the issue: that happens when the release is merged.
+                    val lead = if (releaseName != null) "Issue #${issue.number} · release `$releaseName`" else "Closes #${issue.number}"
                     val pr = client.findOpenPull(org, run.repo, branch) ?: client.createPull(
-                        org, run.repo, branch, repoInfo.defaultBranch, "${issue.title} (#${issue.number})",
-                        "Closes #${issue.number}\n\nBuilt by Agern run `${run.id}` for @${owner.githubLogin ?: owner.username}.\n\n" +
+                        org, run.repo, branch, target, "${issue.title} (#${issue.number})",
+                        "$lead\n\nBuilt by Agern run `${run.id}` for @${owner.githubLogin ?: owner.username}.\n\n" +
                             "<details><summary>Spec</summary>\n\n$spec\n\n</details>",
                     )
                     runs.setPr(run.id, pr.number, pr.htmlUrl)
@@ -308,10 +362,18 @@ class Orchestrator(
         }
     }
 
+    /** [targetBranch]: where the pull request merges; [releaseName] is set for a release run. */
     private data class RunContext(
         val runId: UUID, val repo: String, val issue: GhIssue, val issueText: String, val branch: String,
-        val baseRef: String, val defaultBranch: String, val worktree: Path,
-    )
+        val baseRef: String, val targetBranch: String, val worktree: Path,
+        val releaseName: String? = null, val defaultBranch: String = targetBranch,
+    ) {
+        /** For release runs: the sentence that names the release branch as the merge target. */
+        val releaseNote: String
+            get() = if (releaseName == null) "" else
+                "This issue is part of release `$releaseName`: the pull request is squash-merged into the release branch " +
+                    "`$targetBranch` (not into `$defaultBranch`), and the issue stays open until the release is merged.\n"
+    }
 
     /** Runs one stage's agent and marks the stage running/failed. The caller records the outcome on success. */
     private suspend fun stage(
@@ -337,7 +399,7 @@ class Orchestrator(
         if (!res.ok) {
             runs.finishStage(st.id, "failed", null, res.error, emptyList())
             publish(runId)
-            throw StageFailed("$role failed: ${res.error}")
+            throw StageFailed("$role failed: ${res.error}", res.usageLimit, res.credentialRejected)
         }
         return res
     }
@@ -373,7 +435,10 @@ class Orchestrator(
         publish(run.id)
     }
 
-    /** Squash-merges the PR and closes the issue. On failure the run goes (back) to needs_human. */
+    /**
+     * Squash-merges the PR and closes the issue; a release run's issue stays open until the release is merged.
+     * On failure the run goes (back) to needs_human.
+     */
     private fun merge(run: RunRecord, owner: UserRecord, approvedBy: String?) {
         val client = gh(owner)
         val pr = run.prNumber ?: run { needsHuman(run, owner, "There is no pull request to merge."); return }
@@ -384,11 +449,18 @@ class Orchestrator(
             return
         }
         bestEffort { client.removeLabel(org, run.repo, run.issueNumber, "needs-human") }
-        bestEffort {
-            client.comment(org, run.repo, run.issueNumber,
-                "**Agern: merged** pull request #$pr" + (approvedBy?.let { " (approved by @$it)" } ?: " (approved by the approver agent)") + ".")
+        val approval = approvedBy?.let { " (approved by @$it)" } ?: " (approved by the approver agent)"
+        if (run.releaseId != null && run.baseBranch != null) {
+            val defaultBranch = runCatching { client.getRepo(org, run.repo)?.defaultBranch }.getOrNull() ?: "main"
+            bestEffort {
+                client.comment(org, run.repo, run.issueNumber,
+                    "**Agern: merged** pull request #$pr into `${run.baseBranch}`$approval. " +
+                        "The issue stays open until the release is merged into `$defaultBranch`.")
+            }
+        } else {
+            bestEffort { client.comment(org, run.repo, run.issueNumber, "**Agern: merged** pull request #$pr$approval.") }
+            bestEffort { client.closeIssue(org, run.repo, run.issueNumber) }
         }
-        bestEffort { client.closeIssue(org, run.repo, run.issueNumber) }
         runs.setStatus(run.id, RunStatus.MERGED, clearError = true)
         cleanupWorktree(run, owner)
     }
@@ -469,7 +541,7 @@ class Orchestrator(
         |You are in a git worktree on branch `${c.branch}`, created from `${c.baseRef}`. Commit your work to this branch.
         |Do not push, open pull requests or merge: the factory does that after you finish.
         |
-        |${c.issueText}
+        |${c.releaseNote}${c.issueText}
         |<spec>
         |$spec
         |</spec>
@@ -497,7 +569,7 @@ class Orchestrator(
         |Inspect the change with `git diff ${c.baseRef}...HEAD`, `git log ${c.baseRef}..HEAD` and by reading the code; run tests or
         |the app where that helps your review.
         |
-        |${c.issueText}
+        |${c.releaseNote}${c.issueText}
         |<spec>
         |$spec
         |</spec>
@@ -511,7 +583,8 @@ class Orchestrator(
     """.trimMargin()
 
     private fun approvalPrompt(c: RunContext, spec: String, reviews: Map<String, Verdict>, round: Int, maxRounds: Int, prUrl: String?) = buildString {
-        append("Decide whether the pull request for issue #${c.issue.number} in ${org}/${c.repo} may be squash-merged into `${c.defaultBranch}`.\n")
+        append("Decide whether the pull request for issue #${c.issue.number} in ${org}/${c.repo} may be squash-merged into `${c.targetBranch}`.\n")
+        append(c.releaseNote)
         append("Branch `${c.branch}`; pull request ${prUrl ?: "(none)"}; fix rounds used: $round of $maxRounds.\n")
         append("Inspect the change with `git diff ${c.baseRef}...HEAD`. You cannot edit files.\n\n")
         append(c.issueText).append("<spec>\n").append(spec).append("\n</spec>\n\n<reviews>\n")
@@ -528,6 +601,10 @@ class Orchestrator(
 
         fun modelFor(s: dk.egernet.factory.SettingsDto, role: String): String =
             s.pipelineModels[role] ?: dk.egernet.factory.DEFAULT_PIPELINE_MODELS[role] ?: "sonnet"
+
+        /** `factory/issue-<n>-<slug>`; a release run's is `factory/release-<name>/issue-<n>-<slug>`, so it never reuses a single run's pull request. */
+        fun runBranch(issueNumber: Int, title: String, releaseName: String?): String =
+            (if (releaseName != null) "factory/release-$releaseName/" else "factory/") + "issue-$issueNumber-${slug(title)}"
 
         fun slug(title: String): String =
             title.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-').take(40).trim('-').ifEmpty { "work" }

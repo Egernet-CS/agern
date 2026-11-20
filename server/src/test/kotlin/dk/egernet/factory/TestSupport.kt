@@ -163,11 +163,14 @@ class FakeLauncher(var stage: (FakeProcess) -> Unit = { it.init(); it.result("ok
 
 class FakeGitOps : GitOps {
     val pushes = CopyOnWriteArrayList<String>()
+    /** Every worktree created, as `"<branch> <- <baseBranch>"`. */
+    val worktrees = CopyOnWriteArrayList<String>()
     @Volatile var commits = 1
     override fun ensureClone(id: AgentIdentity, cloneUrl: String, dir: Path, home: Path) { Files.createDirectories(dir) }
-    override fun createWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, defaultBranch: String, home: Path): String {
+    override fun createWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, baseBranch: String, home: Path): String {
         Files.createDirectories(worktree)
-        return "origin/$defaultBranch"
+        worktrees += "$branch <- $baseBranch"
+        return "origin/$baseBranch"
     }
     override fun commitsAhead(worktree: Path, baseRef: String, home: Path) = commits
     override fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path) { pushes += branch }
@@ -198,7 +201,7 @@ class TestWorld(
     tweak: (Config) -> Config = { it },
     loginThrottle: dk.egernet.factory.auth.LoginThrottle = dk.egernet.factory.auth.LoginThrottle(stepDelay = java.time.Duration.ZERO),
     clock: java.time.Clock = java.time.Clock.systemUTC(),
-    releaseStarter: ReleaseStarter = ReleaseStarter.Unavailable,
+    releaseStarter: ReleaseStarter? = null,
 ) {
     val dataDir: Path = Files.createTempDirectory("agern-test")
     val cfg = tweak(testConfig(dataDir, twoFactor))

@@ -2669,6 +2669,12 @@ html.app-locked #root {
   font-size: 0.82rem;
   flex: none;
 }
+.ro-main {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
 .ro-title {
   flex: 1;
   min-width: 0;
@@ -2694,6 +2700,61 @@ html.app-locked #root {
 .release-add-row select {
   flex: 1;
   min-width: 0;
+}
+
+/* Releases, building: status line, progress, issue states. */
+.release-facts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 14px;
+  color: var(--text-2);
+  margin: 2px 0;
+}
+.release-facts a {
+  overflow-wrap: anywhere;
+}
+.release-progress {
+  font-family: var(--font-mono);
+}
+.release-status {
+  padding: 10px 14px;
+  border-radius: var(--r);
+  border: 1px solid var(--line-2);
+  background: var(--surface);
+  margin: 0 0 14px;
+  font-size: 0.9rem;
+  max-width: 900px;
+  overflow-wrap: anywhere;
+}
+.release-status--building {
+  border-color: rgba(255, 177, 74, 0.35);
+  background: var(--amber-wash);
+}
+.release-status--paused {
+  border-color: rgba(255, 120, 174, 0.35);
+  background: var(--escalate-wash);
+}
+.release-status--cancelled {
+  color: var(--text-2);
+}
+.issue-state {
+  flex: none;
+}
+.ro-note {
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+.ro-item--held {
+  border-color: rgba(255, 120, 174, 0.35);
+}
+.ro-item--merged .ro-title,
+.ro-item--skipped .ro-title {
+  color: var(--text-2);
+}
+.ro-run {
+  flex: none;
+  font-family: var(--font-mono);
 }
 @media (max-width: 640px) {
   .ro-item {

@@ -25,7 +25,7 @@ sealed class FeedItem(val repo: String) {
     /** A chat session that was closed (deleted). */
     class SessionClosed(repo: String, val sessionId: String) : FeedItem(repo)
 
-    /** A release after a change (created, edited, issues added, removed, moved or reordered). */
+    /** A release after a change (created, edited, issues added, removed, moved or reordered, or its build state changed). */
     class Release(val release: dk.egernet.factory.ReleaseDto) : FeedItem(release.repo)
 
     /** A release that was deleted. */

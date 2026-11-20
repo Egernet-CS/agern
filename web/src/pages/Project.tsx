@@ -378,6 +378,8 @@ function IssuesPanel({ repo, releases }: { repo: string; releases: Release[] }) 
     return m;
   }, [releases]);
   const hasReleases = releases.length > 0;
+  // Cancelled releases take no new issues; they are not offered as targets.
+  const targets = useMemo(() => releases.filter((r) => r.status !== 'cancelled'), [releases]);
   // A deleted release falls back to all issues.
   const filter: ReleaseFilter =
     releaseFilter === 'all' || releaseFilter === 'none' || releases.some((r) => r.id === releaseFilter) ? releaseFilter : 'all';
@@ -474,7 +476,7 @@ function IssuesPanel({ repo, releases }: { repo: string; releases: Release[] }) 
           <span className="bulk-target">
             <select aria-label="Assign selected to" value={bulkTarget} onChange={(e) => setBulkTarget(e.target.value)}>
               <option value="" disabled>Assign to…</option>
-              {releases.map((r) => (
+              {targets.map((r) => (
                 <option key={r.id} value={r.id}>{r.name}</option>
               ))}
               <option value={NO_RELEASE}>No release</option>
@@ -537,9 +539,12 @@ function IssuesPanel({ repo, releases }: { repo: string; releases: Release[] }) 
                     <span className="release-pick">
                       <select aria-label={`Release for #${i.number}`} value={rel?.id ?? ''} disabled={assigning.has(i.number)} onChange={(e) => void assign([i.number], e.target.value || null)}>
                         <option value="">No release</option>
-                        {releases.map((r) => (
+                        {targets.map((r) => (
                           <option key={r.id} value={r.id}>{r.name}</option>
                         ))}
+                        {rel?.status === 'cancelled' && (
+                          <option value={rel.id} disabled>{rel.name} (cancelled)</option>
+                        )}
                       </select>
                     </span>
                   )}
@@ -615,6 +620,15 @@ function NewIssueDialog({ repo, open, onClose, onCreated }: { repo: string; open
       </form>
     </Dialog>
   );
+}
+
+/** "N issues" while planning; "k of n merged" (plus "· h held") once started. */
+function releaseProgress(r: Release): string {
+  const n = r.issues.length;
+  if (r.status === 'planning' || r.status === 'scheduled') return `${n} issue${n === 1 ? '' : 's'}`;
+  const merged = r.issues.filter((i) => i.state === 'merged').length;
+  const held = r.issues.filter((i) => i.state === 'held').length;
+  return `${merged} of ${n} merged${held > 0 ? ` · ${held} held` : ''}`;
 }
 
 /** Creates a release; the new release shows through the shared live list (once, even though its feed frame follows). */
@@ -774,7 +788,7 @@ function ActivityPanel({
               <div className="rr-bot">
                 <ReleaseStatusPill status={r.status} />
                 <span className="rr-line">
-                  {r.issues.length} issue{r.issues.length === 1 ? '' : 's'}
+                  {releaseProgress(r)}
                   {r.status === 'scheduled' &&
                     (r.waitingFor ? (
                       <> · waiting for {r.waitingFor.name}</>

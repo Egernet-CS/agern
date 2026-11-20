@@ -311,6 +311,10 @@ data class RunRecord(
     val status: String, val round: Int, val maxRounds: Int, val branch: String?, val prNumber: Int?, val prUrl: String?,
     val ownerId: UUID, val ownerUsername: String, val ownerDisplayName: String, val startedBySessionId: UUID?,
     val error: String?, val createdAt: Instant, val updatedAt: Instant, val endedAt: Instant?,
+    /** Set for a release run (docs/ARCHITECTURE.md §6 "Releases"). */
+    val releaseId: UUID? = null,
+    /** The branch the run starts from and merges into; null = the repository's default branch. */
+    val baseBranch: String? = null,
 )
 
 class RunStore(private val db: Db) {
@@ -323,7 +327,7 @@ class RunStore(private val db: Db) {
         rs.getString("status"), rs.getInt("round"), rs.getInt("max_rounds"), rs.getString("branch"), rs.intOrNull("pr_number"),
         rs.getString("pr_url"), rs.uuid("owner_id"), rs.getString("owner_username"), rs.getString("owner_display_name"),
         rs.uuidOrNull("started_by_session_id"), rs.getString("error"), rs.instant("created_at"), rs.instant("updated_at"),
-        rs.instantOrNull("ended_at"),
+        rs.instantOrNull("ended_at"), rs.uuidOrNull("release_id"), rs.getString("base_branch"),
     )
 
     private fun mapStage(rs: ResultSet) = StageRecord(
@@ -333,9 +337,13 @@ class RunStore(private val db: Db) {
         rs.uuidOrNull("session_id"), rs.instantOrNull("started_at"), rs.instantOrNull("ended_at"),
     )
 
-    /** Creates a run unless the issue already has an active one (checked under a row lock on the repo/issue). */
+    /**
+     * Creates a run unless the issue already has an active one (checked under a row lock on the repo/issue).
+     * A release run has [releaseId] and [baseBranch] (`release/<name>`).
+     */
     fun createIfNoActive(
         repo: String, issueNumber: Int, issueTitle: String, issueKind: String, maxRounds: Int, ownerId: UUID, startedBy: UUID?,
+        releaseId: UUID? = null, baseBranch: String? = null,
     ): RunRecord? {
         val id = UUID.randomUUID()
         val inserted = db.tx { c ->
@@ -346,9 +354,10 @@ class RunStore(private val db: Db) {
             ).use { ps -> ps.executeQuery().use { rs -> rs.next(); rs.getInt(1) } }
             if (active > 0) return@tx false
             c.prepare(
-                """INSERT INTO runs(id, repo, issue_number, issue_title, issue_kind, status, max_rounds, owner_id, started_by_session_id)
-                   VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)""",
-                arrayOf<Any?>(id, repo, issueNumber, issueTitle, issueKind, maxRounds, ownerId, startedBy),
+                """INSERT INTO runs(id, repo, issue_number, issue_title, issue_kind, status, max_rounds, owner_id, started_by_session_id,
+                     release_id, base_branch)
+                   VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)""",
+                arrayOf<Any?>(id, repo, issueNumber, issueTitle, issueKind, maxRounds, ownerId, startedBy, releaseId, baseBranch),
             ).use { it.executeUpdate() }
             true
         }
@@ -377,6 +386,12 @@ class RunStore(private val db: Db) {
         "SELECT id FROM runs WHERE repo = ? AND issue_number = ? AND status IN ('queued','spec','building','reviewing','approving','needs_human') ORDER BY created_at DESC LIMIT 1",
         repo, issueNumber,
     ) { it.uuid("id") }
+
+    /** Active runs (including `needs_human`) of a release. */
+    fun activeByRelease(releaseId: UUID): List<RunRecord> = db.query(
+        "$select WHERE r.release_id = ? AND r.status IN ('queued','spec','building','reviewing','approving','needs_human') ORDER BY r.created_at",
+        releaseId, map = ::map,
+    )
 
     fun activeRunsByIssue(repo: String): Map<Int, UUID> = db.query(
         "SELECT issue_number, id FROM runs WHERE repo = ? AND status IN ('queued','spec','building','reviewing','approving','needs_human')",
@@ -451,6 +466,7 @@ class RunStore(private val db: Db) {
         owner = OwnerDto(r.ownerUsername, r.ownerDisplayName), startedBySessionId = r.startedBySessionId?.toString(),
         error = r.error, createdAt = r.createdAt.iso(), updatedAt = r.updatedAt.iso(), endedAt = r.endedAt?.iso(),
         stages = stages(r.id).map { it.toDto() },
+        releaseId = r.releaseId?.toString(), baseBranch = r.baseBranch,
     )
 
     /** v1: runs cannot survive a restart. needs_human runs have no process and stay as they are. */

@@ -4,33 +4,46 @@ import dk.egernet.factory.IssueReleaseDto
 import dk.egernet.factory.OwnerDto
 import dk.egernet.factory.ReleaseDto
 import dk.egernet.factory.ReleaseIssueDto
+import dk.egernet.factory.ReleaseIssueState
+import dk.egernet.factory.ReleasePauseDto
 import dk.egernet.factory.ReleaseStartFailureDto
 import dk.egernet.factory.ReleaseStatus
 import dk.egernet.factory.conflict
+import dk.egernet.factory.forbidden
 import java.sql.Connection
 import java.sql.ResultSet
 import java.sql.SQLException
 import java.time.Instant
 import java.util.UUID
 
-data class ReleaseIssueRecord(val number: Int, val title: String, val kind: String)
+data class ReleaseIssueRecord(
+    val number: Int, val title: String, val kind: String,
+    val state: String = ReleaseIssueState.WAITING, val runId: UUID? = null, val note: String? = null,
+)
 
 data class ReleaseRecord(
     val id: UUID, val repo: String, val name: String, val description: String, val status: String,
     val createdBy: UUID, val createdByUsername: String, val createdByDisplayName: String,
     val createdAt: Instant, val updatedAt: Instant, val issues: List<ReleaseIssueRecord>,
-    /** The user who scheduled the release (later: whose credentials build it). */
+    /** Who scheduled or started the release; its runs use this user's credentials. */
     val ownerId: UUID? = null, val ownerUsername: String? = null, val ownerDisplayName: String? = null,
+    val branch: String? = null, val startedAt: Instant? = null, val endedAt: Instant? = null,
+    val pauseReason: String? = null, val pauseNote: String? = null, val resumeAt: Instant? = null,
     val scheduledAt: Instant? = null,
     val waitingForId: UUID? = null, val waitingForName: String? = null,
     val startFailedAt: Instant? = null, val startFailedOwnerId: UUID? = null,
     val startFailedOwnerUsername: String? = null, val startFailedOwnerDisplayName: String? = null,
     val startFailedReason: String? = null,
 ) {
+    val started: Boolean get() = status in ReleaseStatus.STARTED
+
     fun toDto() = ReleaseDto(
         id.toString(), repo, name, description, status, OwnerDto(createdByUsername, createdByDisplayName),
-        createdAt.iso(), updatedAt.iso(), issues.map { ReleaseIssueDto(it.number, it.title, it.kind) },
-        owner = ownerUsername?.let { OwnerDto(it, ownerDisplayName ?: it) },
+        createdAt.iso(), updatedAt.iso(),
+        issues.map { ReleaseIssueDto(it.number, it.title, it.kind, it.state, it.runId?.toString(), it.note) },
+        owner = if (ownerId != null && ownerUsername != null) OwnerDto(ownerUsername, ownerDisplayName ?: ownerUsername) else null,
+        branch = branch, startedAt = startedAt?.iso(), endedAt = endedAt?.iso(),
+        pause = if (status == ReleaseStatus.PAUSED && pauseReason != null) ReleasePauseDto(pauseReason, pauseNote, resumeAt?.iso()) else null,
         scheduledAt = scheduledAt?.iso(),
         waitingFor = if (waitingForId != null && waitingForName != null) IssueReleaseDto(waitingForId.toString(), waitingForName) else null,
         startFailure = if (startFailedAt != null && startFailedReason != null) {
@@ -42,6 +55,17 @@ data class ReleaseRecord(
         } else null,
     )
 }
+
+/** Who acts on a release, for the rules of started releases (docs/ARCHITECTURE.md §6 "Releases", access table). */
+data class ReleaseActor(val id: UUID, val isAdmin: Boolean)
+
+/** 403 for an action on a started release that only its owner (and, when [adminAllowed], an admin) may take. */
+fun releaseForbidden(ownerUsername: String?, adminAllowed: Boolean) = forbidden(
+    "Only ${ownerUsername ?: "the owner"}, who started this release, ${if (adminAllowed) "or an admin " else ""}can do this",
+)
+
+/** The issue of a release that a run builds. */
+data class ReleaseIssueRef(val releaseId: UUID, val number: Int, val state: String, val runId: UUID?)
 
 /** An issue to put into a release, with the title and kind it has at that moment. */
 data class IssueToAssign(val number: Int, val title: String, val kind: String)
@@ -66,6 +90,8 @@ class ReleaseStore(private val db: Db) {
         rs.instant("created_at"), rs.instant("updated_at"), emptyList(),
         ownerId = rs.uuidOrNull("owner_id"), ownerUsername = rs.getString("owner_username"),
         ownerDisplayName = rs.getString("owner_display_name"),
+        branch = rs.getString("branch"), startedAt = rs.instantOrNull("started_at"), endedAt = rs.instantOrNull("ended_at"),
+        pauseReason = rs.getString("pause_reason"), pauseNote = rs.getString("pause_note"), resumeAt = rs.instantOrNull("resume_at"),
         scheduledAt = rs.instantOrNull("scheduled_at"),
         waitingForId = rs.uuidOrNull("waiting_for"), waitingForName = rs.getString("waiting_for_name"),
         startFailedAt = rs.instantOrNull("start_failed_at"), startFailedOwnerId = rs.uuidOrNull("start_failed_owner"),
@@ -74,13 +100,18 @@ class ReleaseStore(private val db: Db) {
         startFailedReason = rs.getString("start_failed_reason"),
     )
 
+    private fun mapIssue(rs: ResultSet) = ReleaseIssueRecord(
+        rs.getInt("issue_number"), rs.getString("issue_title"), rs.getString("issue_kind"),
+        rs.getString("state"), rs.uuidOrNull("run_id"), rs.getString("note"),
+    )
+
     private fun issuesOf(ids: List<UUID>): Map<UUID, List<ReleaseIssueRecord>> {
         if (ids.isEmpty()) return emptyMap()
         return db.query(
-            "SELECT release_id, issue_number, issue_title, issue_kind FROM release_issues WHERE release_id IN (" +
+            "SELECT release_id, issue_number, issue_title, issue_kind, state, run_id, note FROM release_issues WHERE release_id IN (" +
                 ids.joinToString(",") { "?" } + ") ORDER BY position, added_at",
             *ids.toTypedArray(),
-        ) { it.uuid("release_id") to ReleaseIssueRecord(it.getInt("issue_number"), it.getString("issue_title"), it.getString("issue_kind")) }
+        ) { it.uuid("release_id") to mapIssue(it) }
             .groupBy({ it.first }, { it.second })
     }
 
@@ -117,18 +148,100 @@ class ReleaseStore(private val db: Db) {
     fun byName(repo: String, name: String): ReleaseRecord? =
         db.queryOne("$select WHERE r.repo = ? AND lower(r.name) = lower(?)", repo, name, map = ::mapRow)?.let { withIssues(listOf(it)).first() }
 
+    /** Renames only while planned (`planning` or `scheduled`): a started release keeps its name (its branch is named after it). */
     fun update(id: UUID, name: String, description: String) {
-        uniqueName(name) {
+        val n = uniqueName(name) {
             db.update(
-                """UPDATE releases SET name = ?, description = ?,
-                   updated_at = GREATEST(now(), date_trunc('milliseconds', updated_at) + interval '1 millisecond') WHERE id = ?""",
-                name, description, id,
+                """UPDATE releases SET name = CASE WHEN status IN ('planning', 'scheduled') THEN ? ELSE name END, description = ?,
+                   updated_at = GREATEST(now(), date_trunc('milliseconds', updated_at) + interval '1 millisecond')
+                   WHERE id = ? AND (status IN ('planning', 'scheduled') OR name = ?)""",
+                name, description, id, name,
             )
         }
+        if (n == 0 && get(id) != null) throw conflict("The name is fixed once the release is started", "release_name_locked")
     }
 
-    /** Deletes the release unless it is `scheduled` (the schedule must be cancelled first). */
-    fun delete(id: UUID): Boolean = db.update("DELETE FROM releases WHERE id = ? AND status <> ?", id, ReleaseStatus.SCHEDULED) > 0
+    /** Deletes a release in preparation or cancelled; never one that is scheduled (cancel the schedule first), building or paused. */
+    fun delete(id: UUID): Boolean = db.update("DELETE FROM releases WHERE id = ? AND status IN ('planning', 'cancelled')", id) > 0
+
+    // ------------------------------------------------------------ building (docs/ARCHITECTURE.md §6 "Releases")
+
+    /**
+     * Claims a planned release for building: [ownerId] becomes its owner. [from] is `planning` (start now) or
+     * `scheduled` (the scheduler; the owner stays the one who scheduled it). False when it is no longer in [from];
+     * 409 `release_already_building` when another release of the project holds the building slot.
+     */
+    fun claim(id: UUID, ownerId: UUID, branch: String, from: String = ReleaseStatus.PLANNING): Boolean = try {
+        db.update(
+            """UPDATE releases SET status = 'building', owner_id = ?, branch = ?, started_at = now(), ended_at = NULL,
+               pause_reason = NULL, pause_note = NULL, resume_at = NULL, scheduled_at = NULL, waiting_for = NULL
+               WHERE id = ? AND status = ?""",
+            ownerId, branch, id, from,
+        ) == 1
+    } catch (e: SQLException) {
+        if (e.sqlState == "23505") throw conflict("Another release of this project is already building", "release_already_building")
+        throw e
+    }
+
+    /**
+     * Undoes [claim] after the branch could not be created: back to [before]'s status, owner and scheduled time
+     * (`planning` with no owner, or still `scheduled`, so the scheduler records the failed start).
+     */
+    fun unclaim(id: UUID, before: ReleaseRecord) = db.update(
+        """UPDATE releases SET status = ?, owner_id = ?, scheduled_at = ?, branch = NULL, started_at = NULL
+           WHERE id = ? AND status = 'building'""",
+        before.status, if (before.status == ReleaseStatus.SCHEDULED) before.ownerId else null,
+        if (before.status == ReleaseStatus.SCHEDULED) before.scheduledAt else null, id,
+    )
+
+    /** The other release of [repo] that holds the building slot, if any. */
+    fun activeIn(repo: String): ReleaseRecord? =
+        db.queryOne("$select WHERE r.repo = ? AND r.status IN ('building', 'paused')", repo, map = ::mapRow)
+
+    /** `building` → `paused`. False when the release is not building. */
+    fun pause(id: UUID, reason: String, note: String?, resumeAt: Instant?): Boolean = db.update(
+        "UPDATE releases SET status = 'paused', pause_reason = ?, pause_note = ?, resume_at = ? WHERE id = ? AND status = 'building'",
+        reason, note, resumeAt, id,
+    ) == 1
+
+    /** `paused` → `building`, clearing the pause. False when the release is not paused. */
+    fun resume(id: UUID): Boolean = db.update(
+        "UPDATE releases SET status = 'building', pause_reason = NULL, pause_note = NULL, resume_at = NULL WHERE id = ? AND status = 'paused'", id,
+    ) == 1
+
+    /** `building` or `paused` → `cancelled`. False otherwise. */
+    fun cancel(id: UUID): Boolean = db.update(
+        """UPDATE releases SET status = 'cancelled', ended_at = now(), pause_reason = NULL, pause_note = NULL, resume_at = NULL
+           WHERE id = ? AND status IN ('building', 'paused')""", id,
+    ) == 1
+
+    /** Sets the state, note and run link of one issue of a release. */
+    fun setIssue(releaseId: UUID, number: Int, state: String, note: String?, runId: UUID?) = db.update(
+        "UPDATE release_issues SET state = ?, note = ?, run_id = ? WHERE release_id = ? AND issue_number = ?",
+        state, note, runId, releaseId, number,
+    )
+
+    /** Sets state and note of the issues of [releaseId] that are in [from]; returns how many changed. */
+    fun setIssuesInState(releaseId: UUID, from: String, state: String, note: String?) = db.update(
+        "UPDATE release_issues SET state = ?, note = ? WHERE release_id = ? AND state = ?", state, note, releaseId, from,
+    )
+
+    /** The release issue linked to [runId] (its latest release run), if any. */
+    fun issueByRun(runId: UUID): ReleaseIssueRef? = db.queryOne(
+        "SELECT release_id, issue_number, state, run_id FROM release_issues WHERE run_id = ?", runId,
+    ) { ReleaseIssueRef(it.uuid("release_id"), it.getInt("issue_number"), it.getString("state"), it.uuidOrNull("run_id")) }
+
+    /** Every release issue that is `running` (for recovery after a restart). */
+    fun runningIssues(): List<ReleaseIssueRef> = db.query(
+        "SELECT release_id, issue_number, state, run_id FROM release_issues WHERE state = 'running'",
+    ) { ReleaseIssueRef(it.uuid("release_id"), it.getInt("issue_number"), it.getString("state"), it.uuidOrNull("run_id")) }
+
+    /** Ids of all `building` releases. */
+    fun building(): List<UUID> = db.query("SELECT id FROM releases WHERE status = 'building'") { it.uuid("id") }
+
+    /** Ids of paused releases whose automatic resume is due at [now]. */
+    fun dueForResume(now: Instant): List<UUID> =
+        db.query("SELECT id FROM releases WHERE status = 'paused' AND resume_at IS NOT NULL AND resume_at <= ?", now) { it.uuid("id") }
 
     // ---------------------------------------------------------------- scheduled start (§6 "Scheduled start")
     // Every state change is conditional on the expected status and reports whether it applied.
@@ -162,15 +275,6 @@ class ReleaseStore(private val db: Db) {
             ReleaseStatus.SCHEDULED, now, map = ::mapRow,
         ),
     )
-
-    /** A release of [repo] other than [exceptId] that occupies the project (`building` or `paused`), if any. */
-    fun occupying(repo: String, exceptId: UUID): ReleaseRecord? {
-        val states = ReleaseStatus.OCCUPYING.toList()
-        return db.queryOne(
-            "$select WHERE r.repo = ? AND r.id <> ? AND r.status IN (${states.joinToString(",") { "?" }}) ORDER BY r.created_at, r.id LIMIT 1",
-            repo, exceptId, *states.toTypedArray(), map = ::mapRow,
-        )
-    }
 
     /** Sets or clears what a `scheduled` release waits behind; true only if the value changed. */
     fun setWaitingFor(id: UUID, otherId: UUID?): Boolean = db.update(
@@ -209,71 +313,123 @@ class ReleaseStore(private val db: Db) {
         c.prepare("SELECT pg_advisory_xact_lock(hashtext(?))", arrayOf<Any?>("releases:$repo")).use { it.executeQuery().close() }
     }
 
-    private fun currentRelease(c: Connection, repo: String, number: Int): UUID? =
-        c.prepare("SELECT release_id FROM release_issues WHERE repo = ? AND issue_number = ?", arrayOf<Any?>(repo, number)).use { ps ->
-            ps.executeQuery().use { rs -> if (rs.next()) rs.uuid("release_id") else null }
+    private data class Meta(val status: String, val ownerId: UUID?, val ownerUsername: String?)
+
+    private fun meta(c: Connection, id: UUID): Meta? = c.prepare(
+        "SELECT r.status, r.owner_id, o.username FROM releases r LEFT JOIN users o ON o.id = r.owner_id WHERE r.id = ?", arrayOf<Any?>(id),
+    ).use { ps -> ps.executeQuery().use { rs -> if (rs.next()) Meta(rs.getString(1), rs.uuidOrNull("owner_id"), rs.getString(3)) else null } }
+
+    private data class Current(val releaseId: UUID, val state: String, val runId: UUID?)
+
+    private fun currentRelease(c: Connection, repo: String, number: Int): Current? =
+        c.prepare("SELECT release_id, state, run_id FROM release_issues WHERE repo = ? AND issue_number = ?", arrayOf<Any?>(repo, number)).use { ps ->
+            ps.executeQuery().use { rs -> if (rs.next()) Current(rs.uuid("release_id"), rs.getString("state"), rs.uuidOrNull("run_id")) else null }
         }
+
+    /** Checks that [actor] may take issue #[number] (in [state]) out of a release described by [m]. */
+    private fun checkLeave(m: Meta, actor: ReleaseActor, number: Int, state: String) {
+        if (m.status in ReleaseStatus.PLANNED) return
+        if (m.ownerId != actor.id && !actor.isAdmin) throw releaseForbidden(m.ownerUsername, adminAllowed = true)
+        if (m.status != ReleaseStatus.CANCELLED && state !in LEAVABLE) {
+            throw conflict("Issue #$number is $state in a started release and cannot be taken out", "release_issue_started")
+        }
+    }
 
     /**
      * Puts [issues] into [releaseId], appended in the given order; issues in another release are moved, issues already
      * in this one keep their position. Returns the ids of all releases that changed, with the issues that left each
-     * (`moved[from]`), so callers can describe the move.
+     * (`moved[from]`), so callers can describe the move. The rules of started releases are checked for the target and
+     * every source in the same transaction: all or nothing.
      */
-    fun assign(repo: String, releaseId: UUID, issues: List<IssueToAssign>, userId: UUID): AssignResult = db.tx { c ->
+    fun assign(repo: String, releaseId: UUID, issues: List<IssueToAssign>, actor: ReleaseActor): AssignResult = db.tx { c ->
         lock(c, repo)
+        val target = meta(c, releaseId) ?: throw dk.egernet.factory.notFound("Release not found")
+        when (target.status) {
+            ReleaseStatus.CANCELLED -> throw conflict("The release is cancelled; no issues can be added", "release_closed")
+            in ReleaseStatus.ACTIVE -> if (target.ownerId != actor.id) throw releaseForbidden(target.ownerUsername, adminAllowed = false)
+        }
         val changed = linkedSetOf<UUID>()
         val movedFrom = linkedMapOf<UUID, MutableList<Int>>()
         val added = mutableListOf<Int>()
+        val leftRuns = mutableListOf<UUID>()
         var next = c.prepare("SELECT COALESCE(max(position) + 1, 0) FROM release_issues WHERE release_id = ?", arrayOf<Any?>(releaseId))
             .use { ps -> ps.executeQuery().use { rs -> rs.next(); rs.getInt(1) } }
         for (i in issues) {
             val current = currentRelease(c, repo, i.number)
-            if (current == releaseId) continue
+            if (current?.releaseId == releaseId) continue
             if (current != null) {
+                checkLeave(meta(c, current.releaseId)!!, actor, i.number, current.state)
                 c.prepare("DELETE FROM release_issues WHERE repo = ? AND issue_number = ?", arrayOf<Any?>(repo, i.number)).use { it.executeUpdate() }
-                changed += current
-                movedFrom.getOrPut(current) { mutableListOf() } += i.number
+                changed += current.releaseId
+                movedFrom.getOrPut(current.releaseId) { mutableListOf() } += i.number
+                current.runId?.let { leftRuns += it }
             }
             c.prepare(
                 """INSERT INTO release_issues(release_id, repo, issue_number, position, issue_title, issue_kind, added_by)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                arrayOf<Any?>(releaseId, repo, i.number, next++, i.title, i.kind, userId),
+                arrayOf<Any?>(releaseId, repo, i.number, next++, i.title, i.kind, actor.id),
             ).use { it.executeUpdate() }
             added += i.number
         }
         if (added.isNotEmpty()) changed += releaseId
-        AssignResult(changed.toList(), added, movedFrom)
+        AssignResult(changed.toList(), added, movedFrom, leftRuns)
     }
 
-    data class AssignResult(val changed: List<UUID>, val added: List<Int>, val movedFrom: Map<UUID, List<Int>>)
+    /** [leftRuns]: the release runs linked to issues that left a release (callers cancel those still active). */
+    data class AssignResult(val changed: List<UUID>, val added: List<Int>, val movedFrom: Map<UUID, List<Int>>, val leftRuns: List<UUID> = emptyList())
 
-    /** Takes [numbers] out of whatever release they are in. Returns the ids of the releases that changed. */
-    fun unassign(repo: String, numbers: List<Int>): List<UUID> = db.tx { c ->
+    /** What [unassign] did: the releases that changed and the release runs of the issues taken out. */
+    data class UnassignResult(val changed: List<UUID>, val leftRuns: List<UUID>)
+
+    /** Takes [numbers] out of whatever release they are in (all or nothing, checking the rules of started releases). */
+    fun unassign(repo: String, numbers: List<Int>, actor: ReleaseActor): UnassignResult = db.tx { c ->
         lock(c, repo)
         val changed = linkedSetOf<UUID>()
+        val leftRuns = mutableListOf<UUID>()
         for (n in numbers) {
             val current = currentRelease(c, repo, n) ?: continue
+            checkLeave(meta(c, current.releaseId)!!, actor, n, current.state)
             c.prepare("DELETE FROM release_issues WHERE repo = ? AND issue_number = ?", arrayOf<Any?>(repo, n)).use { it.executeUpdate() }
-            changed += current
+            changed += current.releaseId
+            current.runId?.let { leftRuns += it }
         }
-        changed.toList()
+        UnassignResult(changed.toList(), leftRuns)
     }
 
     /**
      * Sets the complete order of the release's issues. [numbers] must be exactly its current issues, each once;
-     * otherwise nothing changes and 409 `release_issues_changed` is thrown.
+     * otherwise nothing changes and 409 `release_issues_changed` is thrown. In a building or paused release only its
+     * owner may reorder, and only among waiting issues: every other issue keeps its index (409 `release_issue_started`).
      */
-    fun reorder(repo: String, releaseId: UUID, numbers: List<Int>) = db.tx { c ->
+    fun reorder(repo: String, releaseId: UUID, numbers: List<Int>, actor: ReleaseActor) = db.tx { c ->
         lock(c, repo)
-        val current = c.prepare("SELECT issue_number FROM release_issues WHERE release_id = ?", arrayOf<Any?>(releaseId)).use { ps ->
-            ps.executeQuery().use { rs -> buildList { while (rs.next()) add(rs.getInt(1)) } }
+        val m = meta(c, releaseId) ?: throw dk.egernet.factory.notFound("Release not found")
+        if (m.status == ReleaseStatus.CANCELLED) throw conflict("The release is cancelled", "release_closed")
+        if (m.status in ReleaseStatus.ACTIVE && m.ownerId != actor.id) throw releaseForbidden(m.ownerUsername, adminAllowed = false)
+        val current = c.prepare(
+            "SELECT issue_number, state FROM release_issues WHERE release_id = ? ORDER BY position, added_at", arrayOf<Any?>(releaseId),
+        ).use { ps ->
+            ps.executeQuery().use { rs -> buildList { while (rs.next()) add(rs.getInt(1) to rs.getString(2)) } }
         }
-        if (numbers.size != current.size || numbers.toSet() != current.toSet() || numbers.toSet().size != numbers.size) {
+        val currentNumbers = current.map { it.first }
+        if (numbers.size != current.size || numbers.toSet() != currentNumbers.toSet() || numbers.toSet().size != numbers.size) {
             throw conflict("The release's issues changed in the meantime; reload and try again.", "release_issues_changed")
+        }
+        if (m.status in ReleaseStatus.ACTIVE) {
+            current.forEachIndexed { i, (n, state) ->
+                if (state != ReleaseIssueState.WAITING && numbers[i] != n) {
+                    throw conflict("Issue #$n is $state; only waiting issues can be reordered", "release_issue_started")
+                }
+            }
         }
         numbers.forEachIndexed { pos, n ->
             c.prepare("UPDATE release_issues SET position = ? WHERE release_id = ? AND issue_number = ?", arrayOf<Any?>(pos, releaseId, n))
                 .use { it.executeUpdate() }
         }
+    }
+
+    private companion object {
+        /** Issue states that may leave a building or paused release. */
+        val LEAVABLE = setOf(ReleaseIssueState.WAITING, ReleaseIssueState.HELD, ReleaseIssueState.SKIPPED)
     }
 }

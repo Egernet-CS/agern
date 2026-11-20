@@ -53,8 +53,8 @@ class Services(
     val loginThrottle: dk.egernet.factory.auth.LoginThrottle = dk.egernet.factory.auth.LoginThrottle(),
     /** Time source of the release scheduler (tests use a controllable clock). */
     val clock: java.time.Clock = java.time.Clock.systemUTC(),
-    /** What a scheduled start calls; [ReleaseStarter.Unavailable] until step 2 (#19) provides building releases. */
-    releaseStarter: ReleaseStarter = ReleaseStarter.Unavailable,
+    /** What a scheduled start calls; null = the real start ([ReleaseService.startScheduled]). Tests may replace it. */
+    releaseStarter: ReleaseStarter? = null,
 ) {
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     val box = SecretBox(cfg.masterKey)
@@ -77,19 +77,29 @@ class Services(
     val agents = AgentManager(cfg, sessions, events, access, launcher, bus, mcpRegistry, settings, prompts, workspaces, scope, attachments, preferences)
     val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences)
     val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
-    val releaseScheduler = ReleaseScheduler(cfg, clock, releaseStore, users, access, bus, releaseStarter)
-    val releases = ReleaseService(cfg, access, releaseStore, bus, releaseScheduler)
+    val releaseBuilder = dk.egernet.factory.pipeline.ReleaseBuilder(cfg, releaseStore, runs, users, access, orchestrator, bus, scope)
+    // A scheduled start goes through the same start as "start now" (ReleaseService.startScheduled), as the owner.
+    val releaseScheduler: ReleaseScheduler = ReleaseScheduler(
+        cfg, clock, releaseStore, users, access, bus,
+        releaseStarter ?: ReleaseStarter { release, owner -> releases.startScheduled(owner, release.id) },
+    )
+    val releases: ReleaseService = ReleaseService(cfg, access, releaseStore, bus, releaseBuilder, releaseScheduler)
     val factory = FactoryService(cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases)
     val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version)
 
     init {
         agents.commandHandler = { session, owner, text -> factory.handleCommand(session, owner, text) }
+        orchestrator.onReleaseRunSettled = releaseBuilder::onRunSettled
     }
 
-    /** v1 restart semantics: no process survives; unfinished runs fail with a clear reason. */
+    /**
+     * v1 restart semantics: no process survives; unfinished runs fail with a clear reason. Building releases continue
+     * with the interrupted issue (docs/ARCHITECTURE.md §6 "Releases").
+     */
     fun recoverAfterRestart() {
         val failed = runs.failUnfinishedAfterRestart()
         if (failed.isNotEmpty()) LoggerFactory.getLogger("dk.egernet.factory").warn("Marked {} unfinished run(s) as failed after restart", failed.size)
+        releaseBuilder.recoverAfterRestart()
         sessions.recoverAfterRestart()
         webSessions.purgeExpired()
     }
@@ -98,6 +108,7 @@ class Services(
         recoverAfterRestart()
         releaseScheduler.start(scope)
         agents.startIdleReaper()
+        releaseBuilder.startTicker()
         attachments.startReaper(scope)
     }
 
