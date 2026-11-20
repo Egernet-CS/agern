@@ -123,7 +123,7 @@ screenshots of the main screens.
 
 Agern runs directly on one host on your network: **Linux with systemd** or **macOS with launchd**.
 
-**Debian 12, Debian 13, Ubuntu 24.04: use the Debian package** — it brings its dependencies,
+**Debian 13 (recommended) or Ubuntu 24.04: use the Debian package** — it brings its dependencies,
 upgrades with `apt`/`agern upgrade`, can upgrade itself when idle, and is how a machine that
 develops Agern with Agern is set up. Step by step, from an empty VM (Proxmox notes included):
 **[docs/INSTALL-LINUX.md](docs/INSTALL-LINUX.md)**. In short:
