@@ -139,6 +139,23 @@ class AgentCommandTest {
 }
 
 class ConfigTest {
+    @Test
+    fun `text for GitHub links to this installation only when its address is public`() {
+        for (u in listOf(
+            "http://localhost:8080", "http://127.0.0.1:8080", "http://10.1.2.3:8080", "http://172.16.0.9", "http://192.168.1.5:8080",
+            "http://169.254.1.1", "http://100.64.0.1", "http://[::1]:8080", "http://[fd00::1]", "http://[fe80::1]", "http://agern:8080",
+            "https://agern.local", "https://agern.lan", "https://build.internal", "not a url", "",
+        )) assertTrue(Config.isInternalUrl(u), u)
+        for (u in listOf("https://agern.example.com", "http://172.32.0.1", "http://8.8.8.8:8080", "https://[2001:db8::1]")) {
+            assertFalse(Config.isInternalUrl(u), u)
+        }
+        assertEquals(
+            "https://agern.example.com/p/app/releases/1",
+            Config(masterKey = ByteArray(32), githubOrg = "o", publicUrl = "https://agern.example.com/").pageRef("p/app/releases/1", "the page of release `1.0`"),
+        )
+        assertEquals("the page of release `1.0` in Agern", Config(masterKey = ByteArray(32), githubOrg = "o", publicUrl = "http://10.1.2.3:8080").pageRef("p/app/releases/1", "the page of release `1.0`"))
+    }
+
     private val base = mapOf("FACTORY_MASTER_KEY" to Base64.getEncoder().encodeToString(ByteArray(32)), "FACTORY_GITHUB_ORG" to "o")
 
     @Test

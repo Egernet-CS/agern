@@ -63,6 +63,15 @@ data class Config(
     }
     val secureCookies: Boolean get() = publicUrl.lowercase().startsWith("https://")
 
+    /**
+     * How text Agern writes on GitHub (comments, pull request bodies) points at a page of this installation: the link
+     * when FACTORY_PUBLIC_URL is a public address, otherwise only [label]. An internal address (loopback, a private
+     * network, a host name without a public domain) is useless to other readers and must not be published in a
+     * repository that may be public.
+     */
+    fun pageRef(path: String, label: String): String =
+        if (isInternalUrl(publicUrl)) "$label in Agern" else publicUrl.trimEnd('/') + "/" + path.trimStart('/')
+
     override fun toString(): String =
         "Config(host=$host, port=$port, dbUrl=$dbUrl, dbUser=$dbUser, githubOrg=$githubOrg, auth=$authProviders, " +
             "admins=$admins, dataDir=$dataDir, webDir=$webDir, claudeBin=$claudeBin, publicUrl=$publicUrl, " +
@@ -161,6 +170,33 @@ data class Config(
         }
 
         /** `https://Host:8443/path` -> `https://host:8443` (default ports dropped). */
+        /**
+         * True when [url]'s host is not publicly reachable by its name: loopback, private (RFC 1918), carrier-grade NAT,
+         * link-local and unique-local addresses, `localhost`, single-label names and the usual internal suffixes. No DNS
+         * lookup is made; an unreadable URL counts as internal.
+         */
+        fun isInternalUrl(url: String): Boolean {
+            val host = try {
+                java.net.URI(url.trim()).host?.lowercase()?.removePrefix("[")?.removeSuffix("]")
+            } catch (e: Exception) {
+                null
+            } ?: return true
+            if (host.contains(':')) { // IPv6 literal
+                val a = runCatching { java.net.InetAddress.getByName(host) }.getOrNull() ?: return true
+                val first = a.address[0].toInt() and 0xff
+                return a.isLoopbackAddress || a.isLinkLocalAddress || a.isSiteLocalAddress || a.isAnyLocalAddress || (first and 0xfe) == 0xfc
+            }
+            val v4 = Regex("""(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})""").matchEntire(host)
+            if (v4 != null) {
+                val (a, b) = v4.destructured.toList().map { it.toInt() }
+                return a == 10 || a == 127 || a == 0 || (a == 172 && b in 16..31) || (a == 192 && b == 168) ||
+                    (a == 169 && b == 254) || (a == 100 && b in 64..127)
+            }
+            return !host.contains('.') || INTERNAL_SUFFIXES.any { host.endsWith(it) }
+        }
+
+        private val INTERNAL_SUFFIXES = listOf(".local", ".localhost", ".lan", ".internal", ".intranet", ".home", ".home.arpa", ".corp", ".test")
+
         fun originOf(url: String): String {
             if (url.isBlank()) return ""
             return try {
