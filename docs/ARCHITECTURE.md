@@ -585,7 +585,7 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   (`ON DELETE SET NULL`), `start_failed_at`, `start_failed_owner`, `start_failed_reason`, with the partial index
   `releases_due` on `scheduled_at` for `status = 'scheduled'`; migrations V7 and V8; for releasing (V10) `pr_number`,
   `pr_url`, `pr_body_sha`, `target_branch`, `merge_state`, `merge_method`, `notice`, `ready_at`, `ready_announced`,
-  `released_at`, `released_by`, `merge_sha`, `cleanup_pending`; for the release mode (V11) `release_mode` (`manual` |
+  `released_at`, `released_by`, `merge_sha`, `cleanup_pending`; for the release mode (V12) `release_mode` (`manual` |
   `automatic`, checked), `released_automatically`, `checks_state`, `checks_sha`, `checks_detail`, `checks_failure_sha`,
   `auto_merge_failed_sha`, `checks_head_seen_at`) and `release_issues` (`release_id`, `repo`, `issue_number`, `position`, `issue_title`, `issue_kind`,
   `added_by`, `added_at`, `state`, `run_id` = the issue's latest release run, `note`). `runs` carry `release_id`
