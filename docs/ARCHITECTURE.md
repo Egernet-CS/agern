@@ -1617,7 +1617,7 @@ is cleared and the page falls back to another chat or the empty state. Others wa
 "This chat was closed" with a Dismiss button instead of an error.
 
 **Releases.** The activity pane has a "Releases" section above "Runs": one row per release (name, the status pill
-— "in preparation", "scheduled", "building", "paused" or "cancelled" — and "N issues", or for started releases
+— "in preparation", "scheduled", "building", "paused", "ready to release", "released" or "cancelled" — and "N issues", or for started releases
 "k of n merged" plus "· h held" when h > 0; for a scheduled release "· starts <local date and time>" or "· waiting
 for <name>", for one in preparation whose scheduled start failed "· start failed") linking to its page, and "+ New" (accessible name "New release") opening the dialog
 "New release in <repo>" (Name with the naming rule, optional Description). Once the project has at least one
@@ -1670,6 +1670,37 @@ release?" explains the branch, the credentials used and that merged issues stay 
 note for held and skipped issues; "Retry #n" (owner, held or skipped); in a started release moving is owner-only
 among `waiting` issues and removing is for the owner or admins on `waiting`, `held` and `skipped` issues (any issue
 when cancelled); "Add an open issue" shows while planning and, for the owner, while building or paused.
+
+Releasing on the release page (§6 "Releasing"). A `ready` release shows the section "Release pull request" (`<h2>`):
+the link "#<prNumber>" to the pull request (new tab) and `release/<name> → <targetBranch>`, or "No pull request
+yet."; a `role="status"` line — complete and clean "Ready to release. Merges cleanly into <target>."; complete and
+unknown "Ready to release. Mergeability has not been confirmed yet."; conflict "`release/<name>` no longer merges
+cleanly into <target>. Agern will not merge it. Resolve the conflicts on the release branch, then check again.";
+incomplete "Incomplete: N issue(s) are held (#a, #b). Approve or retry their runs, or move them out, before
+releasing."; empty "Nothing was merged into the release branch, so there is nothing to release."; no usable merge
+method "This repository only allows squash merges. …" — and, when it can be approved, a muted line naming the merge
+method ("Approval merges it by rebasing: one commit per issue on <target>." or "…with a merge commit…"). The notice,
+when set, is in `role="alert"`. The owner gets "Check again" ("Checking…" while it runs) and the primary "Approve and
+release", disabled unless the release is complete, has a pull request, does not conflict and has a merge method
+(`aria-describedby` → the status line); everyone else sees "Only <owner> can approve this release." The dialog
+"Release <name>?" says "This merges pull request #n into <target> by rebasing: N issues, one commit each. The issues
+are closed and the branch release/<name> is deleted. This cannot be undone." (or "with a merge commit: …, plus the
+merge commit"), with "Cancel" focused and "Approve and release" ("Releasing…"); errors close it and show in the
+page's alert line. "Cancel release" (owner or admin) and, for the owner, "Retry #n" and adding issues stay available
+in `ready` (adding builds again); there is no Pause. Each issue with a run pull request shows a "PR #n" link. A
+`released` release is read-only: no Edit, Delete, Cancel, move, remove, add, retry, check or approve; it shows
+"Released <time ago> by <owner> · pull request #n" (or "Merged on GitHub <time ago> · …"), the method in words, the
+default branch's commit (7 characters) and that the issues were closed and the branch deleted. The note "This release
+is a plan…" is shown only while planning.
+
+Project page, releasing: a `ready` row shows the pill "ready to release" and "k of n merged", plus "· h held" or "·
+conflict". Released and cancelled releases leave the list and appear in a collapsed `<details>` "History (N)" below it
+(newest first by `releasedAt`, else `updatedAt`; name, pill, "N issue(s)", and for released ones the relative time),
+which is not rendered when empty; both update live. Released and cancelled releases are not
+offered as targets in the issues panel's selects or the release page's "Add an open issue"; `ready` ones are (owner
+rules as for building). The mock seeds `web-shop` with a ready and clean release (`1.2`), a conflicting one
+(`cart-fixes`), an incomplete one (`payments`), a released one (`1.1`) and a cancelled one (`promo`), and implements
+approve and check with the server's rules and error codes.
 
 On the run page of a release run the merge node is titled "merge to release" and the header shows the base branch
 linking to the release page (plain text when the release was deleted); single runs still say "merge to main".
