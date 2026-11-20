@@ -2,6 +2,7 @@ import type {
   AgentMessage,
   AgentSession,
   Attachment,
+  ClaudeUsage,
   ClientConfig,
   PreferenceOverrides,
   Preferences,
@@ -50,6 +51,8 @@ export interface Api {
   preferences(): Promise<Preferences>;
   /** Replaces the user's own choices (validated like the admin settings; maxFixRounds 0..admin value, else 422). */
   putPreferences(p: PreferenceOverrides): Promise<Preferences>;
+  /** The caller's own Claude usage (limit windows for an OAuth token, spend through Agern); never anyone else's. */
+  usage(): Promise<ClaudeUsage>;
   deleteGithubToken(): Promise<User>;
 
   projects(): Promise<Project[]>;

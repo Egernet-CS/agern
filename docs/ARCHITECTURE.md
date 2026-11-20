@@ -203,6 +203,33 @@ The factory must run on a dedicated machine or VM. Per-user OS accounts or conta
 planned hardening and are why `AgentLauncher` is an interface. Sandboxes (below) do not change this:
 the agent process still runs on the host.
 
+### Claude usage
+
+Every agent runs on its owner's Claude credential, so each user can see their own usage (`GET /api/me/usage`, §8;
+the top-bar indicator and Settings → "Models & cost", §10). Two things are recorded per user, private to that user:
+
+- **Limit windows** (`claude_usage_windows`): the CLI emits a `rate_limit_event` whenever a subscription limit
+  changes, `{ type: 'rate_limit_event', rate_limit_info: { status, rateLimitType?, utilization?, resetsAt?,
+  unifiedWindows?: { <type>: { utilization, resetsAt, status? } }, … } }` (shape from the Claude Code 2.1.328
+  schema, not from a captured event; `utilization` is a fraction that may exceed 1, `resetsAt` epoch seconds).
+  Every such event of a chat or stage is parsed tolerantly (`RateLimitWindows`): the top-level fields describe the
+  currently limiting window, each `unifiedWindows` object is one window, the per-window values win and `rejected`
+  from either side wins; window types must match `^[A-Za-z0-9_.-]{1,64}$` (unknown types are kept), statuses are
+  strings of at most 40 characters, anything else is dropped, at most 20 windows per event and per user. Only the
+  latest value per `(user, window type)` is kept: status and observation time are replaced, a reset time only by a
+  known one, and a missing utilization keeps the stored one only while the reset time is unchanged. Windows are
+  recorded only while the owner's current credential is the OAuth token the process was launched with (checked in
+  the SQL upsert), so API-key sessions and agents still running on a replaced or removed credential record nothing.
+  Replacing or removing the credential clears the windows (in the same transaction). The values are only refreshed
+  while one of the user's agents runs: Agern never polls Anthropic.
+- **Spend** (`claude_spend_daily`): on every `result`, the increase of the process's cumulative `total_cost_usd`
+  since its previous `result` is added to the owner's total of the current UTC day — for both credential kinds, chats
+  and stages. It is kept when a chat is closed or the credential changes. Sessions from before this ledger are
+  counted on the UTC day they were created.
+
+A malformed event or a failed write is logged and ignored; it never fails the session, and the event is still part
+of the transcript. After a recorded change the owner's feed connections get a data-less `usage` frame (§8).
+
 **Software installation.** Global setting `agentsMayInstallSoftware` (default `false`). When
 false, agents are instructed not to install system-wide software and are given the MCP tool
 `factory_request_software`, which files a request an admin handles manually. When true the
@@ -1150,6 +1177,16 @@ type Preferences = { overrides: PreferenceOverrides;
     maxFixRounds: { value: number; source: 'user' | 'default'; max: number; clamped: boolean } };
   suggestions: string[] };                                       // 'opus', 'sonnet', 'haiku', 'fable'; free text is fine
 
+// The caller's own Claude usage (§5 "Claude usage"). ISO timestamps; days and months are UTC.
+type UsageWindow = { type: string;                // five_hour | seven_day | seven_day_opus | seven_day_sonnet |
+                                                  // seven_day_overage_included | overage | anything else, as reported
+  utilization: number | null;                     // fraction used (1 = 100 %), may exceed 1
+  status: string | null;                          // allowed | allowed_warning | rejected | …
+  resetsAt: string | null; observedAt: string };  // returned as stored: the client shows a passed resetsAt as reset
+type ClaudeUsage = { credentialKind: 'oauth_token' | 'api_key' | null;
+  windows: UsageWindow[];                         // ordered by type; [] unless credentialKind is 'oauth_token'
+  spend: { todayUsd: number; monthUsd: number; day: string; month: string } };   // 'YYYY-MM-DD', 'YYYY-MM'
+
 type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   requestedBy: string; sessionId: string | null;
   status: 'pending' | 'installed' | 'denied'; note: string | null; createdAt: string; resolvedAt: string | null };
@@ -1169,8 +1206,9 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `POST /api/admin/users/{id}/reset-2fa` | → `User` | admin |
 | `POST /api/auth/logout` | → 204 | |
 | `GET /api/me` | → `User` | 401 when not logged in |
-| `PUT /api/me/claude-credential` | `{ kind, value }` → `User` | |
-| `DELETE /api/me/claude-credential` | → `User` | |
+| `PUT /api/me/claude-credential` | `{ kind, value }` → `User` | clears the caller's recorded limit windows (spend is kept) and sends them a `usage` frame |
+| `DELETE /api/me/claude-credential` | → `User` | same: clears the limit windows, keeps the spend, sends a `usage` frame |
+| `GET /api/me/usage` | → `ClaudeUsage` | the caller's own Claude usage (§5 "Claude usage"); there is no way to read another user's, also not for admins |
 | `PUT /api/me/github-token` | `{ token }` → `User` | 422 if GitHub rejects it. `GET /user` succeeds with any scope, so the token's kind and (classic) scopes are recorded and shown; Settings warns when a classic token lacks `repo` (public repositories only, no push) and explains the grants a fine-grained token needs |
 | `DELETE /api/me/github-token` | → `User` | |
 | `GET /api/me/preferences` | → `Preferences` | the caller's own model / fix-round choices and the effective values |
@@ -1319,6 +1357,9 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   container) or removed (one container to free a slot, or the whole sandbox when its run's build/review part ended),
   or an admin stopped a sandbox. It carries no project data; the admin page reloads `GET /api/admin/sandboxes`
   (debounced) and keeps a slow fallback poll for missed frames.
+  `{ type: 'usage' }` is **private**: it goes only to the feed connections of the user whose Claude usage changed (limit
+  windows recorded, spend added, credential replaced or removed), is not subject to the visibility filter and carries
+  no data; the client reloads `GET /api/me/usage` (debounced ~500 ms, and after a reconnect).
 
 ## 9. Deployment and release
 
@@ -1580,6 +1621,20 @@ Routes: `/login`, `/` (projects), `/p/:repo` (issues · CLI chat · agents), `/p
 role and fix rounds, with presets — *Default* clears every choice, *Economy* picks Sonnet for chat and spec,
 Haiku for the four reviewers and one fix round), `/admin` ("Factory settings": the default models and the
 default and maximum fix rounds; installing software stays admin-only).
+
+**Claude usage.** For users with a Claude credential, the top bar shows a compact indicator before the active-agents
+count on every page (`UsageIndicator`, a link to `/settings#models`, `data-level` `none` | `ok` | `high` | `limit` |
+`spend`): for an OAuth token the most constrained window — a `rejected` one (*limit*, with "resets in …" when known),
+else the highest utilization, as short label and percentage (`5h 42%`; *high* from 80 % or `allowed_warning`, with a
+⚠ glyph and the word "high"); "no usage data" before any agent ran; "usage reset" when every window's reset time has
+passed. For an API key it shows the spend this month, and its label says that this is spend through Agern, not the
+Anthropic account's balance. States differ by text and glyph, not only colour; the title / aria-label spells out
+window, percentage, reset time and age. Settings → "Models & cost" has a "Usage" block (`#usage`): every window with
+percentage and bar, a *high* / *limit reached* badge, "resets in …" and "updated … ago" (a window whose reset time has
+passed shows "reset"), the note that the values are only refreshed while an agent runs, and "Spent through Agern:
+today $X · this month $Y (UTC days)"; for an API key only the spend, with the same "not the remaining balance"
+sentence. Both reload on the private `usage` frame, after a feed reconnect, when the credential changes and when the
+UTC day rolls over (`useClaudeUsage`, `web/src/lib/usage.ts`); relative times are re-evaluated every 30 s.
 
 The chat renders the Claude stream the way the terminal does: prompt line, streamed assistant
 text, tool calls as `⏺ Tool(args)` with collapsible results, thinking, cost/turn footer. Sessions
