@@ -387,7 +387,8 @@ class ReleaseMerger(
      * a push, so "none" right after opening the pull request or a new commit means nothing yet), not `none`.
      */
     private suspend fun readChecks(r: ReleaseRecord, client: GitHubClient, sha: String): ChecksSummary {
-        val now = clock.instant()
+        // The database keeps microseconds: compare at that precision, or a rounded-up "seen" lies after "now".
+        val now = clock.instant().truncatedTo(java.time.temporal.ChronoUnit.MICROS)
         val seen = io { store.headSeenAt(r.id, sha, now) }
         var summary = try {
             io { ChecksSummary.of(client.combinedStatus(org, r.repo, sha), client.checkRuns(org, r.repo, sha)) }
