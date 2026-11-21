@@ -2,6 +2,10 @@
 // Scenarios via ?mock=default|fresh|noclaude|observer|loggedout|nosandbox|usage-none|usage-high|usage-limit (remembered per tab;
 // nosandbox: FACTORY_SANDBOX=off; usage-*: alice's Claude usage without data, at 86 % or at a reached limit).
 import { ApiError, type Api, type Channel } from '../api/api';
+
+/** A 16×10 PNG sketching a page with a sidebar, used for every mock screenshot. */
+const SCREENSHOT_PNG =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAKCAIAAAAy3EnLAAAAKElEQVR42mOQVTEhCTGQrEFIXAkZictq4UcM/zd6ISMaaCDZScNAAwAkqEt/fIx+TwAAAABJRU5ErkJggg==';
 import { isRunActive, isSessionActive, type AgentSession, type Attachment, type ClientConfig, type Issue, type LoginStep, type Preferences, type Release, type Run, type StageRole, type User } from '../api/types';
 import {
   announceIssue,
@@ -465,6 +469,8 @@ export const mockApi: Api = {
       URL.revokeObjectURL(a.url);
       attachments.delete(id);
     }),
+  // One small PNG stands in for every screenshot (the mock has no image bytes).
+  screenshotUrl: () => SCREENSHOT_PNG,
   attachmentUrl: (_sessionId, id) => attachments.get(id)?.url ?? '/art/favicon.svg',
   config: () => ok(() => ({ attachments: LIMITS })),
   interrupt: (id) =>

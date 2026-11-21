@@ -157,6 +157,8 @@ export interface Api {
   deleteAttachment(sessionId: string, id: string): Promise<void>;
   /** URL of the bytes; `preview` serves the downscaled copy when there is one. */
   attachmentUrl(sessionId: string, id: string, opts?: { preview?: boolean }): string;
+  /** URL of a stage screenshot's image (same visibility as the run). */
+  screenshotUrl(runId: string, id: string): string;
   /** Server limits for the client (attachments). */
   config(): Promise<ClientConfig>;
   interrupt(id: string): Promise<void>;

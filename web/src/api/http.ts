@@ -172,6 +172,7 @@ export const httpApi: Api = {
   sendToAgent: (id, text) => post(`/api/sessions/${enc(id)}/input`, { text }),
   uploadAttachment: (sessionId, file, opts) => upload(`/api/sessions/${enc(sessionId)}/attachments?name=${enc(file.name)}`, file, opts),
   deleteAttachment: (sessionId, id) => del(`/api/sessions/${enc(sessionId)}/attachments/${enc(id)}`),
+  screenshotUrl: (runId, id) => `/api/runs/${enc(runId)}/screenshots/${enc(id)}`,
   attachmentUrl: (sessionId, id, opts) => `/api/sessions/${enc(sessionId)}/attachments/${enc(id)}${opts?.preview ? '?preview=1' : ''}`,
   config: () => get('/api/config'),
   interrupt: (id) => post(`/api/sessions/${enc(id)}/interrupt`),

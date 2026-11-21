@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
-import { api, ApiError, isRunActive, isRunWorking, type AgentSession, type Run, type StageRole } from '../api';
+import { api, ApiError, isRunActive, isRunWorking, type AgentSession, type Run, type Screenshot, type StageRole } from '../api';
 import { ChatView } from '../components/chat/ChatView';
 import { RunSandboxLine } from '../components/sandbox/SandboxBits';
 import { Markdown } from '../components/chat/Markdown';
@@ -9,7 +9,7 @@ import { PipelineDiagram } from '../components/pipeline/PipelineDiagram';
 import { Dialog, Empty, ErrorBox, KindBadge, Loading, RunStatusPill, Verdict } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
-import { between, cost, modelLabel, shortId, timeAgo } from '../lib/format';
+import { between, bytes, cost, modelLabel, shortId, timeAgo } from '../lib/format';
 import { useLiveRun, useLiveSessions } from '../lib/realtime';
 import { useNow } from '../lib/useNow';
 
@@ -243,6 +243,7 @@ function StageDetail({ run, node, round, sessions, onRound }: { run: Run; node: 
                 </ul>
               </>
             )}
+            <StageScreenshots runId={run.id} screenshots={stage.screenshots} />
           </>
         )}
       </div>
@@ -256,5 +257,44 @@ function StageDetail({ run, node, round, sessions, onRound }: { run: Run; node: 
         )}
       </div>
     </div>
+  );
+}
+
+/**
+ * The screenshots a UX or UI design reviewer attached to the selected stage (one round's stage row). Renders nothing
+ * when there are none. Captions are untrusted text and are only ever rendered as text.
+ */
+function StageScreenshots({ runId, screenshots }: { runId: string; screenshots: Screenshot[] }) {
+  const [openId, setOpenId] = useState<string | null>(null);
+  if (screenshots.length === 0) return null;
+  const open = screenshots.find((s) => s.id === openId) ?? null;
+  return (
+    <>
+      <h3 className="sd-h">Screenshots <span className="muted">{screenshots.length}</span></h3>
+      <ul className="shots">
+        {screenshots.map((s) => (
+          <li key={s.id}>
+            <figure className="shot">
+              <button type="button" className="shot-thumb" onClick={() => setOpenId(s.id)} aria-label={`Open screenshot: ${s.caption}`}>
+                <img src={api.screenshotUrl(runId, s.id)} alt={s.caption} loading="lazy" width={s.width} height={s.height} />
+              </button>
+              <figcaption>{s.caption}</figcaption>
+            </figure>
+          </li>
+        ))}
+      </ul>
+      <Dialog open={open !== null} onClose={() => setOpenId(null)} title="Screenshot" wide>
+        {open && (
+          <div className="att-lightbox shot-lightbox">
+            <img src={api.screenshotUrl(runId, open.id)} alt={open.caption} />
+            <p className="shot-caption">{open.caption}</p>
+            <p className="muted small">
+              {open.mediaType} · {bytes(open.size)} · {open.width}×{open.height} ·{' '}
+              <a href={api.screenshotUrl(runId, open.id)} target="_blank" rel="noreferrer">Open full size ↗</a>
+            </p>
+          </div>
+        )}
+      </Dialog>
+    </>
   );
 }
