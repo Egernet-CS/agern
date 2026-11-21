@@ -4,12 +4,14 @@ import dk.egernet.factory.AppJson
 import dk.egernet.factory.Config
 import dk.egernet.factory.FindingDto
 import dk.egernet.factory.REVIEWER_ROLES
+import dk.egernet.factory.SCREENSHOT_ROLES
 import dk.egernet.factory.RunStatus
 import dk.egernet.factory.agent.AgentIdentity
 import dk.egernet.factory.agent.AgentManager
 import dk.egernet.factory.agent.EventBus
 import dk.egernet.factory.agent.FeedItem
 import dk.egernet.factory.agent.Prompts
+import dk.egernet.factory.agent.Screenshots
 import dk.egernet.factory.agent.StageAgentRequest
 import dk.egernet.factory.agent.StageAgentResult
 import dk.egernet.factory.agent.UsageLimit
@@ -17,6 +19,7 @@ import dk.egernet.factory.agent.Workspaces
 import dk.egernet.factory.conflict
 import dk.egernet.factory.db.RunRecord
 import dk.egernet.factory.db.RunStore
+import dk.egernet.factory.db.ScreenshotStore
 import dk.egernet.factory.db.SettingsStore
 import dk.egernet.factory.db.StageRecord
 import dk.egernet.factory.db.UserRecord
@@ -94,6 +97,7 @@ class Orchestrator(
     private val scope: CoroutineScope,
     private val preferences: dk.egernet.factory.db.PreferenceStore,
     private val sandboxes: dk.egernet.factory.sandbox.SandboxManager,
+    private val screenshots: ScreenshotStore,
 ) {
     private val log = LoggerFactory.getLogger(Orchestrator::class.java)
     private val jobs = ConcurrentHashMap<UUID, Job>()
@@ -371,7 +375,8 @@ class Orchestrator(
             lastReviews = coroutineScope {
                 REVIEWER_ROLES.map { role ->
                     async {
-                        val r = stage(run.id, role, round, owner, ctx, reviewPrompt(ctx, role, round, spec, builderSummary), schema = Schemas.REVIEW, disallowed = READ_ONLY_TOOLS)
+                        val r = stage(run.id, role, round, owner, ctx, reviewPrompt(ctx, role, round, spec, builderSummary), schema = Schemas.REVIEW,
+                            disallowed = READ_ONLY_TOOLS, extraTools = if (role in SCREENSHOT_ROLES) Screenshots.TOOLS else emptySet())
                         val v = parseVerdict(r, setOf("PASS", "CHANGES"))
                         if (v == null) {
                             finishStage(run.id, role, round, null, "No valid verdict in the agent's output", emptyList(), failed = true)
@@ -386,6 +391,7 @@ class Orchestrator(
                 if (list.any { it == null }) throw StageFailed("A reviewer did not return a valid verdict")
                 list.filterNotNull().toMap()
             }
+            withContext(Dispatchers.IO) { bestEffort { screenshotNote(runs.get(run.id)!!, client, round) } }
             val changes = lastReviews.filterValues { it.verdict == "CHANGES" }
             if (changes.isEmpty()) break
             if (round >= maxRounds) {
@@ -421,6 +427,17 @@ class Orchestrator(
         } else {
             needsHuman(runs.get(run.id)!!, owner, "The approver escalated: ${v.summary}")
         }
+    }
+
+    /**
+     * After a review round: one comment on the pull request listing the screenshots the reviewers of [round] attached,
+     * pointing at the run page (docs/ARCHITECTURE.md §6 "Screenshots"). Nothing for a round without screenshots; the
+     * images themselves never go to GitHub. Blocking.
+     */
+    private fun screenshotNote(run: RunRecord, client: GitHubClient, round: Int) {
+        val pr = run.prNumber ?: return
+        screenshotNoteText(cfg, run.repo, run.id, round, runs.stages(run.id), screenshots.forRun(run.id))
+            ?.let { client.comment(org, run.repo, pr, it) }
     }
 
     /** [targetBranch]: where the pull request merges; [releaseName] is set for a release run. */
@@ -706,5 +723,25 @@ class Orchestrator(
             title.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-').take(40).trim('-').ifEmpty { "work" }
 
         fun firstParagraph(s: String): String = s.trim().split(Regex("\n\\s*\n")).first().take(500)
+
+        /**
+         * The pull request note for the screenshots of review [round] (null when there are none): the count, a pointer to
+         * the run page ([Config.pageRef], so an internal address is never published) and one line per screenshot,
+         * reviewers in [REVIEWER_ROLES] order, each in attach order. Captions are single-line already (sanitised on attach).
+         */
+        fun screenshotNoteText(
+            cfg: Config, repo: String, runId: UUID, round: Int, stages: List<StageRecord>, shots: List<dk.egernet.factory.db.ScreenshotMeta>,
+        ): String? {
+            val byStage = shots.groupBy { it.stageId }
+            val lines = REVIEWER_ROLES.flatMap { role ->
+                stages.filter { it.role == role && it.round == round }.flatMap { st -> byStage[st.id].orEmpty().map { role to it.caption } }
+            }
+            if (lines.isEmpty()) return null
+            val n = lines.size
+            val what = if (round == 0) "build" else "fix round $round"
+            val ref = cfg.pageRef("p/$repo/runs/$runId", "the page of run `$runId`")
+            return "**Agern: screenshots** — the reviewers attached $n ${if (n == 1) "screenshot" else "screenshots"} of this change " +
+                "($what). See them on $ref:\n\n" + lines.joinToString("\n") { (role, caption) -> "- **$role:** $caption" }
+        }
     }
 }

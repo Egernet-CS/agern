@@ -39,6 +39,10 @@ data class Config(
     val attachmentMaxMessageBytes: Long = 50L shl 20,
     /** FACTORY_ATTACHMENT_MAX_COUNT: attachments per message. */
     val attachmentMaxCount: Int = 10,
+    /** FACTORY_SCREENSHOT_MAX_MB: largest single screenshot a UX or UI design reviewer attaches to its stage. */
+    val screenshotMaxBytes: Long = 5L shl 20,
+    /** FACTORY_SCREENSHOT_MAX_COUNT: screenshots per stage (per reviewer per round). */
+    val screenshotMaxCount: Int = 12,
     /** FACTORY_SANDBOX*: per-run build/test sandboxes (docs/ARCHITECTURE.md §5 "Sandboxes"). */
     val sandbox: SandboxConfig = SandboxConfig(),
     /**
@@ -76,7 +80,8 @@ data class Config(
         "Config(host=$host, port=$port, dbUrl=$dbUrl, dbUser=$dbUser, githubOrg=$githubOrg, auth=$authProviders, " +
             "admins=$admins, dataDir=$dataDir, webDir=$webDir, claudeBin=$claudeBin, publicUrl=$publicUrl, " +
             "maxAgentsPerUser=$maxAgentsPerUser, chatIdleMinutes=$chatIdleMinutes, stageTimeoutMs=$stageTimeoutMs, fakeGithub=$fakeGithub, " +
-            "attachments=${attachmentMaxCount}x${attachmentMaxBytes shr 20}MB/${attachmentMaxMessageBytes shr 20}MB, sandbox=$sandbox)"
+            "attachments=${attachmentMaxCount}x${attachmentMaxBytes shr 20}MB/${attachmentMaxMessageBytes shr 20}MB, " +
+            "screenshots=${screenshotMaxCount}x${screenshotMaxBytes shr 20}MB, sandbox=$sandbox)"
 
     companion object {
         fun defaultAgentPath(): String =
@@ -151,6 +156,10 @@ data class Config(
                 attachmentMaxCount = (get("FACTORY_ATTACHMENT_MAX_COUNT")?.toIntOrNull() ?: get("FACTORY_ATTACHMENT_MAX_COUNT")?.let {
                     throw IllegalArgumentException("FACTORY_ATTACHMENT_MAX_COUNT must be a whole number")
                 } ?: 10).also { require(it in 1..20) { "FACTORY_ATTACHMENT_MAX_COUNT must be between 1 and 20" } },
+                screenshotMaxBytes = mb(get("FACTORY_SCREENSHOT_MAX_MB"), "FACTORY_SCREENSHOT_MAX_MB", 5),
+                screenshotMaxCount = (get("FACTORY_SCREENSHOT_MAX_COUNT")?.toIntOrNull() ?: get("FACTORY_SCREENSHOT_MAX_COUNT")?.let {
+                    throw IllegalArgumentException("FACTORY_SCREENSHOT_MAX_COUNT must be a whole number")
+                } ?: 12).also { require(it in 1..50) { "FACTORY_SCREENSHOT_MAX_COUNT must be between 1 and 50" } },
                 sandbox = sandbox,
                 releaseChecksSettleSeconds = get("FACTORY_RELEASE_CHECKS_SETTLE_SECONDS")?.let { v ->
                     (v.toLongOrNull() ?: throw IllegalArgumentException("FACTORY_RELEASE_CHECKS_SETTLE_SECONDS must be a whole number of seconds"))

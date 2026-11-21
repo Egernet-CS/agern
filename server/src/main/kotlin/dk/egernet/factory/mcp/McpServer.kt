@@ -37,6 +37,7 @@ class McpServer(
     private val releases: ReleaseService,
     private val version: String,
     private val sandboxes: dk.egernet.factory.sandbox.SandboxManager,
+    private val screenshots: dk.egernet.factory.agent.Screenshots,
 ) {
     private val log = LoggerFactory.getLogger(McpServer::class.java)
 
@@ -121,6 +122,14 @@ class McpServer(
                 Triple("timeoutSeconds", "integer", "Optional time limit in seconds (default and maximum: the server's limit)"),
                 Triple("platform", "string", "Optional: a platform from factory_sandbox_info (another image, e.g. 'jdk17'); default: the main image"),
                 required = listOf("command"))),
+        Tool("factory_attach_screenshot", "Attach a screenshot of the running app to your review stage, so the people following " +
+            "the run see what was built (on the run page; the pull request gets a note listing the captions). Only for the ux " +
+            "and ui-design reviewers. The file must be a PNG, JPEG, GIF or WebP image inside your working directory; it is " +
+            "copied and left as it is (delete it yourself afterwards, never commit it). The caption is one line saying what " +
+            "the screenshot shows, including state and theme.",
+            schema(Triple("path", "string", "Image file, relative to your working directory (or absolute, inside it)"),
+                Triple("caption", "string", "What the screenshot shows, e.g. 'Settings › Tokens, empty state, dark theme' (at most 200 characters)"),
+                required = listOf("path", "caption"))),
         Tool("factory_request_software", "Ask an administrator to install software on the factory host. " +
             "Use this instead of installing system-wide software yourself.",
             schema(Triple("name", "string", "Software name, e.g. 'ffmpeg' or 'JDK 21'"),
@@ -271,6 +280,8 @@ class McpServer(
                     sandboxes.exec(runId, grant.sessionId, str("command") ?: return toolError("command is required"), timeout, platform)
                         .let { if (it.isError) return toolError(it.text) else it.text }
                 }
+                "factory_attach_screenshot" ->
+                    screenshots.attach(grant.sessionId, grant.runId, repo, owner, str("path"), str("caption"))
                 "factory_request_software" -> {
                     val sr = factory.requestSoftware(owner, repo, grant.sessionId, str("name") ?: "", str("reason") ?: "")
                     "Request ${sr.id} filed for '${sr.name}'. An administrator will handle it; continue without it for now."
