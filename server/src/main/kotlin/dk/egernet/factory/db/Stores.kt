@@ -6,6 +6,7 @@ import dk.egernet.factory.EventDto
 import dk.egernet.factory.FindingDto
 import dk.egernet.factory.OwnerDto
 import dk.egernet.factory.RunDto
+import dk.egernet.factory.ReviewState
 import dk.egernet.factory.RunStatus
 import dk.egernet.factory.SettingsDto
 import dk.egernet.factory.SoftwareRequestDto
@@ -263,12 +264,14 @@ class SessionStore(private val db: Db) {
     fun countBusy(): Int =
         db.queryOne("SELECT count(*) AS n FROM agent_sessions WHERE status IN ('starting','running')") { it.getInt("n") } ?: 0
 
-    /** On startup no process can be alive: chats become idle (resumable), stage agents failed. */
+    /** On startup no process can be alive: chats and run assistants become idle (resumable), stage agents failed. */
     fun recoverAfterRestart() {
-        db.update("UPDATE agent_sessions SET status = 'idle', updated_at = now() WHERE kind = 'chat' AND status IN ('starting','running')")
+        db.update(
+            "UPDATE agent_sessions SET status = 'idle', updated_at = now() WHERE kind IN ('chat','assistant') AND status IN ('starting','running')",
+        )
         db.update(
             "UPDATE agent_sessions SET status = 'failed', updated_at = now(), ended_at = now() " +
-                "WHERE kind <> 'chat' AND status IN ('starting','running','idle')",
+                "WHERE kind NOT IN ('chat','assistant') AND status IN ('starting','running','idle')",
         )
     }
 }
@@ -292,6 +295,13 @@ class EventStore(private val db: Db) {
         )
         return EventDto(seq, sessionId.toString(), ts.iso(), type, payload)
     }
+
+    /** The `result` text of the session's last `claude` result event, or null. */
+    fun lastResultText(sessionId: UUID): String? = db.queryOne(
+        """SELECT payload->>'result' AS r FROM events WHERE session_id = ? AND type = 'claude' AND payload->>'type' = 'result'
+           ORDER BY seq DESC LIMIT 1""",
+        sessionId,
+    ) { it.getString("r") }
 
     fun list(sessionId: UUID, after: Long, limit: Int): List<EventDto> = db.query(
         "SELECT seq, ts, type, payload::text AS p FROM events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?",
@@ -322,6 +332,12 @@ data class RunRecord(
     val releaseId: UUID? = null,
     /** The branch the run starts from and merges into; null = the repository's default branch. */
     val baseBranch: String? = null,
+    /** The branch head Agern knows (set after each push); null for runs from before conversations. */
+    val headSha: String? = null,
+    /** The head the last complete review round covered; equal to [headSha] when the head has been reviewed. */
+    val reviewedSha: String? = null,
+    /** The run's `assistant` conversation, created on the owner's first message at needs_human. */
+    val assistantSessionId: UUID? = null,
 )
 
 class RunStore(private val db: Db) {
@@ -336,6 +352,7 @@ class RunStore(private val db: Db) {
         rs.getString("pr_url"), rs.uuid("owner_id"), rs.getString("owner_username"), rs.getString("owner_display_name"),
         rs.uuidOrNull("started_by_session_id"), rs.getString("error"), rs.instant("created_at"), rs.instant("updated_at"),
         rs.instantOrNull("ended_at"), rs.getString("sandbox"), rs.uuidOrNull("release_id"), rs.getString("base_branch"),
+        rs.getString("head_sha"), rs.getString("reviewed_sha"), rs.uuidOrNull("assistant_session_id"),
     )
 
     private fun mapStage(rs: ResultSet) = StageRecord(
@@ -447,6 +464,30 @@ class RunStore(private val db: Db) {
         JsonbParam(AppJson.encodeToString(dk.egernet.factory.RunSandboxDto.serializer(), info)), id,
     )
 
+    /** The branch head Agern knows; [reviewed] also records it as reviewed (the conversation's first use of an old run). */
+    fun setHead(id: UUID, sha: String?, reviewed: Boolean = false) = db.update(
+        "UPDATE runs SET head_sha = ?, reviewed_sha = CASE WHEN ? THEN ? ELSE reviewed_sha END, updated_at = now() WHERE id = ?",
+        sha, reviewed, sha, id,
+    )
+
+    /** The head a complete review round covered. */
+    fun setReviewed(id: UUID, sha: String?) = db.update("UPDATE runs SET reviewed_sha = ?, updated_at = now() WHERE id = ?", sha, id)
+
+    fun setAssistantSession(id: UUID, sessionId: UUID) =
+        db.update("UPDATE runs SET assistant_session_id = ?, updated_at = now() WHERE id = ?", sessionId, id)
+
+    /**
+     * Whether the branch head of a `needs_human` run has been reviewed (null in every other status): `reviewing` while a
+     * reviewer stage is pending or running, `unreviewed` when [RunRecord.headSha] differs from [RunRecord.reviewedSha],
+     * `current` otherwise. Used by the API view and by the approve gate alike.
+     */
+    fun reviewState(r: RunRecord, stages: List<StageRecord>): String? = when {
+        r.status != RunStatus.NEEDS_HUMAN -> null
+        stages.any { it.role in dk.egernet.factory.REVIEWER_ROLES && it.status in setOf("pending", "running") } -> ReviewState.REVIEWING
+        r.headSha != r.reviewedSha -> ReviewState.UNREVIEWED
+        else -> ReviewState.CURRENT
+    }
+
     fun setRound(id: UUID, round: Int) = db.update("UPDATE runs SET round = ?, updated_at = now() WHERE id = ?", round, id)
     fun setBranch(id: UUID, branch: String) = db.update("UPDATE runs SET branch = ?, updated_at = now() WHERE id = ?", branch, id)
     fun setPr(id: UUID, number: Int, url: String) =
@@ -480,17 +521,27 @@ class RunStore(private val db: Db) {
         db.update("UPDATE stages SET status = 'failed', ended_at = now() WHERE run_id = ? AND status = 'running'", runId)
     }
 
+    /**
+     * At start-up: a `needs_human` run has no process, so a follow-up review round that was interrupted is closed
+     * (pending → skipped, running → failed) and the run shows as `unreviewed`.
+     */
+    fun closeOpenStagesOfWaitingRuns() {
+        db.query("SELECT id FROM runs WHERE status = 'needs_human'") { it.uuid("id") }.forEach { closeOpenStages(it) }
+    }
+
     /** Stage screenshots are read with one query per run, never one per stage. */
     fun toDto(r: RunRecord): RunDto {
         val shots = screenshots.forRun(r.id).groupBy({ it.stageId }, { it.toDto() })
+        val stages = stages(r.id)
         return RunDto(
             id = r.id.toString(), repo = r.repo, issueNumber = r.issueNumber, issueTitle = r.issueTitle, issueKind = r.issueKind,
             status = r.status, round = r.round, maxRounds = r.maxRounds, branch = r.branch, prNumber = r.prNumber, prUrl = r.prUrl,
             owner = OwnerDto(r.ownerUsername, r.ownerDisplayName), startedBySessionId = r.startedBySessionId?.toString(),
             error = r.error, createdAt = r.createdAt.iso(), updatedAt = r.updatedAt.iso(), endedAt = r.endedAt?.iso(),
-            stages = stages(r.id).map { it.toDto(shots[it.id].orEmpty()) },
+            stages = stages.map { it.toDto(shots[it.id].orEmpty()) },
             sandbox = r.sandboxJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunSandboxDto.serializer(), it) }.getOrNull() },
             releaseId = r.releaseId?.toString(), baseBranch = r.baseBranch,
+            assistantSessionId = r.assistantSessionId?.toString(), reviewState = reviewState(r, stages),
         )
     }
 

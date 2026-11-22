@@ -23,6 +23,12 @@ interface GitOps {
     fun createWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, baseBranch: String, home: Path): String
     fun commitsAhead(worktree: Path, baseRef: String, home: Path): Int
     fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path)
+    /** The commit checked out in [worktree] (`git rev-parse HEAD`), or null when it cannot be read. */
+    fun headSha(worktree: Path, home: Path): String?
+    /** Whether [worktree] has uncommitted changes (`git status --porcelain` is not empty). */
+    fun hasUncommittedChanges(worktree: Path, home: Path): Boolean
+    /** The ref a worktree created from [baseBranch] was based on: `origin/<baseBranch>` (or `<baseBranch>` for local clones). */
+    fun baseRef(baseBranch: String): String
     /** The worktrees registered in [mainDir] (the main working tree included). Prunes stale entries first. */
     fun listWorktrees(mainDir: Path, home: Path): List<WorktreeInfo>
     /**
@@ -122,6 +128,14 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
         if (localOnly) return
         git(worktree, home, id, "push", "--force-with-lease", "origin", "HEAD:refs/heads/$branch")
     }
+
+    override fun headSha(worktree: Path, home: Path): String? =
+        runCatching { git(worktree, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim() }.getOrNull()?.takeIf { it.isNotEmpty() }
+
+    override fun hasUncommittedChanges(worktree: Path, home: Path): Boolean =
+        runCatching { git(worktree, home, null, "status", "--porcelain", timeoutSec = 60).isNotBlank() }.getOrDefault(false)
+
+    override fun baseRef(baseBranch: String): String = if (localOnly) baseBranch else "origin/$baseBranch"
 
     override fun readFile(dir: Path, ref: String, path: String, home: Path, maxBytes: Int): String? {
         require(!ref.startsWith("-") && !path.startsWith("-") && ':' !in path) { "Invalid ref or path" }

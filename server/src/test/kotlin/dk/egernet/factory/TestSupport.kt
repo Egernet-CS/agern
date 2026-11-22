@@ -132,6 +132,11 @@ class FakeLauncher(var stage: (FakeProcess) -> Unit = { it.init(); it.result("ok
     val launched = CopyOnWriteArrayList<FakeProcess>()
     /** Every chat `user` message written to a process (the stream-json `message.content`). */
     val chatInputs = CopyOnWriteArrayList<kotlinx.serialization.json.JsonElement>()
+    /**
+     * Called for each interactive `user` message before the echo answer (e.g. to simulate a commit); returning false
+     * means the hook answered (or will answer) itself and no echo is sent.
+     */
+    @Volatile var beforeEcho: ((FakeProcess, String) -> Boolean)? = null
 
     override fun launch(spec: LaunchSpec): AgentProcess {
         val p = if (spec.interactive) {
@@ -143,9 +148,11 @@ class FakeLauncher(var stage: (FakeProcess) -> Unit = { it.init(); it.result("ok
                     val text = (content as? kotlinx.serialization.json.JsonArray)
                         ?.mapNotNull { (it as? JsonObject)?.get("text")?.jsonPrimitive?.contentOrNull }?.joinToString(" ")
                         ?: content.jsonPrimitive.content
-                    proc.init(proc.spec.resumeClaudeSessionId ?: "chat-claude-${proc.spec.sessionId}")
-                    proc.assistantText("echo: $text")
-                    proc.result("echo: $text")
+                    if (beforeEcho?.invoke(proc, text) != false) {
+                        proc.init(proc.spec.resumeClaudeSessionId ?: "chat-claude-${proc.spec.sessionId}")
+                        proc.assistantText("echo: $text")
+                        proc.result("echo: $text")
+                    }
                 }
             }
         } else FakeProcess(spec)
@@ -181,7 +188,19 @@ class FakeGitOps : GitOps {
         return "origin/$baseBranch"
     }
     override fun commitsAhead(worktree: Path, baseRef: String, home: Path) = commits
-    override fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path) { pushes += branch }
+    override fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path) {
+        pushFailure?.let { throw dk.egernet.factory.git.GitException(it) }
+        pushes += branch
+    }
+    /** What [headSha] returns: the commit "checked out" in every worktree (a test changes it to simulate a commit). */
+    @Volatile var head: String? = "head-1"
+    /** What [hasUncommittedChanges] returns. */
+    @Volatile var dirty = false
+    /** When set, [push] fails with this message. */
+    @Volatile var pushFailure: String? = null
+    override fun headSha(worktree: Path, home: Path): String? = head
+    override fun hasUncommittedChanges(worktree: Path, home: Path) = dirty
+    override fun baseRef(baseBranch: String) = "origin/$baseBranch"
     override fun listWorktrees(mainDir: Path, home: Path): List<dk.egernet.factory.git.WorktreeInfo> = emptyList()
     /** When set, [removeWorktree] deletes the directory (like the real one) and records it in [removedWorktrees]. */
     @Volatile var deleteWorktrees = false

@@ -108,7 +108,7 @@ class Services(
         },
     )
     val screenshotStore = dk.egernet.factory.db.ScreenshotStore(db)
-    val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes, screenshotStore)
+    val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes, screenshotStore, sessions, events)
     val screenshots = dk.egernet.factory.agent.Screenshots(cfg, screenshotStore, runs, workspaces, publishRun = { orchestrator.publish(it) })
     val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
     val releaseLocks = dk.egernet.factory.pipeline.ReleaseLocks()
@@ -132,6 +132,8 @@ class Services(
     init {
         agents.commandHandler = { session, owner, text -> factory.handleCommand(session, owner, text) }
         orchestrator.onReleaseRunSettled = releaseBuilder::onRunSettled
+        agents.assistantContext = { runId, full -> orchestrator.assistantContext(runId, full) }
+        agents.onAssistantTurnEnded = { runId -> orchestrator.afterAssistantTurn(runId) }
     }
 
     /**
@@ -140,6 +142,8 @@ class Services(
      */
     fun recoverAfterRestart() {
         val failed = runs.failUnfinishedAfterRestart()
+        // A needs_human run survives, but a follow-up review round it was running did not: it shows as unreviewed.
+        runs.closeOpenStagesOfWaitingRuns()
         if (failed.isNotEmpty()) LoggerFactory.getLogger("dk.egernet.factory").warn("Marked {} unfinished run(s) as failed after restart", failed.size)
         // Order matters: first the sandboxes of runs that are no longer active (their containers bind-mount the worktrees),
         // then those worktrees, then the releases (which may start new runs). Bounded, so a hanging Podman cannot keep

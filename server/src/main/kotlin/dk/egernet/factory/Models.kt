@@ -193,6 +193,10 @@ data class RunDto(
     val releaseId: String? = null,
     /** The branch the run starts from and merges into; null = the repository's default branch. */
     val baseBranch: String? = null,
+    /** The run's `assistant` conversation at needs_human (docs/ARCHITECTURE.md §6 "Talking to an agent at needs human"). */
+    val assistantSessionId: String? = null,
+    /** Only while `needs_human`: `current`, `reviewing` or `unreviewed` (whether the branch head has been reviewed). */
+    val reviewState: String? = null,
 )
 
 /**
@@ -330,6 +334,10 @@ val REVIEWER_ROLES = listOf("security", "ux", "ui-design", "code")
 val SCREENSHOT_ROLES = setOf("ux", "ui-design")
 /** Pipeline roles whose running agent accepts messages from the run's owner (docs/ARCHITECTURE.md §6 "Messages"). */
 val STEERABLE_ROLES = setOf("spec-writer", "builder")
+/** The session kind of the agent a run's owner talks to while the run waits at needs_human; not a pipeline role. */
+const val ASSISTANT_KIND = "assistant"
+/** Session kinds whose process stays alive between turns and takes input from its owner. */
+val INTERACTIVE_KINDS = setOf("chat", ASSISTANT_KIND)
 val DEFAULT_PIPELINE_MODELS = mapOf(
     "spec-writer" to "opus", "builder" to "opus", "security" to "opus",
     "ux" to "sonnet", "ui-design" to "sonnet", "code" to "sonnet", "approver" to "opus",
@@ -495,6 +503,11 @@ object ReleaseIssueState {
 /** Why a release is paused. */
 object PauseReason {
     const val MANUAL = "manual"; const val USAGE_LIMIT = "usage_limit"; const val CREDENTIALS = "credentials"
+}
+
+/** [RunDto.reviewState] values. */
+object ReviewState {
+    const val CURRENT = "current"; const val REVIEWING = "reviewing"; const val UNREVIEWED = "unreviewed"
 }
 
 object SessionStatus {

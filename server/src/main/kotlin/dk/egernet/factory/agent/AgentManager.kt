@@ -2,6 +2,8 @@ package dk.egernet.factory.agent
 
 import dk.egernet.factory.AppJson
 import dk.egernet.factory.AgentMessageDto
+import dk.egernet.factory.ASSISTANT_KIND
+import dk.egernet.factory.INTERACTIVE_KINDS
 import dk.egernet.factory.AttachmentDto
 import dk.egernet.factory.STEERABLE_ROLES
 import kotlinx.serialization.builtins.ListSerializer
@@ -195,6 +197,35 @@ class AgentManager(
     /** Handles `/factory …` chat commands; wired after construction (orchestrator depends on this class). */
     var commandHandler: (suspend (session: SessionRecord, owner: UserRecord, text: String) -> String)? = null
 
+    /**
+     * What a run assistant is told before the owner's message (docs/ARCHITECTURE.md §6 "Talking to an agent at needs
+     * human"): with `full` the whole `<run_context>`, otherwise the `<review_results>` of a follow-up round it has not
+     * been told about, or nothing. Called at delivery time; wired by the orchestrator.
+     */
+    var assistantContext: (suspend (runId: UUID, full: Boolean) -> String)? = null
+
+    /**
+     * Called when a run assistant's turn has ended: after its `result`, after its process exited and after a failed
+     * delivery. Dispatched with `scope.launch`, never awaited by process handling.
+     */
+    var onAssistantTurnEnded: (suspend (runId: UUID) -> Unit)? = null
+
+    private fun assistantTurnEnded(sessionId: UUID, kind: String) {
+        if (kind != ASSISTANT_KIND) return
+        val runId = sessions.get(sessionId)?.runId ?: return
+        val hook = onAssistantTurnEnded ?: return
+        scope.launch {
+            try {
+                hook(runId)
+            } catch (e: Exception) {
+                log.warn("After-turn handling of run {} failed: {}", runId, e.message)
+            }
+        }
+    }
+
+    /** One stdin message of an interactive agent not yet answered; [ownerPart] is a run assistant's message without its context. */
+    private class Pending(val content: JsonElement, val ownerPart: String? = null)
+
     private class Live(
         val sessionId: UUID, val ownerId: UUID, val repo: String, val kind: String,
         val proc: AgentProcess, val mcpToken: String, val interactive: Boolean,
@@ -217,7 +248,7 @@ class AgentManager(
         /** Usage-limit signals of a pipeline stage. */
         val usage = UsageLimitDetector()
         /** Chat inputs (stream-json `message.content`) written to this process and not yet answered by a `result`. */
-        val pending = java.util.Collections.synchronizedList(mutableListOf<JsonElement>())
+        val pending = java.util.Collections.synchronizedList(mutableListOf<Pending>())
 
         // ---- steerable pipeline stages (spec-writer, builder): stdin stays open while the agent works
         @Volatile var steerable = false
@@ -342,7 +373,7 @@ class AgentManager(
                     val content = withContext(Dispatchers.IO) { attachments.content(text, attached) }
                     val l = live[s.id] ?: startChat(s.id, user)
                     try {
-                        deliver(l, content)
+                        deliver(l, Pending(content))
                     } catch (e: Exception) {
                         // A resume launch that already died is relaunched by finishChat with this input.
                         if (l.resumed && !l.sawInit) return@withLock
@@ -363,11 +394,11 @@ class AgentManager(
         putJsonObject("message") { put("role", "user"); put("content", content) }
     }.toString()
 
-    private suspend fun deliver(l: Live, content: JsonElement) {
+    private suspend fun deliver(l: Live, p: Pending) {
         l.turnActive = true
         l.lastUse = System.currentTimeMillis()
-        l.pending += content
-        val msg = userLine(content)
+        l.pending += p
+        val msg = userLine(p.content)
         // Running before the write: a fast agent can answer (and go idle) before this coroutine continues, and
         // setting the status afterwards would then leave the session "running" with nothing going on.
         val before = sessions.get(l.sessionId)?.status
@@ -375,8 +406,98 @@ class AgentManager(
         try {
             withContext(Dispatchers.IO) { l.proc.send(msg) }
         } catch (e: Exception) {
+            l.turnActive = false
             if (before != null && before != SessionStatus.RUNNING && isLive(l.sessionId)) setStatus(l.sessionId, before)
             throw e
+        }
+    }
+
+    /**
+     * A message from the run's owner to the run's assistant (docs/ARCHITECTURE.md §6 "Talking to an agent at needs
+     * human"). The orchestrator has checked the run (status, reviews, worktree) under its run lock; this checks the
+     * session, marks it `running` before returning (so a second message is refused as busy) and delivers in the
+     * background: the `<run_context>` or `<review_results>` from [assistantContext], then the owner's text.
+     */
+    fun sendToRunAssistant(user: UserRecord, s: SessionRecord, text: String) {
+        if (s.kind != ASSISTANT_KIND || s.runId == null) throw conflict("Not a run assistant session")
+        if (s.ownerId != user.id) throw forbidden("Only the owner of this run can talk to its agent")
+        if (text.isBlank()) throw dk.egernet.factory.badRequest("text must not be empty")
+        if (text.length > 100_000) throw dk.egernet.factory.badRequest("text is too long")
+        if (isAssistantBusy(s.id)) throw conflict("The agent is still answering; wait for it or press Esc to interrupt", "agent_busy")
+        if (!isLive(s.id)) {
+            if (user.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
+            if (slot(user.id).availablePermits == 0) throw conflict("You already have ${cfg.maxAgentsPerUser} agents running", "too_many_agents")
+        }
+        val runId = s.runId
+        publish(s.id, "user", buildJsonObject { put("text", text); put("username", user.username) })
+        setStatus(s.id, SessionStatus.RUNNING)
+        val ownerPart = "Message from the run owner (${user.username}):\n\n$text"
+        scope.launch {
+            val mutex = chatLocks.computeIfAbsent(s.id) { Mutex() }
+            try {
+                mutex.withLock {
+                    val l = live[s.id] ?: startChat(s.id, user)
+                    val full = sessions.get(s.id)?.claudeSessionId == null
+                    val prefix = assistantContext?.invoke(runId, full).orEmpty()
+                    try {
+                        deliver(l, Pending(JsonPrimitive(prefix + ownerPart), ownerPart))
+                    } catch (e: Exception) {
+                        // A resume launch that already died is relaunched by finishChat with this message.
+                        if (l.resumed && !l.sawInit) return@withLock
+                        throw e
+                    }
+                }
+            } catch (e: Exception) {
+                log.warn("Message to run assistant {} failed: {}", s.id, e.message)
+                systemEvent(s.id, "error", "Could not deliver the message to the agent: ${e.message}")
+                if (live[s.id]?.turnActive != true) setStatus(s.id, SessionStatus.IDLE)
+                assistantTurnEnded(s.id, ASSISTANT_KIND)
+            }
+        }
+    }
+
+    /**
+     * The run's assistant session (docs/ARCHITECTURE.md §6 "Talking to an agent at needs human"): created on the owner's
+     * first message, with the owner's effective builder [model] at that moment.
+     */
+    fun createRunAssistant(owner: UserRecord, repo: String, runId: UUID, issueNumber: Int, model: String): SessionRecord {
+        val s = sessions.create(repo, ASSISTANT_KIND, model, SessionStatus.IDLE, owner.id, "assistant · #$issueNumber", runId, null, issueNumber)
+        systemEvent(
+            s.id, "info",
+            "Conversation with the run assistant about run $runId (model $model). It works in the run's worktree; " +
+                "talking never approves the run, and a committed change is reviewed again before approval.",
+        )
+        publishFeed(s.id)
+        return sessions.get(s.id)!!
+    }
+
+    /** The checks before a message can start an agent process for [user]: a Claude credential and a free slot (unless [sessionId] is live). */
+    fun requireLaunchable(user: UserRecord, sessionId: UUID?) {
+        if (sessionId != null && isLive(sessionId)) return
+        if (user.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
+        if (slot(user.id).availablePermits == 0) throw conflict("You already have ${cfg.maxAgentsPerUser} agents running", "too_many_agents")
+    }
+
+    /** A run assistant is mid-turn: from the moment a message is accepted until its turn ends. */
+    fun isAssistantBusy(sessionId: UUID): Boolean =
+        live[sessionId]?.turnActive == true || sessions.get(sessionId)?.status in setOf(SessionStatus.STARTING, SessionStatus.RUNNING)
+
+    /**
+     * The run was approved or cancelled (or is being merged): stops the assistant's process and leaves the session
+     * `stopped`; [note] (if any) is added as an info event. A later owner message would resume it (a failed merge).
+     */
+    suspend fun endRunAssistant(sessionId: UUID, note: String?) {
+        chatLocks.computeIfAbsent(sessionId) { Mutex() }.withLock {
+            val l = live[sessionId]
+            if (l != null) {
+                killAndWait(l)
+            } else if (sessions.get(sessionId)?.status != SessionStatus.STOPPED) {
+                setStatus(sessionId, SessionStatus.STOPPED, ended = true)
+            }
+        }
+        if (note != null) {
+            systemEvent(sessionId, "info", note)
+            publishFeed(sessionId)
         }
     }
 
@@ -390,20 +511,33 @@ class AgentManager(
             if (s.endedAt != null) sessions.reopen(sessionId)
             setStatus(sessionId, SessionStatus.STARTING)
             val identity = AgentIdentity(owner.username, owner.displayName, owner.githubLogin, access.githubToken(owner), cred)
-            val workDir = withContext(Dispatchers.IO) { workspaces.ensureMain(identity, s.repo) }
-            // The attachment files are a cache of the database: put back what a cleaned data dir lost.
-            withContext(Dispatchers.IO) { attachments.materialiseSession(sessionId) }
             val mayInstall = settings.get().agentsMayInstallSoftware
-            val tools = if (mayInstall) McpRegistry.CHAT_TOOLS - "factory_request_software" else McpRegistry.CHAT_TOOLS
-            token = mcp.issue(McpGrant(sessionId, owner.id, s.repo, null, tools))
+            val assistant = s.kind == ASSISTANT_KIND
+            val workDir: Path
+            val grant: McpGrant
+            if (assistant) {
+                // A run assistant works in the run's worktree with the stage tools: no approve, cancel or start tools.
+                val runId = s.runId ?: error("assistant session without a run")
+                workDir = workspaces.runDir(owner.username, s.repo, runId)
+                if (!java.nio.file.Files.isDirectory(workDir)) throw conflict("The run's worktree no longer exists", "worktree_missing")
+                val tools = if (mayInstall) McpRegistry.STAGE_TOOLS - "factory_request_software" else McpRegistry.STAGE_TOOLS
+                grant = McpGrant(sessionId, owner.id, s.repo, runId, tools)
+            } else {
+                workDir = withContext(Dispatchers.IO) { workspaces.ensureMain(identity, s.repo) }
+                // The attachment files are a cache of the database: put back what a cleaned data dir lost.
+                withContext(Dispatchers.IO) { attachments.materialiseSession(sessionId) }
+                val tools = if (mayInstall) McpRegistry.CHAT_TOOLS - "factory_request_software" else McpRegistry.CHAT_TOOLS
+                grant = McpGrant(sessionId, owner.id, s.repo, null, tools)
+            }
+            token = mcp.issue(grant)
             val spec = LaunchSpec(
-                sessionId = sessionId, kind = "chat", model = s.model, workDir = workDir, home = workspaces.home(owner.username),
+                sessionId = sessionId, kind = s.kind, model = s.model, workDir = workDir, home = workspaces.home(owner.username),
                 identity = identity, interactive = true, resumeClaudeSessionId = s.claudeSessionId,
-                appendSystemPrompt = prompts.system("chat", s.repo, mayInstall), mcpConfigJson = mcpConfig(token),
+                appendSystemPrompt = prompts.system(if (assistant) ASSISTANT_KIND else "chat", s.repo, mayInstall), mcpConfigJson = mcpConfig(token),
             )
             val proc = withContext(Dispatchers.IO) { launcher.launch(spec) }
             if (s.claudeSessionId != null) systemEvent(sessionId, "info", "Resuming conversation ${s.claudeSessionId}")
-            val l = Live(sessionId, owner.id, s.repo, "chat", proc, token, true, s.costUsd ?: 0.0, s.numTurns ?: 0, s.claudeSessionId, owner.claudeCredEnc)
+            val l = Live(sessionId, owner.id, s.repo, s.kind, proc, token, true, s.costUsd ?: 0.0, s.numTurns ?: 0, s.claudeSessionId, owner.claudeCredEnc)
             l.resumedFrom = s.claudeSessionId
             live[sessionId] = l
             scope.launch { pump(l); finishChat(l, slot) }
@@ -460,7 +594,7 @@ class AgentManager(
             // Completed last, so stop() returns the final status.
             l.exited.complete(code)
         }
-        if (relaunch) relaunchFresh(l)
+        if (relaunch) relaunchFresh(l) else assistantTurnEnded(l.sessionId, l.kind)
     }
 
     /** One fresh launch (no `--resume`) after a failed resume; re-delivers the inputs the dead process never answered. */
@@ -471,16 +605,25 @@ class AgentManager(
             val texts = synchronized(dead.pending) { dead.pending.toList() }
             if (texts.isEmpty()) {
                 setStatus(id, SessionStatus.IDLE)
+                assistantTurnEnded(id, dead.kind)
                 return
             }
             try {
                 val owner = access.userById(dead.ownerId) ?: error("owner no longer exists")
                 val l = live[id] ?: startChat(id, owner)
-                for (t in texts) deliver(l, t)
+                for (t in texts) {
+                    // A run assistant's fresh conversation knows nothing: its unanswered message gets the full context again.
+                    val runId = sessions.get(id)?.runId
+                    val p = if (t.ownerPart != null && runId != null) {
+                        Pending(JsonPrimitive(assistantContext?.invoke(runId, true).orEmpty() + t.ownerPart), t.ownerPart)
+                    } else t
+                    deliver(l, p)
+                }
             } catch (e: Exception) {
                 log.warn("Fresh relaunch of session {} failed: {}", id, e.message)
                 systemEvent(id, "error", "Could not start a fresh conversation: ${e.message}")
                 if (!isLive(id)) setStatus(id, SessionStatus.IDLE)
+                assistantTurnEnded(id, dead.kind)
             }
         }
     }
@@ -494,7 +637,7 @@ class AgentManager(
 
     fun interrupt(user: UserRecord, s: SessionRecord) {
         if (s.ownerId != user.id) throw forbidden("Only the owner of this session can interrupt it")
-        if (s.kind != "chat") throw conflict("Pipeline agents are stopped by cancelling the run")
+        if (s.kind !in INTERACTIVE_KINDS) throw conflict("Pipeline agents are stopped by cancelling the run")
         val l = live[s.id] ?: return
         if (!l.turnActive) return
         val req = buildJsonObject {
@@ -516,6 +659,7 @@ class AgentManager(
      */
     fun sendToStageAgent(user: UserRecord, s: SessionRecord, text: String, viaChatSession: UUID? = null): AgentMessageDto {
         if (s.kind == "chat") throw conflict("Chat sessions take input, not agent messages")
+        if (s.kind == ASSISTANT_KIND) throw conflict("Talk to the run assistant on the run page.", "agent_does_not_accept_messages")
         if (s.ownerId != user.id) throw forbidden("Only the owner of this run can send messages to its agents")
         if (s.kind !in STEERABLE_ROLES) {
             throw conflict(
@@ -837,6 +981,7 @@ class AgentManager(
                     l.turnActive = false
                     l.lastUse = System.currentTimeMillis()
                     if (l.stopReason == null) setStatus(l.sessionId, SessionStatus.IDLE) else publishFeed(l.sessionId)
+                    assistantTurnEnded(l.sessionId, l.kind)
                 } else {
                     publishFeed(l.sessionId)
                     // A steerable stage ends when a turn ends and no message is waiting: then stdin is closed. A message

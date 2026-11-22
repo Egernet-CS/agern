@@ -68,6 +68,9 @@ class PipelineTest {
         assertTrue(actions.any { it.startsWith("merge demo-app #") })
         assertTrue(actions.any { it == "close demo-app#1" })
         assertEquals(listOf(done.branch), world.git.pushes.toList())
+        // The pushed head is recorded, and as reviewed once all four reviewers returned a verdict.
+        assertEquals("head-1", done.headSha)
+        assertEquals("head-1", done.reviewedSha)
         val stages = s.runs.stages(run.id)
         assertEquals(7, stages.size)
         assertTrue(stages.all { it.status == "done" }, stages.toString())

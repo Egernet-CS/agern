@@ -148,6 +148,18 @@ class FactoryService(
         return runs.toDto(orchestrator.approve(user, runId))
     }
 
+    /** The owner's message to the agent of a run waiting at needs_human (docs/ARCHITECTURE.md §6 "Talking to an agent"). */
+    suspend fun talkToRun(user: UserRecord, runId: UUID, text: String): RunDto {
+        visibleRun(user, runId)
+        return runs.toDto(orchestrator.talk(user, runId, text))
+    }
+
+    /** "Review changes" on a waiting run: push the branch head and review it again. */
+    suspend fun reviewRun(user: UserRecord, runId: UUID): RunDto {
+        visibleRun(user, runId)
+        return runs.toDto(orchestrator.review(user, runId))
+    }
+
     suspend fun cancelRun(user: UserRecord, runId: UUID): RunDto {
         visibleRun(user, runId)
         return runs.toDto(orchestrator.cancel(user, runId))

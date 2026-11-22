@@ -28,6 +28,16 @@ Behaviour
         "usage-ok"    -> unifiedWindows five_hour 0.42 and seven_day 0.18, both "allowed"
         "usage-high"  -> unifiedWindows five_hour 0.86 "allowed_warning" and seven_day 0.18 "allowed"
         "usage-limit" -> top-level status "rejected", rateLimitType "five_hour", utilization 1.0, resetsAt now + 2 h
+  Run assistant (interactive, "# Role: assistant"; docs/ARCHITECTURE.md §6 "Talking to an agent at needs human"):
+    every message is answered with "Run assistant (fake)." plus
+    - with a <run_context> block: "Context: issue #<n>; <k> finding(s); reason: <first line of the reason>" and
+      "Diff: <last line of git diff --stat <baseRef>...HEAD>"
+    - with a <review_results round="<label>"> block: "Review results received (<label>)."
+    Triggers in the owner's own text (after "Message from the run owner (...):"):
+    - "change:" -> appends a line to AGERN_FAKE.md, commits it ("Fake follow-up commit") and says "Committed the change."
+    - "dirty"   -> edits AGERN_FAKE.md without committing
+    - "slow"    -> streams ~10 s of output (interruptible)
+    - "crash"   -> exits with status 3
   Conversations are remembered under $HOME/.fake-claude/sessions/<id>. Like the real CLI,
   --resume <id> of an unknown conversation fails at once ("No conversation found with session ID").
   A Claude credential containing "invalid" is rejected like a bad key ("Invalid API key").
@@ -41,7 +51,7 @@ Behaviour
     - spec-writer: prints a small spec
     - builder: appends a line to AGERN_FAKE.md and commits it (if the cwd is a git repository)
     - reviewers (--json-schema with PASS/CHANGES): PASS, unless the prompt contains
-        "fake:changes" (CHANGES before the first fix round) or "fake:always-changes"
+        "fake:changes" (CHANGES before the first fix round and never in a follow-up review) or "fake:always-changes"
     - approver (--json-schema with APPROVE/ESCALATE): APPROVE, unless "fake:escalate"
     - "fake:fail-<role>" anywhere in the prompt makes that role exit with status 1 and no result
     - "fake:hang-<role>" makes that role hang until it is killed (stage time limit, cancel)
@@ -244,7 +254,8 @@ def tiny_png(width=4, height=3, rgb=(0x2B, 0x6C, 0xB0)):
 def attach_fake_screenshot(prompt):
     """fake:screenshots: one screenshot through factory_attach_screenshot; returns the line for the summary."""
     m = re.search(r"after fix round (\d+)", prompt)
-    when = "fix round %s" % m.group(1) if m else "build"
+    f = re.search(r"follow-up review (\d+)", prompt)
+    when = "fix round %s" % m.group(1) if m else "follow-up review %s" % f.group(1) if f else "build"
     name = "agern-fake-screenshot-%s.png" % role
     try:
         with open(name, "wb") as f:
@@ -379,6 +390,9 @@ def chat_mode():
                                if isinstance(c, dict) and c.get("type") == "text" and not c.get("text", "").startswith("[Attachments]"))
         interrupt_flag["set"] = False
         init_event()
+        if role == "assistant":
+            assistant_turn(content, lambda: (drain_controls() or interrupt_flag["set"]))
+            continue
         forward = re.match(r"\s*forward (\S+) (\S+?):\s*(.+)$", content, re.S)
         if forward and mcp_config:
             try:
@@ -448,6 +462,59 @@ def chat_mode():
             result(reply)
 
 
+def assistant_turn(content, interrupted):
+    """One turn of the run assistant: what it was told about the run, and the owner's triggers."""
+    head = "Message from the run owner"
+    i = content.find(head)
+    owner = content[i:].split("\n\n", 1)[1] if i >= 0 and "\n\n" in content[i:] else content
+    lines = ["Run assistant (fake)."]
+    if "<run_context>" in content:
+        issue = re.search(r"issue #(\d+)", content)
+        reviews = re.search(r"<reviews[^>]*>([\s\S]*?)</reviews>", content)
+        findings = len(re.findall(r"^- \[", reviews.group(1), re.M)) if reviews else 0
+        reason = re.search(r"^Why it needs a human: (.*)$", content, re.M)
+        lines.append("Context: issue #%s; %d finding(s); reason: %s" % (
+            issue.group(1) if issue else "?", findings, reason.group(1).strip() if reason else "?"))
+        base = re.search(r"git diff (\S+)\.\.\.HEAD", content)
+        stat = ""
+        if base:
+            try:
+                out = subprocess.run(["git", "diff", "--stat", "%s...HEAD" % base.group(1)], capture_output=True, text=True, timeout=10).stdout
+                stat = out.strip().splitlines()[-1].strip() if out.strip() else "(no changes)"
+            except Exception as e:  # noqa
+                stat = "git failed: %s" % e
+        lines.append("Diff: %s" % (stat or "?"))
+    rr = re.search(r'<review_results round="([^"]+)">', content)
+    if rr:
+        lines.append("Review results received (%s)." % rr.group(1))
+    if "crash" in owner:
+        sys.stderr.write("fake-claude: crashing as requested\n")
+        sys.exit(3)
+    if "change:" in owner:
+        with open("AGERN_FAKE.md", "a") as f:
+            f.write("fake follow-up change at %s: %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), owner.split("change:", 1)[1].strip()[:200]))
+        tool_roundtrip("git add AGERN_FAKE.md && git commit -q -m 'Fake follow-up commit' && git log --oneline -1")
+        lines.append("Committed the change.")
+    elif "dirty" in owner:
+        with open("AGERN_FAKE.md", "a") as f:
+            f.write("uncommitted fake edit\n")
+        lines.append("Edited AGERN_FAKE.md without committing.")
+    reply = "\n".join(lines)
+    if "slow" in owner:
+        chunks = ["%d " % i for i in range(1, 41)]
+        ok, _ = stream_text("".join(chunks), chunk_delay=0.25, chunks=chunks, interrupted=interrupted)
+        if ok:
+            stream_text(reply)
+    else:
+        ok, _ = stream_text(reply)
+    if not ok:
+        emit({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]},
+              "parent_tool_use_id": None, "session_id": session_id, "uuid": str(uuid.uuid4())})
+        result(None, subtype="error_during_execution", is_error=True, turns=1, cost=0.001)
+    else:
+        result(reply)
+
+
 # --------------------------------------------------------------------------- one-shot mode
 
 def owner_text(t):
@@ -500,7 +567,8 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
         shot = ""
         if "fake:screenshots" in prompt and role in ("ux", "ui-design") and mcp_config:
             shot = " " + attach_fake_screenshot(prompt)
-        changes = "fake:always-changes" in prompt or ("fake:changes" in prompt and "after fix round" not in prompt)
+        changes = "fake:always-changes" in prompt or (
+            "fake:changes" in prompt and "after fix round" not in prompt and "follow-up review" not in prompt)
         if changes:
             detail = "Fake finding from %s." % role
             if markdown:
@@ -646,7 +714,7 @@ if __name__ == "__main__":
         emit({"type": "result", "subtype": "success", "is_error": True, "duration_ms": 10, "num_turns": 1,
               "result": "Invalid API key · Please run /login", "session_id": session_id, "total_cost_usd": 0})
         sys.exit(1)
-    if interactive and role != "chat":
+    if interactive and role not in ("chat", "assistant"):
         stage_stream_mode()
     elif interactive:
         chat_mode()

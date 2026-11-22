@@ -1,5 +1,6 @@
 package dk.egernet.factory.api
 
+import dk.egernet.factory.ASSISTANT_KIND
 import dk.egernet.factory.ApiException
 import dk.egernet.factory.AppJson
 import dk.egernet.factory.BuildInfo
@@ -100,6 +101,7 @@ private val log = LoggerFactory.getLogger("dk.egernet.factory.api")
 @Serializable data class OrderReq(val issueNumbers: List<Int>)
 @Serializable data class CreateSessionReq(val model: String? = null)
 @Serializable data class InputReq(val text: String = "", val attachmentIds: List<String> = emptyList())
+@Serializable data class RunMessageReq(val text: String = "")
 @Serializable data class ResolveReq(val status: String, val note: String? = null)
 @Serializable data class ApproveSandboxReq(val sha256: String)
 @Serializable data class HealthDto(val status: String, val version: String, val name: String)
@@ -458,6 +460,14 @@ private fun Route.runRoutes(s: Services) {
     }
     post("/runs/{id}/approve") { call.respond(s.factory.approveRun(call.requireUser(s), uuidParam("id"))) }
     post("/runs/{id}/cancel") { call.respond(s.factory.cancelRun(call.requireUser(s), uuidParam("id"))) }
+    // Talking to the run's agent while it waits at needs_human (docs/ARCHITECTURE.md §6 "Talking to an agent at needs human").
+    post("/runs/{id}/messages") {
+        val u = call.requireUser(s)
+        val id = uuidParam("id")
+        val req = call.receive<RunMessageReq>()
+        call.respond(HttpStatusCode.Accepted, s.factory.talkToRun(u, id, req.text))
+    }
+    post("/runs/{id}/review") { call.respond(HttpStatusCode.Accepted, s.factory.reviewRun(call.requireUser(s), uuidParam("id"))) }
 }
 
 // ------------------------------------------------------------------ releases (docs/ARCHITECTURE.md §6 "Releases")
@@ -598,6 +608,12 @@ private fun Route.sessionRoutes(s: Services) {
         val rec = visibleSession(s, u, uuidParam("id"))
         val req = call.receive<InputReq>()
         val ids = req.attachmentIds.map { runCatching { UUID.fromString(it) }.getOrNull() ?: throw badRequest("Invalid attachment id") }
+        if (rec.kind == ASSISTANT_KIND && rec.runId != null) {
+            // The run assistant: the same as POST /runs/{runId}/messages (text only).
+            if (rec.ownerId == u.id && ids.isNotEmpty()) throw unprocessable("Messages to the run assistant are text only", "attachments_not_allowed")
+            call.respond(HttpStatusCode.Accepted, s.factory.talkToRun(u, rec.runId, req.text))
+            return@post
+        }
         if (rec.kind != "chat") {
             // A message for a running pipeline agent (spec-writer / builder), from its owner directly.
             if (rec.ownerId == u.id && ids.isNotEmpty()) throw unprocessable("Messages to pipeline agents are text only", "attachments_not_allowed")
