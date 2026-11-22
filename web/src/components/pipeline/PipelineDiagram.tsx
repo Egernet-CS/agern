@@ -21,8 +21,8 @@ const H: Layout = {
     code: { x: 674, y: 318, w: 172, h: 82 },
     gate: { x: 880, y: 176, w: 116, h: 80 },
     approver: { x: 1030, y: 168, w: 150, h: 96 },
-    merge: { x: 1246, y: 40, w: 146, h: 76 },
-    human: { x: 1246, y: 316, w: 146, h: 76 },
+    merge: { x: 1226, y: 40, w: 166, h: 76 },
+    human: { x: 1226, y: 316, w: 166, h: 76 },
   },
 };
 
@@ -189,7 +189,12 @@ function Node({ n, box, selected, onSelect, selectable, now, compact }: { n: Nod
               <text className="pn-status" x={pad} y={48}>
                 <tspan className="pn-icon">{STATE_ICON[n.state]}</tspan> {n.verdict ?? STATE_TEXT[n.state]}
               </text>
-              {n.sub && <text className="pn-sub" x={pad} y={67}>{trunc(n.sub, maxChars)}</text>}
+              {/* The needs-human states ("change not reviewed") are squeezed to fit rather than cut off. */}
+              {n.sub && (n.sub.length > maxChars && n.sub.length <= maxChars + 5 ? (
+                <text className="pn-sub" x={pad} y={67} textLength={w - pad * 2} lengthAdjust="spacingAndGlyphs">{n.sub}</text>
+              ) : (
+                <text className="pn-sub" x={pad} y={67}>{trunc(n.sub, maxChars)}</text>
+              ))}
             </>
           ) : (
             <>

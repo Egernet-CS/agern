@@ -17,10 +17,11 @@ import { useNow } from '../lib/useNow';
 const ROLE_ORDER: StageRole[] = ['spec-writer', 'builder', 'security', 'ux', 'ui-design', 'code', 'approver'];
 
 function defaultNode(run: Run): NodeId {
+  // At needs human the conversation with the run assistant is where the owner goes next (also while follow-up
+  // reviewers run).
+  if (run.status === 'needs_human') return 'human';
   const running = run.stages.find((s) => s.status === 'running');
   if (running) return running.role;
-  // At needs human the conversation with the run assistant is where the owner goes next.
-  if (run.status === 'needs_human') return 'human';
   const last = [...run.stages].sort((a, b) => (a.startedAt ?? '').localeCompare(b.startedAt ?? '')).pop();
   return last?.role ?? 'issue';
 }

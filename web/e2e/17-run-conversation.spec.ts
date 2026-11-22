@@ -81,6 +81,8 @@ test('the owner talks to the run assistant, a change is reviewed again before ap
   // 4. Alice approves: merged, and the conversation is closed (Bob's page follows live).
   await approve(page).click();
   await expect(pill(page)).toHaveText('merged');
+  // The conversation stays part of the run's history: the node remains selectable after the run ended.
+  await node(page, 'needs-human').click();
   await expect(log).toContainText('The run was approved by alice; this conversation is closed.');
   await expect(detail).toContainText('This conversation ended when the run was merged.');
   await expect(detail.getByLabel('Message the run assistant')).toHaveCount(0);
