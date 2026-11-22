@@ -416,6 +416,19 @@ data class AttachmentDto(
 @Serializable data class ImageProviderInfoDto(
     val id: String, val label: String, val models: List<String>, val defaultModel: String, val supportsTransparency: Boolean,
     val keyPlaceholder: String,
+    /** `api_key` or `device_login` (connected through the `/me/image-provider/codex/login` flow). */
+    val auth: String = "api_key",
+    val available: Boolean = true,
+    val unavailableReason: String? = null,
+)
+
+/** A Codex device login of the caller (`/api/me/image-provider/codex/login`); URL and code only while `pending`. */
+@Serializable data class CodexLoginDto(
+    val status: String,
+    val verificationUrl: String? = null,
+    val userCode: String? = null,
+    val expiresAt: String? = null,
+    val error: String? = null,
 )
 @Serializable data class ImageLimitsDto(val maxPerRequest: Int, val maxPerTurn: Int, val maxPerStage: Int, val maxEdge: Int)
 @Serializable data class ImageConfigDto(val providers: List<ImageProviderInfoDto>, val limits: ImageLimitsDto)

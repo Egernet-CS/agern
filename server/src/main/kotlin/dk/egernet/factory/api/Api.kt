@@ -379,6 +379,23 @@ private fun Route.meRoutes(s: Services) {
         call.respond(s.images.save(u, req.provider, req.model, req.apiKey).toDto())
     }
     delete("/me/image-provider") { call.respond(s.images.remove(call.requireUser(s)).toDto()) }
+    // The Codex device login (docs/ARCHITECTURE.md §4 "Codex login"): the URL and code go only to their owner.
+    post("/me/image-provider/codex/login") {
+        val u = call.requireUser(s)
+        val logins = s.codexLogins ?: throw conflict(dk.egernet.factory.images.CodexImageProvider.UNAVAILABLE, "image_provider_unavailable_here")
+        call.respond(logins.start(u.id))
+    }
+    get("/me/image-provider/codex/login") {
+        val u = call.requireUser(s)
+        val logins = s.codexLogins ?: throw conflict(dk.egernet.factory.images.CodexImageProvider.UNAVAILABLE, "image_provider_unavailable_here")
+        call.respond(logins.status(u.id))
+    }
+    delete("/me/image-provider/codex/login") {
+        val u = call.requireUser(s)
+        val logins = s.codexLogins ?: throw conflict(dk.egernet.factory.images.CodexImageProvider.UNAVAILABLE, "image_provider_unavailable_here")
+        logins.cancel(u.id)
+        call.respond(logins.status(u.id))
+    }
     get("/me/preferences") { call.respond(s.preferences.dto(call.requireUser(s).id)) }
     put("/me/preferences") {
         val u = call.requireUser(s)

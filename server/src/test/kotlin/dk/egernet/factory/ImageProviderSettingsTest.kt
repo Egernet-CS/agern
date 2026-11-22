@@ -125,15 +125,59 @@ class ImageProviderSettingsTest {
     }
 
     @Test
-    fun `the default catalogue offers OpenAI and Gemini, plus the fake provider only in fake-GitHub mode`() {
-        val plain = TestWorld(twoFactor = false)
-        val fake = TestWorld(twoFactor = false, tweak = { it.copy(fakeGithub = true) })
+    fun `the default catalogue offers OpenAI, Gemini and Codex, plus the fake provider only in fake-GitHub mode`() {
+        val plain = TestWorld(twoFactor = false, tweak = { it.copy(codexBin = "/nonexistent/codex") })
+        val fake = TestWorld(twoFactor = false, tweak = { it.copy(fakeGithub = true, codexBin = CodexProviderTest.fakeCodex()) })
         try {
-            assertEquals(listOf("openai", "gemini"), plain.services.images.catalogue().providers.map { it.id })
-            assertEquals(listOf("openai", "gemini", "fake"), fake.services.images.catalogue().providers.map { it.id })
-            assertTrue(plain.services.images.catalogue().providers.none { "codex" in it.id.lowercase() })
+            assertEquals(listOf("openai", "gemini", "codex"), plain.services.images.catalogue().providers.map { it.id })
+            assertEquals(listOf("openai", "gemini", "codex", "fake"), fake.services.images.catalogue().providers.map { it.id })
+            val missing = plain.services.images.catalogue().providers
+            assertEquals(
+                listOf(Triple("api_key", true, null), Triple("api_key", true, null), Triple("device_login", false, "The Codex CLI is not installed on this server.")),
+                missing.map { Triple(it.auth, it.available, it.unavailableReason) },
+            )
+            val codex = fake.services.images.catalogue().providers.single { it.id == "codex" }
+            assertEquals(listOf("OpenAI Codex", "default", "true", "true"), listOf(codex.label, codex.defaultModel, "${codex.available}", "${codex.supportsTransparency}"))
+            assertEquals(listOf("default"), codex.models)
+            assertNull(codex.unavailableReason)
         } finally {
             plain.closeAndReleaseDb(); fake.closeAndReleaseDb()
+        }
+    }
+
+    @Test
+    fun `five rejected keys within 15 minutes block further saves without calling the provider`() {
+        val clock = MutableClock(java.time.Instant.parse("2026-11-22T10:00:00Z"))
+        val p = RecordingImageProvider()
+        val tw = TestWorld(twoFactor = false, imageProviders = listOf(p), clock = clock)
+        try {
+            testApplication {
+                application { agernModule(tw.services) }
+                val alice = login("alice", "pw-a")
+                // Malformed input is not counted.
+                repeat(3) { assertEquals(422, alice.save("rec", "rec-1", "two words").status.value) }
+                assertEquals(400, alice.save("rec", "bad model!", "rec-key").status.value)
+                repeat(4) { assertEquals(422, alice.save("rec", "rec-1", "bad-$it").status.value) }
+                clock.advance(java.time.Duration.ofMinutes(5))
+                // A success in between does not reset the counter.
+                assertEquals(200, alice.save("rec", "rec-1", "rec-good").status.value)
+                assertEquals(422, alice.save("rec", "rec-1", "bad-5").status.value)
+                val calls = p.validations.size
+                val blocked = alice.save("rec", "rec-1", "rec-good-2")
+                assertEquals(429, blocked.status.value)
+                val err = json(blocked.bodyAsText())["error"]!!.jsonObject
+                assertEquals("too_many_attempts", err["code"]!!.jsonPrimitive.content)
+                assertEquals("Too many rejected API keys. Try again later.", err["message"]!!.jsonPrimitive.content)
+                assertEquals("2026-11-22T10:15:00.000Z", err["lockedUntil"]!!.jsonPrimitive.content)
+                assertEquals(calls, p.validations.size, "no provider call while blocked")
+                // Other users are not affected.
+                assertEquals(200, login("bob", "pw-b").save("rec", "rec-1", "rec-bob").status.value)
+                // When the oldest rejections leave the window, saving works again.
+                clock.advance(java.time.Duration.ofMinutes(10))
+                assertEquals(200, alice.save("rec", "rec-1", "rec-good-2").status.value)
+            }
+        } finally {
+            tw.closeAndReleaseDb()
         }
     }
 

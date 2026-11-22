@@ -175,8 +175,11 @@ class FakeGitOps : GitOps {
         return files[path]
     }
     override fun ensureClone(id: AgentIdentity, cloneUrl: String, dir: Path, home: Path) { Files.createDirectories(dir) }
+    /** Runs on every worktree right after it is created (e.g. to plant files a repository could contain). */
+    @Volatile var afterWorktree: (Path) -> Unit = {}
     override fun createWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, baseBranch: String, home: Path): String {
         Files.createDirectories(worktree)
+        afterWorktree(worktree)
         worktrees += "$branch <- $baseBranch"
         return "origin/$baseBranch"
     }

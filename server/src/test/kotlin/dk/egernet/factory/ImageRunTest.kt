@@ -173,4 +173,33 @@ class ImageRunTest {
         assertEquals("?? README.md", git("status", "--porcelain").trim())
         repo.toFile().deleteRecursively()
     }
+
+    @Test
+    fun `a repository with agern-run as a symlink fails the hand-over, writes nothing outside and unlocks the selection`() {
+        val w = world()
+        val id = selected(w, "alice", 1, "App icon")
+        val outside = Files.createTempDirectory("agern-outside")
+        w.git.afterWorktree = { wt -> Files.createSymbolicLink(wt.resolve(".agern-run"), outside) }
+        val seen = Seen()
+        script(w, seen)
+        val runId = start(w)
+        val done = w.awaitRun(runId, RunStatus.TERMINAL)
+        assertEquals(RunStatus.FAILED, done.status)
+        assertEquals("Prepared images could not be handed over: `.agern-run` in the repository is not a plain directory", done.error)
+        assertTrue(seen.prompts.isEmpty(), "no stage started")
+        Files.list(outside).use { assertEquals(emptyList(), it.toList()) }
+        assertFalse(w.services.images.store.get(id)!!.locked)
+
+        // A symlink planted at a prepared image's file name is replaced, not written through.
+        val victim = outside.resolve("victim.png")
+        w.git.afterWorktree = { wt ->
+            Files.createDirectories(wt.resolve(".agern-run/images"))
+            Files.createSymbolicLink(wt.resolve(".agern-run/images/prepared-01-app-icon.png"), victim)
+        }
+        script(w, Seen())
+        val second = start(w)
+        assertEquals(RunStatus.MERGED, w.awaitRun(second, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
+        assertFalse(Files.exists(victim, java.nio.file.LinkOption.NOFOLLOW_LINKS))
+        outside.toFile().deleteRecursively()
+    }
 }

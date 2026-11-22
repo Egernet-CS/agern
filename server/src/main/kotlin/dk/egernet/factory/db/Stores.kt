@@ -97,6 +97,14 @@ class UserStore(private val db: Db) {
         "UPDATE users SET image_provider = ?, image_model = ?, image_key_enc = ? WHERE id = ?", provider, model, keyEnc, id,
     )
 
+    /**
+     * Replaces the stored image credential only if the row still holds [oldEnc] for [provider] (compare-and-set, so a
+     * re-login or removal made meanwhile wins). Returns whether it changed.
+     */
+    fun replaceImageKey(id: UUID, provider: String, oldEnc: ByteArray, newEnc: ByteArray): Boolean = db.update(
+        "UPDATE users SET image_key_enc = ? WHERE id = ? AND image_provider = ? AND image_key_enc = ?", newEnc, id, provider, oldEnc,
+    ) > 0
+
     fun setTotpPending(id: UUID, enc: ByteArray?) = db.update("UPDATE users SET totp_pending_enc = ? WHERE id = ?", enc, id)
 
     fun confirmTotp(id: UUID, secretEnc: ByteArray, step: Long) = db.update(

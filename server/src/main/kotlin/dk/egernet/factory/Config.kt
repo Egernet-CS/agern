@@ -23,6 +23,8 @@ data class Config(
     /** null: serve the frontend embedded on the classpath under `web/` (if any). */
     val webDir: Path? = null,
     val claudeBin: String = "claude",
+    /** The OpenAI Codex CLI (image provider `codex`); a bare name is resolved on [agentPath]. */
+    val codexBin: String = "codex",
     val publicUrl: String = "http://localhost:8080",
     val allowedOrigins: Set<String> = emptySet(),
     val maxAgentsPerUser: Int = 8,
@@ -80,7 +82,7 @@ data class Config(
 
     override fun toString(): String =
         "Config(host=$host, port=$port, dbUrl=$dbUrl, dbUser=$dbUser, githubOrg=$githubOrg, auth=$authProviders, " +
-            "admins=$admins, dataDir=$dataDir, webDir=$webDir, claudeBin=$claudeBin, publicUrl=$publicUrl, " +
+            "admins=$admins, dataDir=$dataDir, webDir=$webDir, claudeBin=$claudeBin, codexBin=$codexBin, publicUrl=$publicUrl, " +
             "maxAgentsPerUser=$maxAgentsPerUser, chatIdleMinutes=$chatIdleMinutes, stageTimeoutMs=$stageTimeoutMs, fakeGithub=$fakeGithub, " +
             "attachments=${attachmentMaxCount}x${attachmentMaxBytes shr 20}MB/${attachmentMaxMessageBytes shr 20}MB, " +
             "screenshots=${screenshotMaxCount}x${screenshotMaxBytes shr 20}MB, images=$imageLimits, sandbox=$sandbox)"
@@ -140,6 +142,7 @@ data class Config(
                 dataDir = Paths.get(get("FACTORY_DATA_DIR") ?: "./data").toAbsolutePath().normalize(),
                 webDir = get("FACTORY_WEB_DIR")?.let { Paths.get(it).toAbsolutePath().normalize() },
                 claudeBin = get("FACTORY_CLAUDE_BIN") ?: "claude",
+                codexBin = get("FACTORY_CODEX_BIN") ?: "codex",
                 publicUrl = get("FACTORY_PUBLIC_URL") ?: "http://localhost:8080",
                 allowedOrigins = (get("FACTORY_ALLOWED_ORIGINS") ?: "").split(',').map { originOf(it.trim()) }
                     .filter { it.isNotEmpty() }.toSet(),

@@ -25,10 +25,13 @@ import dk.egernet.factory.forbidden
 import dk.egernet.factory.github.Access
 import dk.egernet.factory.mcp.McpGrant
 import dk.egernet.factory.notFound
+import dk.egernet.factory.tooManyAttempts
 import dk.egernet.factory.security.SecretBox
 import dk.egernet.factory.unprocessable
 import io.ktor.http.HttpStatusCode
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -42,6 +45,7 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import org.slf4j.LoggerFactory
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.security.MessageDigest
 import java.util.UUID
@@ -69,6 +73,8 @@ class ImageService(
     private val workspaces: Workspaces,
     /** Appends an event to a session's transcript (AgentManager.publish). */
     private val publishEvent: (UUID, String, JsonElement) -> Unit,
+    /** Time source of the key and login throttles (tests use a controllable clock). */
+    clock: java.time.Clock = java.time.Clock.systemUTC(),
 ) {
     private val log = LoggerFactory.getLogger(ImageService::class.java)
     private val providers: Map<String, ImageProvider> = providers.associateBy { it.id }
@@ -76,6 +82,14 @@ class ImageService(
 
     /** Publishes a run on the feed (Orchestrator.publish); set after construction, as the orchestrator depends on this. */
     @Volatile var publishRun: (UUID) -> Unit = {}
+
+    /** The user's provider setting was saved or removed: cancels a pending device login (set to CodexLogins.cancel). */
+    @Volatile var onSettingChanged: (UUID) -> Unit = {}
+
+    /** Provider-rejected keys per user: 5 within 15 minutes block further `PUT /api/me/image-provider` calls. */
+    private val rejectedKeys = AttemptLimiter(5, java.time.Duration.ofMinutes(15), clock)
+    /** Device-login starts per user (CodexLogins). */
+    val loginStarts = AttemptLimiter(5, java.time.Duration.ofMinutes(15), clock)
 
     companion object {
         /** The tool offered to chats, spec-writers and builders. */
@@ -97,13 +111,22 @@ class ImageService(
         fun slug(s: String): String =
             s.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-').take(40).trim('-').ifEmpty { "image" }
 
-        /** Creates `<worktree>/.agern-run/` with a `.gitignore` of `*`, so git ignores the directory, that file included. */
+        /**
+         * Creates `<worktree>/.agern-run/` with a `.gitignore` of `*`, so git ignores the directory, that file included.
+         * Never follows a symlink: `.agern-run` must be absent or a real directory inside the worktree, else
+         * [UnsafeDirectoryException] and nothing is written.
+         */
         fun ensureRunDir(worktree: Path): Path {
-            val dir = worktree.resolve(RUN_DIR)
-            Files.createDirectories(dir)
+            val dir = SafeFiles.plainDirectories(worktree, RUN_DIR)
             val ignore = dir.resolve(".gitignore")
-            if (!Files.exists(ignore)) Files.writeString(ignore, "*\n")
+            if (!Files.isRegularFile(ignore, LinkOption.NOFOLLOW_LINKS)) SafeFiles.write(ignore, "*\n".toByteArray())
             return dir
+        }
+
+        /** `<worktree>/.agern-run/images/`, created under the rules of [ensureRunDir]. Blocking. */
+        fun runImagesDir(worktree: Path): Path {
+            ensureRunDir(worktree)
+            return SafeFiles.plainDirectories(worktree, RUN_DIR, "images")
         }
 
         /** The `<images>` block of the spec-writer's and builder's task prompts. */
@@ -121,29 +144,45 @@ class ImageService(
             append("</images>\n")
         }
 
+        const val UNSAFE_RUN_DIR_TOOL = "Images cannot be written: `.agern-run` in this working directory is not a plain directory."
+        const val UNSAFE_RUN_DIR_RUN = "Prepared images could not be handed over: `.agern-run` in the repository is not a plain directory"
+
         private fun toolError(msg: String) = ApiException(HttpStatusCode.BadRequest, "image_tool", msg)
     }
 
     // ------------------------------------------------------------ catalogue and the per-user setting
 
     fun catalogue() = ImageConfigDto(
-        providers.values.map { ImageProviderInfoDto(it.id, it.label, it.models, it.defaultModel, it.supportsTransparency, it.keyPlaceholder) },
+        providers.values.map {
+            val reason = it.availability()
+            ImageProviderInfoDto(
+                it.id, it.label, it.models, it.defaultModel, it.supportsTransparency, it.keyPlaceholder, it.auth, reason == null, reason,
+            )
+        },
         ImageLimitsDto(limits.maxPerRequest, limits.maxPerTurn, limits.maxPerStage, limits.maxEdge),
     )
 
     /** Validates [apiKey] and [model] with the provider, then stores them encrypted for [user] (replacing any earlier setting). */
     suspend fun save(user: UserRecord, providerId: String, model: String, apiKey: String): UserRecord {
         val p = providers[providerId] ?: throw badRequest("Unknown image provider '$providerId'")
+        if (p.auth == ImageProvider.DEVICE_LOGIN) {
+            throw conflict("${p.label} is connected by signing in with ChatGPT, not with an API key.", "codex_login_required")
+        }
         val m = model.trim()
         if (!MODEL.matches(m)) throw badRequest("The model name may only contain letters, digits, '.', '_', ':' and '-' (at most 100)")
         val key = apiKey.trim()
         if (key.isEmpty() || key.length > 4096 || key.any { it.isWhitespace() }) throw unprocessable("The API key looks malformed", "image_key_invalid")
+        withContext(Dispatchers.IO) { p.availability() }?.let { throw unavailableHere(it) }
+        // Testing stolen keys through us is throttled: provider-rejected keys count, per user (a success does not reset).
+        rejectedKeys.blockedUntil(user.id)?.let { throw tooManyAttempts("Too many rejected API keys. Try again later.", it) }
         try {
             withContext(Dispatchers.IO) { p.validate(key, m) }
         } catch (e: ImageProviderException) {
             throw when (e.kind) {
-                ImageProviderException.INVALID_CREDENTIAL ->
+                ImageProviderException.INVALID_CREDENTIAL -> {
+                    rejectedKeys.record(user.id)
                     unprocessable("${p.label} rejected the API key. Check that it is complete and active.", "image_key_invalid")
+                }
                 ImageProviderException.UNKNOWN_MODEL -> unprocessable("${p.label} does not know the model '$m' for this key.", "image_model_unknown")
                 else -> unavailable(p)
             }
@@ -151,14 +190,31 @@ class ImageService(
             throw unavailable(p)
         }
         users.setImageProvider(user.id, p.id, m, box.encrypt(key, user.username))
+        onSettingChanged(user.id)
         log.info("Image provider of {} set to {} ({})", user.username, p.id, m)
         return users.byId(user.id)!!
     }
+
+    /**
+     * Stores a device-login secret (e.g. Codex's `auth.json`) encrypted for [userId], replacing any earlier setting.
+     * Called by CodexLogins when the user finished signing in. Blocking.
+     */
+    fun storeLogin(userId: UUID, providerId: String, secret: String) {
+        val p = providers[providerId] ?: error("unknown provider $providerId")
+        val u = users.byId(userId) ?: return
+        users.setImageProvider(u.id, p.id, p.defaultModel, box.encrypt(secret, u.username))
+        log.info("Image provider of {} set to {} (device login)", u.username, p.id)
+    }
+
+    fun provider(id: String): ImageProvider? = providers[id]
+
+    fun unavailableHere(reason: String) = conflict(reason, "image_provider_unavailable_here")
 
     private fun unavailable(p: ImageProvider) =
         ApiException(HttpStatusCode.BadGateway, "image_provider_unavailable", "Could not reach ${p.label} to check the key. Nothing was saved.")
 
     fun remove(user: UserRecord): UserRecord {
+        onSettingChanged(user.id)
         users.setImageProvider(user.id, null, null, null)
         return users.byId(user.id)!!
     }
@@ -166,6 +222,9 @@ class ImageService(
     // ------------------------------------------------------------ budgets (in memory, per agent session)
 
     private val used = ConcurrentHashMap<UUID, Int>()
+
+    /** Per-user lock of device-login providers: one generation at a time per stored login. */
+    private val loginLocks = ConcurrentHashMap<UUID, Mutex>()
 
     /** Reserves [n] images of [max] for [sessionId]; null on success, else how many are left. */
     private fun reserve(sessionId: UUID, n: Int, max: Int): Int? {
@@ -267,6 +326,15 @@ class ImageService(
         if (args.transparent && !provider.supportsTransparency) {
             throw toolError("${provider.label} cannot generate a transparent background. Ask without transparentBackground (or generate on a plain background).")
         }
+        // Where a run's images go must be a plain directory before anything is spent (a repository may plant a symlink).
+        val worktree = run?.let { workspaces.runDir(owner.username, it.repo, it.id) }
+        if (worktree != null) {
+            try {
+                withContext(Dispatchers.IO) { runImagesDir(worktree) }
+            } catch (e: UnsafeDirectoryException) {
+                throw toolError(UNSAFE_RUN_DIR_TOOL)
+            }
+        }
 
         val max = if (run == null) limits.maxPerTurn else limits.maxPerStage
         reserve(session.id, args.count, max)?.let { left ->
@@ -277,12 +345,33 @@ class ImageService(
         }
 
         var delivered = 0
+        var key = ""
         try {
-            val key = box.decrypt(enc, owner.username)
             val started = System.currentTimeMillis()
+            val request = ImageRequest(args.prompt, args.width, args.height, args.format, args.count, args.transparent)
             val raw = try {
-                withContext(Dispatchers.IO) {
-                    provider.generate(key, model, ImageRequest(args.prompt, args.width, args.height, args.format, args.count, args.transparent))
+                if (provider.auth == ImageProvider.DEVICE_LOGIN) {
+                    // A login must not be used by two processes at once (it may be refreshed and rewritten): one call per
+                    // user at a time, and the stored login is read only once the lock is held.
+                    loginLocks.computeIfAbsent(owner.id) { Mutex() }.withLock {
+                        val now = withContext(Dispatchers.IO) { users.byId(owner.id) }
+                        val nowEnc = now?.imageKeyEnc
+                        if (now?.imageProvider != provider.id || nowEnc == null) {
+                            throw ImageProviderException(ImageProviderException.INVALID_CREDENTIAL)
+                        }
+                        key = box.decrypt(nowEnc, owner.username)
+                        var current: ByteArray = nowEnc
+                        withContext(Dispatchers.IO) {
+                            provider.generate(key, now.imageModel ?: model, request) { renewed ->
+                                val newEnc = box.encrypt(renewed, owner.username)
+                                // Compare-and-set: a re-login or removal during the call wins.
+                                if (users.replaceImageKey(owner.id, provider.id, current, newEnc)) current = newEnc
+                            }
+                        }
+                    }
+                } else {
+                    key = box.decrypt(enc, owner.username)
+                    withContext(Dispatchers.IO) { provider.generate(key, model, request) {} }
                 }
             } catch (e: ImageProviderException) {
                 log.info("Image generation for {} with {} ({}) failed: {}", owner.username, provider.id, model, e.kind)
@@ -303,7 +392,6 @@ class ImageService(
             if (checked.isEmpty()) throw toolError(providerMessage(provider, ImageProviderException(ImageProviderException.NO_IMAGE), key))
 
             val requestId = UUID.randomUUID()
-            val worktree = run?.let { workspaces.runDir(owner.username, it.repo, it.id) }
             val stored = withContext(Dispatchers.IO) {
                 checked.map { (bytes, type, dims) ->
                     val sha = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
@@ -313,7 +401,12 @@ class ImageService(
                             args.prompt, args.purpose, type, bytes, sha, dims.first, dims.second, args.transparent,
                         ),
                     )
-                    meta to writeFile(meta, bytes, worktree)
+                    meta to try {
+                        writeFile(meta, bytes, worktree)
+                    } catch (e: UnsafeDirectoryException) {
+                        store.deleteUnselected(meta.id, owner.id)
+                        throw toolError(UNSAFE_RUN_DIR_TOOL)
+                    }
                 }
             }
             delivered = stored.size
@@ -369,7 +462,9 @@ class ImageService(
     private fun providerMessage(p: ImageProvider, e: ImageProviderException, key: String): String {
         val l = p.label
         return when (e.kind) {
-            ImageProviderException.INVALID_CREDENTIAL -> "$l rejected your API key. Update it under Settings → Image generation."
+            ImageProviderException.INVALID_CREDENTIAL ->
+                if (p.auth == ImageProvider.DEVICE_LOGIN) "Your sign-in to $l is no longer valid. Connect it again under Settings → Image generation."
+                else "$l rejected your API key. Update it under Settings → Image generation."
             ImageProviderException.QUOTA -> "Your $l account has no quota or credit left for image generation."
             ImageProviderException.RATE_LIMITED -> "$l is rate-limiting your account right now. Try again in a little while."
             ImageProviderException.CONTENT_REFUSED -> "$l refused to generate this image because of its content rules. Change the prompt."
@@ -394,15 +489,14 @@ class ImageService(
     /** Writes the agent's copy and returns the tool's `path`: relative to the worktree in a run, absolute in a chat. Blocking. */
     private fun writeFile(m: ImageMeta, bytes: ByteArray, worktree: Path?): String {
         return if (worktree != null) {
-            val dir = ensureRunDir(worktree).resolve("images")
-            Files.createDirectories(dir)
-            Files.write(dir.resolve(fileName(m)), bytes)
+            SafeFiles.write(runImagesDir(worktree).resolve(fileName(m)), bytes)
             "$RUN_DIR/images/${fileName(m)}"
         } else {
-            val dir = chatDir(m.sessionId)
-            Files.createDirectories(dir)
+            val parent = cfg.dataDir.resolve("generated-images")
+            Files.createDirectories(parent)
+            val dir = SafeFiles.plainDirectories(parent, m.sessionId.toString())
             val f = dir.resolve(fileName(m))
-            Files.write(f, bytes)
+            SafeFiles.write(f, bytes)
             f.toAbsolutePath().toString()
         }
     }
@@ -480,12 +574,20 @@ class ImageService(
     fun handOver(run: RunRecord, worktree: Path): List<PreparedImage> {
         val claimed = store.claimForRun(run.repo, run.issueNumber, run.id)
         if (claimed.isEmpty()) return emptyList()
-        val dir = ensureRunDir(worktree).resolve("images")
-        Files.createDirectories(dir)
+        // The selection is claimed already; a failed run unlocks it again.
+        val dir = try {
+            runImagesDir(worktree)
+        } catch (e: UnsafeDirectoryException) {
+            throw IllegalStateException(UNSAFE_RUN_DIR_RUN)
+        }
         return claimed.mapIndexedNotNull { i, m ->
             val bytes = store.data(m.id) ?: return@mapIndexedNotNull null
             val name = "prepared-%02d-%s.%s".format(i + 1, slug(m.name ?: m.purpose), Screenshots.extension(m.mediaType))
-            Files.write(dir.resolve(name), bytes)
+            try {
+                SafeFiles.write(dir.resolve(name), bytes)
+            } catch (e: UnsafeDirectoryException) {
+                throw IllegalStateException(UNSAFE_RUN_DIR_RUN)
+            }
             PreparedImage(m, "$RUN_DIR/images/$name")
         }
     }
@@ -494,6 +596,6 @@ class ImageService(
     fun removeSession(sessionId: UUID) {
         newTurn(sessionId)
         store.deleteUnselectedOfSession(sessionId)
-        runCatching { chatDir(sessionId).toFile().deleteRecursively() }
+        runCatching { SafeFiles.deleteTree(chatDir(sessionId)) }
     }
 }

@@ -293,4 +293,40 @@ class ImageToolTest {
         val ev = w.services.events.list(UUID.fromString(run.stages.single { it.role == "builder" }.sessionId), 0, 100)
         assertEquals(1, ev.count { it.type == "images" })
     }
+
+    @Test
+    fun `a symlinked agern-run directory is refused before the provider is called, a symlinked file name is replaced`() {
+        val w = world()
+        w.user("alice"); w.imageKey("alice", "rec-alice-key")
+        val outside = Files.createTempDirectory("agern-outside")
+        val answers = ConcurrentHashMap<String, Mcp.Answer>()
+        runWith(w) { role, p ->
+            if (role == "spec-writer") {
+                Files.createSymbolicLink(p.spec.workDir.resolve(".agern-run"), outside)
+                answers["dir"] = Mcp.generate(w, Mcp.token(p))
+                answers["again"] = Mcp.generate(w, Mcp.token(p))
+                Files.delete(p.spec.workDir.resolve(".agern-run"))
+                // `.agern-run/images` as a symlink is refused the same way.
+                Files.createDirectories(p.spec.workDir.resolve(".agern-run"))
+                Files.createSymbolicLink(p.spec.workDir.resolve(".agern-run/images"), outside)
+                answers["images"] = Mcp.generate(w, Mcp.token(p))
+                Files.delete(p.spec.workDir.resolve(".agern-run/images"))
+                // A symlink planted at the `.gitignore` name is replaced, not written through.
+                Files.delete(p.spec.workDir.resolve(".agern-run/.gitignore"))
+                Files.createSymbolicLink(p.spec.workDir.resolve(".agern-run/.gitignore"), outside.resolve("victim"))
+                answers["file"] = Mcp.generate(w, Mcp.token(p))
+                answers["link"] = Mcp.Answer(false, Files.isSymbolicLink(p.spec.workDir.resolve(".agern-run/.gitignore")).toString())
+            }
+        }
+        val msg = "Images cannot be written: `.agern-run` in this working directory is not a plain directory."
+        assertEquals(Mcp.Answer(true, msg), answers.getValue("dir"))
+        assertEquals(Mcp.Answer(true, msg), answers.getValue("again"), "nothing was reserved by the refused call")
+        assertEquals(Mcp.Answer(true, msg), answers.getValue("images"))
+        assertFalse(answers.getValue("file").isError, answers.getValue("file").text)
+        assertEquals("false", answers.getValue("link").text)
+        assertEquals(1, provider.generations.size, "only the last call reached the provider")
+        assertEquals(1, stored(w))
+        Files.list(outside).use { assertEquals(emptyList(), it.toList(), "nothing was written outside the worktree") }
+        outside.toFile().deleteRecursively()
+    }
 }

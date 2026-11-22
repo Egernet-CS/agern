@@ -33,6 +33,26 @@ interface ImageProvider {
 
     /** Generates the images (encoded bytes, in any order). Blocking; throws [ImageProviderException]. */
     fun generate(key: String, model: String, request: ImageRequest): List<ByteArray>
+
+    /**
+     * How a user connects: [API_KEY] (the Settings form validates and stores a key) or [DEVICE_LOGIN] (the user signs in
+     * through the provider's own device-code flow; `PUT /api/me/image-provider` refuses it).
+     */
+    val auth: String get() = API_KEY
+
+    /** Null when the provider can be used on this server, else the reason shown in Settings. May block briefly. */
+    fun availability(): String? = null
+
+    /**
+     * [generate] for providers whose credential changes while used (e.g. refreshed login tokens): [renew] is called with
+     * the replacement secret whenever it changed, before this returns or throws. [ImageService] always calls this one.
+     */
+    fun generate(key: String, model: String, request: ImageRequest, renew: (String) -> Unit): List<ByteArray> = generate(key, model, request)
+
+    companion object {
+        const val API_KEY = "api_key"
+        const val DEVICE_LOGIN = "device_login"
+    }
 }
 
 /**
