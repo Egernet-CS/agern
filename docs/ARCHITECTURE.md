@@ -1353,7 +1353,7 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 
 | Method & path | Body → Response | Notes |
 |---|---|---|
-| `GET /api/health` | → `{ status: 'ok', version, name: 'agern' }` | no auth |
+| `GET /api/health` | → `{ status: 'ok', version, name: 'agern' }` | no auth; the web UI shows `version` in the user menu |
 | `GET /api/internal/activity` | → `{ idle, activeRuns, busyAgents, version }` | no auth, **host-local only**: answered only when the TCP peer is a loopback address and no proxy header (`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP`) is present; anyone else gets the generic 404. `activeRuns`: runs in `queued`/`spec`/`building`/`reviewing`/`approving` (a restart fails them); `busyAgents`: sessions `starting`/`running` (pipeline agents, chats mid-turn). `needs_human` runs and chats between turns survive a restart and do not count. Used by the upgrade timer (§9) |
 | `GET /api/auth/providers` | → `{ providers: string[], org: string, twoFactor: boolean }` | no auth |
 | `POST /api/auth/login` | `{ username, password }` → `LoginStep` | sets cookie (pending until 2FA passes) |
