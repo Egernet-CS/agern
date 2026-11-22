@@ -18,7 +18,8 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   } catch {
     throw new ApiError(0, 'network', 'The factory server could not be reached.');
   }
-  if (res.status === 204 || res.status === 202) return undefined as T;
+  // 202 may carry a body (e.g. the Run of POST /runs/{id}/messages); an empty one reads as undefined below.
+  if (res.status === 204) return undefined as T;
   const text = await res.text();
   let data: unknown = undefined;
   if (text) {

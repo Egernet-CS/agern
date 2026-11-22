@@ -301,7 +301,8 @@ function HumanDetail({ run, session, isOwner, onRun }: { run: Run; session: Agen
     setStarting(true);
     setErr(null);
     try {
-      onRun(await api.reviewRun(run.id));
+      const r = await api.reviewRun(run.id);
+      if (r) onRun(r);
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : 'Could not start the review.');
     } finally {
@@ -312,7 +313,10 @@ function HumanDetail({ run, session, isOwner, onRun }: { run: Run; session: Agen
     () =>
       isOwner && waiting
         ? {
-            send: async (text: string) => onRun(await api.sendRunMessage(run.id, text)),
+            send: async (text: string) => {
+              const r = await api.sendRunMessage(run.id, text);
+              if (r) onRun(r);
+            },
             blocked: state === 'reviewing' ? 'The reviewers are checking the latest change. You can continue when they are done.' : null,
             label: 'Message the run assistant',
             placeholder: 'Ask about this run, or ask for a change…',
