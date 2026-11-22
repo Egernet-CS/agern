@@ -263,12 +263,20 @@ class SessionStore(private val db: Db) {
     fun countBusy(): Int =
         db.queryOne("SELECT count(*) AS n FROM agent_sessions WHERE status IN ('starting','running')") { it.getInt("n") } ?: 0
 
-    /** On startup no process can be alive: chats become idle (resumable), stage agents failed. */
+    /**
+     * On startup no process can be alive: chats become idle (resumable), and so do the advisors of runs that still need
+     * a human; every other unfinished session (stage agents, advisors of ended runs) fails.
+     */
     fun recoverAfterRestart() {
         db.update("UPDATE agent_sessions SET status = 'idle', updated_at = now() WHERE kind = 'chat' AND status IN ('starting','running')")
         db.update(
-            "UPDATE agent_sessions SET status = 'failed', updated_at = now(), ended_at = now() " +
-                "WHERE kind <> 'chat' AND status IN ('starting','running','idle')",
+            """UPDATE agent_sessions s SET status = 'idle', updated_at = now() FROM runs r
+               WHERE s.kind = 'advisor' AND s.status IN ('starting','running','idle') AND r.id = s.run_id AND r.status = 'needs_human'""",
+        )
+        db.update(
+            """UPDATE agent_sessions s SET status = 'failed', updated_at = now(), ended_at = now()
+               WHERE s.kind <> 'chat' AND s.status IN ('starting','running','idle')
+                 AND NOT (s.kind = 'advisor' AND EXISTS (SELECT 1 FROM runs r WHERE r.id = s.run_id AND r.status = 'needs_human'))""",
         )
     }
 }
@@ -292,6 +300,13 @@ class EventStore(private val db: Db) {
         )
         return EventDto(seq, sessionId.toString(), ts.iso(), type, payload)
     }
+
+    /** The `result` text of the session's last `claude` event of type `result`, or null. */
+    fun lastResultText(sessionId: UUID): String? = db.queryOne(
+        """SELECT payload->>'result' AS r FROM events WHERE session_id = ? AND type = 'claude' AND payload->>'type' = 'result'
+           ORDER BY seq DESC LIMIT 1""",
+        sessionId,
+    ) { it.getString("r") }
 
     fun list(sessionId: UUID, after: Long, limit: Int): List<EventDto> = db.query(
         "SELECT seq, ts, type, payload::text AS p FROM events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?",
@@ -322,6 +337,13 @@ data class RunRecord(
     val releaseId: UUID? = null,
     /** The branch the run starts from and merges into; null = the repository's default branch. */
     val baseBranch: String? = null,
+    /** The run's advisor session (docs/ARCHITECTURE.md §6 "Conversation at needs human"). */
+    val advisorSessionId: UUID? = null,
+    /** The worktree HEAD the last completed review saw; set when the conversation starts. */
+    val reviewedSha: String? = null,
+    /** [dk.egernet.factory.ReviewState]. */
+    val reviewState: String = dk.egernet.factory.ReviewState.NONE,
+    val followUpFrom: Int? = null,
 )
 
 class RunStore(private val db: Db) {
@@ -336,6 +358,7 @@ class RunStore(private val db: Db) {
         rs.getString("pr_url"), rs.uuid("owner_id"), rs.getString("owner_username"), rs.getString("owner_display_name"),
         rs.uuidOrNull("started_by_session_id"), rs.getString("error"), rs.instant("created_at"), rs.instant("updated_at"),
         rs.instantOrNull("ended_at"), rs.getString("sandbox"), rs.uuidOrNull("release_id"), rs.getString("base_branch"),
+        rs.uuidOrNull("advisor_session_id"), rs.getString("reviewed_sha"), rs.getString("review_state"), rs.intOrNull("follow_up_from"),
     )
 
     private fun mapStage(rs: ResultSet) = StageRecord(
@@ -452,6 +475,36 @@ class RunStore(private val db: Db) {
     fun setPr(id: UUID, number: Int, url: String) =
         db.update("UPDATE runs SET pr_number = ?, pr_url = ?, updated_at = now() WHERE id = ?", number, url, id)
 
+    /**
+     * Binds [sessionId] as the run's advisor unless it already has one (concurrent first messages); records
+     * [headSha] as the reviewed commit when none is recorded yet. Returns the run's advisor session id afterwards.
+     */
+    fun bindAdvisor(id: UUID, sessionId: UUID, headSha: String?): UUID? {
+        db.update(
+            """UPDATE runs SET advisor_session_id = ?, reviewed_sha = COALESCE(reviewed_sha, ?), updated_at = now()
+               WHERE id = ? AND advisor_session_id IS NULL""",
+            sessionId, headSha, id,
+        )
+        return get(id)?.advisorSessionId
+    }
+
+    fun setReviewState(id: UUID, state: String) =
+        db.update("UPDATE runs SET review_state = ?, updated_at = now() WHERE id = ?", state, id)
+
+    /** Moves the review state from [from] to [to]; false when it was not [from] (another caller won). */
+    fun casReviewState(id: UUID, from: String, to: String): Boolean =
+        db.update("UPDATE runs SET review_state = ?, updated_at = now() WHERE id = ? AND review_state = ?", to, id, from) == 1
+
+    fun setReviewedSha(id: UUID, sha: String) =
+        db.update("UPDATE runs SET reviewed_sha = ?, updated_at = now() WHERE id = ?", sha, id)
+
+    /** A follow-up round starts: the run's round becomes [round], and the first one is remembered. */
+    fun startFollowUp(id: UUID, round: Int) = db.update(
+        "UPDATE runs SET round = ?, follow_up_from = COALESCE(follow_up_from, ?), updated_at = now() WHERE id = ?", round, round, id,
+    )
+
+    fun setError(id: UUID, error: String) = db.update("UPDATE runs SET error = ?, updated_at = now() WHERE id = ?", error, id)
+
     fun createStage(runId: UUID, role: String, round: Int, model: String): StageRecord {
         val id = UUID.randomUUID()
         db.update("INSERT INTO stages(id, run_id, role, round, model, status) VALUES (?, ?, ?, ?, ?, 'pending')", id, runId, role, round, model)
@@ -491,6 +544,7 @@ class RunStore(private val db: Db) {
             stages = stages(r.id).map { it.toDto(shots[it.id].orEmpty()) },
             sandbox = r.sandboxJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunSandboxDto.serializer(), it) }.getOrNull() },
             releaseId = r.releaseId?.toString(), baseBranch = r.baseBranch,
+            conversation = dk.egernet.factory.RunConversationDto(r.advisorSessionId?.toString(), r.reviewState, r.followUpFrom),
         )
     }
 
@@ -501,6 +555,17 @@ class RunStore(private val db: Db) {
             setStatus(id, RunStatus.FAILED, "Server restarted while the run was in progress; start a new run.")
             closeOpenStages(id)
         }
+        return ids
+    }
+
+    /**
+     * After a restart, for runs that survived it (`needs_human`): an interrupted follow-up review must be started again
+     * (`running` → `required`), and no stage of theirs is left open. Returns the runs whose review was interrupted.
+     */
+    fun recoverConversationsAfterRestart(): List<UUID> {
+        val ids = db.query("SELECT id FROM runs WHERE review_state = 'running'") { it.uuid("id") }
+        db.update("UPDATE runs SET review_state = 'required', updated_at = now() WHERE review_state = 'running'")
+        db.query("SELECT id FROM runs WHERE status = 'needs_human'") { it.uuid("id") }.forEach { closeOpenStages(it) }
         return ids
     }
 }
