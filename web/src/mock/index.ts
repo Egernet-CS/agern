@@ -44,6 +44,8 @@ import {
   interrupt,
   messageAgent,
   MockError,
+  reviewRunChanges,
+  runMessage,
   ORG,
   startRun,
   stopSession,
@@ -387,6 +389,8 @@ export const mockApi: Api = {
       approveRun(r, me());
       return r;
     }),
+  sendRunMessage: (id, text) => ok(() => (needClaude(), runMessage(run(id), text, me()))),
+  reviewRun: (id) => ok(() => reviewRunChanges(run(id), me())),
   cancelRun: (id) =>
     ok(() => {
       const r = run(id);
@@ -411,6 +415,12 @@ export const mockApi: Api = {
     ok(() => {
       const s = session(id);
       if (s.owner.username !== me().username) throw new MockError(403, 'forbidden', 'Only the owner can send input.');
+      if (s.kind === 'assistant' && s.runId) {
+        // Like the backend: the run assistant's input is POST /runs/{runId}/messages (text only).
+        if (attachmentIds.length) throw new MockError(422, 'attachments_not_allowed', 'Messages to the run assistant are text only');
+        runMessage(run(s.runId), text, me());
+        return;
+      }
       if (s.kind !== 'chat') {
         // Like the backend: the same endpoint carries messages to a running spec-writer / builder (text only).
         if (attachmentIds.length) throw new MockError(422, 'attachments_not_allowed', 'Messages to pipeline agents are text only');

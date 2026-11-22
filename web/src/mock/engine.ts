@@ -670,6 +670,8 @@ function findRun(idOrPrefix: string) {
 
 function setRunStatus(r: Run, status: Run['status'], ts: string) {
   r.status = status;
+  // Like the backend: only a waiting run has a review state.
+  r.reviewState = status === 'needs_human' ? r.reviewState ?? 'current' : null;
   if (['merged', 'failed', 'cancelled'].includes(status)) {
     r.endedAt = ts;
     const issue = db.issues[r.repo]?.find((i) => i.number === r.issueNumber);
@@ -968,6 +970,8 @@ function makeRun(repo: string, issue: Issue, owner: User, createdMs: number, sta
     sandbox: runSandboxFor(repo),
     releaseId: release?.id ?? null,
     baseBranch: release ? `release/${release.name}` : null,
+    assistantSessionId: null,
+    reviewState: null,
   };
   for (const role of ['spec-writer', 'builder', ...reviewers, 'approver'] as StageRole[]) pendingStage(r, role, 0);
   db.runs.set(r.id, r);
@@ -1001,8 +1005,99 @@ export function startRun(repo: string, issueNumber: number, owner: User, started
 export function approveRun(r: Run, by: User) {
   if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner can approve this run.');
   if (r.status !== 'needs_human') throw new MockError(409, 'conflict', 'Run is not waiting for a human.');
+  // Like the backend: not while the run assistant works or reviews run, and only once the branch head was reviewed.
+  const a = r.assistantSessionId ? db.sessions.get(r.assistantSessionId) : undefined;
+  if (a && (a.status === 'running' || a.status === 'starting')) throw new MockError(409, 'agent_busy', 'The run assistant is still working; wait for its answer or interrupt it');
+  if (r.reviewState === 'reviewing') throw new MockError(409, 'reviews_running', 'The reviewers are checking the latest change; continue when they are done');
+  if (r.reviewState === 'unreviewed') throw new MockError(409, 'changes_not_reviewed', 'The latest change on the branch has not been reviewed yet.');
   r.error = null;
   setRunStatus(r, 'merged', iso(Date.now()));
+  if (a) closeAssistant(a, `The run was approved by ${by.username}; this conversation is closed.`);
+}
+
+function closeAssistant(s: AgentSession, note: string) {
+  db.players.get(s.id)?.cancel();
+  db.players.delete(s.id);
+  const ts = iso(Date.now());
+  setStatus(s, 'stopped', ts);
+  emit(s.id, 'system', { level: 'info', text: note }, ts);
+}
+
+/**
+ * Like the backend's `POST /runs/{id}/messages` (docs/ARCHITECTURE.md §6 "Talking to an agent at needs human"): a
+ * canned answer from the run assistant; a message containing "change" simulates a commit, after which a follow-up
+ * review round runs and passes.
+ */
+export function runMessage(r: Run, text: string, by: User): Run {
+  if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner of this run can talk to its agent');
+  if (r.status !== 'needs_human') throw new MockError(409, 'run_not_waiting', `Run is ${r.status}; its agent can only be talked to while it waits at needs_human`);
+  const existing = r.assistantSessionId ? db.sessions.get(r.assistantSessionId) : undefined;
+  if (existing && (existing.status === 'running' || existing.status === 'starting')) throw new MockError(409, 'agent_busy', 'The run assistant is still working; wait for its answer or interrupt it');
+  if (r.reviewState === 'reviewing') throw new MockError(409, 'reviews_running', 'The reviewers are checking the latest change; continue when they are done');
+  if (!text.trim()) throw new MockError(400, 'bad_request', 'text must not be empty');
+  if (text.length > 100_000) throw new MockError(400, 'bad_request', 'text is too long');
+  const now = Date.now();
+  let s = existing;
+  if (!s) {
+    s = newSession(r.repo, 'assistant', by, { runId: r.id, issueNumber: r.issueNumber, title: `assistant · #${r.issueNumber}`, model: effective(by.username).model('builder') }, now);
+    s.status = 'idle';
+    emit(s.id, 'system', { level: 'info', text: `Conversation with the run assistant about run ${r.id}. It works in the run's worktree; talking never approves the run, and a committed change is reviewed again before approval.` }, iso(now));
+    r.assistantSessionId = s.id;
+  }
+  const first = (db.events.get(s.id) ?? []).every((e) => e.type !== 'claude');
+  const commit = /change/i.test(text);
+  const findings = r.stages.filter((x) => x.findings.length && x.round === Math.max(...r.stages.map((y) => y.round))).reduce((n, x) => n + x.findings.length, 0);
+  const steps: Step[] = commit
+    ? [
+        { kind: 'think', text: 'The owner asked for a change; keep it as small as asked.' },
+        { kind: 'tool', name: 'Bash', input: { command: 'git commit -am "Follow-up change"' }, result: '[branch 4f2c1d9] Follow-up change\n 1 file changed, 3 insertions(+)' },
+        { kind: 'text', text: 'Committed the change (`Follow-up change`, 1 file). Agern pushes it to the pull request now, and the four reviewers check it again before the run can be approved.' },
+      ]
+    : [
+        { kind: 'think', text: 'Read the diff and the findings before answering.' },
+        { kind: 'text', text: `The run needs a human because: ${r.error ?? 'the approver escalated'}\n\nThe latest review round has ${findings} finding${findings === 1 ? '' : 's'}; none of them blocks the merge on its own. Ask me for a change if you want one before approving.` },
+      ];
+  const p = new Player('live', now);
+  db.players.set(s.id, p);
+  const sess = s;
+  play(sess, steps, p, {
+    userText: text,
+    init: first,
+    onDone: () => {
+      db.players.delete(sess.id);
+      setStatus(sess, 'idle', iso(Date.now()));
+      if (commit && r.status === 'needs_human') followUpReview(r, by);
+    },
+  });
+  touchRun(r, iso(now));
+  return r;
+}
+
+/** Like the backend: four reviewer stages in a new round (no builder), run in parallel; they all pass here. */
+function followUpReview(r: Run, owner: User) {
+  const round = Math.max(...r.stages.map((x) => x.round)) + 1;
+  r.reviewState = 'reviewing';
+  for (const role of reviewers) pendingStage(r, role, round);
+  touchRun(r, iso(Date.now()));
+  const plan: Plan = { changes: {}, approver: 'APPROVE', liveFrom: () => true };
+  let pending = reviewers.length;
+  for (const role of reviewers) {
+    runStage(r, role, round, plan, Date.now(), owner, () => {
+      if (--pending > 0 || r.status !== 'needs_human') return;
+      r.reviewState = 'current';
+      touchRun(r, iso(Date.now()));
+    });
+  }
+}
+
+/** Like the backend's `POST /runs/{id}/review`. */
+export function reviewRunChanges(r: Run, by: User): Run {
+  if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner of this run can start its reviews');
+  if (r.status !== 'needs_human') throw new MockError(409, 'run_not_waiting', `Run is ${r.status}; its agent can only be talked to while it waits at needs_human`);
+  if (r.reviewState === 'reviewing') throw new MockError(409, 'reviews_running', 'The reviewers are checking the latest change; continue when they are done');
+  if (r.reviewState !== 'unreviewed') throw new MockError(409, 'nothing_to_review', 'The branch head has already been reviewed');
+  followUpReview(r, by);
+  return r;
 }
 
 export function cancelRun(r: Run) {
@@ -1019,6 +1114,8 @@ export function cancelRun(r: Run) {
   }
   dropSandbox(r.id);
   setRunStatus(r, 'cancelled', iso(Date.now()));
+  const a = r.assistantSessionId ? db.sessions.get(r.assistantSessionId) : undefined;
+  if (a && a.status !== 'stopped') closeAssistant(a, 'The run was cancelled; this conversation is closed.');
 }
 
 // ---------------------------------------------------------------- releases (same rules and error codes as the server)

@@ -9,7 +9,10 @@ import { useLiveRuns, useLiveSessions } from '../lib/realtime';
 import { useNow } from '../lib/useNow';
 import { runStageLine } from './Project';
 
-export const transcriptLink = (s: AgentSession) => (s.kind === 'chat' ? `/p/${s.repo}?session=${s.id}` : `/p/${s.repo}/runs/${s.runId}?stage=${s.kind}`);
+export const transcriptLink = (s: AgentSession) =>
+  s.kind === 'chat'
+    ? `/p/${s.repo}?session=${s.id}`
+    : `/p/${s.repo}/runs/${s.runId}?stage=${s.kind === 'assistant' ? 'human' : s.kind}`;
 
 export function AgentsPage() {
   const me = useMe();

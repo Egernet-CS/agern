@@ -76,8 +76,9 @@ export function buildNodes(run: Run, sessions: Map<string, AgentSession>): Recor
 
   nodes.issue = { ...base('issue'), title: `#${run.issueNumber}`, sub: run.issueTitle, state: 'done', note: run.issueKind, startedAt: run.createdAt };
 
-  // Run.round counts fix rounds: 0 is the initial build, 1..maxRounds are fix rounds.
-  const currentRound = Math.max(run.round, latestStage(run, 'builder')?.round ?? 0);
+  // Run.round counts fix rounds: 0 is the initial build, 1..maxRounds are fix rounds. A follow-up review round (a change
+  // the run assistant made at needs human) has reviewers but no builder: the reviewers and the gate show the highest one.
+  const currentRound = Math.max(run.round, latestStage(run, 'builder')?.round ?? 0, ...REVIEWERS.map((r) => latestStage(run, r)?.round ?? 0));
 
   for (const role of ['spec-writer', 'builder', ...REVIEWERS, 'approver'] as StageRole[]) {
     const st = latestStage(run, role);
@@ -95,12 +96,12 @@ export function buildNodes(run: Run, sessions: Map<string, AgentSession>): Recor
       const stale = REVIEWERS.includes(role) && st.round < currentRound && st.status === 'done';
       if (stale) {
         n.state = TERMINAL_FAIL.includes(run.status) ? 'skipped' : 'stale';
-        n.note = `${roundName(st.round)}: ${st.verdict ?? st.status}`;
+        n.note = `${roundLabel(run, st.round)}: ${st.verdict ?? st.status}`;
         n.verdict = null;
         n.tone = null;
       } else if (st.status === 'pending' && st.round > 0) {
         const prev = stagesFor(run, role).filter((x) => x.round < st.round && x.verdict).pop();
-        if (prev) n.note = `${roundName(prev.round)}: ${prev.verdict}`;
+        if (prev) n.note = `${roundLabel(run, prev.round)}: ${prev.verdict}`;
       }
       if (st.status === 'running' && TERMINAL_FAIL.includes(run.status)) n.state = 'failed';
     } else if (TERMINAL_FAIL.includes(run.status)) n.state = 'skipped';
@@ -128,7 +129,7 @@ export function buildNodes(run: Run, sessions: Map<string, AgentSession>): Recor
   nodes.human = {
     ...base('human'),
     state: run.status === 'needs_human' ? 'running' : approvedByHuman ? 'done' : TERMINAL_FAIL.includes(run.status) || run.status === 'merged' ? 'skipped' : 'pending',
-    sub: run.status === 'needs_human' ? 'waiting for owner' : approvedByHuman ? 'approved by owner' : run.status === 'merged' ? 'not needed' : '/factory approve',
+    sub: run.status === 'needs_human' ? HUMAN_SUB[run.reviewState ?? 'current'] : approvedByHuman ? 'approved by owner' : run.status === 'merged' ? 'not needed' : '/factory approve',
     tone: run.status === 'needs_human' ? 'escalate' : approvedByHuman ? 'pass' : null,
     verdict: run.status === 'needs_human' ? 'WAITING' : approvedByHuman ? 'APPROVED' : null,
   };
@@ -137,6 +138,23 @@ export function buildNodes(run: Run, sessions: Map<string, AgentSession>): Recor
 
 /** "build" for round 0, "fix round N" after. */
 export const roundName = (round: number) => (round === 0 ? 'build' : `fix round ${round}`);
+
+const HUMAN_SUB: Record<NonNullable<Run['reviewState']>, string> = {
+  current: 'waiting for owner',
+  reviewing: 'reviewing change',
+  unreviewed: 'change not reviewed',
+};
+
+/**
+ * Like [roundName], but a round without a builder stage is a follow-up review of a change made at needs human:
+ * "follow-up K", counted from the last builder round.
+ */
+export function roundLabel(run: Run, round: number): string {
+  if (round === 0) return 'build';
+  if (run.stages.some((s) => s.role === 'builder' && s.round === round)) return `fix round ${round}`;
+  const lastBuilder = Math.max(0, ...run.stages.filter((s) => s.role === 'builder' && s.round < round).map((s) => s.round));
+  return `follow-up ${round - lastBuilder}`;
+}
 
 export function rounds(run: Run): { round: number; stages: Stage[] }[] {
   const by = new Map<number, Stage[]>();

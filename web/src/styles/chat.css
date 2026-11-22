@@ -959,3 +959,8 @@
     right: 10px;
   }
 }
+
+/* The run assistant's empty conversation: the message sits at the top, the composer at the bottom. */
+.stage-detail--human .chat-scroll {
+  min-height: 120px;
+}

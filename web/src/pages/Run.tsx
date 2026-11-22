@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { api, ApiError, isRunActive, isRunWorking, type AgentSession, type Run, type Screenshot, type StageRole } from '../api';
-import { ChatView } from '../components/chat/ChatView';
+import { ChatView, type ComposeOverride } from '../components/chat/ChatView';
+import { Prompt } from '../components/chat/Prompt';
 import { RunSandboxLine } from '../components/sandbox/SandboxBits';
 import { Markdown } from '../components/chat/Markdown';
-import { buildNodes, latestStage, REVIEWERS, ROLE_BLURB, roundName, rounds, stagesFor, type NodeId } from '../components/pipeline/model';
+import { buildNodes, latestStage, REVIEWERS, ROLE_BLURB, roundLabel, rounds, stagesFor, type NodeId } from '../components/pipeline/model';
 import { PipelineDiagram } from '../components/pipeline/PipelineDiagram';
 import { Dialog, Empty, ErrorBox, KindBadge, Loading, RunStatusPill, Verdict } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
@@ -18,7 +19,8 @@ const ROLE_ORDER: StageRole[] = ['spec-writer', 'builder', 'security', 'ux', 'ui
 function defaultNode(run: Run): NodeId {
   const running = run.stages.find((s) => s.status === 'running');
   if (running) return running.role;
-  if (run.status === 'needs_human') return 'approver';
+  // At needs human the conversation with the run assistant is where the owner goes next.
+  if (run.status === 'needs_human') return 'human';
   const last = [...run.stages].sort((a, b) => (a.startedAt ?? '').localeCompare(b.startedAt ?? '')).pop();
   return last?.role ?? 'issue';
 }
@@ -44,9 +46,10 @@ export function RunPage() {
 
   // Sessions created after first load: refetch when the run references one we don't know.
   useEffect(() => {
-    if (run?.stages.some((s) => s.sessionId && !sessionMap.has(s.sessionId)) && !sessQ.loading) sessQ.reload();
+    const unknown = run?.stages.some((s) => s.sessionId && !sessionMap.has(s.sessionId)) || (run?.assistantSessionId && !sessionMap.has(run.assistantSessionId));
+    if (unknown && !sessQ.loading) sessQ.reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [run?.stages.length]);
+  }, [run?.stages.length, run?.assistantSessionId]);
 
   if (runQ.error)
     return (
@@ -58,13 +61,20 @@ export function RunPage() {
 
   const nodes = buildNodes(run, sessionMap);
   const selParam = params.get('stage') as NodeId | null;
-  const selected: NodeId = selParam && (selParam === 'issue' || ROLE_ORDER.includes(selParam as StageRole)) ? selParam : defaultNode(run);
+  const humanSelectable = run.status === 'needs_human' || !!run.assistantSessionId;
+  const selected: NodeId =
+    selParam && (selParam === 'issue' || ROLE_ORDER.includes(selParam as StageRole) || (selParam === 'human' && humanSelectable)) ? selParam : defaultNode(run);
   const select = (id: NodeId) => {
     params.set('stage', id);
     params.delete('round');
     setParams(params, { replace: true });
   };
   const isOwner = run.owner.username === me.username;
+  // Approval waits for the run assistant to finish its turn and for the branch head to be reviewed.
+  const assistant = run.assistantSessionId ? sessionMap.get(run.assistantSessionId) : undefined;
+  const assistantWorking = assistant?.status === 'running' || assistant?.status === 'starting';
+  const reviewed = (run.reviewState ?? 'current') === 'current';
+  const approveBlock = !reviewed ? 'Approval is possible once the latest change has been reviewed.' : assistantWorking ? 'The agent is still working.' : null;
 
   const act = async (kind: 'approve' | 'cancel') => {
     setBusy(kind);
@@ -113,9 +123,17 @@ export function RunPage() {
         <RunSandboxLine run={run} />
         <div className="rh-actions">
           {run.status === 'needs_human' && isOwner && (
-            <button className="btn btn--approve" onClick={() => void act('approve')} disabled={busy !== null}>
+            <button
+              className="btn btn--approve"
+              onClick={() => void act('approve')}
+              disabled={busy !== null || approveBlock !== null}
+              aria-describedby={approveBlock ? 'approve-block' : undefined}
+            >
               {busy === 'approve' ? 'Approving…' : '✓ Approve & merge'}
             </button>
+          )}
+          {run.status === 'needs_human' && isOwner && approveBlock && (
+            <span id="approve-block" className="muted small">{approveBlock}</span>
           )}
           {run.status === 'needs_human' && !isOwner && <span className="muted small">Waiting for {run.owner.username} to approve.</span>}
           {active && (isOwner || me.isAdmin) && (
@@ -134,7 +152,11 @@ export function RunPage() {
 
       <RoundsStrip run={run} onPick={(role, round) => { params.set('stage', role); params.set('round', String(round)); setParams(params, { replace: true }); }} />
 
-      <StageDetail run={run} node={selected} round={params.get('round')} sessions={sessionMap} onRound={(r) => { params.set('round', String(r)); setParams(params, { replace: true }); }} />
+      {selected === 'human' ? (
+        <HumanDetail run={run} session={assistant} isOwner={isOwner} onRun={(r) => runQ.setData(() => r)} />
+      ) : (
+        <StageDetail run={run} node={selected} round={params.get('round')} sessions={sessionMap} onRound={(r) => { params.set('round', String(r)); setParams(params, { replace: true }); }} />
+      )}
 
       <Dialog open={confirmCancel} onClose={() => setConfirmCancel(false)} title="Cancel this run?">
         <p>Running agents are stopped. The branch {run.branch && <code>{run.branch}</code>} and any pull request stay on GitHub.</p>
@@ -154,7 +176,7 @@ function RoundsStrip({ run, onPick }: { run: Run; onPick: (role: StageRole, roun
     <section className="rounds" aria-label="Rounds">
       {rs.map(({ round, stages }) => (
         <div key={round} className="round">
-          <span className="round-k">{roundName(round)}</span>
+          <span className="round-k">{roundLabel(run, round)}</span>
           {[...stages].sort((a, b) => ROLE_ORDER.indexOf(a.role) - ROLE_ORDER.indexOf(b.role)).map((s) => (
             <button key={s.id} type="button" className={`round-chip round-chip--${s.status} ${s.verdict ? `round-chip--${s.verdict.toLowerCase()}` : ''}`} onClick={() => onPick(s.role, s.round)}>
               {s.role}
@@ -206,7 +228,7 @@ function StageDetail({ run, node, round, sessions, onRound }: { run: Run; node: 
           <div className="seg seg--small" role="tablist" aria-label="Round">
             {all.map((s) => (
               <button key={s.id} role="tab" aria-selected={s.id === stage?.id} className={s.id === stage?.id ? 'is-on' : ''} onClick={() => onRound(s.round)}>
-                {roundName(s.round)}
+                {roundLabel(run, s.round)}
               </button>
             ))}
           </div>
@@ -224,7 +246,7 @@ function StageDetail({ run, node, round, sessions, onRound }: { run: Run; node: 
               <div><dt>turns</dt><dd>{session?.numTurns ?? '—'}</dd></div>
             </dl>
             {role === 'builder' && stage.round > 0 && (
-              <p className="muted small">Continues the builder conversation of {roundName(stage.round - 1)} (a new agent session resumed with <code>--resume</code>), given all reviewer findings.</p>
+              <p className="muted small">Continues the builder conversation of {roundLabel(run, stage.round - 1)} (a new agent session resumed with <code>--resume</code>), given all reviewer findings.</p>
             )}
             {stage.summary && <div className="sd-summary"><Markdown text={stage.summary} /></div>}
             {stage.findings.length > 0 && (
@@ -257,6 +279,133 @@ function StageDetail({ run, node, round, sessions, onRound }: { run: Run; node: 
         )}
       </div>
     </div>
+  );
+}
+
+const REVIEW_LINE: Record<NonNullable<Run['reviewState']>, string> = {
+  current: 'The branch head has been reviewed.',
+  reviewing: 'The reviewers are checking the latest change…',
+  unreviewed: 'The latest change has not been reviewed.',
+};
+
+/**
+ * The needs-human node: the run's conversation with its assistant (docs/ARCHITECTURE.md §6 "Talking to an agent at needs
+ * human"). Only the owner can talk, and only while the run waits; everyone who can see the run can read it.
+ */
+function HumanDetail({ run, session, isOwner, onRun }: { run: Run; session: AgentSession | undefined; isOwner: boolean; onRun: (r: Run) => void }) {
+  const [starting, setStarting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const waiting = run.status === 'needs_human';
+  const state = run.reviewState ?? 'current';
+  const startReview = async () => {
+    setStarting(true);
+    setErr(null);
+    try {
+      onRun(await api.reviewRun(run.id));
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : 'Could not start the review.');
+    } finally {
+      setStarting(false);
+    }
+  };
+  const compose: ComposeOverride | undefined = useMemo(
+    () =>
+      isOwner && waiting
+        ? {
+            send: async (text: string) => onRun(await api.sendRunMessage(run.id, text)),
+            blocked: state === 'reviewing' ? 'The reviewers are checking the latest change. You can continue when they are done.' : null,
+            label: 'Message the run assistant',
+            placeholder: 'Ask about this run, or ask for a change…',
+            note: 'Talking never approves the run. If the agent commits a change, it is pushed and reviewed again before you can approve. Not posted on GitHub.',
+          }
+        : undefined,
+    [isOwner, waiting, state, run.id, onRun],
+  );
+  return (
+    <div className="stage-detail stage-detail--human">
+      <div className="sd-info">
+        <p className="eyebrow">outcome</p>
+        <h2 className="sd-role">needs-human</h2>
+        <p className="muted">Talk to the run assistant about this run. Talking never approves it.</p>
+        {waiting && (
+          <div className={`sd-review sd-review--${state}`}>
+            <p role="status">{REVIEW_LINE[state]}</p>
+            {state === 'unreviewed' && isOwner && (
+              <button type="button" className="btn btn--sm" onClick={() => void startReview()} disabled={starting}>
+                {starting ? 'Starting…' : 'Review changes'}
+              </button>
+            )}
+          </div>
+        )}
+        {err && <p className="form-error" role="alert">{err}</p>}
+        {session && (
+          <dl className="sd-facts">
+            <div><dt>status</dt><dd className={`st st--${session.status}`}>{session.status}</dd></div>
+            <div><dt>model</dt><dd>{modelLabel(session.model)}</dd></div>
+            <div><dt>cost</dt><dd>{cost(session.costUsd)}</dd></div>
+            <div><dt>turns</dt><dd>{session.numTurns ?? '—'}</dd></div>
+          </dl>
+        )}
+      </div>
+      <div className="sd-transcript">
+        {run.assistantSessionId ? (
+          <ChatView
+            key={run.assistantSessionId}
+            sessionId={run.assistantSessionId}
+            session={session}
+            embedded
+            compose={compose}
+            endedNote={waiting ? undefined : `This conversation ended when the run was ${run.status.replace('_', ' ')}.`}
+          />
+        ) : (
+          <NoConversation run={run} compose={compose} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Before the first message: the empty state and, for the owner of a waiting run, the composer that starts the conversation. */
+function NoConversation({ run, compose }: { run: Run; compose: ComposeOverride | undefined }) {
+  const [err, setErr] = useState<string | null>(null);
+  const send = async (text: string) => {
+    if (!compose) return false;
+    setErr(null);
+    try {
+      await compose.send(text);
+      return true;
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : 'Could not send.');
+      return false;
+    }
+  };
+  const text = compose
+    ? 'No conversation yet. Ask why the run needs a human, or ask for a change.'
+    : run.status === 'needs_human'
+      ? `No conversation yet. Only ${run.owner.username} can talk to the agent about this run.`
+      : 'There was no conversation about this run.';
+  return (
+    <section className="chat chat--embedded" aria-label="Agent transcript">
+      <div className="chat-scroll-wrap">
+        <div className="chat-scroll">
+          <div className="chat-log">
+            <div className="t-meta">{text}</div>
+          </div>
+        </div>
+      </div>
+      {err && (
+        <div className="chat-error" role="alert">
+          {err}
+          <button type="button" className="link" onClick={() => setErr(null)}>dismiss</button>
+        </div>
+      )}
+      {compose && (
+        <>
+          {compose.note && <div className="chat-steer-note muted" role="note">{compose.note}</div>}
+          <Prompt onSubmit={send} working={false} commands={false} label={compose.label} placeholder={compose.placeholder} history={[]} blocked={compose.blocked ?? null} />
+        </>
+      )}
+    </section>
   );
 }
 

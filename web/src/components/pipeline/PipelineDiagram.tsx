@@ -229,7 +229,9 @@ export function PipelineDiagram({ run, nodes, selected, onSelect }: { run: Run; 
   const L = narrow ? V : H;
   const edges = buildEdges(L, nodes, run);
   const order: NodeId[] = ['issue', 'spec-writer', 'builder', 'security', 'ux', 'ui-design', 'code', 'gate', 'approver', 'merge', 'human'];
-  const selectable = (id: NodeId) => !!nodes[id].stage || id === 'issue';
+  // The needs-human node opens the run's conversation with its assistant (while waiting, or once one exists).
+  const selectable = (id: NodeId) =>
+    !!nodes[id].stage || id === 'issue' || (id === 'human' && (run.status === 'needs_human' || !!run.assistantSessionId));
 
   return (
     <div className={`pipeline ${narrow ? 'pipeline--v' : ''}`} ref={wrap}>

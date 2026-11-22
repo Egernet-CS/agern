@@ -159,6 +159,8 @@ export const httpApi: Api = {
   run: (id) => get(`/api/runs/${enc(id)}`),
   approveRun: (id) => post(`/api/runs/${enc(id)}/approve`),
   cancelRun: (id) => post(`/api/runs/${enc(id)}/cancel`),
+  sendRunMessage: (runId, text) => post(`/api/runs/${enc(runId)}/messages`, { text }),
+  reviewRun: (runId) => post(`/api/runs/${enc(runId)}/review`),
 
   projectSessions: (repo, kind) => get(`/api/projects/${enc(repo)}/sessions${kind ? `?kind=${kind}` : ''}`),
   createChat: (repo, model) => post(`/api/projects/${enc(repo)}/sessions`, model ? { model } : {}),

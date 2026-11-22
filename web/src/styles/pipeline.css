@@ -363,3 +363,26 @@
     display: none;
   }
 }
+
+/* needs-human node: the run assistant's review line (Run page, HumanDetail) */
+.sd-review {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin: 12px 0 4px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--pass);
+  border-radius: 6px;
+  background: var(--surface);
+  font: 13px/1.5 var(--font-ui);
+}
+.sd-review p {
+  margin: 0;
+}
+.sd-review--reviewing {
+  border-left-color: var(--amber);
+}
+.sd-review--unreviewed {
+  border-left-color: var(--fail);
+}

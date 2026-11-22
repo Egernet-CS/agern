@@ -173,8 +173,9 @@ export function releaseReadiness(r: Release): 'complete' | 'incomplete' | 'empty
   return r.issues.some((i) => i.state === 'merged') ? 'complete' : 'empty';
 }
 
-export type SessionKind = 'chat' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
-export type StageRole = Exclude<SessionKind, 'chat'>;
+/** `assistant`: the agent a run's owner talks to while the run waits at needs human (not a pipeline stage). */
+export type SessionKind = 'chat' | 'assistant' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
+export type StageRole = Exclude<SessionKind, 'chat' | 'assistant'>;
 
 /** Roles whose running agent accepts messages from the run's owner (docs/ARCHITECTURE.md §6). */
 export const STEERABLE_ROLES: StageRole[] = ['spec-writer', 'builder'];
@@ -220,7 +221,10 @@ export type Finding = { severity: string; file: string | null; detail: string };
 export type Stage = {
   id: string;
   role: StageRole;
-  /** 0 = the initial build; fix rounds are 1..Run.maxRounds. */
+  /**
+   * 0 = the initial build; fix rounds are 1..Run.maxRounds. A round without a builder stage is a follow-up review of a
+   * change the run assistant made while the run waited at needs human.
+   */
   round: number;
   /** The model this stage runs (or ran) with. */
   model: string;
@@ -285,7 +289,16 @@ export type Run = {
   releaseId: string | null;
   /** The branch the run branches from and merges into (`release/<name>`); null for a single run (default branch). */
   baseBranch: string | null;
+  /** The run's conversation with its assistant (created on the owner's first message at needs human). */
+  assistantSessionId: string | null;
+  /**
+   * Only while `needs_human`: whether the branch head has been reviewed. `reviewing`: a follow-up review round runs;
+   * `unreviewed`: the head changed since the last complete review; `current`: approval is possible.
+   */
+  reviewState: ReviewState | null;
 };
+
+export type ReviewState = 'current' | 'reviewing' | 'unreviewed';
 
 /**
  * Whether a run's builder got a sandbox (docs/ARCHITECTURE.md §5 "Sandboxes"). Only `approved` does:

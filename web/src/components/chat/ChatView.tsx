@@ -41,25 +41,46 @@ export type ChatViewProps = {
    */
   embedded?: boolean;
   header?: ReactNode;
+  /**
+   * A text-only composer for an embedded interactive agent other than a chat (the run assistant): its owner sends
+   * through [ComposeOverride.send] instead of the session's input endpoint. Absent: no composer.
+   */
+  compose?: ComposeOverride;
+  /** Shown where the composer would be (e.g. why a conversation has ended). */
+  endedNote?: ReactNode;
 };
 
-export function ChatView({ sessionId, session, disabledReason, embedded, header }: ChatViewProps) {
+export type ComposeOverride = {
+  send: (text: string) => Promise<void>;
+  /** Why sending is not possible right now (e.g. the reviewers are checking a change). */
+  blocked?: string | null;
+  label: string;
+  placeholder: string;
+  /** Shown above the composer. */
+  note?: ReactNode;
+};
+
+export function ChatView({ sessionId, session, disabledReason, embedded, header, compose, endedNote }: ChatViewProps) {
   const me = useMe();
   const stream = useSessionStream(sessionId);
   const { items, summary } = useMemo(() => buildTranscript(stream.events, stream.partials), [stream.events, stream.partials]);
   const isOwner = session ? session.owner.username === me.username : false;
   const isChat = session?.kind === 'chat';
-  const canDrive = isOwner && isChat && !embedded;
+  // The run assistant is interactive like a chat, but driven through the run (a compose override).
+  const isAssistant = session?.kind === 'assistant';
+  const interactive = isChat || isAssistant;
+  const canDrive = isOwner && ((isChat && !embedded) || (isAssistant && !!compose));
   // The server's session status says whether the agent is mid-turn (`starting`/`running`) or waiting (`idle`).
   // It arrives as `status` events on this session's stream and as feed updates of the session.
   const status = summary.status ?? session?.status ?? null;
-  // A stopped chat is not over: the owner's next message resumes the conversation (--resume).
-  const ended = !isChat && (status === 'stopped' || status === 'failed' || status === 'done');
-  const resumable = isChat && status === 'stopped';
+  // A stopped chat (or run assistant) is not over: the owner's next message resumes the conversation (--resume).
+  const ended = !interactive && (status === 'stopped' || status === 'failed' || status === 'done');
+  const resumable = interactive && status === 'stopped';
   const working = status === 'running' || status === 'starting';
   const [sending, setSending] = useState<{ text: string; attachments: Attachment[] } | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const canCompose = canDrive && !ended && !disabledReason;
+  // The chat composer (attachments, /factory commands); the run assistant has its own text-only one.
+  const canCompose = canDrive && isChat && !ended && !disabledReason;
   // Messages to a working pipeline agent: its owner only, spec-writer / builder only, only while it runs.
   const stageRole = !isChat && session ? (session.kind as StageRole) : null;
   const canSteer = isOwner && !!stageRole && STEERABLE_ROLES.includes(stageRole) && status === 'running' && session?.live !== false;
@@ -150,6 +171,24 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
       return true;
     },
     [sessionId],
+  );
+
+  const sendOverride = useCallback(
+    async (text: string) => {
+      if (!compose) return false;
+      setError(null);
+      setSending({ text, attachments: [] });
+      stick.current = true;
+      try {
+        await compose.send(text);
+      } catch (e) {
+        setSending(null);
+        setError(e instanceof ApiError ? e.message : 'Could not send.');
+        return false;
+      }
+      return true;
+    },
+    [compose],
   );
 
   // --- drag and drop anywhere on the chat pane (owner only)
@@ -268,8 +307,26 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
         </div>
       )}
       {canDrive && resumable && !disabledReason && (
-        <div className="chat-resume muted small" role="note">This chat’s agent was stopped. Your next message resumes the conversation.</div>
+        <div className="chat-resume muted small" role="note">
+          {isChat ? 'This chat’s agent was stopped.' : 'The agent was stopped.'} Your next message resumes the conversation.
+        </div>
       )}
+      {canDrive && isAssistant && compose && !disabledReason && (
+        <>
+          {compose.note && <div className="chat-steer-note muted" role="note">{compose.note}</div>}
+          <Prompt
+            onSubmit={sendOverride}
+            onInterrupt={interrupt}
+            working={working}
+            commands={false}
+            label={compose.label}
+            placeholder={compose.placeholder}
+            history={history}
+            blocked={compose.blocked ?? null}
+          />
+        </>
+      )}
+      {endedNote && <div className="chat-disabled">{endedNote}</div>}
       {canCompose && (
         <Prompt
           onSubmit={send}
@@ -308,9 +365,10 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
         <span className={`cf-conn cf-conn--${stream.conn}`}>
           <span aria-hidden>●</span> {stream.conn === 'live' ? 'live' : stream.conn}
         </span>
-        {canDrive && !ended && !disabledReason && (
+        {canDrive && isChat && !ended && !disabledReason && (
           <span className="cf-hints" aria-hidden>⏎ send · ⇧⏎ newline · esc interrupt · / commands · paste or drop files</span>
         )}
+        {canDrive && isAssistant && <span className="cf-hints" aria-hidden>⏎ send · ⇧⏎ newline · esc interrupt</span>}
         {canSteer && <span className="cf-hints" aria-hidden>⏎ send · ⇧⏎ newline · delivered at the agent’s next step</span>}
       </footer>
     </section>

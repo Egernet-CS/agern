@@ -138,6 +138,14 @@ export interface Api {
   run(id: string): Promise<Run>;
   approveRun(id: string): Promise<Run>;
   cancelRun(id: string): Promise<Run>;
+  /**
+   * Owner only, run at `needs_human`: a message to the run assistant (docs/ARCHITECTURE.md §6 "Talking to an agent at
+   * needs human"). Rejects with ApiError 403 for anyone else, 409 `run_not_waiting` / `agent_busy` / `reviews_running`
+   * / `worktree_missing` / `too_many_agents`, 422 `claude_credential_required`.
+   */
+  sendRunMessage(runId: string, text: string): Promise<Run>;
+  /** Owner only: push and review the unreviewed branch head again. 409 `nothing_to_review` when it is current. */
+  reviewRun(runId: string): Promise<Run>;
 
   projectSessions(repo: string, kind?: 'chat'): Promise<AgentSession[]>;
   createChat(repo: string, model?: string): Promise<AgentSession>;
