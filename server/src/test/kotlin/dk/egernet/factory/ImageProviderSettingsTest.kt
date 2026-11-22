@@ -136,4 +136,22 @@ class ImageProviderSettingsTest {
             plain.closeAndReleaseDb(); fake.closeAndReleaseDb()
         }
     }
+
+    @Test
+    fun `image limits are read from the environment and range-checked`() {
+        val base = mapOf("FACTORY_MASTER_KEY" to java.util.Base64.getEncoder().encodeToString(ByteArray(32)), "FACTORY_GITHUB_ORG" to "o")
+        assertEquals(ImageLimits(4, 8, 12, 2048), Config.fromEnv(base).imageLimits)
+        val c = Config.fromEnv(base + mapOf(
+            "FACTORY_IMAGE_MAX_PER_REQUEST" to "10", "FACTORY_IMAGE_MAX_PER_TURN" to "100", "FACTORY_IMAGE_MAX_PER_STAGE" to "1", "FACTORY_IMAGE_MAX_EDGE" to "4096",
+        ))
+        assertEquals(ImageLimits(10, 100, 1, 4096), c.imageLimits)
+        for ((k, v) in listOf(
+            "FACTORY_IMAGE_MAX_PER_REQUEST" to "0", "FACTORY_IMAGE_MAX_PER_REQUEST" to "11", "FACTORY_IMAGE_MAX_PER_TURN" to "101",
+            "FACTORY_IMAGE_MAX_PER_STAGE" to "201", "FACTORY_IMAGE_MAX_PER_STAGE" to "0", "FACTORY_IMAGE_MAX_EDGE" to "255",
+            "FACTORY_IMAGE_MAX_EDGE" to "4097", "FACTORY_IMAGE_MAX_EDGE" to "big",
+        )) {
+            val e = assertFailsWith<IllegalArgumentException>("$k=$v") { Config.fromEnv(base + (k to v)) }
+            assertTrue(e.message!!.contains(k), e.message)
+        }
+    }
 }

@@ -281,7 +281,7 @@ class SandboxTest {
         val run = start(w)
         val done = w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
         assertEquals(RunStatus.MERGED, done.status)
-        assertEquals(McpRegistry.STAGE_TOOLS.sorted(), tools.sorted())
+        assertEquals((McpRegistry.STAGE_TOOLS + dk.egernet.factory.images.ImageService.TOOLS).sorted(), tools.sorted(), "no sandbox tools; the image tool as for every builder")
         assertEquals("disabled", w.services.runs.toDto(done).sandbox!!.state)
         assertTrue(systemTexts(w, run.id).none { it.startsWith("Sandbox") })
         assertFalse(w.launcher.byRole("builder").single().written.first().contains("Sandbox:"))
