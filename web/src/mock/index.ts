@@ -270,6 +270,9 @@ export const mockApi: Api = {
     }),
   putImageProvider: (provider, model, apiKey) => ok(() => images.setImageProvider(me(), provider, model, apiKey)),
   deleteImageProvider: () => ok(() => images.removeImageProvider(me())),
+  startCodexLogin: () => ok(() => images.startCodexLogin()),
+  codexLogin: () => ok(() => images.pollCodexLogin(me())),
+  cancelCodexLogin: () => ok(() => images.cancelCodexLogin()),
   deleteGithubToken: () => ok(() => Object.assign(me(), { hasGithubToken: false, githubLogin: null, githubTokenKind: null, githubTokenScopes: null })),
 
   preferences: () => ok(preferences),

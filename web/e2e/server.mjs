@@ -90,6 +90,8 @@ export async function startServer({ log = false } = {}) {
     FACTORY_2FA: 'required',
     FACTORY_DEV_FAKE_GITHUB: 'true',
     FACTORY_CLAUDE_BIN: join(repo, 'server', 'src', 'test', 'resources', 'fake-claude'),
+    // The fake Codex CLI: device login with the code FAKE-12345 (docs/ARCHITECTURE.md §4 "Codex login").
+    FACTORY_CODEX_BIN: join(repo, 'server', 'src', 'test', 'resources', 'fake-codex'),
     FACTORY_DATA_DIR: dataDir,
     // Sandboxes with the in-memory development runtime; files under <dataDir>/fake-github/<repo>/ are on the fake
     // GitHub's default branches (e.g. .agern/sandbox.yml, written by the sandbox spec).

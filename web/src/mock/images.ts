@@ -1,6 +1,6 @@
 // Generated images in the mock (docs/ARCHITECTURE.md §6 "Generated images"): the provider catalogue, the per-user
 // setting, images from chat messages that ask for an icon, selection per issue and one seeded run image.
-import type { AgentSession, ClientConfig, GeneratedImage, ImagesPayload, Run, User } from '../api/types';
+import type { AgentSession, ClientConfig, CodexLogin, GeneratedImage, ImagesPayload, Run, User } from '../api/types';
 import { db, emitEvent, MockError, uid } from './engine';
 
 /** A 24×24 orange disc on a transparent background: the bytes of every mock image. */
@@ -16,6 +16,9 @@ export const IMAGE_CONFIG: ClientConfig['images'] = {
       defaultModel: 'gpt-image-2.5-flare',
       supportsTransparency: true,
       keyPlaceholder: 'sk-…',
+      auth: 'api_key',
+      available: true,
+      unavailableReason: null,
     },
     {
       id: 'gemini',
@@ -24,6 +27,20 @@ export const IMAGE_CONFIG: ClientConfig['images'] = {
       defaultModel: 'gemini-3.1-flash-image',
       supportsTransparency: false,
       keyPlaceholder: 'AIza…',
+      auth: 'api_key',
+      available: true,
+      unavailableReason: null,
+    },
+    {
+      id: 'codex',
+      label: 'OpenAI Codex',
+      models: ['default'],
+      defaultModel: 'default',
+      supportsTransparency: true,
+      keyPlaceholder: '',
+      auth: 'device_login',
+      available: true,
+      unavailableReason: null,
     },
   ],
   limits: { maxPerRequest: 4, maxPerTurn: 8, maxPerStage: 12, maxEdge: 2048 },
@@ -47,17 +64,48 @@ const byAge = (a: GeneratedImage, b: GeneratedImage) => a.createdAt.localeCompar
 export function setImageProvider(u: User, provider: string, model: string, apiKey: string) {
   const p = IMAGE_CONFIG.providers.find((x) => x.id === provider);
   if (!p) throw new MockError(400, 'bad_request', `Unknown image provider '${provider}'`);
+  if (p.auth === 'device_login') throw new MockError(409, 'codex_login_required', `${p.label} is connected by signing in with ChatGPT, not with an API key.`);
   const m = model.trim();
   if (!MODEL_RE.test(m)) throw new MockError(400, 'bad_request', "The model name may only contain letters, digits, '.', '_', ':' and '-' (at most 100)");
   const key = apiKey.trim();
   if (!key || key.length > 4096 || /\s/.test(key)) throw new MockError(422, 'image_key_invalid', 'The API key looks malformed');
   if (key.includes('bad')) throw new MockError(422, 'image_key_invalid', `${p.label} rejected the API key. Check that it is complete and active.`);
   Object.assign(u, { imageProvider: p.id, imageModel: m });
+  codexLogin = { status: 'none' };
   return u;
 }
 
 export function removeImageProvider(u: User) {
+  codexLogin = { status: 'none' };
   return Object.assign(u, { imageProvider: null, imageModel: null });
+}
+
+// The Codex device login: pending after a start; the third status poll connects it.
+let codexLogin: CodexLogin = { status: 'none' };
+let codexPolls = 0;
+
+export function startCodexLogin(): CodexLogin {
+  codexPolls = 0;
+  codexLogin = {
+    status: 'pending',
+    verificationUrl: 'https://auth.openai.com/codex/device',
+    userCode: 'MOCK-12345',
+    expiresAt: new Date(Date.now() + 15 * 60_000).toISOString(),
+  };
+  return { ...codexLogin };
+}
+
+export function pollCodexLogin(u: User): CodexLogin {
+  if (codexLogin.status === 'pending' && ++codexPolls >= 3) {
+    codexLogin = { status: 'connected' };
+    Object.assign(u, { imageProvider: 'codex', imageModel: 'default' });
+  }
+  return { ...codexLogin };
+}
+
+export function cancelCodexLogin(): CodexLogin {
+  if (codexLogin.status === 'pending') codexLogin = { status: 'none' };
+  return { ...codexLogin };
 }
 
 function newImage(owner: User, repo: string, sessionId: string, origin: 'chat' | 'run', prompt: string, purpose: string, provider: string, model: string): GeneratedImage {

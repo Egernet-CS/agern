@@ -274,6 +274,20 @@ export type ImageProviderInfo = {
   defaultModel: string;
   supportsTransparency: boolean;
   keyPlaceholder: string;
+  /** `device_login`: connected by signing in (Codex), not with an API key. */
+  auth: 'api_key' | 'device_login';
+  /** False when the provider cannot be used on this server (e.g. the CLI is not installed). */
+  available: boolean;
+  unavailableReason: string | null;
+};
+
+/** The caller's Codex device login; the URL and code are present only while `pending`. */
+export type CodexLogin = {
+  status: 'none' | 'pending' | 'connected' | 'failed' | 'expired';
+  verificationUrl?: string | null;
+  userCode?: string | null;
+  expiresAt?: string | null;
+  error?: string | null;
 };
 
 /** Payload of an `images` event: one successful `factory_generate_image` call. */

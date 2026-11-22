@@ -154,3 +154,29 @@ test('runs: prepared images reach the builder, and run images show under their s
   await node(page, 'security').click();
   await expect(detail.getByRole('heading', { name: /Generated images/ })).toHaveCount(0);
 });
+
+test('Settings: Codex is connected with a ChatGPT device login and removed again', async ({ page }) => {
+  // Bob, so that alice's fake provider stays as the tests above left it.
+  await login(page, 'bob');
+  await page.goto(`${BASE()}/settings#images`);
+  const section = page.locator('#images');
+  await expect(section).toContainText('not set — agents cannot generate images');
+  await section.getByText('OpenAI Codex', { exact: true }).click();
+  await expect(section.getByLabel('API key')).toHaveCount(0);
+  await expect(section.getByLabel('Model')).toHaveCount(0);
+  await expect(section).toContainText('Codex generates images on your own ChatGPT account.');
+
+  await section.getByRole('button', { name: 'Connect ChatGPT' }).click();
+  await expect(section.getByRole('link', { name: 'https://auth.openai.com/codex/device' })).toHaveAttribute('target', '_blank');
+  await expect(section.locator('code', { hasText: 'FAKE-12345' })).toBeVisible();
+  await expect(section.getByRole('status')).toHaveText('Waiting for you to finish signing in…');
+
+  // The fake CLI finishes the login after a second; the page polls every 3 s.
+  await expect(section.getByRole('status')).toHaveText('Connected. New image requests will use it.', { timeout: 15_000 });
+  await expect(section).toContainText('OpenAI Codex · ChatGPT login');
+  await expect(section.getByRole('button', { name: 'Reconnect' })).toBeVisible();
+
+  await section.getByRole('button', { name: 'Remove' }).click();
+  await expect(section.getByRole('status')).toHaveText('Removed.');
+  await expect(section).toContainText('not set — agents cannot generate images');
+});

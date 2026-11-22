@@ -4,6 +4,7 @@ import type {
   Attachment,
   ClaudeUsage,
   ClientConfig,
+  CodexLogin,
   GeneratedImage,
   PreferenceOverrides,
   Preferences,
@@ -62,6 +63,10 @@ export interface Api {
    */
   putImageProvider(provider: string, model: string, apiKey: string): Promise<User>;
   deleteImageProvider(): Promise<User>;
+  /** Starts a Codex device login (cancels a pending one). */
+  startCodexLogin(): Promise<CodexLogin>;
+  codexLogin(): Promise<CodexLogin>;
+  cancelCodexLogin(): Promise<CodexLogin>;
 
   projects(): Promise<Project[]>;
   project(repo: string): Promise<Project>;
