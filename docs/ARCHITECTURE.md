@@ -193,6 +193,11 @@ Launch rules:
   OAuth token, …) is reported as a `system` error telling the user to update it in Settings, for
   chats and pipeline stages alike. A process the server stops itself (stop, idle, shutdown) is
   reported as a neutral notice, never as an error exit code.
+- The **run assistant** (kind `assistant`, §6 "Talking to an agent at needs human") is launched like a chat
+  (`--input-format stream-json --include-partial-messages`, alive between turns, `--resume` and the single
+  fresh relaunch, stopped by the idle reaper after `FACTORY_CHAT_IDLE_MINUTES`, one of the owner's agent slots
+  while its process lives), but in the run's worktree `…/<repo>/runs/<runId>`, with the role prompt
+  `prompts/assistant.md` and the stage MCP grant (§7) for the run. It takes no attachments.
 - Each stdout line is one JSON object. Complete messages are persisted as events; partial
   `stream_event` deltas are broadcast live but not persisted.
 
@@ -494,6 +499,8 @@ issue → spec-writer (opus) → builder (opus) ─┬→ security  (opus)   ┐
                                              all PASS → approver (opus)
                                                           ├ APPROVE  → merge to main
                                                           └ ESCALATE → needs-human ← /factory approve
+                                                                         ▲   │ owner talks to the run assistant;
+                                                                         └───┘ a commit → push → 4 reviewers again
 ```
 
 "main" is the repository's default branch for a single run, and `release/<name>` for a release run (§6
@@ -593,9 +600,85 @@ reaches the default branch only through the owner's approval of the release (§6
 Run `status`: `queued`, `spec`, `building`, `reviewing`, `approving`, `merged`, `needs_human`,
 `failed`, `cancelled`.
 
+The run records `headSha` (the branch head Agern knows: set after each builder stage's push) and `reviewedSha`
+(the head the last complete review round covered: set when all four reviewers of a round returned a valid
+verdict). Runs from before head tracking have both null, which counts as reviewed.
+
 Stage `role`: `spec-writer`, `builder`, `security`, `ux`, `ui-design`, `code`, `approver`.
 Stage `status`: `pending`, `running`, `done`, `failed`, `skipped`.
 Stage `verdict`: `PASS`, `CHANGES`, `APPROVE`, `ESCALATE` or null.
+
+### Talking to an agent at needs human
+
+A run waiting at `needs_human` has a conversation: its owner talks to the **run assistant**, an agent of kind
+`assistant` with both the approver's and the builder's context, to ask why the run needs a human, what a
+reviewer was unsure about, or to have one small change made before approving. Talking never approves anything:
+the run stays `needs_human` until its owner approves or cancels it.
+
+- *Which agent.* A new agent (not a resumed approver or builder, not a stage: no `stages` row, not in the
+  pipeline roles). One `assistant` session per run, created on the owner's first message, linked as
+  `Run.assistantSessionId` (`agent_sessions.run_id` is the run), titled `assistant · #<n>`, with the owner's
+  effective `builder` model at that moment (fixed for the session; it edits code). It works in the run's
+  worktree with the stage MCP tools (`factory_get_issue`, `factory_request_software`): no approve, cancel,
+  start or sandbox tools, so no conversation path can reach the merge. Launch details are in §5.
+- *Who.* Only the run's owner may send messages, interrupt or start a review (403 `forbidden` for anyone else,
+  admins included). The owner or an admin may stop the agent process (the owner's next message resumes the
+  conversation) or cancel the run. Anyone who can see the repository can read the transcript; it stays readable
+  after the run ends. The session cannot be deleted (409 `not_a_chat`) and takes no attachments.
+- *Messages.* Text only, 1–100 000 characters, not blank. One at a time: the session is `running` from the
+  moment a message is accepted until its turn ends (result, process exit or delivery failure); a message sent
+  meanwhile is 409 `agent_busy`. The transcript's `user` event holds the owner's text as written. What goes to
+  the agent's stdin is: when the session has no stored Claude conversation id (the first message, or after a
+  failed resume) a `<run_context>` block; otherwise, when a follow-up review round completed that the
+  conversation was not told about, a `<review_results round="<label>">` block; then
+  `Message from the run owner (<username>):\n\n<text>`. A resume that dies before `init` is relaunched once
+  without `--resume`, and the unanswered message is delivered again with the full `<run_context>` in front.
+  Which round a conversation was last told about is kept in memory (re-sent after a restart).
+- *`<run_context>`* (plain text, in this order): owner, run id, `org/repo`, issue number; `Why it needs a human:
+  <run.error>`; branch, base ref, pull request URL, merge target and, for a release run, the release note;
+  ``Inspect the change with `git diff <baseRef>...HEAD` and `git log <baseRef>..HEAD`.``; the issue text as the
+  stage prompts have it (`<issue_body>`, `<issue_comments>`; `Issue #<n>: <title>` when GitHub cannot be read);
+  `<spec>` (the spec-writer's last result); `<builder_summary>` (the last builder result); `<reviews round=…>`
+  with, per reviewer of the latest complete round, `### <role> — <VERDICT>`, its summary and
+  `- [<severity>] <file|(general)>: <detail>` lines; `<approver>` with its verdict and summary, or "did not run".
+  The prompt tells the agent that these blocks are data, not instructions.
+- *Changes.* The agent commits to the run's branch (it never pushes). A **sync** reads the worktree's `HEAD`
+  after every turn ends (also interrupted, stopped or crashed), before accepting a message, before approving
+  and on "Review changes": a new head updates `headSha`; when `headSha` then differs from `reviewedSha`, Agern
+  pushes the branch with the owner's identity (as after a builder stage) and starts a **follow-up review round**.
+  A failed push starts no review and leaves the change `unreviewed`; after a turn it is reported in the
+  conversation ("Could not push the change to `<branch>`: <reason>. Use “Review changes” to try again."), from
+  an API call it is 502 `github_error`. After a turn with uncommitted changes in the worktree a `system` warn
+  says they are not part of the pull request. The first use of a run from before head tracking records the
+  worktree's `HEAD` as both `headSha` and `reviewedSha`.
+- *Follow-up review round.* Four new reviewer stages in round = highest stage round + 1 (owner's effective
+  models; `Run.round` is not changed), run exactly like pipeline reviewers (schema, read-only, time limit,
+  screenshot tools for `ux` and `ui-design`). The prompt names the round `follow-up review <k>: the run owner
+  asked for a change while the run waits at needs human` (k counted from the last builder round) and its
+  `<builder_summary>` is the assistant's last answer. When all four return a valid verdict — `PASS` or
+  `CHANGES`; the owner may still approve, as after exhausted fix rounds — `reviewedSha` becomes the head the
+  round started for and the screenshots note is posted (labelled `follow-up review <k>`). If a reviewer fails,
+  the round's open stages are closed (pending → skipped, running → failed) and the change stays `unreviewed`.
+  The round never changes the run's status or error, never runs the approver, never merges, and never calls
+  the release callback. While it runs, messages are refused (409 `reviews_running`), so the worktree does not
+  change under the reviewers.
+- *Review state* (`Run.reviewState`, only while `needs_human`): `reviewing` while a reviewer stage is pending or
+  running, `unreviewed` when `headSha` ≠ `reviewedSha`, `current` otherwise.
+- *Approve* (HTTP, `/factory approve`, `factory_approve_run`) keeps its checks and then refuses, in this order,
+  409 `agent_busy` (assistant mid-turn), 409 `reviews_running`, and — after a sync, which starts a review when it
+  can — 409 `changes_not_reviewed` unless the state is `current`. Otherwise the assistant's process is stopped
+  and the merge proceeds; if the merge fails, the run is `needs_human` again and the conversation stays usable.
+  *Cancel* (also through a release cancel or retry) cancels a running follow-up round and stops the assistant
+  before the worktree is removed. Either way the session ends `stopped` with "The run was approved by <user>;
+  this conversation is closed." (or "cancelled by").
+- *Limits and cost.* The agent runs on the owner's Claude credential; spend and limit windows are recorded as
+  for chats (§5 "Claude usage"). A usage limit ends the turn with the CLI's error in the transcript; the owner
+  continues later.
+- *Releases.* The run never leaves `needs_human`, so its release issue stays `held` during the conversation and
+  follow-up reviews, and becomes `merged` when the run is approved.
+- *Restart.* `assistant` sessions become `idle` like chats; open stages of `needs_human` runs are closed
+  (pending → skipped, running → failed), so an interrupted follow-up round leaves the change `unreviewed`; the
+  run stays `needs_human`, and the owner's next message resumes the conversation (after the missing review).
 
 ### Screenshots
 
@@ -1071,7 +1154,10 @@ Tools: `factory_list_issues`, `factory_get_issue`, `factory_create_issue`, `fact
 `factory_assign_issues`, `factory_unassign_issues`, `factory_approve_release`. Pipeline-stage agents get only `factory_get_issue`
 and `factory_request_software`; with sandboxes switched on (`FACTORY_SANDBOX` not `off`) the builder also
 gets `factory_sandbox_info` and `factory_sandbox_exec`; the `ux` and `ui-design` reviewers also get
-`factory_attach_screenshot`.
+`factory_attach_screenshot`. The run assistant (§6 "Talking to an agent at needs human") gets the stage tools
+too, bound to its run: no approve, cancel, start, sandbox or messaging tools. `factory_send_to_agent` addressed to
+an `assistant` session answers 409 `agent_does_not_accept_messages` ("Talk to the run assistant on the run page.");
+the conversation is not reachable through the chat agent or `/factory` commands.
 
 Screenshot tool (§6 "Screenshots"), `ux` and `ui-design` reviewers only:
 - `factory_attach_screenshot { path, caption }` → text such as `Attached screenshot 2 of at most 12 for this stage:
@@ -1210,7 +1296,8 @@ type Release = { id: string; repo: string; name: string; description: string;
   checks: { state: 'unknown' | 'awaiting' | 'none' | 'pending' | 'passed' | 'failed';   // on the pull request's head commit
             detail: string | null; sha: string | null } | null };         // null until there is a pull request
 
-type SessionKind = 'chat' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
+type SessionKind = 'chat' | 'assistant' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
+// 'assistant': the run assistant a run's owner talks to at needs_human (§6 "Talking to an agent at needs human")
 type SessionStatus = 'starting' | 'running' | 'idle' | 'done' | 'failed' | 'stopped';
 type AgentSession = { id: string; repo: string; kind: SessionKind; model: string; status: SessionStatus;
   owner: { username: string; displayName: string }; title: string | null;
@@ -1220,10 +1307,11 @@ type AgentSession = { id: string; repo: string; kind: SessionKind; model: string
   live: boolean };  // an agent process exists right now
 // status: `starting` = process launching; `running` = mid-turn (busy); `idle` = waiting for input
 // (a chat between turns, with a process if `live`, else resumed on the next input); `stopped` = stopped by
-// a person (a chat resumes on its owner's next input); `done` / `failed` = a pipeline agent finished.
+// a person (a chat or run assistant resumes on its owner's next input); `done` / `failed` = a pipeline agent finished.
 
-type Stage = { id: string; role: Exclude<SessionKind, 'chat'>;
-  round: number;             // 0 = initial build/review, 1..maxRounds = fix rounds
+type Stage = { id: string; role: Exclude<SessionKind, 'chat' | 'assistant'>;
+  round: number;             // 0 = initial build/review, 1..maxRounds = fix rounds; a round without a builder
+                             // stage is a follow-up review of a change made at needs_human (UI: "follow-up <k>")
   model: string;             // the model the stage runs (or ran) with; set when the stage is created
   status: 'pending' | 'running' | 'done' | 'failed' | 'skipped';
   verdict: 'PASS' | 'CHANGES' | 'APPROVE' | 'ESCALATE' | null; summary: string | null;
@@ -1245,7 +1333,9 @@ type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; 
   stages: Stage[];
   sandbox: RunSandbox | null;  // the run's sandbox decision (§5 "Sandboxes"); null until the workspace is ready / older runs
   releaseId: string | null;  // the release this run builds an issue for (null: a single run, or the release was deleted)
-  baseBranch: string | null }; // the branch it starts from and merges into; null = the default branch
+  baseBranch: string | null;  // the branch it starts from and merges into; null = the default branch
+  assistantSessionId: string | null;  // the run's conversation (§6 "Talking to an agent at needs human")
+  reviewState: 'current' | 'reviewing' | 'unreviewed' | null };  // only while needs_human: is the branch head reviewed
 
 type RunSandbox = { state: 'disabled' | 'none' | 'invalid' | 'unapproved' | 'approved';  // only 'approved' gives a sandbox
   reason: string;            // human-readable, also shown at the top of the builder's transcript
@@ -1401,18 +1491,20 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `GET /api/runs/{id}` | → `Run` | |
 | `GET /api/runs/{id}/screenshots/{sid}` | → image bytes | anyone who may see the run (404 otherwise, and for a screenshot of another run). Served with the sniffed type, `nosniff`, a sandboxing CSP, `Cross-Origin-Resource-Policy: same-origin`, `Cache-Control: private, max-age=31536000, immutable` and `Content-Disposition: inline` (`screenshot-<role>-<id8>.<ext>`). There is no upload or delete route |
 | `POST /api/runs/{id}/approve` | → `Run` | owner only, only in `needs_human` |
-| `POST /api/runs/{id}/cancel` | → `Run` | owner or admin |
+| `POST /api/runs/{id}/cancel` | → `Run` | owner or admin; also cancels a follow-up review round and stops the run assistant |
+| `POST /api/runs/{id}/messages` | `{ text }` → 202 `Run` | a message to the run assistant (§6 "Talking to an agent at needs human"). In order: 401; 404 when the caller cannot see the repository; 403 `forbidden` for anyone but the owner (admins too); 409 `run_not_waiting` unless `needs_human`; 409 `agent_busy` (mid-turn); 409 `reviews_running`; 400 blank or over 100 000 characters; 422 `claude_credential_required`; 409 `too_many_agents`; 409 `worktree_missing`; 409 `reviews_running` when the sync found unreviewed commits and started their review; 502 `github_error` when pushing them failed. Creates the `assistant` session on the first message |
+| `POST /api/runs/{id}/review` | → 202 `Run` (`reviewState: 'reviewing'`) | "Review changes": push the unreviewed branch head and start a follow-up review round. Same checks 1–6 as `messages` ("…can start its reviews"); 409 `nothing_to_review` when the head is reviewed; 502 `github_error` when the push fails |
 | `GET /api/projects/{repo}/sessions?kind=chat` | → `AgentSession[]` | |
 | `POST /api/projects/{repo}/sessions` | `{ model? }` → `AgentSession` | new chat; needs Claude credential; without `model` the owner's effective `chatModel` |
 | `GET /api/agents?active=true` | → `AgentSession[]` | all kinds, across visible repos. `active=true`: `live` (a process exists, e.g. a chat idling between turns) or `starting`/`running` |
 | `GET /api/sessions/{id}` | → `AgentSession` | |
 | `GET /api/sessions/{id}/events?after=<seq>&limit=<n>` | → `Event[]` | ascending |
 | `GET /api/config` | → `ClientConfig` | limits the frontend checks before uploading |
-| `POST /api/sessions/{id}/input` | `{ text, attachmentIds? }` → 202 | owner only. **Chat:** accepted mid-turn too (delivered after the current turn); a `stopped` or process-less chat resumes. `text` may be empty when `attachmentIds` is not. The attachments are bound to this message when it is accepted, so a message queued mid-turn keeps its own. Answer `{ status: 'accepted' }`. **Pipeline agent:** a text message for a running spec-writer or builder (§6 "Messages to running agents") → 202 `AgentMessage`; 403 for everyone but the run's owner (admins too), 409 `agent_does_not_accept_messages` (reviewers, approver), 409 `agent_not_running`, 422 `attachments_not_allowed` |
+| `POST /api/sessions/{id}/input` | `{ text, attachmentIds? }` → 202 | owner only. **Chat:** accepted mid-turn too (delivered after the current turn); a `stopped` or process-less chat resumes. `text` may be empty when `attachmentIds` is not. The attachments are bound to this message when it is accepted, so a message queued mid-turn keeps its own. Answer `{ status: 'accepted' }`. **Run assistant:** the same as `POST /api/runs/{runId}/messages` (→ 202 `Run`); with `attachmentIds` 422 `attachments_not_allowed`. **Pipeline agent:** a text message for a running spec-writer or builder (§6 "Messages to running agents") → 202 `AgentMessage`; 403 for everyone but the run's owner (admins too), 409 `agent_does_not_accept_messages` (reviewers, approver), 409 `agent_not_running`, 422 `attachments_not_allowed` |
 | `POST /api/sessions/{id}/attachments?name=<file name>` | raw bytes → 201 `Attachment` | owner only, chat only; see "Attachments" below |
 | `GET /api/sessions/{id}/attachments/{aid}?preview=1` | → bytes | anyone who may see the session once it is sent; before that only its uploader. `preview=1`: the downscaled copy if there is one |
 | `DELETE /api/sessions/{id}/attachments/{aid}` | → 204 | owner only; unsent only (409 `attachment_sent`) |
-| `POST /api/sessions/{id}/interrupt` | → 202 | owner only; stops the current turn (chat only; 409 for pipeline agents — cancel the run instead) |
+| `POST /api/sessions/{id}/interrupt` | → 202 | owner only; stops the current turn (chats and run assistants; 409 for pipeline agents — cancel the run instead) |
 | `POST /api/sessions/{id}/stop` | → `AgentSession` | owner or admin |
 | `DELETE /api/sessions/{id}` | → 204 | **Close a chat**: owner or admin (403 otherwise, 404 if the repo is not visible); chat only (409 `not_a_chat` for pipeline sessions — cancel the run instead). A live process is stopped first (as `stop`, up to 10 s; if it has not exited, 409 `agent_not_stopped` and nothing is deleted). Then the session is deleted permanently with its events, attachment rows and the files under `<dataDir>/attachments/<id>/`; its session sockets are closed with `4404` and the feed announces `session_closed`. Runs started from it keep running (their `startedBySessionId` becomes `null`). Afterwards every route for the id answers 404 |
 | `GET /api/admin/settings` · `PUT /api/admin/settings` | `Settings` | admin |
@@ -1441,6 +1533,11 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 - Messages to pipeline agents: reviewer/approver → 409 `agent_does_not_accept_messages`; agent not running
   (pending, finished, failed, stopped) → 409 `agent_not_running`; with attachments → 422
   `attachments_not_allowed`; not the run's owner → 403 `forbidden`.
+- The run assistant (§6 "Talking to an agent at needs human"): run not waiting → 409 `run_not_waiting`; agent
+  mid-turn → 409 `agent_busy`; a follow-up review round runs → 409 `reviews_running`; worktree gone → 409
+  `worktree_missing`; nothing to review → 409 `nothing_to_review`; push failed → 502 `github_error`; addressed
+  through `factory_send_to_agent` or a stage-agent message → 409 `agent_does_not_accept_messages`. Approve:
+  409 `agent_busy`, `reviews_running` or `changes_not_reviewed` (the branch head has not been reviewed).
 - Releases: duplicate name → 409 `release_name_taken`; assigning a closed issue → 409 `issue_closed`; a stale
   order → 409 `release_issues_changed`. Every release route answers 404 when the caller cannot see the project,
   also when addressed by release id; then 403 `forbidden` for the owner/admin rules of started releases (§6
@@ -1811,6 +1908,26 @@ builder while that agent is `running`, with a note that messages are queued for 
 not posted on GitHub. Everyone else, and every other stage, stays read-only. In the transcript a forwarded
 message shows its sender and origin ("alice · direct" or "alice · via chat <id>") and its state: "queued —
 delivered at the agent's next step", then "delivered" (or "not delivered" if the agent stopped first).
+
+**Run conversation** (§6 "Talking to an agent at needs human"). The `needs-human` node of the diagram is selectable
+when the run is `needs_human` or has an `assistantSessionId` (`?stage=human`), and it is the default selection while
+the run waits. Its sub-line reads "waiting for owner", "reviewing change" or "change not reviewed" (`reviewState`). Its
+detail pane uses the stage-detail layout: the heading "needs-human", the blurb "Talk to the run assistant about this
+run. Talking never approves it.", a review line (`role="status"`: "The branch head has been reviewed." / "The
+reviewers are checking the latest change…" / "The latest change has not been reviewed." with, for the owner, a
+"Review changes" button, "Starting…" while busy) and the session's facts; on the right the transcript (`ChatView`
+with a compose override). Before the first message the owner sees "No conversation yet. Ask why the run needs a
+human, or ask for a change." and everyone else "No conversation yet. Only <owner> can talk to the agent about this
+run."; the owner of a waiting run gets a text-only composer ("Message the run assistant", placeholder "Ask about this
+run, or ask for a change…", no attachments or `/factory` commands) under the note "Talking never approves the run. If
+the agent commits a change, it is pushed and reviewed again before you can approve. Not posted on GitHub." While the
+agent works the spinner shows and Esc interrupts; while reviewers run the composer is blocked ("The reviewers are
+checking the latest change. You can continue when they are done."); others see the "observing" banner; after the run
+ended "This conversation ended when the run was <status>." API errors show in the `chat-error` alert. "✓ Approve &
+merge" is disabled unless `reviewState` is `current` and the agent is not working, with a muted line: "Approval is
+possible once the latest change has been reviewed." or "The agent is still working." Rounds without a builder stage
+are labelled "follow-up <k>" in the rounds strip, round tabs and reviewer notes; the gate and reviewer nodes show the
+highest reviewer round. The agents page links an `assistant` session to `…/runs/<runId>?stage=human`.
 
 The owner attaches files by pasting (a pasted screenshot is named `screenshot-<date>-<time>.png`),
 dropping them anywhere on the chat pane (which shows a drop target) or with the `+` button. Each becomes a
