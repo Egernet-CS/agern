@@ -87,6 +87,14 @@ tests `FACTORY_2FA=off` is accepted when `dev` is the only provider.
 
     Put `fake:sandbox` in the issue body to make the builder call `factory_sandbox_info` and
     `factory_sandbox_exec` (`echo built in the sandbox && ls`) through MCP and report both answers.
+
+    Images: in fake-GitHub mode Settings offers the provider "Fake (development)" (keys starting with
+    `fake-image-`, model `fake-image-1`; it draws PNGs, and `fake:refuse` / `fake:quota` in a prompt fail).
+    A chat message containing `fake:image` (or `fake:image=<n>`, plus `#<issue>` as the issue hint) makes
+    the chat agent call `factory_generate_image` with the purpose "app icon" and append "Image tool: <answer>".
+    `fake:image` in an issue body makes the builder generate one, copy it to `assets/fake-icon.png` and commit
+    it. A spec-writer or builder whose prompt has an `<images>` block reports `PREPARED ok <path> <bytes>`
+    or `PREPARED missing <path>` for each prepared image.
 * `FACTORY_SANDBOX=fake` (only together with `FACTORY_DEV_FAKE_GITHUB`): sandboxes with an in-memory runtime
   that pretends to run commands (`echo …`, `ls` of the worktree, `seq N`, `sleep N`, `exit N`/`false`; anything
   else prints what would have run), so the sandbox UI works without Podman. The fake GitHub also serves files from
