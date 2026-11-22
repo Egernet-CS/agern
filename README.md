@@ -55,7 +55,11 @@ Models per role are a setting. The details are in [`docs/ARCHITECTURE.md`](docs/
   terminal shows them (streamed text, tool calls, cost per turn). Anyone who can read the repository
   can watch; sessions owned by someone else are read-only.
 - **Agents can use the factory.** The chat agent gets factory tools over MCP (list and create issues,
-  start, approve and cancel runs), and `/factory run|status|approve|cancel` works in the chat.
+  start, approve and cancel runs), and `/factory run|status|approve|cancel|retry` works in the chat.
+- **Retry without losing work.** A failed run can retry just the step that failed (a refused push, a
+  pull request, a merge), continue from its commits in a new run that reuses its spec, or start over;
+  the sensible choice is preselected with a one-line reason. Builders are warned before the stage time
+  limit so they can commit and leave a hand-over note.
 - **Build and test sandboxes (optional).** A project describes a container for its builds and tests
   in `.agern/sandbox.yml` — toolchain image, setup script, sidecar services such as PostgreSQL with a
   readiness check, caches, a non-root user, and extra *platform* images to test on. After an admin
