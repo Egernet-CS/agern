@@ -95,6 +95,8 @@ data class ReleaseIssueDto(
     val state: String = ReleaseIssueState.WAITING, val runId: String? = null, val note: String? = null,
     /** The pull request of [runId] (into the release branch), if it has one. */
     val prNumber: Int? = null, val prUrl: String? = null,
+    /** A waiting issue that was retried with `continue` or `step` from [runId]; null = built from scratch. */
+    val retryMode: String? = null,
 )
 
 /** Why a release is paused; [resumeAt] is set only for an automatic resume after a usage limit. */
@@ -184,7 +186,81 @@ data class RunDto(
     val releaseId: String? = null,
     /** The branch the run starts from and merges into; null = the repository's default branch. */
     val baseBranch: String? = null,
+    /** The failed run this one continues from its commits (docs/ARCHITECTURE.md §6 "Retrying a run"). */
+    val continuesRunId: String? = null,
+    /** The newest run that continues this one, if any. */
+    val continuedByRunId: String? = null,
+    /** Why a failed run stopped ([FailureKind]); null when it did not fail (or failed before this was recorded). */
+    val failureKind: String? = null,
+    /** The mechanical step after the builder that failed ([FailedStep]): `push`, `pull_request` or `merge`. */
+    val failedStep: String? = null,
 )
+
+/** Ways to retry a failed run (docs/ARCHITECTURE.md §6 "Retrying a run"). */
+object RetryMode {
+    /** Retry only the failed step (push, pull request, merge) on the same run and go on from there. */
+    const val STEP = "step"
+    /** A new run whose worktree starts from the failed run's branch, reusing its spec. */
+    const val CONTINUE = "continue"
+    /** A new run from scratch (the behaviour before retry modes existed; the default when a client sends none). */
+    const val START_OVER = "start_over"
+    /** Whatever the server recommends for the run. Only accepted in requests. */
+    const val RECOMMENDED = "recommended"
+    val ALL = listOf(STEP, CONTINUE, START_OVER)
+}
+
+/** Why a run failed, recorded when it fails. */
+object FailureKind {
+    const val TIME_LIMIT = "time_limit"; const val USAGE_LIMIT = "usage_limit"; const val RESTART = "restart"
+    const val API_UNREACHABLE = "api_unreachable"; const val CREDENTIALS = "credentials"
+    /** The builder made no commits (it usually says why: blocked on something). */
+    const val BLOCKED = "blocked"
+    /** A mechanical step after the builder failed (see [FailedStep]). */
+    const val STEP = "step"
+    const val OTHER = "other"
+
+    /**
+     * Failures that come from the environment rather than the work. Continuing is recommended for them when the branch
+     * has commits; issue #57 (pause and retry transient failures automatically) can build on this set.
+     */
+    val INTERRUPTED = setOf(TIME_LIMIT, USAGE_LIMIT, RESTART, API_UNREACHABLE)
+
+    private val API_UNREACHABLE_RE = Regex(
+        "(?i)can'?t reach the api|unable to connect to (the )?api|api error: (connection|network)|connection error|" +
+            "network error|fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|ECONNRESET|ConnectException|UnknownHostException",
+    )
+
+    /** True when [error] (a stage agent's error) says the Claude API or the network could not be reached. */
+    fun looksUnreachable(error: String?): Boolean = error != null && API_UNREACHABLE_RE.containsMatchIn(error)
+}
+
+/** The mechanical steps after the builder that a step retry can repeat. */
+object FailedStep {
+    const val PUSH = "push"; const val PULL_REQUEST = "pull_request"; const val MERGE = "merge"
+}
+
+/** One way to retry a run, and whether it is possible now. */
+@Serializable
+data class RetryOptionDto(val mode: String, val available: Boolean, val detail: String)
+
+/** `GET /api/runs/{id}/retry`: how the run can be retried, and what is recommended (with a one-line reason). */
+@Serializable
+data class RetryOptionsDto(
+    val runId: String,
+    val recommended: String,
+    val reason: String,
+    val options: List<RetryOptionDto>,
+    /** The step a step retry repeats, when one is possible. */
+    val step: String? = null,
+    /** Commits of the run's branch that are not on its base branch; null when the branch was not found. */
+    val commits: Int? = null,
+    /** For a release run: the release and its issue number (retry through the release). */
+    val releaseId: String? = null,
+)
+
+/** Body of the retry endpoints; [mode] omitted = `start_over` (as before retry modes existed). */
+@Serializable
+data class RetryReq(val mode: String? = null)
 
 /**
  * A run's sandbox decision (docs/ARCHITECTURE.md §5 "Sandboxes"), fixed when the run starts.
