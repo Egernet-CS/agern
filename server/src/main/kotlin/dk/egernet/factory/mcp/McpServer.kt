@@ -38,6 +38,7 @@ class McpServer(
     private val version: String,
     private val sandboxes: dk.egernet.factory.sandbox.SandboxManager,
     private val screenshots: dk.egernet.factory.agent.Screenshots,
+    private val images: dk.egernet.factory.images.ImageService,
 ) {
     private val log = LoggerFactory.getLogger(McpServer::class.java)
 
@@ -56,6 +57,9 @@ class McpServer(
                 } else if (type == "kind") {
                     put("type", "string")
                     putJsonArray("enum") { add(JsonPrimitive("feature")); add(JsonPrimitive("bug")); add(JsonPrimitive("task")) }
+                } else if (type == "format") {
+                    put("type", "string")
+                    putJsonArray("enum") { add(JsonPrimitive("png")); add(JsonPrimitive("jpeg")); add(JsonPrimitive("webp")) }
                 } else if (type == "integers") {
                     put("type", "array")
                     putJsonObject("items") { put("type", "integer") }
@@ -130,6 +134,19 @@ class McpServer(
             schema(Triple("path", "string", "Image file, relative to your working directory (or absolute, inside it)"),
                 Triple("caption", "string", "What the screenshot shows, e.g. 'Settings › Tokens, empty state, dark theme' (at most 200 characters)"),
                 required = listOf("path", "caption"))),
+        Tool("factory_generate_image", "Have an image AI make graphics — icons, illustrations, logos, empty-state art, hero " +
+            "images — with the image provider the user chose in Settings, billed to them. Use it whenever the request or issue asks " +
+            "for graphics instead of drawing a placeholder; never when nothing calls for graphics. Write the prompt yourself from the " +
+            "request and the project's existing visual style, colours, sizes and formats. Returns JSON with the files (`path`, " +
+            "read it to look at the result), the remaining image budget and what to do next. Agern does not resize or convert.",
+            schema(Triple("prompt", "string", "The image prompt: subject, style, colours, composition (1 to 4000 characters)"),
+                Triple("purpose", "string", "What the image is for, e.g. 'app icon' or 'empty state of the issue list' (at most 200 characters)"),
+                Triple("size", "string", "WIDTHxHEIGHT in pixels, default 1024x1024 (each edge from 256 up to the server's limit)"),
+                Triple("format", "format", "png (default), jpeg or webp"),
+                Triple("count", "integer", "How many variants, default 1 (at most the server's per-request limit)"),
+                Triple("transparentBackground", "boolean", "A transparent background (png or webp; not every provider supports it)"),
+                Triple("issueNumber", "integer", "Optional: the issue the images are meant for"),
+                required = listOf("prompt", "purpose"))),
         Tool("factory_request_software", "Ask an administrator to install software on the factory host. " +
             "Use this instead of installing system-wide software yourself.",
             schema(Triple("name", "string", "Software name, e.g. 'ffmpeg' or 'JDK 21'"),
@@ -282,6 +299,7 @@ class McpServer(
                 }
                 "factory_attach_screenshot" ->
                     screenshots.attach(grant.sessionId, grant.runId, repo, owner, str("path"), str("caption"))
+                "factory_generate_image" -> images.generate(grant, owner, args)
                 "factory_request_software" -> {
                     val sr = factory.requestSoftware(owner, repo, grant.sessionId, str("name") ?: "", str("reason") ?: "")
                     "Request ${sr.id} filed for '${sr.name}'. An administrator will handle it; continue without it for now."

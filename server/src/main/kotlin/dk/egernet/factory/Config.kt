@@ -43,6 +43,8 @@ data class Config(
     val screenshotMaxBytes: Long = 5L shl 20,
     /** FACTORY_SCREENSHOT_MAX_COUNT: screenshots per stage (per reviewer per round). */
     val screenshotMaxCount: Int = 12,
+    /** FACTORY_IMAGE_MAX_*: limits on image generation (docs/ARCHITECTURE.md §6 "Generated images"). */
+    val imageLimits: ImageLimits = ImageLimits(),
     /** FACTORY_SANDBOX*: per-run build/test sandboxes (docs/ARCHITECTURE.md §5 "Sandboxes"). */
     val sandbox: SandboxConfig = SandboxConfig(),
     /**
@@ -81,7 +83,7 @@ data class Config(
             "admins=$admins, dataDir=$dataDir, webDir=$webDir, claudeBin=$claudeBin, publicUrl=$publicUrl, " +
             "maxAgentsPerUser=$maxAgentsPerUser, chatIdleMinutes=$chatIdleMinutes, stageTimeoutMs=$stageTimeoutMs, fakeGithub=$fakeGithub, " +
             "attachments=${attachmentMaxCount}x${attachmentMaxBytes shr 20}MB/${attachmentMaxMessageBytes shr 20}MB, " +
-            "screenshots=${screenshotMaxCount}x${screenshotMaxBytes shr 20}MB, sandbox=$sandbox)"
+            "screenshots=${screenshotMaxCount}x${screenshotMaxBytes shr 20}MB, images=$imageLimits, sandbox=$sandbox)"
 
     companion object {
         fun defaultAgentPath(): String =
@@ -160,6 +162,12 @@ data class Config(
                 screenshotMaxCount = (get("FACTORY_SCREENSHOT_MAX_COUNT")?.toIntOrNull() ?: get("FACTORY_SCREENSHOT_MAX_COUNT")?.let {
                     throw IllegalArgumentException("FACTORY_SCREENSHOT_MAX_COUNT must be a whole number")
                 } ?: 12).also { require(it in 1..50) { "FACTORY_SCREENSHOT_MAX_COUNT must be between 1 and 50" } },
+                imageLimits = ImageLimits(
+                    maxPerRequest = intIn(get("FACTORY_IMAGE_MAX_PER_REQUEST"), "FACTORY_IMAGE_MAX_PER_REQUEST", 4, 1..10),
+                    maxPerTurn = intIn(get("FACTORY_IMAGE_MAX_PER_TURN"), "FACTORY_IMAGE_MAX_PER_TURN", 8, 1..100),
+                    maxPerStage = intIn(get("FACTORY_IMAGE_MAX_PER_STAGE"), "FACTORY_IMAGE_MAX_PER_STAGE", 12, 1..200),
+                    maxEdge = intIn(get("FACTORY_IMAGE_MAX_EDGE"), "FACTORY_IMAGE_MAX_EDGE", 2048, 256..4096),
+                ),
                 sandbox = sandbox,
                 releaseChecksSettleSeconds = get("FACTORY_RELEASE_CHECKS_SETTLE_SECONDS")?.let { v ->
                     (v.toLongOrNull() ?: throw IllegalArgumentException("FACTORY_RELEASE_CHECKS_SETTLE_SECONDS must be a whole number of seconds"))
@@ -170,6 +178,12 @@ data class Config(
                     "FACTORY_ATTACHMENT_MAX_MESSAGE_MB must be at least FACTORY_ATTACHMENT_MAX_MB"
                 }
             }
+        }
+
+        private fun intIn(v: String?, name: String, default: Int, range: IntRange): Int {
+            val n = if (v == null) default else v.trim().toIntOrNull() ?: throw IllegalArgumentException("$name must be a whole number")
+            require(n in range) { "$name must be between ${range.first} and ${range.last}" }
+            return n
         }
 
         private fun mb(v: String?, name: String, default: Long): Long {
@@ -347,3 +361,6 @@ data class SandboxConfig(
         }
     }
 }
+
+/** Limits on image generation per tool call, per chat message, per stage agent, and the longest edge in pixels. */
+data class ImageLimits(val maxPerRequest: Int = 4, val maxPerTurn: Int = 8, val maxPerStage: Int = 12, val maxEdge: Int = 2048)
