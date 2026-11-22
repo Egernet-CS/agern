@@ -191,6 +191,8 @@ class ImageToolTest {
         val partial = Mcp.generate(w, t, args("count" to 2))
         assertEquals(3, partial.json["remaining"]!!.jsonPrimitive.int, partial.text)
         assertEquals(1, partial.json["images"]!!.jsonArray.size)
+        // Stop the chat's agent process before the world is torn down (it would write to a closed database).
+        runBlocking { w.services.agents.closeChat(alice, w.services.sessions.get(chatId)!!) }
 
         // Per stage.
         val answers = CopyOnWriteArrayList<Mcp.Answer>()
