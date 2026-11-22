@@ -411,11 +411,12 @@ class Orchestrator(
             val changes = REVIEWER_ROLES.filter { reviews[it]?.verdict == "CHANGES" }
             val verdicts = REVIEWER_ROLES.joinToString(", ") { "$it ${reviews.getValue(it).verdict}" }
             runs.setReviewedSha(runId, head)
-            runs.setReviewState(runId, ReviewState.NONE)
             val reason = originalReason(runs.get(runId)!!.error)
             val outcome = if (changes.isEmpty()) "all four reviewers pass." else "${changes.joinToString(", ")} still request changes."
             runs.setError(runId, (if (reason.isEmpty()) "" else "$reason\n\n") + "**Follow-up review $n** (commit `$sha7`): $outcome")
             advisor?.let { agents.systemEvent(it, "info", "Follow-up review $n of commit $sha7: $verdicts.") }
+            // Last: `none` tells clients (and approve) that the review and everything it records is complete.
+            runs.setReviewState(runId, ReviewState.NONE)
             publish(runId)
             val pr = runs.get(runId)?.prNumber
             if (pr != null) withContext(Dispatchers.IO) {

@@ -333,7 +333,9 @@ class RunConversationTest {
             done.error,
         )
         assertTrue(events(sid).any { it.type == "system" && payload(it)["text"]!!.jsonPrimitive.content.startsWith("Follow-up review 1 of commit 1111111: security PASS") })
-        assertTrue(world.github.actions.any { it.contains("were pushed (1111111) and reviewed again: security PASS, ux PASS, ui-design PASS, code PASS.") })
+        eventually("pull request comment") {
+            world.github.actions.any { it.contains("were pushed (1111111) and reviewed again: security PASS, ux PASS, ui-design PASS, code PASS.") }
+        }
 
         // Approve merges and ends the conversation.
         val merged = runBlocking { s.orchestrator.approve(alice, runId) }
