@@ -238,7 +238,8 @@ fun Application.installApi(s: Services) {
                 call.respond(
                     dk.egernet.factory.ClientConfigDto(
                         dk.egernet.factory.AttachmentLimitsDto(cfg.attachmentMaxBytes, cfg.attachmentMaxMessageBytes, cfg.attachmentMaxCount, INLINE_IMAGE_TYPES),
-                        s.images.catalogue(),
+                        // May run `codex --version` (at most once a minute): off the request thread.
+                        withContext(Dispatchers.IO) { s.images.catalogue() },
                     ),
                 )
             }
