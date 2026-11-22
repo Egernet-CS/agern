@@ -95,6 +95,15 @@ tests `FACTORY_2FA=off` is accepted when `dev` is the only provider.
     `fake:image` in an issue body makes the builder generate one, copy it to `assets/fake-icon.png` and commit
     it. A spec-writer or builder whose prompt has an `<images>` block reports `PREPARED ok <path> <bytes>`
     or `PREPARED missing <path>` for each prepared image.
+
+    Codex: set `FACTORY_CODEX_BIN=$PWD/server/src/test/resources/fake-codex` to offer "OpenAI Codex" without a
+    ChatGPT login. "Connect ChatGPT" shows the code `FAKE-12345` and connects after a second. In tests,
+    `FAKE_CODEX_LOGIN` (passed through the provider's `extraEnv`; the server never hands its own environment to
+    the CLI) changes the login: `wait` (never finishes), `nocode` (prints nothing), `fail`
+    (exits 1), `badurl` (a URL outside `https://auth.openai.com/`). Generation writes PNGs of the wanted size; a
+    prompt containing `fake:refresh` also rewrites the login, `fake:limit` hits the usage limit, `fake:none` exits
+    without an image, `fake:symlink` leaves a symlink instead of an image, `fake:slow` sleeps 30 s, and `fake:dump`
+    writes the CLI's environment and arguments to `$FAKE_CODEX_DUMP/dump.json`.
 * `FACTORY_SANDBOX=fake` (only together with `FACTORY_DEV_FAKE_GITHUB`): sandboxes with an in-memory runtime
   that pretends to run commands (`echo …`, `ls` of the worktree, `seq N`, `sleep N`, `exit N`/`false`; anything
   else prints what would have run), so the sandbox UI works without Podman. The fake GitHub also serves files from

@@ -60,6 +60,7 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_DATA_DIR` | `./data` | Workspaces and per-user homes |
 | `FACTORY_WEB_DIR` | unset | Built frontend directory, served with SPA fallback. Unset: the frontend embedded in `agern.jar` (classpath `web/`) is served; with neither, non-API paths answer 404 |
 | `FACTORY_CLAUDE_BIN` | `claude` | Path of the Claude CLI (tests point this at a stub) |
+| `FACTORY_CODEX_BIN` | `codex` | The OpenAI Codex CLI for the image provider `codex` (§4 "Codex login"); a bare name is resolved on `FACTORY_AGENT_PATH`. Optional: without it Codex is listed as unavailable. Tests and the e2e suite point it at `server/src/test/resources/fake-codex` |
 | `FACTORY_PUBLIC_URL` | `http://localhost:8080` | The URL browsers use. Cookie is `Secure` only when it is `https`; mutating requests and WebSocket upgrades with a different `Origin` are rejected (403). Agents reach MCP over loopback (`http://127.0.0.1:<port>/mcp`), not through this URL Text Agern writes on GitHub (comments, pull request bodies) links to its pages only when this is a public address; with an internal one (loopback, a private network, a name without a public domain) it names the page instead, so no internal address is published. |
 | `FACTORY_ALLOWED_ORIGINS` | empty | Extra allowed browser origins, comma list (e.g. `http://localhost:5173` for the Vite dev server) |
 | `FACTORY_MAX_AGENTS_PER_USER` | `8` | Concurrent agent processes per user |
@@ -131,7 +132,8 @@ Sessions are server-side rows in PostgreSQL referenced by an opaque random id in
   (`kind = api_key`, passed as `ANTHROPIC_API_KEY`).
 - *GitHub token* — a personal access token. The server calls `GET /user` to learn the login.
 - *Image provider* (optional) — one image-generation provider (OpenAI or Google Gemini) with the user's own API
-  key and a model (§6 "Generated images"). The key is checked with the provider before it is stored.
+  key and a model (§6 "Generated images"), or OpenAI Codex with the user's own ChatGPT login (below). An API key is
+  checked with the provider before it is stored.
 
 All three are stored encrypted with AES-256-GCM under `FACTORY_MASTER_KEY` (random 12-byte nonce per
 value, username as associated data). They are never returned by any API, never logged, and never
@@ -144,13 +146,48 @@ credential: only the owner may send input to, resume, or approve work in their s
 generates them only with the image key of the owner of the chat or run whose agent asks, and the key never reaches
 an agent process.
 
-**Codex is not an image provider (yet).** The issue asked to verify first that the OpenAI Codex CLI can generate
-images non-interactively on a ChatGPT login, and how such a login could be kept per user on a shared host. Checked on
-the factory host on 2026-11-22: `codex` 0.170.0 is installed, `codex features list` reports `image_generation stable
-true`, `codex exec` runs non-interactively and `CODEX_HOME=<dir> codex login status` answers "Not logged in". No
-ChatGPT login was available, so an actual generation (its output location and error texts) could not be verified, and
-Codex was left out rather than half-implemented. The provider interface is neutral: Codex can be added as one more
-`ImageProvider` plus its login flow.
+**Codex login.** The image provider `codex` (`CodexImageProvider`) runs the OpenAI Codex CLI on the server with the
+user's own ChatGPT login instead of an API key.
+
+- *Connecting:* `POST /api/me/image-provider/codex/login` runs `codex login --device-auth -c
+  cli_auth_credentials_store="file"` in a fresh directory and answers the verification URL (only
+  `https://auth.openai.com/…` is accepted) and the one-time code once the CLI printed them (ANSI codes stripped; 502
+  `codex_login_failed` if none within 20 s). The web polls `GET …/codex/login` (`pending`, `connected`, `failed`,
+  `expired` after 15 minutes, `none`). When the CLI exits 0 and `$CODEX_HOME/auth.json` is a regular file of 1 byte to
+  64 KiB holding a JSON object, its text is stored like an API key (`users.image_key_enc`, AES-GCM, username as
+  associated data) with `image_provider = 'codex'`, `image_model = 'default'`. Pending logins live in memory
+  (`CodexLogins`), one per user; a new start, `DELETE …/codex/login`, saving or removing the provider setting, expiry
+  and server shutdown kill the process. `PUT /api/me/image-provider` refuses `codex` (409 `codex_login_required`).
+  Starts are limited to 5 per user per 15 minutes (429). The URL, the code and `auth.json` are never logged; only
+  the two login responses to their owner contain the code.
+- *Generating:* each call gets `$FACTORY_DATA_DIR/codex/<uuid>/` (`0700`) with `home/` (`HOME` and `CODEX_HOME`, the
+  login written as `auth.json`, `0600`) and `work/`, and runs `codex exec --skip-git-repo-check --ignore-user-config
+  --json --color never -s read-only -C <work> -c cli_auth_credentials_store="file" -` with an environment built from
+  scratch (`PATH`, `HOME`, `CODEX_HOME`, `LANG`, `TERM`, `NO_COLOR` only — no Claude, GitHub or factory variable). The
+  instruction, a fixed template ending in the agent's prompt, goes to stdin only. Size and format are wishes (the
+  tool's `notes` report what came back). Images are collected from regular files (no symlinks) under
+  `home/generated_images/` and `work/`, oldest first. The directory is deleted afterwards in every case; leftovers are
+  deleted at server start. 600 s timeout.
+- *Plaintext on disk:* the login is the one secret that exists in plaintext on disk, only while its `codex` process
+  runs, in that `0700` directory. Codex runs as the server's OS user, like every agent (the v1 limitation of §5).
+- *Refreshed tokens:* Codex may refresh and rewrite `auth.json`. One login must not be used by two processes, so one
+  user's Codex generations run one at a time (a per-user lock; the stored login is read after taking it). If the file
+  changed — on success or failure — the new text replaces the stored login by compare-and-set
+  (`UPDATE … WHERE image_provider = 'codex' AND image_key_enc = <what was read>`), so a re-login or removal made
+  during the call wins.
+- *Errors:* CLI output never leaves the provider. Without an image, the output is matched loosely: `401`/unauthorized/
+  not logged in/refresh token/expired token → "Your sign-in to OpenAI Codex is no longer valid. Connect it again under
+  Settings → Image generation."; usage limit/rate limit/quota → quota; content policy/safety/moderation → refused;
+  otherwise "answered without a usable image".
+- *Verification (factory host, 2026-11-22):* `codex` 0.170.0 is installed; `codex features list` reports
+  `image_generation stable true`; the bundled `imagegen` skill says the built-in `image_gen` tool needs no
+  `OPENAI_API_KEY` and saves under `$CODEX_HOME/generated_images/…`; `codex exec` is non-interactive and reads the
+  prompt from stdin; `codex login --device-auth` runs headless and prints the URL and code shown above. **Not
+  verified**, because no ChatGPT login was available to the pipeline: a real generation on a given ChatGPT plan, that
+  the file appears under `generated_images` with `-s read-only`, and the CLI's exact error texts. The owner's first
+  real use is the acceptance test for these; if it fails, removing `CodexImageProvider` from the list in `App.kt`
+  removes the provider without touching the rest. The user must enable device-code login in their ChatGPT security
+  settings.
 
 **Visibility.** A user may see a project, its issues, runs, sessions and transcripts if and only if
 their own GitHub token can read that repository (`GET /repos/{org}/{repo}` → 200; cached 60 s per
@@ -1087,7 +1124,15 @@ Agents can have graphics made by an image AI the user chose (issue #11). Claude 
   send the key only in a header, connect within 10 s and wait at most 300 s. Model names are free text
   (`^[A-Za-z0-9._:-]{1,100}$`); the catalogue's models are suggestions.
 - **Setting:** one provider per user (`users.image_provider`, `image_model`, `image_key_enc`), set with
-  `PUT /api/me/image-provider` after the provider accepted key and model, removed with `DELETE` (images stay).
+  `PUT /api/me/image-provider` after the provider accepted key and model, removed with `DELETE` (images stay). Codex
+  is connected by its device login instead (§4 "Codex login"). Each catalogue entry says how it is connected
+  (`auth`: `api_key` or `device_login`) and whether it can be used on this server (`available`,
+  `unavailableReason`; Codex is unavailable when `FACTORY_CODEX_BIN --version` does not exit 0 within 10 s, checked
+  at most once a minute).
+- **Key throttle:** a key the provider rejects counts against its user; after 5 within 15 minutes, further `PUT
+  /api/me/image-provider` calls answer 429 `too_many_attempts` (`lockedUntil` = when the oldest counted rejection is 15
+  minutes old) without calling the provider, so the route cannot be used to test stolen keys. Malformed input does not
+  count and a successful save does not reset the count. In memory (`AttemptLimiter`).
 - **Tool:** `factory_generate_image` (§7) for the chat agent, the spec-writer and the builder (fix rounds included).
   The service also derives the session kind from the grant and refuses any other, and for a run checks that the run
   belongs to the grant's repository and owner. Order: who may call, arguments, provider configured, transparency
@@ -1105,7 +1150,13 @@ Agents can have graphics made by an image AI the user chose (issue #11). Claude 
   `$FACTORY_DATA_DIR/generated-images/<sessionId>/<id8>-<slug>.<ext>` (absolute `path`), runs under
   `<worktree>/.agern-run/images/<id8>-<slug>.<ext>` (relative `path`). Whenever the server creates
   `<worktree>/.agern-run/` it writes `.agern-run/.gitignore` containing `*`, so git ignores the directory without any
-  change to the repository. Each generation appends an `images` event to the session (§8) and, in a run, publishes the
+  change to the repository. **Symlinks are never followed:** `.agern-run` and `.agern-run/images` must be absent or
+  real directories (checked with `NOFOLLOW_LINKS`) whose real path lies inside the worktree's; a file is written by
+  removing whatever is at its name (a symlink itself, not its target) and creating it with `CREATE_NEW` and
+  `NOFOLLOW_LINKS`. The tool checks this before the limits and the provider call ("Images cannot be written:
+  `.agern-run` in this working directory is not a plain directory."); the run hand-over fails the run ("Prepared
+  images could not be handed over: …"), which unlocks the selection. Directory removal walks the tree without
+  following links. Each generation appends an `images` event to the session (§8) and, in a run, publishes the
   run so the run page updates.
 - **Selection:** the owner of a chat image selects it for an open issue under a short name (`PUT
   /api/images/{id}/selection`), moves, renames or unselects it, or discards an unselected one; at most 20 per issue.
@@ -1459,8 +1510,11 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `GET /api/me/usage` | → `ClaudeUsage` | the caller's own Claude usage (§5 "Claude usage"); there is no way to read another user's, also not for admins |
 | `PUT /api/me/github-token` | `{ token }` → `User` | 422 if GitHub rejects it. `GET /user` succeeds with any scope, so the token's kind and (classic) scopes are recorded and shown; Settings warns when a classic token lacks `repo` (public repositories only, no push) and explains the grants a fine-grained token needs |
 | `DELETE /api/me/github-token` | → `User` | |
-| `PUT /api/me/image-provider` | `{ provider, model, apiKey }` → `User` | §6 "Generated images". 400 unknown provider or bad model name; 422 `image_key_invalid` (malformed, or rejected by the provider), 422 `image_model_unknown`, 502 `image_provider_unavailable`; nothing is stored on any error. The key is never returned |
-| `DELETE /api/me/image-provider` | → `User` | idempotent; images stay |
+| `PUT /api/me/image-provider` | `{ provider, model, apiKey }` → `User` | §6 "Generated images". 400 unknown provider or bad model name; 409 `codex_login_required` (a `device_login` provider), 409 `image_provider_unavailable_here`; 422 `image_key_invalid` (malformed, or rejected by the provider), 422 `image_model_unknown`, 429 `too_many_attempts` (5 rejected keys per 15 minutes), 502 `image_provider_unavailable`; nothing is stored on any error. The key is never returned |
+| `DELETE /api/me/image-provider` | → `User` | idempotent; images stay; cancels a pending Codex login |
+| `POST /api/me/image-provider/codex/login` | → `CodexLogin` | §4 "Codex login". Starts a device login (cancels a pending one); answers `{ status: "pending", verificationUrl, userCode, expiresAt }`, or `{ status: "failed", error }` for a refused URL. 409 `image_provider_unavailable_here` (no Codex CLI), 429 `too_many_attempts` (5 starts per 15 minutes), 502 `codex_login_failed` (no code within 20 s) |
+| `GET /api/me/image-provider/codex/login` | → `CodexLogin` | `{ status: none\|pending\|connected\|failed\|expired, verificationUrl?, userCode?, expiresAt?, error? }`; URL and code only while `pending` |
+| `DELETE /api/me/image-provider/codex/login` | → `CodexLogin` | cancels a pending login (`none`); idempotent |
 | `GET /api/images/{id}` | → image bytes | anyone who can see the image's repository (404 otherwise and for unknown ids); the attachment headers, `Content-Disposition: inline` |
 | `PUT /api/images/{id}/selection` | `{ issueNumber, name }` → `GeneratedImage` | the image's owner, chat images only: 403 not the owner, 404 unknown image/issue, 400 name empty or over 60, 409 `run_image` / `issue_closed` / `too_many_images` (20 per issue) / `image_in_use` (locked) |
 | `DELETE /api/images/{id}/selection` | → `GeneratedImage` | as above; 409 `image_in_use` while locked |
@@ -1506,7 +1560,7 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `GET /api/agents?active=true` | → `AgentSession[]` | all kinds, across visible repos. `active=true`: `live` (a process exists, e.g. a chat idling between turns) or `starting`/`running` |
 | `GET /api/sessions/{id}` | → `AgentSession` | |
 | `GET /api/sessions/{id}/events?after=<seq>&limit=<n>` | → `Event[]` | ascending |
-| `GET /api/config` | → `ClientConfig` | limits the frontend checks before uploading |
+| `GET /api/config` | → `ClientConfig` | limits the frontend checks before uploading; `images.providers[]` with `id, label, models, defaultModel, supportsTransparency, keyPlaceholder, auth, available, unavailableReason` |
 | `POST /api/sessions/{id}/input` | `{ text, attachmentIds? }` → 202 | owner only. **Chat:** accepted mid-turn too (delivered after the current turn); a `stopped` or process-less chat resumes. `text` may be empty when `attachmentIds` is not. The attachments are bound to this message when it is accepted, so a message queued mid-turn keeps its own. Answer `{ status: 'accepted' }`. **Pipeline agent:** a text message for a running spec-writer or builder (§6 "Messages to running agents") → 202 `AgentMessage`; 403 for everyone but the run's owner (admins too), 409 `agent_does_not_accept_messages` (reviewers, approver), 409 `agent_not_running`, 422 `attachments_not_allowed` |
 | `POST /api/sessions/{id}/attachments?name=<file name>` | raw bytes → 201 `Attachment` | owner only, chat only; see "Attachments" below |
 | `GET /api/sessions/{id}/attachments/{aid}?preview=1` | → bytes | anyone who may see the session once it is sent; before that only its uploader. `preview=1`: the downscaled copy if there is one |
@@ -1909,7 +1963,12 @@ dimensions, model and "Open full size ↗"; it also updates live.
 
 **Image generation.** Settings has an "Image generation" section (`#images`) between GitHub and Models: the provider
 as a segmented choice from `GET /api/config`, a password field for the API key, a model field with the provider's
-models as suggestions, Save/Replace ("Checking with <provider>…") and Remove, and the limits. In a transcript, an
+models as suggestions, Save/Replace ("Checking with <provider>…") and Remove, and the limits. An unavailable
+provider's choice is disabled (its reason shown muted when it is the saved provider or the only one). For OpenAI Codex
+the key and model fields are replaced by the device login (`CodexConnect`): an explanation and "Connect ChatGPT";
+while pending "1. Open <link>", "2. Enter this code <code>" with a copy button, "Waiting for you to finish signing in…"
+and Cancel, polling every 3 s; then "Connected. New image requests will use it." and the status "OpenAI Codex ·
+ChatGPT login" with Reconnect and Remove; a failed or expired login shows its error and "Connect ChatGPT" again. In a transcript, an
 `images` event renders as a block "Generated N image(s) with <provider> · <model>", the purpose, the prompt in a
 disclosure and one tile per image (from `GET /api/sessions/{id}/images`; a discarded image shows a placeholder).
 The image's owner, for chat images, gets "Use for issue…" (a dialog with issue number and name) and "Discard", or

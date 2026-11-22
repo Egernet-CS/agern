@@ -56,8 +56,8 @@ Models per role are a setting. The details are in [`docs/ARCHITECTURE.md`](docs/
   can watch; sessions owned by someone else are read-only.
 - **Agents can use the factory.** The chat agent gets factory tools over MCP (list and create issues,
   start, approve and cancel runs), and `/factory run|status|approve|cancel` works in the chat.
-- **Generated images.** Each person can register an image AI (OpenAI or Google Gemini, their own API
-  key and model) under Settings. When a request or issue asks for an icon, illustration or other graphics,
+- **Generated images.** Each person can register an image AI under Settings: OpenAI or Google Gemini
+  with their own API key and model, or OpenAI Codex signed in with their own ChatGPT account. When a request or issue asks for an icon, illustration or other graphics,
   the chat agent, spec-writer and builder have them generated on the server with the owner's key; chat
   images can be picked for an issue and are handed to its run, run images show on the run page.
 - **Build and test sandboxes (optional).** A project describes a container for its builds and tests
@@ -149,6 +149,7 @@ sudo agern doctor && sudo agern start
 - PostgreSQL 16, installed natively
 - `claude`, `git` and `gh` on the service's `PATH` (agents are `claude` processes started by the
   server; they use `git` and `gh`)
+- Optional: the OpenAI `codex` CLI, for users who generate images with their ChatGPT login (`FACTORY_CODEX_BIN`)
 - `curl`, `tar` and `openssl` for the installer
 
 **1. Database.** Create a role and a database (Flyway creates and migrates the schema on startup):
