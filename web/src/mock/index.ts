@@ -31,6 +31,8 @@ import {
   approveRun,
   approveSandbox,
   cancelRun,
+  reviewRun,
+  talkToRun,
   revokeSandboxApproval,
   pendingSandboxes,
   sandboxOverview,
@@ -392,6 +394,14 @@ export const mockApi: Api = {
       const r = run(id);
       if (r.owner.username !== me().username && !me().isAdmin) throw new MockError(403, 'forbidden', 'Only the owner or an admin can cancel.');
       cancelRun(r);
+      return r;
+    }),
+
+  talkToRun: (id, text) => ok(() => (needGithub(), talkToRun(run(id), text, me()))),
+  reviewRun: (id) =>
+    ok(() => {
+      const r = run(id);
+      reviewRun(r, me());
       return r;
     }),
 

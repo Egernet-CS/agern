@@ -441,7 +441,8 @@ function newSession(
     id: uid(),
     repo,
     kind,
-    model: kind === 'chat' ? effective(owner.username).chatModel : effective(owner.username).model(kind as StageRole),
+    // The advisor runs on the owner's builder model (it may change code that is merged).
+    model: kind === 'chat' ? effective(owner.username).chatModel : effective(owner.username).model(kind === 'advisor' ? 'builder' : (kind as StageRole)),
     status: 'starting',
     owner: ownerOf(owner),
     title: null,
@@ -968,6 +969,7 @@ function makeRun(repo: string, issue: Issue, owner: User, createdMs: number, sta
     sandbox: runSandboxFor(repo),
     releaseId: release?.id ?? null,
     baseBranch: release ? `release/${release.name}` : null,
+    conversation: { sessionId: null, review: 'none', followUpFrom: null },
   };
   for (const role of ['spec-writer', 'builder', ...reviewers, 'approver'] as StageRole[]) pendingStage(r, role, 0);
   db.runs.set(r.id, r);
@@ -1001,11 +1003,19 @@ export function startRun(repo: string, issueNumber: number, owner: User, started
 export function approveRun(r: Run, by: User) {
   if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner can approve this run.');
   if (r.status !== 'needs_human') throw new MockError(409, 'conflict', 'Run is not waiting for a human.');
+  const adv = r.conversation.sessionId ? db.sessions.get(r.conversation.sessionId) : undefined;
+  if (r.conversation.review === 'running') throw new MockError(409, 'review_in_progress', 'Changes from the conversation are being reviewed; wait for the reviews.');
+  if (adv && (adv.status === 'running' || adv.status === 'starting')) throw new MockError(409, 'agent_busy', 'The agent is still answering; wait for it or interrupt it');
+  if (r.conversation.review === 'required') throw new MockError(409, 'review_required', 'Changes from the conversation have not been reviewed yet. Review them again first.');
+  if (adv) setStatus(adv, 'done', iso(Date.now()));
   r.error = null;
   setRunStatus(r, 'merged', iso(Date.now()));
 }
 
 export function cancelRun(r: Run) {
+  const adv = r.conversation.sessionId ? db.sessions.get(r.conversation.sessionId) : undefined;
+  if (adv && !['done', 'failed', 'stopped'].includes(adv.status)) stopSession(adv);
+  if (r.conversation.review === 'running') r.conversation.review = 'required';
   for (const st of r.stages) {
     if (st.status === 'running' && st.sessionId) {
       const s = db.sessions.get(st.sessionId);
@@ -1019,6 +1029,94 @@ export function cancelRun(r: Run) {
   }
   dropSandbox(r.id);
   setRunStatus(r, 'cancelled', iso(Date.now()));
+}
+
+// ---------------------------------------------------------------- conversation (docs/ARCHITECTURE.md §6 "Conversation")
+
+const shortSha = () => Math.random().toString(16).slice(2, 9).padEnd(7, '0');
+
+/** Like the backend: the owner's message to the run's advisor while it needs a human. Same checks and codes. */
+export function talkToRun(r: Run, text: string, by: User): { status: 'accepted'; sessionId: string } {
+  if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner of this run can talk to its agent');
+  if (r.status !== 'needs_human') throw new MockError(409, 'run_not_waiting', `Run is ${r.status}; the agent can only be talked to while the run needs a human`);
+  if (!text.trim()) throw new MockError(400, 'bad_request', 'text must not be empty');
+  if (text.length > 100_000) throw new MockError(400, 'bad_request', 'text is too long');
+  if (r.conversation.review === 'running') throw new MockError(409, 'review_in_progress', 'Changes from the conversation are being reviewed; wait for the reviews.');
+  let s = r.conversation.sessionId ? db.sessions.get(r.conversation.sessionId) : undefined;
+  if (s && (s.status === 'running' || s.status === 'starting' || db.players.has(s.id))) throw new MockError(409, 'agent_busy', 'The agent is still answering; wait for it or interrupt it');
+  if (!by.claudeCredentialKind) throw new MockError(422, 'claude_credential_required', 'Register a Claude credential in Settings first');
+  const ts = iso(Date.now());
+  if (!s) {
+    s = newSession(r.repo, 'advisor', by, { runId: r.id, issueNumber: r.issueNumber, title: `advisor · #${r.issueNumber}` });
+    r.conversation.sessionId = s.id;
+    touchRun(r, ts);
+  }
+  const first = (db.events.get(s.id) ?? []).every((e) => e.type !== 'claude');
+  if (first || !s.live) emit(s.id, 'system', { level: 'info', text: 'The agent was given the run’s context: the issue, the spec, the diff, the reviewers’ findings and why the run needs a human.' }, ts);
+  const change = /change/i.test(text);
+  const reason = r.error?.split('\n\n')[0] ?? 'The run needs a human.';
+  const steps: Step[] = change
+    ? [
+        { kind: 'think', text: 'The owner asks for a change. Keep it minimal, run the checks, commit.' },
+        { kind: 'tool', name: 'Bash', input: { command: 'git diff --stat origin/main...HEAD' }, result: ' AGERN_FAKE.md | 1 +\n 1 file changed, 1 insertion(+)' },
+        { kind: 'tool', name: 'Bash', input: { command: 'git commit -am "Apply the change the run owner asked for"' }, result: '[factory 3f2a1c9] Apply the change the run owner asked for\n 1 file changed, 1 insertion(+)' },
+        { kind: 'text', text: 'Done: I committed the change. The factory pushes it and the four reviewers look at it again; only you can approve the run.' },
+      ]
+    : [
+        { kind: 'tool', name: 'Bash', input: { command: 'git diff --stat origin/main...HEAD' }, result: ' AGERN_FAKE.md | 1 +\n 1 file changed, 1 insertion(+)' },
+        { kind: 'text', text: `Advisor: ${text}\n\n${reason}\n\nThe diff touches \`AGERN_FAKE.md\`. The reviewers' findings are in the rounds above; ask me for a change if you want one before approving.` },
+      ];
+  const p = new Player('live', Date.now());
+  db.players.set(s.id, p);
+  const sess = s;
+  play(sess, steps, p, {
+    userText: text,
+    init: true,
+    onDone: () => {
+      db.players.delete(sess.id);
+      setStatus(sess, 'idle', iso(Date.now()));
+      if (change && r.status === 'needs_human') followUpReview(r, by);
+    },
+  });
+  return { status: 'accepted', sessionId: s.id };
+}
+
+/** Like the backend's follow-up review: four reviewers in a new round; the approver does not run again. */
+function followUpReview(r: Run, owner: User) {
+  const round = Math.max(...r.stages.map((x) => x.round)) + 1;
+  r.round = round;
+  r.conversation.followUpFrom ??= round;
+  r.conversation.review = 'running';
+  for (const role of reviewers) pendingStage(r, role, round);
+  touchRun(r, iso(Date.now()));
+  const plan: Plan = { changes: {}, approver: 'APPROVE', liveFrom: () => true };
+  let pending = reviewers.length;
+  const sha = shortSha();
+  const n = round - r.conversation.followUpFrom + 1;
+  for (const role of reviewers) {
+    runStage(r, role, round, plan, Date.now(), owner, () => {
+      if (--pending > 0 || r.status !== 'needs_human') return;
+      const changes = r.stages.filter((x) => x.round === round && x.verdict === 'CHANGES').map((x) => x.role);
+      const base = (r.error ?? '').split('\n\n**Follow-up review')[0];
+      r.error = `${base}\n\n**Follow-up review ${n}** (commit \`${sha}\`): ${changes.length ? `${changes.join(', ')} still request changes.` : 'all four reviewers pass.'}`;
+      r.conversation.review = 'none';
+      const adv = r.conversation.sessionId;
+      if (adv) emit(adv, 'system', { level: 'info', text: `Follow-up review ${n}: ${reviewers.map((x) => `${x} ${r.stages.find((st) => st.role === x && st.round === round)?.verdict ?? '—'}`).join(', ')}.` }, iso(Date.now()));
+      touchRun(r, iso(Date.now()));
+    });
+  }
+}
+
+/** Like the backend's "Review again". */
+export function reviewRun(r: Run, by: User) {
+  if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner of this run can review it again');
+  if (r.status !== 'needs_human') throw new MockError(409, 'run_not_waiting', `Run is ${r.status}; the agent can only be talked to while the run needs a human`);
+  if (r.conversation.review === 'running') throw new MockError(409, 'review_in_progress', 'Changes from the conversation are being reviewed; wait for the reviews.');
+  const s = r.conversation.sessionId ? db.sessions.get(r.conversation.sessionId) : undefined;
+  if (s && (s.status === 'running' || s.status === 'starting')) throw new MockError(409, 'agent_busy', 'The agent is still answering; wait for it or interrupt it');
+  if (!by.claudeCredentialKind) throw new MockError(422, 'claude_credential_required', 'Register a Claude credential in Settings first');
+  if (r.conversation.review === 'none' || !s) throw new MockError(409, 'nothing_to_review', 'Nothing changed since the last review.');
+  followUpReview(r, by);
 }
 
 // ---------------------------------------------------------------- releases (same rules and error codes as the server)

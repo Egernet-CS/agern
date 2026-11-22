@@ -138,6 +138,14 @@ export interface Api {
   run(id: string): Promise<Run>;
   approveRun(id: string): Promise<Run>;
   cancelRun(id: string): Promise<Run>;
+  /**
+   * Owner only (403 for everyone else, admins included): a message to the run's advisor while it needs a human. 409
+   * `run_not_waiting` / `review_in_progress` / `agent_busy` / `too_many_agents` / `run_worktree_missing`, 422
+   * `claude_credential_required`.
+   */
+  talkToRun(id: string, text: string): Promise<{ status: 'accepted'; sessionId: string }>;
+  /** Owner only: reviews changes from the conversation again. 409 `nothing_to_review` / `review_in_progress` / `agent_busy`. */
+  reviewRun(id: string): Promise<Run>;
 
   projectSessions(repo: string, kind?: 'chat'): Promise<AgentSession[]>;
   createChat(repo: string, model?: string): Promise<AgentSession>;

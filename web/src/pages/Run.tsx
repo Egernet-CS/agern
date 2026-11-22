@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { api, ApiError, isRunActive, isRunWorking, type AgentSession, type Run, type Screenshot, type StageRole } from '../api';
 import { ChatView } from '../components/chat/ChatView';
 import { RunSandboxLine } from '../components/sandbox/SandboxBits';
 import { Markdown } from '../components/chat/Markdown';
-import { buildNodes, latestStage, REVIEWERS, ROLE_BLURB, roundName, rounds, stagesFor, type NodeId } from '../components/pipeline/model';
+import { buildNodes, humanSelectable, isFollowUp, latestStage, REVIEWERS, ROLE_BLURB, roundName, rounds, stagesFor, type NodeId } from '../components/pipeline/model';
+import { Prompt } from '../components/chat/Prompt';
 import { PipelineDiagram } from '../components/pipeline/PipelineDiagram';
 import { Dialog, Empty, ErrorBox, KindBadge, Loading, RunStatusPill, Verdict } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
@@ -18,7 +19,7 @@ const ROLE_ORDER: StageRole[] = ['spec-writer', 'builder', 'security', 'ux', 'ui
 function defaultNode(run: Run): NodeId {
   const running = run.stages.find((s) => s.status === 'running');
   if (running) return running.role;
-  if (run.status === 'needs_human') return 'approver';
+  if (run.status === 'needs_human') return run.conversation.sessionId ? 'human' : 'approver';
   const last = [...run.stages].sort((a, b) => (a.startedAt ?? '').localeCompare(b.startedAt ?? '')).pop();
   return last?.role ?? 'issue';
 }
@@ -48,6 +49,18 @@ export function RunPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [run?.stages.length]);
 
+  // The advisor session appears once the owner has sent a first message: fetch it when the run names one we don't know.
+  useEffect(() => {
+    const sid = run?.conversation.sessionId;
+    if (sid && !sessionMap.has(sid) && !sessQ.loading) sessQ.reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [run?.conversation.sessionId]);
+
+  const focusComposer = useCallback(() => {
+    // The composer mounts focused; when it is already there, focus it again.
+    setTimeout(() => document.querySelector<HTMLTextAreaElement>('.conv-panel textarea')?.focus(), 0);
+  }, []);
+
   if (runQ.error)
     return (
       <div className="page">
@@ -58,13 +71,24 @@ export function RunPage() {
 
   const nodes = buildNodes(run, sessionMap);
   const selParam = params.get('stage') as NodeId | null;
-  const selected: NodeId = selParam && (selParam === 'issue' || ROLE_ORDER.includes(selParam as StageRole)) ? selParam : defaultNode(run);
+  const selected: NodeId =
+    selParam && (selParam === 'issue' || ROLE_ORDER.includes(selParam as StageRole) || (selParam === 'human' && humanSelectable(run))) ? selParam : defaultNode(run);
   const select = (id: NodeId) => {
     params.set('stage', id);
     params.delete('round');
     setParams(params, { replace: true });
   };
   const isOwner = run.owner.username === me.username;
+  const advisor = run.conversation.sessionId ? sessionMap.get(run.conversation.sessionId) : undefined;
+  const advisorWorking = advisor?.status === 'starting' || advisor?.status === 'running';
+  const approveHint =
+    run.conversation.review === 'running'
+      ? 'Changes from the conversation are being reviewed.'
+      : run.conversation.review === 'required'
+        ? 'Changes from the conversation have not been reviewed yet. Review them again first.'
+        : advisorWorking
+          ? 'The agent is still working.'
+          : null;
 
   const act = async (kind: 'approve' | 'cancel') => {
     setBusy(kind);
@@ -96,7 +120,7 @@ export function RunPage() {
         </div>
         <dl className="rh-meta">
           <div><dt>owner</dt><dd>{run.owner.displayName || run.owner.username}{isOwner ? ' (you)' : ''}</dd></div>
-          <div><dt>round</dt><dd>{run.round === 0 ? 'build' : <>fix round {run.round} <span className="muted">of {run.maxRounds}</span></>}{run.round === 0 && <span className="muted"> · up to {run.maxRounds} fix rounds</span>}</dd></div>
+          <div><dt>round</dt><dd>{run.round === 0 ? 'build' : isFollowUp(run.round, run) ? roundName(run.round, run) : <>fix round {run.round} <span className="muted">of {run.maxRounds}</span></>}{run.round === 0 && <span className="muted"> · up to {run.maxRounds} fix rounds</span>}</dd></div>
           <div><dt>branch</dt><dd className="mono">{run.branch ?? '—'}</dd></div>
           {run.baseBranch && (
             <div>
@@ -113,9 +137,26 @@ export function RunPage() {
         <RunSandboxLine run={run} />
         <div className="rh-actions">
           {run.status === 'needs_human' && isOwner && (
-            <button className="btn btn--approve" onClick={() => void act('approve')} disabled={busy !== null}>
-              {busy === 'approve' ? 'Approving…' : '✓ Approve & merge'}
-            </button>
+            <>
+              <button
+                className="btn btn--approve"
+                onClick={() => void act('approve')}
+                disabled={busy !== null || approveHint !== null}
+                aria-describedby={approveHint ? 'approve-hint' : undefined}
+              >
+                {busy === 'approve' ? 'Approving…' : '✓ Approve & merge'}
+              </button>
+              <button
+                className="btn btn--ghost"
+                onClick={() => {
+                  select('human');
+                  focusComposer();
+                }}
+              >
+                Talk to the agent
+              </button>
+              {approveHint && <span id="approve-hint" className="muted small">{approveHint}</span>}
+            </>
           )}
           {run.status === 'needs_human' && !isOwner && <span className="muted small">Waiting for {run.owner.username} to approve.</span>}
           {active && (isOwner || me.isAdmin) && (
@@ -134,7 +175,11 @@ export function RunPage() {
 
       <RoundsStrip run={run} onPick={(role, round) => { params.set('stage', role); params.set('round', String(round)); setParams(params, { replace: true }); }} />
 
+      {selected === 'human' ? (
+        <HumanDetail run={run} session={advisor} isOwner={isOwner} onRun={(r) => runQ.setData(() => r)} />
+      ) : (
       <StageDetail run={run} node={selected} round={params.get('round')} sessions={sessionMap} onRound={(r) => { params.set('round', String(r)); setParams(params, { replace: true }); }} />
+      )}
 
       <Dialog open={confirmCancel} onClose={() => setConfirmCancel(false)} title="Cancel this run?">
         <p>Running agents are stopped. The branch {run.branch && <code>{run.branch}</code>} and any pull request stay on GitHub.</p>
@@ -154,7 +199,7 @@ function RoundsStrip({ run, onPick }: { run: Run; onPick: (role: StageRole, roun
     <section className="rounds" aria-label="Rounds">
       {rs.map(({ round, stages }) => (
         <div key={round} className="round">
-          <span className="round-k">{roundName(round)}</span>
+          <span className="round-k">{roundName(round, run)}</span>
           {[...stages].sort((a, b) => ROLE_ORDER.indexOf(a.role) - ROLE_ORDER.indexOf(b.role)).map((s) => (
             <button key={s.id} type="button" className={`round-chip round-chip--${s.status} ${s.verdict ? `round-chip--${s.verdict.toLowerCase()}` : ''}`} onClick={() => onPick(s.role, s.round)}>
               {s.role}
@@ -163,6 +208,120 @@ function RoundsStrip({ run, onPick }: { run: Run; onPick: (role: StageRole, roun
           ))}
         </div>
       ))}
+    </section>
+  );
+}
+
+/** The conversation with the run's advisor, under the needs-human node (docs/ARCHITECTURE.md §6 "Conversation"). */
+function HumanDetail({ run, session, isOwner, onRun }: { run: Run; session: AgentSession | undefined; isOwner: boolean; onRun: (r: Run) => void }) {
+  const [starting, setStarting] = useState(false);
+  const [reviewErr, setReviewErr] = useState<string | null>(null);
+  const conv = run.conversation;
+  const waiting = run.status === 'needs_human';
+  const followUp = conv.followUpFrom != null ? run.round - conv.followUpFrom + 1 : 1;
+  const reviewLine =
+    conv.review === 'running'
+      ? `Reviewing the changes (follow-up ${followUp})…`
+      : conv.review === 'required'
+        ? 'Changes have not been reviewed.'
+        : 'No changes since the last review.';
+  const reviewAgain = async () => {
+    setStarting(true);
+    setReviewErr(null);
+    try {
+      onRun(await api.reviewRun(run.id));
+    } catch (e) {
+      setReviewErr((e as Error).message);
+    } finally {
+      setStarting(false);
+    }
+  };
+  return (
+    <div className="stage-detail conv-panel">
+      <div className="sd-info">
+        <p className="eyebrow">needs human</p>
+        <h2>Conversation</h2>
+        <p className="muted">
+          Ask the agent about this run, or ask it for a change. A change is committed, pushed and reviewed again before the run can be
+          approved. Talking never approves anything. Messages are not posted on GitHub.
+        </p>
+        <dl className="sd-facts">
+          <div><dt>model</dt><dd>{modelLabel(session?.model)}</dd></div>
+          <div><dt>cost</dt><dd>{cost(session?.costUsd)}</dd></div>
+          <div><dt>turns</dt><dd>{session?.numTurns ?? '—'}</dd></div>
+        </dl>
+        {(waiting || conv.sessionId) && <p className="muted small" role="status">{reviewLine}</p>}
+        {isOwner && waiting && conv.review === 'required' && (
+          <button type="button" className="btn btn--sm" onClick={() => void reviewAgain()} disabled={starting}>
+            {starting ? 'Starting…' : 'Review again'}
+          </button>
+        )}
+        {reviewErr && <p className="form-error" role="alert">{reviewErr}</p>}
+      </div>
+      <div className="sd-transcript">
+        {conv.sessionId ? (
+          <ChatView key={conv.sessionId} sessionId={conv.sessionId} session={session} embedded advisorRun={run} />
+        ) : !waiting ? (
+          <div className="sd-empty"><p className="muted">No conversation took place.</p></div>
+        ) : isOwner ? (
+          <FirstMessage run={run} />
+        ) : (
+          <div className="sd-empty"><p className="muted">No conversation yet. Only {run.owner.username} can talk to the agent.</p></div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** The owner's composer before the conversation exists; the transcript replaces it once the server has the session. */
+function FirstMessage({ run }: { run: Run }) {
+  const [error, setError] = useState<string | null>(null);
+  const [sent, setSent] = useState<string | null>(null);
+  const send = async (text: string) => {
+    setError(null);
+    try {
+      await api.talkToRun(run.id, text);
+      setSent(text);
+      return true;
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : 'Could not send.');
+      return false;
+    }
+  };
+  return (
+    <section className="chat chat--embedded" aria-label="Agent transcript">
+      <div className="chat-scroll-wrap">
+        <div className="chat-scroll">
+          <div className="chat-log">
+            {sent ? (
+              <div className="t-user t-user--pending">
+                <span className="t-prompt" aria-hidden>&gt;</span>
+                <div className="t-user-body"><div className="t-user-text">{sent}</div></div>
+              </div>
+            ) : (
+              <div className="t-meta">No conversation yet. Ask why the run needs a human, or ask for a change.</div>
+            )}
+          </div>
+        </div>
+      </div>
+      {error && (
+        <div className="chat-error" role="alert">
+          {error}
+          <button type="button" className="link" onClick={() => setError(null)}>dismiss</button>
+        </div>
+      )}
+      {run.conversation.review === 'running' ? (
+        <div className="chat-disabled" role="status">The changes are being reviewed; you can continue when the reviews are in.</div>
+      ) : (
+        <Prompt
+          onSubmit={send}
+          working={sent !== null}
+          commands={false}
+          label="Message the agent"
+          placeholder="Ask about this run, or ask for a change"
+          history={[]}
+        />
+      )}
     </section>
   );
 }
@@ -206,7 +365,7 @@ function StageDetail({ run, node, round, sessions, onRound }: { run: Run; node: 
           <div className="seg seg--small" role="tablist" aria-label="Round">
             {all.map((s) => (
               <button key={s.id} role="tab" aria-selected={s.id === stage?.id} className={s.id === stage?.id ? 'is-on' : ''} onClick={() => onRound(s.round)}>
-                {roundName(s.round)}
+                {roundName(s.round, run)}
               </button>
             ))}
           </div>
@@ -224,7 +383,7 @@ function StageDetail({ run, node, round, sessions, onRound }: { run: Run; node: 
               <div><dt>turns</dt><dd>{session?.numTurns ?? '—'}</dd></div>
             </dl>
             {role === 'builder' && stage.round > 0 && (
-              <p className="muted small">Continues the builder conversation of {roundName(stage.round - 1)} (a new agent session resumed with <code>--resume</code>), given all reviewer findings.</p>
+              <p className="muted small">Continues the builder conversation of {roundName(stage.round - 1, run)} (a new agent session resumed with <code>--resume</code>), given all reviewer findings.</p>
             )}
             {stage.summary && <div className="sd-summary"><Markdown text={stage.summary} /></div>}
             {stage.findings.length > 0 && (

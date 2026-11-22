@@ -28,6 +28,13 @@ Behaviour
         "usage-ok"    -> unifiedWindows five_hour 0.42 and seven_day 0.18, both "allowed"
         "usage-high"  -> unifiedWindows five_hour 0.86 "allowed_warning" and seven_day 0.18 "allowed"
         "usage-limit" -> top-level status "rejected", rateLimitType "five_hour", utilization 1.0, resetsAt now + 2 h
+  Advisor (interactive, "# Role: advisor"): the agent a run's owner talks to at needs human, using the chat loop.
+    Every message is answered "Advisor: <the owner's text>", followed by the "Needs a human because:" line and the
+    reviewer headings ("### ...") found in the <run_context> block the server sent to this process, and the output
+    of `git diff --stat <baseRef>...HEAD` (baseRef taken from the context).
+    - text containing "please change" -> appends a line to AGERN_FAKE.md and commits it (the server then pushes and
+                                 reviews it again)
+    - "slow" and "crash" behave as in chat
   Conversations are remembered under $HOME/.fake-claude/sessions/<id>. Like the real CLI,
   --resume <id> of an unknown conversation fails at once ("No conversation found with session ID").
   A Claude credential containing "invalid" is rejected like a bad key ("Invalid API key").
@@ -324,6 +331,32 @@ def describe_blocks(blocks):
 
 # --------------------------------------------------------------------------- chat mode
 
+advisor_context = {}
+
+
+def advisor_reply(text, context):
+    """The advisor's answer: the owner's words, what the run context says, and the actual diff."""
+    lines = ["Advisor: " + text]
+    for line in context.splitlines():
+        if line.startswith("Needs a human because:") or line.startswith("### "):
+            lines.append(line)
+    base = re.search(r"git diff (\S+)\.\.\.HEAD", context)
+    if "please change" in text and (os.path.isdir(".git") or os.path.isfile(".git")):
+        with open("AGERN_FAKE.md", "a") as f:
+            f.write("change requested in the conversation at %s\n" % time.strftime("%Y-%m-%dT%H:%M:%S"))
+        subprocess.run(["git", "add", "AGERN_FAKE.md"], check=False)
+        subprocess.run(["git", "commit", "-q", "-m", "Apply the change the run owner asked for (fake)"], check=False)
+        lines.append("Committed the change; the factory pushes it and has it reviewed again. Only you can approve the run.")
+    if base:
+        ref = base.group(1).strip("`")
+        try:
+            stat = subprocess.run(["git", "diff", "--stat", "%s...HEAD" % ref], capture_output=True, text=True, timeout=30).stdout.strip()
+        except Exception as e:  # noqa
+            stat = "git diff failed: %s" % e
+        lines.append("Diff: " + (stat or "(no changes)"))
+    return "\n".join(lines)
+
+
 def chat_mode():
     inbox = queue.Queue()
 
@@ -405,9 +438,22 @@ def chat_mode():
             stream_text(reply)
             result(reply)
             continue
+        if role == "advisor":
+            context = advisor_context.get("text", "")
+            m_ctx = re.search(r"<run_context>[\s\S]*?</run_context>", content)
+            if m_ctx:
+                context = m_ctx.group(0)
+                advisor_context["text"] = context
+            content = re.sub(r"<run_context>[\s\S]*?</run_context>\s*", "", content)
+            content = owner_text(content.strip())
         if "crash" in content:
             sys.stderr.write("fake-claude: crashing as requested\n")
             sys.exit(3)
+        if role == "advisor" and "slow" not in content:
+            reply = advisor_reply(content, advisor_context.get("text", ""))
+            stream_text(reply)
+            result(reply)
+            continue
         rate_limit_event(content)
         if "tool" in content:
             tool_roundtrip("echo hello from fake-claude && pwd")
@@ -646,7 +692,7 @@ if __name__ == "__main__":
         emit({"type": "result", "subtype": "success", "is_error": True, "duration_ms": 10, "num_turns": 1,
               "result": "Invalid API key · Please run /login", "session_id": session_id, "total_cost_usd": 0})
         sys.exit(1)
-    if interactive and role != "chat":
+    if interactive and role not in ("chat", "advisor"):
         stage_stream_mode()
     elif interactive:
         chat_mode()

@@ -95,12 +95,12 @@ export function buildNodes(run: Run, sessions: Map<string, AgentSession>): Recor
       const stale = REVIEWERS.includes(role) && st.round < currentRound && st.status === 'done';
       if (stale) {
         n.state = TERMINAL_FAIL.includes(run.status) ? 'skipped' : 'stale';
-        n.note = `${roundName(st.round)}: ${st.verdict ?? st.status}`;
+        n.note = `${roundName(st.round, run)}: ${st.verdict ?? st.status}`;
         n.verdict = null;
         n.tone = null;
       } else if (st.status === 'pending' && st.round > 0) {
         const prev = stagesFor(run, role).filter((x) => x.round < st.round && x.verdict).pop();
-        if (prev) n.note = `${roundName(prev.round)}: ${prev.verdict}`;
+        if (prev) n.note = `${roundName(prev.round, run)}: ${prev.verdict}`;
       }
       if (st.status === 'running' && TERMINAL_FAIL.includes(run.status)) n.state = 'failed';
     } else if (TERMINAL_FAIL.includes(run.status)) n.state = 'skipped';
@@ -124,19 +124,29 @@ export function buildNodes(run: Run, sessions: Map<string, AgentSession>): Recor
 
   nodes.merge = { ...base('merge'), title: run.baseBranch ? 'merge to release' : ROLE_TITLE.merge, state: run.status === 'merged' ? 'done' : TERMINAL_FAIL.includes(run.status) ? 'skipped' : 'pending', sub: run.prNumber ? `PR #${run.prNumber}` : null, tone: run.status === 'merged' ? 'pass' : null, verdict: run.status === 'merged' ? 'MERGED' : null, endedAt: run.status === 'merged' ? run.endedAt : null };
   const approver = latestStage(run, 'approver');
+  const review = run.conversation.review;
+  const waitingSub = review === 'running' ? 'reviewing changes' : review === 'required' ? 'changes not reviewed' : 'waiting for owner';
   const approvedByHuman = run.status === 'merged' && (approver?.verdict === 'ESCALATE' || approver?.status === 'skipped');
   nodes.human = {
     ...base('human'),
     state: run.status === 'needs_human' ? 'running' : approvedByHuman ? 'done' : TERMINAL_FAIL.includes(run.status) || run.status === 'merged' ? 'skipped' : 'pending',
-    sub: run.status === 'needs_human' ? 'waiting for owner' : approvedByHuman ? 'approved by owner' : run.status === 'merged' ? 'not needed' : '/factory approve',
+    sub: run.status === 'needs_human' ? waitingSub : approvedByHuman ? 'approved by owner' : run.status === 'merged' ? 'not needed' : '/factory approve',
     tone: run.status === 'needs_human' ? 'escalate' : approvedByHuman ? 'pass' : null,
     verdict: run.status === 'needs_human' ? 'WAITING' : approvedByHuman ? 'APPROVED' : null,
   };
   return nodes;
 }
 
-/** "build" for round 0, "fix round N" after. */
-export const roundName = (round: number) => (round === 0 ? 'build' : `fix round ${round}`);
+/** True for a round that reviewed changes made in the conversation while the run needed a human. */
+export const isFollowUp = (round: number, run?: Pick<Run, 'conversation'>) =>
+  run?.conversation.followUpFrom != null && round >= run.conversation.followUpFrom;
+
+/** "build" for round 0, "fix round N" after; "follow-up N" for rounds that reviewed changes from the conversation. */
+export const roundName = (round: number, run?: Pick<Run, 'conversation'>) =>
+  isFollowUp(round, run) ? `follow-up ${round - run!.conversation.followUpFrom! + 1}` : round === 0 ? 'build' : `fix round ${round}`;
+
+/** The run's selectable conversation node: while it needs a human, or once it has a conversation. */
+export const humanSelectable = (run: Run) => run.status === 'needs_human' || run.conversation.sessionId !== null;
 
 export function rounds(run: Run): { round: number; stages: Stage[] }[] {
   const by = new Map<number, Stage[]>();

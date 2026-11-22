@@ -85,6 +85,12 @@ tests `FACTORY_2FA=off` is accepted when `dev` is the only provider.
     builder pick up the owner's messages after their current tool call, or as a further turn when they
     were finishing.
 
+    The advisor (the agent a run's owner talks to at `needs_human`, e.g. after `fake:escalate`) answers
+    `Advisor: <your text>`, followed by the "Needs a human because:" line and the reviewer headings from the run
+    context it was given, and `git diff --stat <base>...HEAD` of the run's worktree. A message containing
+    `please change` makes it append a line to `AGERN_FAKE.md` and commit it, which starts a follow-up review;
+    `slow` and `crash` behave as in chat.
+
     Put `fake:sandbox` in the issue body to make the builder call `factory_sandbox_info` and
     `factory_sandbox_exec` (`echo built in the sandbox && ls`) through MCP and report both answers.
 * `FACTORY_SANDBOX=fake` (only together with `FACTORY_DEV_FAKE_GITHUB`): sandboxes with an in-memory runtime

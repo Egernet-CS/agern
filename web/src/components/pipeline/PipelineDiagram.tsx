@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import type { Run } from '../../api/types';
 import { between } from '../../lib/format';
 import { useNow } from '../../lib/useNow';
-import type { NodeId, NodeView } from './model';
+import { humanSelectable, isFollowUp, roundName, type NodeId, type NodeView } from './model';
 
 type Box = { x: number; y: number; w: number; h: number };
 type Layout = { w: number; h: number; boxes: Record<NodeId, Box>; orient: 'h' | 'v' };
@@ -229,7 +229,7 @@ export function PipelineDiagram({ run, nodes, selected, onSelect }: { run: Run; 
   const L = narrow ? V : H;
   const edges = buildEdges(L, nodes, run);
   const order: NodeId[] = ['issue', 'spec-writer', 'builder', 'security', 'ux', 'ui-design', 'code', 'gate', 'approver', 'merge', 'human'];
-  const selectable = (id: NodeId) => !!nodes[id].stage || id === 'issue';
+  const selectable = (id: NodeId) => !!nodes[id].stage || id === 'issue' || (id === 'human' && humanSelectable(run));
 
   return (
     <div className={`pipeline ${narrow ? 'pipeline--v' : ''}`} ref={wrap}>
@@ -264,7 +264,7 @@ export function PipelineDiagram({ run, nodes, selected, onSelect }: { run: Run; 
         </g>
         {L.orient === 'h' && (
           <text className="pe-label pe-label--round" x={L.boxes.builder.x + L.boxes.builder.w / 2 + 16} y={418}>
-            {run.round === 0 ? 'build' : `fix round ${run.round} of ${run.maxRounds}`}
+            {run.round === 0 ? 'build' : isFollowUp(run.round, run) ? roundName(run.round, run) : `fix round ${run.round} of ${run.maxRounds}`}
           </text>
         )}
         {order.map((id) => (
