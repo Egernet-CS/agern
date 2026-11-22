@@ -84,6 +84,13 @@ tests `FACTORY_2FA=off` is accepted when `dev` is the only provider.
     (try the composer under its transcript on the run page). Like the real CLI, the spec-writer and
     builder pick up the owner's messages after their current tool call, or as a further turn when they
     were finishing.
+  * run assistant (the conversation of a run at needs human; `fake:escalate` gets a run there): every
+    message is answered with "Run assistant (fake)."; the first one (it carries the `<run_context>`) also with
+    `Context: issue #<n>; <k> finding(s); reason: …` and `Diff: <git diff --stat summary>`, and a message after a
+    follow-up review with `Review results received (<label>).` In the owner's text, `change: …` appends to
+    `AGERN_FAKE.md` and commits it (Agern then pushes and reviews it again), `dirty` edits without committing,
+    `slow` streams for ~10 s (try Esc) and `crash` exits with status 3. Reviewers treat a follow-up review
+    like a fix round for `fake:changes`.
 
     Put `fake:sandbox` in the issue body to make the builder call `factory_sandbox_info` and
     `factory_sandbox_exec` (`echo built in the sandbox && ls`) through MCP and report both answers.

@@ -33,6 +33,8 @@ issue ─▶ spec-writer ─▶ builder ─┬─▶ security  ─┐
                            └──── CHANGES: the same builder conversation fixes (max 2 rounds)
                                  all PASS ─▶ approver (opus) ─┬─ APPROVE  ─▶ squash-merge, close issue
                                                               └─ ESCALATE ─▶ needs-human ─▶ owner approves
+                                                                               ▲     │ the owner talks to the run assistant;
+                                                                               └─────┘ a commit is pushed and reviewed again
 ```
 
 The orchestration is a deterministic state machine in the server, not something a model decides.
@@ -54,6 +56,10 @@ Models per role are a setting. The details are in [`docs/ARCHITECTURE.md`](docs/
 - **Live observation.** Chats and pipeline stages stream live over WebSockets, rendered the way the
   terminal shows them (streamed text, tool calls, cost per turn). Anyone who can read the repository
   can watch; sessions owned by someone else are read-only.
+- **Talk to an agent before approving.** A run waiting at *needs human* has a conversation on its run
+  page: its owner asks the run assistant why it escalated or what a finding means — it answers from the
+  run's diff, spec and findings — or has it make one small change, which Agern pushes and the four
+  reviewers check again before approval is possible. Talking never approves anything.
 - **Agents can use the factory.** The chat agent gets factory tools over MCP (list and create issues,
   start, approve and cancel runs), and `/factory run|status|approve|cancel` works in the chat.
 - **Build and test sandboxes (optional).** A project describes a container for its builds and tests
