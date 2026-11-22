@@ -646,6 +646,24 @@ const passSummary: Record<string, string> = {
   code: 'Clear naming, good test coverage, transactions are scoped correctly.',
 };
 
+/**
+ * Like the backend: the ux and ui-design reviewers attach captioned screenshots to their stage while they run
+ * (docs/ARCHITECTURE.md §6 "Screenshots"). The mock serves one small PNG for all of them (see `screenshotUrl`).
+ */
+const screenshotCaptions: Record<string, (round: number) => string[]> = {
+  ux: (round) => round === 0
+    ? ['Cart drawer, empty state, dark theme', 'Cart drawer with three items after signing in, dark theme']
+    : ['Cart drawer after the fix: merge toast shown on sign-in, dark theme'],
+  'ui-design': (round) => round === 0
+    ? ['Cart drawer at 375 px width, light theme']
+    : ['Cart drawer at 375 px width after the fix, light theme'],
+};
+
+function attachScreenshot(r: Run, stage: Stage, caption: string, ts: string) {
+  stage.screenshots.push({ id: uid(), caption, mediaType: 'image/png', size: 97, width: 16, height: 10, createdAt: ts });
+  touchRun(r, ts);
+}
+
 function findRun(idOrPrefix: string) {
   return db.runs.get(idOrPrefix) ?? [...db.runs.values()].find((r) => r.id.startsWith(idOrPrefix));
 }
@@ -667,7 +685,7 @@ function setRunStatus(r: Run, status: Run['status'], ts: string) {
 
 /** Like the backend: stages exist as `pending` before they run (round 0 at creation, fix rounds when they start). */
 function pendingStage(r: Run, role: StageRole, round: number): Stage {
-  const st: Stage = { id: uid(), role, round, model: effective(r.owner.username).model(role), status: 'pending', verdict: null, summary: null, findings: [], sessionId: null, startedAt: null, endedAt: null };
+  const st: Stage = { id: uid(), role, round, model: effective(r.owner.username).model(role), status: 'pending', verdict: null, summary: null, findings: [], sessionId: null, startedAt: null, endedAt: null, screenshots: [] };
   r.stages.push(st);
   return st;
 }
@@ -728,6 +746,15 @@ function runStage(r: Run, role: StageRole, round: number, plan: Plan, startMs: n
         : [];
     steps = reviewerScript(role, verdict, summary);
     if (live) steps = [{ kind: 'pause', ms: reviewerMs[role] * 1500 }, ...steps];
+    const captions = screenshotCaptions[role]?.(round) ?? [];
+    if (captions.length) summary += ` Attached ${captions.length} screenshot${captions.length > 1 ? 's' : ''}.`;
+    captions.forEach((caption, i) => {
+      if (!live) attachScreenshot(r, stage, caption, iso(p.endMs));
+      // While the stage runs, one after the other, so the run page shows them arriving.
+      else setTimeout(() => {
+        if (stage.status === 'running' && stage.sessionId === s.id) attachScreenshot(r, stage, caption, iso(Date.now()));
+      }, reviewerMs[role] * 1500 * ((i + 1) / (captions.length + 1)));
+    });
   }
   play(s, steps, p, {
     init: true,
@@ -1737,7 +1764,7 @@ function seed() {
   const failed = startRun('web-shop', 44, bob, null, { changes: {}, liveFrom: never }, Date.now() - 86400_000);
   for (const st of failed.stages.slice(2)) {
     if (st.sessionId) db.sessions.delete(st.sessionId);
-    Object.assign(st, { status: 'skipped', sessionId: null, verdict: null, summary: null, findings: [], startedAt: null });
+    Object.assign(st, { status: 'skipped', sessionId: null, verdict: null, summary: null, findings: [], screenshots: [], startedAt: null });
   }
   failed.stages[1].status = 'failed';
   const failedBuilder = db.sessions.get(failed.stages[1].sessionId!);

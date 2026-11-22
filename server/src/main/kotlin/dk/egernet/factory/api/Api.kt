@@ -439,6 +439,23 @@ private fun Route.runRoutes(s: Services) {
         val u = call.requireUser(s)
         call.respond(s.runs.toDto(s.factory.visibleRun(u, uuidParam("id"))))
     }
+    // A stage screenshot (docs/ARCHITECTURE.md §6 "Screenshots"): visible to whoever may see the run.
+    get("/runs/{id}/screenshots/{sid}") {
+        val u = call.requireUser(s)
+        val run = s.factory.visibleRun(u, uuidParam("id"))
+        val sid = uuidParam("sid")
+        val m = withContext(Dispatchers.IO) { s.screenshotStore.get(sid) }?.takeIf { it.runId == run.id }
+            ?: throw notFound("Screenshot not found")
+        val (bytes, role) = withContext(Dispatchers.IO) { s.screenshotStore.data(m.id) to s.runs.stage(m.stageId)?.role }
+        if (bytes == null || m.mediaType !in INLINE_IMAGE_TYPES) throw notFound("Screenshot not found")
+        call.response.header("X-Content-Type-Options", "nosniff")
+        call.response.header("Content-Security-Policy", "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox")
+        call.response.header("Cross-Origin-Resource-Policy", "same-origin")
+        call.response.header(HttpHeaders.CacheControl, "private, max-age=31536000, immutable")
+        val name = "screenshot-${role ?: "stage"}-${m.id.toString().take(8)}.${dk.egernet.factory.agent.Screenshots.extension(m.mediaType)}"
+        call.response.header(HttpHeaders.ContentDisposition, contentDisposition("inline", name))
+        call.respondBytes(bytes, ContentType.parse(m.mediaType))
+    }
     post("/runs/{id}/approve") { call.respond(s.factory.approveRun(call.requireUser(s), uuidParam("id"))) }
     post("/runs/{id}/cancel") { call.respond(s.factory.cancelRun(call.requireUser(s), uuidParam("id"))) }
 }

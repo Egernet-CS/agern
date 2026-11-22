@@ -52,6 +52,10 @@ Behaviour
         "echo built in the sandbox && ls") like a real agent (tool_use + tool_result events) and report both answers
         in its result ("Sandbox info: ..." / "Sandbox exec: ..."); with "fake:platform=<name>" it then runs the same
         command once more with that platform ("Sandbox exec on <name>: ...")
+    - "fake:screenshots" makes the ux and ui-design reviewers, before answering, write a small PNG into their working
+        directory, attach it through the MCP tool factory_attach_screenshot with the caption
+        "Fake <role> screenshot (<build | fix round N>)", delete the file and append "Attached 1 screenshot." (or the
+        tool's error text) to their summary; other roles ignore it
     - "fake:busy-<role>" makes that (stream-json) role work in Bash steps of ~0.4 s for up to ~2 minutes,
       until a message from the owner contains "finish"; each picked-up message is acknowledged with
       "Noted the owner's message: ..." and listed in the final result
@@ -60,12 +64,14 @@ import json
 import os
 import queue
 import re
+import struct
 import subprocess
 import sys
 import threading
 import time
 import urllib.request
 import uuid
+import zlib
 
 args = sys.argv[1:]
 
@@ -224,6 +230,36 @@ def mcp_tool_roundtrip(tool, arguments, req_id):
     emit({"type": "user", "message": {"role": "user", "content": [{"tool_use_id": tid, "type": "tool_result", "content": text, "is_error": is_error}]},
           "parent_tool_use_id": None, "session_id": session_id, "uuid": str(uuid.uuid4())})
     return text, is_error
+
+
+def tiny_png(width=4, height=3, rgb=(0x2B, 0x6C, 0xB0)):
+    """A valid, uncompressed-colour PNG of one solid colour (no dependencies)."""
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    raw = b"".join(b"\x00" + bytes(rgb) * width for _ in range(height))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def attach_fake_screenshot(prompt):
+    """fake:screenshots: one screenshot through factory_attach_screenshot; returns the line for the summary."""
+    m = re.search(r"after fix round (\d+)", prompt)
+    when = "fix round %s" % m.group(1) if m else "build"
+    name = "agern-fake-screenshot-%s.png" % role
+    try:
+        with open(name, "wb") as f:
+            f.write(tiny_png())
+        mcp_call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake-claude", "version": "0"}}, 1)
+        text, is_error = mcp_tool_roundtrip("factory_attach_screenshot",
+                                            {"path": name, "caption": "Fake %s screenshot (%s)" % (role, when)}, 2)
+    except Exception as e:  # noqa
+        text, is_error = "Screenshot failed: %s" % e, True
+    finally:
+        try:
+            os.remove(name)
+        except OSError:
+            pass
+    return text if is_error else "Attached 1 screenshot."
 
 
 def image_size(data):
@@ -461,15 +497,18 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
         result(json.dumps(out), structured=out)
         return
     if schema and "PASS" in schema:
+        shot = ""
+        if "fake:screenshots" in prompt and role in ("ux", "ui-design") and mcp_config:
+            shot = " " + attach_fake_screenshot(prompt)
         changes = "fake:always-changes" in prompt or ("fake:changes" in prompt and "after fix round" not in prompt)
         if changes:
             detail = "Fake finding from %s." % role
             if markdown:
                 detail += "\n\n- rename `oldName` to **newName**"
-            out = {"verdict": "CHANGES", "summary": "Fake %s reviewer wants changes." % role + md_tail,
+            out = {"verdict": "CHANGES", "summary": "Fake %s reviewer wants changes." % role + shot + md_tail,
                    "findings": [{"severity": "major", "file": "AGERN_FAKE.md", "detail": detail}]}
         else:
-            out = {"verdict": "PASS", "summary": "Fake %s reviewer is happy." % role + md_tail, "findings": []}
+            out = {"verdict": "PASS", "summary": "Fake %s reviewer is happy." % role + shot + md_tail, "findings": []}
         stream_text("Reviewed the diff.")
         result(json.dumps(out), structured=out)
         return

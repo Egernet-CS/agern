@@ -231,6 +231,21 @@ export type Stage = {
   sessionId: string | null;
   startedAt: string | null;
   endedAt: string | null;
+  /** Screenshots the stage's reviewer attached (only `ux` and `ui-design`), in attach order; empty for every other stage. */
+  screenshots: Screenshot[];
+};
+
+/** A screenshot a UX or UI design reviewer attached to its stage; the image is at `api.screenshotUrl(runId, id)`. */
+export type Screenshot = {
+  id: string;
+  /** One line saying what the screenshot shows (untrusted text: render as plain text). */
+  caption: string;
+  /** image/png, image/jpeg, image/gif or image/webp (sniffed by the server). */
+  mediaType: string;
+  size: number;
+  width: number;
+  height: number;
+  createdAt: string;
 };
 
 export type RunStatus =

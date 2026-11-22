@@ -170,6 +170,15 @@ data class StageDto(
     val id: String, val role: String, val round: Int, val model: String, val status: String, val verdict: String?,
     val summary: String?, val findings: List<FindingDto>, val sessionId: String?,
     val startedAt: String?, val endedAt: String?,
+    /** Screenshots the stage's reviewer attached (only `ux` and `ui-design`), in attach order. Never the bytes. */
+    val screenshots: List<ScreenshotDto> = emptyList(),
+)
+
+/** A screenshot attached to a stage; the image is served by `GET /api/runs/{id}/screenshots/{sid}`. */
+@Serializable
+data class ScreenshotDto(
+    val id: String, val caption: String, val mediaType: String, val size: Long, val width: Int, val height: Int,
+    val createdAt: String,
 )
 
 @Serializable
@@ -317,6 +326,8 @@ data class SettingsDto(
 
 val PIPELINE_ROLES = listOf("spec-writer", "builder", "security", "ux", "ui-design", "code", "approver")
 val REVIEWER_ROLES = listOf("security", "ux", "ui-design", "code")
+/** Reviewer roles that may attach screenshots to their stage (docs/ARCHITECTURE.md §6 "Screenshots"). */
+val SCREENSHOT_ROLES = setOf("ux", "ui-design")
 /** Pipeline roles whose running agent accepts messages from the run's owner (docs/ARCHITECTURE.md §6 "Messages"). */
 val STEERABLE_ROLES = setOf("spec-writer", "builder")
 val DEFAULT_PIPELINE_MODELS = mapOf(

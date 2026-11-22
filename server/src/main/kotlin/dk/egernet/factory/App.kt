@@ -107,7 +107,9 @@ class Services(
             { repo -> fake.fileOf(repo, dk.egernet.factory.sandbox.SANDBOX_FILE) }
         },
     )
-    val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes)
+    val screenshotStore = dk.egernet.factory.db.ScreenshotStore(db)
+    val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes, screenshotStore)
+    val screenshots = dk.egernet.factory.agent.Screenshots(cfg, screenshotStore, runs, workspaces, publishRun = { orchestrator.publish(it) })
     val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
     val releaseLocks = dk.egernet.factory.pipeline.ReleaseLocks()
     val releaseMerger = dk.egernet.factory.pipeline.ReleaseMerger(
@@ -123,7 +125,7 @@ class Services(
     )
     val releases: ReleaseService = ReleaseService(cfg, access, releaseStore, bus, releaseBuilder, releaseScheduler, releaseMerger, releaseModePolicy)
     val factory = FactoryService(cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases)
-    val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes)
+    val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes, screenshots)
 
     /** The start-up removal of leftover sandboxes (runs in the background; tests wait for it). */
 

@@ -35,7 +35,8 @@ throwaway database.
 | Agents | The `claude` CLI in headless mode (`-p`, stream-json in and out) |
 | Realtime | WebSocket for output, REST for input |
 
-All persistent state lives in PostgreSQL. The only things on disk are git workspaces, the
+All persistent state lives in PostgreSQL, including the bytes of chat attachments and of the screenshots
+reviewers attach to their stage (§6 "Screenshots"). The only things on disk are git workspaces, the
 per-user Claude home directories and the agents' copies of chat attachments (a cache of the database,
 §5), all under `FACTORY_DATA_DIR` — plus, with sandboxes on, the service user's Podman storage (images,
 per-run containers, per-project cache volumes; §5 "Sandboxes").
@@ -70,6 +71,8 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_ATTACHMENT_MAX_MB` | `20` | Largest single chat attachment (1–512) |
 | `FACTORY_ATTACHMENT_MAX_MESSAGE_MB` | `50` | All attachments of one message together (1–512, at least the per-file limit) |
 | `FACTORY_ATTACHMENT_MAX_COUNT` | `10` | Attachments per message (1–20) |
+| `FACTORY_SCREENSHOT_MAX_MB` | `5` | Largest single screenshot a UX or UI design reviewer attaches (1–512; §6 "Screenshots") |
+| `FACTORY_SCREENSHOT_MAX_COUNT` | `12` | Screenshots per stage, i.e. per reviewer per round (1–50) |
 | `FACTORY_SANDBOX` | `off` | `off` or `podman`: per-run build/test sandboxes in rootless Podman (§5 "Sandboxes"). `off`: runs behave as before and the builder gets no sandbox tools; definitions can still be approved. `fake` (development and end-to-end tests only, accepted only with `FACTORY_DEV_FAKE_GITHUB`): an in-memory runtime that only pretends to run commands |
 | `FACTORY_SANDBOX_PODMAN` | `podman` | The podman binary |
 | `FACTORY_SANDBOX_PODMAN_URL` | unset | When set, every call is `podman --url <url> …` (podman-remote against a `podman system service`, e.g. `unix:///run/…/podman.sock`) |
@@ -594,6 +597,39 @@ Stage `role`: `spec-writer`, `builder`, `security`, `ux`, `ui-design`, `code`, `
 Stage `status`: `pending`, `running`, `done`, `failed`, `skipped`.
 Stage `verdict`: `PASS`, `CHANGES`, `APPROVE`, `ESCALATE` or null.
 
+### Screenshots
+
+For a change that affects a UI, the **ux** and **ui-design** reviewers run the app and attach captioned screenshots
+of the screens they reviewed to their stage with the MCP tool `factory_attach_screenshot` (§7); the builder and the
+other roles do not get the tool. Their prompts (`prompts/ux.md`, `prompts/ui-design.md`) tell them to start the app
+on a free port (the four reviewers share the worktree), capture each added or altered screen in the states that
+matter (empty/filled, error/loading, light/dark, narrow width), give each a one-line caption, quote the caption in a
+finding the screenshot supports, delete the files after attaching and never commit them — and to say in their
+summary how many they attached, that the change has no UI, or why they could not take any. Missing screenshots are
+never a reason for `CHANGES` and never fail the stage.
+
+- **Who:** decided from the MCP grant — the token's session must be the session of a `ux` or `ui-design` stage of the
+  token's run, in the token's repository — never from tool arguments.
+- **Per round:** a screenshot belongs to the caller's stage row, so to its role and round. Each fix round creates new
+  stage rows: screenshots of a fix round belong to that round, earlier rounds keep theirs.
+- **Storage:** table `stage_screenshots` in PostgreSQL (bytes included), removed with the stage and with the run
+  (`ON DELETE CASCADE`). Nothing goes into the repository or to GitHub.
+- **Limits:** only PNG, JPEG, GIF and WebP (type sniffed from the bytes, never the extension, with readable
+  dimensions); at most `FACTORY_SCREENSHOT_MAX_MB` per image (checked before reading) and
+  `FACTORY_SCREENSHOT_MAX_COUNT` per stage (checked under a per-stage lock); the file must resolve, symlinks
+  followed, to a regular file inside the run worktree; the caption is required, made one line (control and format
+  characters removed, whitespace collapsed) and at most 200 characters.
+- **Shown** on the run page with the stage (§10), live: each attach publishes the run on the feed. Served by
+  `GET /api/runs/{id}/screenshots/{sid}` (§8) to whoever may see the run.
+- **Pull request note:** after the reviewers of a round have all returned a verdict, if that round's stages have
+  screenshots and the run has a pull request, Agern comments on it once (best effort): `**Agern: screenshots** — the
+  reviewers attached <n> screenshot(s) of this change (<build | fix round N>). See them on <run page>:` followed by
+  `- **<role>:** <caption>` per screenshot (reviewers in pipeline order, each in attach order). The run page is
+  linked only when `FACTORY_PUBLIC_URL` is public (`Config.pageRef`), otherwise named. Images are never uploaded.
+- **Prerequisite:** reviewers run the app on the factory host, so for projects with a web UI a headless browser
+  (e.g. Chromium via Playwright) must be installed there by an administrator. Without it the reviewers report that
+  they could not take screenshots, and the run continues as usual.
+
 ### Releases
 
 A **release** is a named plan of issues for one project, in the order they will be built. Once **started**, Agern
@@ -1034,7 +1070,19 @@ Tools: `factory_list_issues`, `factory_get_issue`, `factory_create_issue`, `fact
 `factory_send_to_agent`, `factory_request_software`, `factory_list_releases`, `factory_create_release`,
 `factory_assign_issues`, `factory_unassign_issues`, `factory_approve_release`. Pipeline-stage agents get only `factory_get_issue`
 and `factory_request_software`; with sandboxes switched on (`FACTORY_SANDBOX` not `off`) the builder also
-gets `factory_sandbox_info` and `factory_sandbox_exec`.
+gets `factory_sandbox_info` and `factory_sandbox_exec`; the `ux` and `ui-design` reviewers also get
+`factory_attach_screenshot`.
+
+Screenshot tool (§6 "Screenshots"), `ux` and `ui-design` reviewers only:
+- `factory_attach_screenshot { path, caption }` → text such as `Attached screenshot 2 of at most 12 for this stage:
+  "<caption>" (image/png, 1440×900, 212.4 KB).` `path` is relative to the agent's working directory (the run
+  worktree) or absolute inside it; the file is copied and left as it is. Refusals are tool errors (`isError`), never
+  JSON-RPC errors: `Only the ux and ui-design reviewers can attach screenshots` (also for a hand-built grant whose
+  session is not a `ux`/`ui-design` stage of its run, or has no run), `path must be a file inside your working
+  directory` (outside, `..`, a symlink pointing out, a directory), `No such file: <path>`, `caption is required: say
+  what the screenshot shows`, `caption is too long (at most 200 characters)`, `The image is larger than <size>`,
+  `The file is empty`, `Only PNG, JPEG, GIF or WebP images are accepted`, `This stage already has <n> screenshots
+  (the maximum)`.
 
 Sandbox tools (§5 "Sandboxes"), builder only; they act on the sandbox of the token's run, and a token
 without a run (a chat) is refused:
@@ -1180,7 +1228,12 @@ type Stage = { id: string; role: Exclude<SessionKind, 'chat'>;
   status: 'pending' | 'running' | 'done' | 'failed' | 'skipped';
   verdict: 'PASS' | 'CHANGES' | 'APPROVE' | 'ESCALATE' | null; summary: string | null;
   findings: { severity: string; file: string | null; detail: string }[];
-  sessionId: string | null; startedAt: string | null; endedAt: string | null };
+  sessionId: string | null; startedAt: string | null; endedAt: string | null;
+  screenshots: Screenshot[] };  // ux / ui-design only (§6 "Screenshots"), attach order; [] for other stages
+
+type Screenshot = { id: string; caption: string;   // caption: one line, untrusted (render as text)
+  mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'; size: number; width: number; height: number;
+  createdAt: string };
 
 type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; issueKind: IssueKind;
   status: 'queued' | 'spec' | 'building' | 'reviewing' | 'approving' | 'merged' | 'needs_human' | 'failed' | 'cancelled';
@@ -1346,6 +1399,7 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `POST /api/projects/{repo}/runs` | `{ issueNumber }` → `Run` | needs Claude credential; 409 if the issue has an active run |
 | `GET /api/runs?active=true&status=<s>` | → `Run[]` | across visible repos, newest first (max 200). `active=true`: not finished, i.e. `queued`, `spec`, `building`, `reviewing`, `approving` or `needs_human`. `status`: only these statuses, repeatable and/or comma list (`?status=needs_human`); unknown status → 400. Both given: both apply |
 | `GET /api/runs/{id}` | → `Run` | |
+| `GET /api/runs/{id}/screenshots/{sid}` | → image bytes | anyone who may see the run (404 otherwise, and for a screenshot of another run). Served with the sniffed type, `nosniff`, a sandboxing CSP, `Cross-Origin-Resource-Policy: same-origin`, `Cache-Control: private, max-age=31536000, immutable` and `Content-Disposition: inline` (`screenshot-<role>-<id8>.<ext>`). There is no upload or delete route |
 | `POST /api/runs/{id}/approve` | → `Run` | owner only, only in `needs_human` |
 | `POST /api/runs/{id}/cancel` | → `Run` | owner or admin |
 | `GET /api/projects/{repo}/sessions?kind=chat` | → `AgentSession[]` | |
@@ -1744,6 +1798,12 @@ UTC day rolls over (`useClaudeUsage`, `web/src/lib/usage.ts`); relative times ar
 The chat renders the Claude stream the way the terminal does: prompt line, streamed assistant
 text, tool calls as `⏺ Tool(args)` with collapsible results, thinking, cost/turn footer. Sessions
 owned by someone else are shown read-only with an "observing <user>" banner.
+
+On the run page, a selected stage (the selected round's stage row) that has screenshots shows a "Screenshots <n>"
+section after its findings: a wrapping grid of lazily loaded thumbnails with their captions as `figcaption`. A
+thumbnail is a button ("Open screenshot: <caption>") that opens a dialog with the image scaled to fit, the caption,
+its type, size and dimensions and an "Open full size ↗" link. A stage without screenshots shows nothing extra.
+Screenshots attached while the page is open arrive through the feed (`useLiveRun`), without a reload.
 
 On the run page the owner of a run gets a text-only composer (the chat prompt without `/factory` commands,
 attachments or interrupt; it can send while the agent works) under the transcript of a selected spec-writer or

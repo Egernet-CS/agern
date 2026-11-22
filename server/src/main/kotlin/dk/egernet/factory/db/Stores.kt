@@ -305,8 +305,9 @@ data class StageRecord(
     val id: UUID, val runId: UUID, val role: String, val round: Int, val model: String, val status: String, val verdict: String?,
     val summary: String?, val findings: List<FindingDto>, val sessionId: UUID?, val startedAt: Instant?, val endedAt: Instant?,
 ) {
-    fun toDto() = StageDto(
+    fun toDto(screenshots: List<dk.egernet.factory.ScreenshotDto> = emptyList()) = StageDto(
         id.toString(), role, round, model, status, verdict, summary, findings, sessionId?.toString(), startedAt?.iso(), endedAt?.iso(),
+        screenshots,
     )
 }
 
@@ -324,6 +325,7 @@ data class RunRecord(
 )
 
 class RunStore(private val db: Db) {
+    private val screenshots = ScreenshotStore(db)
     private val findingsSer = ListSerializer(FindingDto.serializer())
     private val select = """SELECT r.*, u.username AS owner_username, u.display_name AS owner_display_name
         FROM runs r JOIN users u ON u.id = r.owner_id"""
@@ -478,15 +480,19 @@ class RunStore(private val db: Db) {
         db.update("UPDATE stages SET status = 'failed', ended_at = now() WHERE run_id = ? AND status = 'running'", runId)
     }
 
-    fun toDto(r: RunRecord) = RunDto(
-        id = r.id.toString(), repo = r.repo, issueNumber = r.issueNumber, issueTitle = r.issueTitle, issueKind = r.issueKind,
-        status = r.status, round = r.round, maxRounds = r.maxRounds, branch = r.branch, prNumber = r.prNumber, prUrl = r.prUrl,
-        owner = OwnerDto(r.ownerUsername, r.ownerDisplayName), startedBySessionId = r.startedBySessionId?.toString(),
-        error = r.error, createdAt = r.createdAt.iso(), updatedAt = r.updatedAt.iso(), endedAt = r.endedAt?.iso(),
-        stages = stages(r.id).map { it.toDto() },
-        sandbox = r.sandboxJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunSandboxDto.serializer(), it) }.getOrNull() },
-        releaseId = r.releaseId?.toString(), baseBranch = r.baseBranch,
-    )
+    /** Stage screenshots are read with one query per run, never one per stage. */
+    fun toDto(r: RunRecord): RunDto {
+        val shots = screenshots.forRun(r.id).groupBy({ it.stageId }, { it.toDto() })
+        return RunDto(
+            id = r.id.toString(), repo = r.repo, issueNumber = r.issueNumber, issueTitle = r.issueTitle, issueKind = r.issueKind,
+            status = r.status, round = r.round, maxRounds = r.maxRounds, branch = r.branch, prNumber = r.prNumber, prUrl = r.prUrl,
+            owner = OwnerDto(r.ownerUsername, r.ownerDisplayName), startedBySessionId = r.startedBySessionId?.toString(),
+            error = r.error, createdAt = r.createdAt.iso(), updatedAt = r.updatedAt.iso(), endedAt = r.endedAt?.iso(),
+            stages = stages(r.id).map { it.toDto(shots[it.id].orEmpty()) },
+            sandbox = r.sandboxJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunSandboxDto.serializer(), it) }.getOrNull() },
+            releaseId = r.releaseId?.toString(), baseBranch = r.baseBranch,
+        )
+    }
 
     /** v1: runs cannot survive a restart. needs_human runs have no process and stay as they are. */
     fun failUnfinishedAfterRestart(): List<UUID> {
