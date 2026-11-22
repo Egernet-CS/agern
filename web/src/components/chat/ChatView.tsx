@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type ReactNode } from 'react';
-import { api, ApiError, STEERABLE_ROLES, type AgentSession, type Attachment, type StageRole } from '../../api';
+import { api, ApiError, STEERABLE_ROLES, type AgentSession, type Attachment, type Run, type StageRole } from '../../api';
 import { useMe } from '../../lib/auth';
 import { cost, duration, modelLabel } from '../../lib/format';
 import { useSessionStream } from '../../lib/realtime';
@@ -41,20 +41,27 @@ export type ChatViewProps = {
    */
   embedded?: boolean;
   header?: ReactNode;
+  /**
+   * The run whose advisor this is (the conversation while a run needs a human). Its owner talks to the agent through a
+   * text-only composer while the run is `needs_human` and no follow-up review runs.
+   */
+  advisorRun?: Run;
 };
 
-export function ChatView({ sessionId, session, disabledReason, embedded, header }: ChatViewProps) {
+export function ChatView({ sessionId, session, disabledReason, embedded, header, advisorRun }: ChatViewProps) {
   const me = useMe();
   const stream = useSessionStream(sessionId);
   const { items, summary } = useMemo(() => buildTranscript(stream.events, stream.partials), [stream.events, stream.partials]);
-  const isOwner = session ? session.owner.username === me.username : false;
+  const isOwner = session ? session.owner.username === me.username : advisorRun ? advisorRun.owner.username === me.username : false;
   const isChat = session?.kind === 'chat';
   const canDrive = isOwner && isChat && !embedded;
   // The server's session status says whether the agent is mid-turn (`starting`/`running`) or waiting (`idle`).
   // It arrives as `status` events on this session's stream and as feed updates of the session.
   const status = summary.status ?? session?.status ?? null;
   // A stopped chat is not over: the owner's next message resumes the conversation (--resume).
-  const ended = !isChat && (status === 'stopped' || status === 'failed' || status === 'done');
+  // An advisor is not over when its process stops either: the run's status decides whether the conversation is open.
+  const isAdvisor = session?.kind === 'advisor' || !!advisorRun;
+  const ended = !isChat && !isAdvisor && (status === 'stopped' || status === 'failed' || status === 'done');
   const resumable = isChat && status === 'stopped';
   const working = status === 'running' || status === 'starting';
   const [sending, setSending] = useState<{ text: string; attachments: Attachment[] } | null>(null);
@@ -63,6 +70,10 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
   // Messages to a working pipeline agent: its owner only, spec-writer / builder only, only while it runs.
   const stageRole = !isChat && session ? (session.kind as StageRole) : null;
   const canSteer = isOwner && !!stageRole && STEERABLE_ROLES.includes(stageRole) && status === 'running' && session?.live !== false;
+  // The conversation of a run that needs a human: its owner only, text only, one message at a time.
+  const advisorOpen = !!advisorRun && advisorRun.status === 'needs_human';
+  const reviewing = advisorOpen && advisorRun.conversation.review === 'running';
+  const canTalk = isOwner && isAdvisor && advisorOpen && !reviewing;
   const att = useAttachmentDrafts(sessionId, canCompose);
 
   // --- scrolling: stick to the bottom while the agent streams, unless the reader scrolled up
@@ -152,6 +163,24 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
     [sessionId],
   );
 
+  const talk = useCallback(
+    async (text: string) => {
+      if (!advisorRun) return false;
+      setError(null);
+      setSending({ text, attachments: [] });
+      stick.current = true;
+      try {
+        await api.talkToRun(advisorRun.id, text);
+      } catch (e) {
+        setSending(null);
+        setError(e instanceof ApiError ? e.message : 'Could not send.');
+        return false;
+      }
+      return true;
+    },
+    [advisorRun],
+  );
+
   // --- drag and drop anywhere on the chat pane (owner only)
   const [dropping, setDropping] = useState(false);
   const dragDepth = useRef(0);
@@ -193,7 +222,7 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
   }, [sessionId]);
 
   useEffect(() => {
-    if (!canDrive || !working) return;
+    if (!(canDrive || canTalk) || !working) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && !e.defaultPrevented && !document.querySelector('dialog[open]')) {
         e.preventDefault();
@@ -202,7 +231,7 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [canDrive, working, interrupt]);
+  }, [canDrive, canTalk, working, interrupt]);
 
   const history = useMemo(
     () => stream.events.filter((e) => e.type === 'user' && (e.payload as { username?: string })?.username === me.username).map((e) => (e.payload as { text: string }).text),
@@ -234,7 +263,7 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
         <div className="chat-log" aria-live="polite" aria-relevant="additions">
           {loading && <div className="t-meta">connecting to session…</div>}
           {!loading && items.length === 0 && (
-            <div className="t-meta">{isChat ? 'Empty session. Say hello — or type /factory help.' : 'Waiting for the agent to start…'}</div>
+            <div className="t-meta">{isChat ? 'Empty session. Say hello — or type /factory help.' : isAdvisor ? 'No messages yet.' : 'Waiting for the agent to start…'}</div>
           )}
           <TranscriptItems items={items} me={me.username} sessionId={sessionId} />
           {sending && (
@@ -249,7 +278,7 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
           {working && (
             <Spinner
               since={summary.turnStartedAt ?? session?.createdAt ?? null}
-              canInterrupt={canDrive}
+              canInterrupt={canDrive || canTalk}
               activity={isChat ? null : session?.lastActivity ?? null}
             />
           )}
@@ -299,6 +328,23 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
           />
         </>
       )}
+      {canTalk && (
+        <Prompt
+          onSubmit={talk}
+          onInterrupt={interrupt}
+          working={working}
+          commands={false}
+          label="Message the agent"
+          placeholder="Ask about this run, or ask for a change"
+          history={history}
+        />
+      )}
+      {isOwner && reviewing && (
+        <div className="chat-disabled" role="status">The changes are being reviewed; you can continue when the reviews are in.</div>
+      )}
+      {isOwner && advisorRun && !advisorOpen && (
+        <div className="chat-disabled">This run is {advisorRun.status.replace('_', ' ')}; the conversation is closed.</div>
+      )}
       {canDrive && !ended && disabledReason && <div className="chat-disabled">{disabledReason}</div>}
       {canDrive && ended && <div className="chat-disabled">This session has {status}.</div>}
       <footer className="chat-footer">
@@ -312,6 +358,7 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header 
           <span className="cf-hints" aria-hidden>⏎ send · ⇧⏎ newline · esc interrupt · / commands · paste or drop files</span>
         )}
         {canSteer && <span className="cf-hints" aria-hidden>⏎ send · ⇧⏎ newline · delivered at the agent’s next step</span>}
+        {canTalk && <span className="cf-hints" aria-hidden>⏎ send · ⇧⏎ newline · esc interrupt</span>}
       </footer>
     </section>
   );
