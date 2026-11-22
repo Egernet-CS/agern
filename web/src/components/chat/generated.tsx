@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useSyncExternalStore, type FormEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type FormEvent } from 'react';
 import { api, type GeneratedImage, type ImagesPayload } from '../../api';
 import { bytes } from '../../lib/format';
 import { Dialog } from '../ui/ui';
@@ -71,7 +71,7 @@ function useSessionImages(sessionId: string, ids: string[]) {
  * and a tile per image. Its owner can use a chat image for an issue, or discard it; everyone else sees it read-only.
  */
 export function GeneratedImages({ sessionId, payload, me }: { sessionId: string; payload: ImagesPayload; me?: string }) {
-  const ids = payload.images.map((i) => i.id);
+  const ids = useMemo(() => payload.images.map((i) => i.id), [payload]);
   const { list, error, loading } = useSessionImages(sessionId, ids);
   const [open, setOpen] = useState<GeneratedImage | null>(null);
   const n = payload.images.length;
