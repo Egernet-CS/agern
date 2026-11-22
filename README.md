@@ -56,6 +56,9 @@ Models per role are a setting. The details are in [`docs/ARCHITECTURE.md`](docs/
   can watch; sessions owned by someone else are read-only.
 - **Agents can use the factory.** The chat agent gets factory tools over MCP (list and create issues,
   start, approve and cancel runs), and `/factory run|status|approve|cancel` works in the chat.
+- **Talk to an agent when a run needs a human.** Before approving an escalated run, its owner can ask an
+  agent about the run's diff and findings, or ask it for a change, which is pushed and reviewed again by the
+  four reviewers before the run can be approved. Talking never approves anything.
 - **Build and test sandboxes (optional).** A project describes a container for its builds and tests
   in `.agern/sandbox.yml` — toolchain image, setup script, sidecar services such as PostgreSQL with a
   readiness check, caches, a non-root user, and extra *platform* images to test on. After an admin
