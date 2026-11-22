@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Link, useParams, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { api, ApiError, isRunActive, isRunWorking, type AgentSession, type Run, type StageRole } from '../api';
 import { ChatView } from '../components/chat/ChatView';
 import { RunSandboxLine } from '../components/sandbox/SandboxBits';
 import { Markdown } from '../components/chat/Markdown';
 import { buildNodes, latestStage, REVIEWERS, ROLE_BLURB, roundName, rounds, stagesFor, type NodeId } from '../components/pipeline/model';
 import { PipelineDiagram } from '../components/pipeline/PipelineDiagram';
+import { RetryDialog } from '../components/ui/RetryDialog';
 import { Dialog, Empty, ErrorBox, KindBadge, Loading, RunStatusPill, Verdict } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
@@ -34,6 +35,8 @@ export function RunPage() {
   const sessionMap = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions]);
   const [busy, setBusy] = useState<'approve' | 'cancel' | null>(null);
   const [confirmCancel, setConfirmCancel] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const navigate = useNavigate();
   const [err, setErr] = useState<string | null>(null);
   const active = run ? isRunActive(run) : false;
   const now = useNow(1000, run ? isRunWorking(run) : false);
@@ -106,6 +109,12 @@ export function RunPage() {
               </dd>
             </div>
           )}
+          {run.continuesRunId && (
+            <div><dt>continues</dt><dd><Link to={`/p/${repo}/runs/${run.continuesRunId}`}>run {shortId(run.continuesRunId)}</Link></dd></div>
+          )}
+          {run.continuedByRunId && (
+            <div><dt>continued by</dt><dd><Link to={`/p/${repo}/runs/${run.continuedByRunId}`}>run {shortId(run.continuedByRunId)}</Link></dd></div>
+          )}
           <div><dt>pull request</dt><dd>{run.prUrl ? <a href={run.prUrl} target="_blank" rel="noreferrer">#{run.prNumber} ↗</a> : <span className="muted">after first build</span>}</dd></div>
           <div><dt>{run.endedAt ? 'took' : 'running for'}</dt><dd>{between(run.createdAt, run.endedAt, now)}</dd></div>
           <div><dt>started</dt><dd>{timeAgo(run.createdAt, now)}</dd></div>
@@ -118,6 +127,9 @@ export function RunPage() {
             </button>
           )}
           {run.status === 'needs_human' && !isOwner && <span className="muted small">Waiting for {run.owner.username} to approve.</span>}
+          {(run.status === 'failed' || run.status === 'cancelled') && isOwner && (
+            <button className="btn btn--primary" onClick={() => setRetrying(true)} disabled={busy !== null}>Retry…</button>
+          )}
           {active && (isOwner || me.isAdmin) && (
             <button className="btn btn--ghost btn--danger" onClick={() => setConfirmCancel(true)} disabled={busy !== null}>Cancel run</button>
           )}
@@ -135,6 +147,23 @@ export function RunPage() {
       <RoundsStrip run={run} onPick={(role, round) => { params.set('stage', role); params.set('round', String(round)); setParams(params, { replace: true }); }} />
 
       <StageDetail run={run} node={selected} round={params.get('round')} sessions={sessionMap} onRound={(r) => { params.set('round', String(r)); setParams(params, { replace: true }); }} />
+
+      <RetryDialog
+        open={retrying}
+        title={`Retry run ${shortId(run.id)}?`}
+        load={() => (run.releaseId ? api.releaseIssueRetryOptions(run.releaseId, run.issueNumber) : api.runRetryOptions(run.id))}
+        onClose={() => setRetrying(false)}
+        onRetry={async (mode) => {
+          if (run.releaseId) {
+            await api.retryReleaseIssue(run.releaseId, run.issueNumber, mode);
+            navigate(`/p/${repo}/releases/${run.releaseId}`);
+            return;
+          }
+          const next = await api.retryRun(run.id, mode);
+          if (next.id === run.id) runQ.setData(() => next);
+          else navigate(`/p/${repo}/runs/${next.id}`);
+        }}
+      />
 
       <Dialog open={confirmCancel} onClose={() => setConfirmCancel(false)} title="Cancel this run?">
         <p>Running agents are stopped. The branch {run.branch && <code>{run.branch}</code>} and any pull request stay on GitHub.</p>

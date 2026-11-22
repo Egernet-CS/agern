@@ -21,6 +21,8 @@ import {
   resumeRelease,
   cancelRelease,
   retryReleaseIssue,
+  retryOptionsFor,
+  retryRun,
   approveRelease,
   checkRelease,
   setReleaseMode,
@@ -356,7 +358,14 @@ export const mockApi: Api = {
   pauseRelease: (id) => ok(() => withRelease(id, (r) => pauseRelease(r, me()))),
   resumeRelease: (id) => ok(() => withRelease(id, (r) => resumeRelease(r, me()))),
   cancelRelease: (id) => ok(() => withRelease(id, (r) => cancelRelease(r, me()))),
-  retryReleaseIssue: (id, n) => ok(() => withRelease(id, (r) => retryReleaseIssue(r, n, me()))),
+  retryReleaseIssue: (id, n, mode) => ok(() => withRelease(id, (r) => retryReleaseIssue(r, n, me(), mode))),
+  releaseIssueRetryOptions: (id, n) =>
+    ok(() => {
+      const r = getRelease(id);
+      project(r.repo);
+      const i = r.issues.find((x) => x.number === n);
+      return retryOptionsFor(i?.runId ? db.runs.get(i.runId) : undefined);
+    }),
   approveRelease: (id) => ok(() => withRelease(id, (r) => approveRelease(r, me()))),
   checkRelease: (id) => ok(() => withRelease(id, (r) => checkRelease(r, me()))),
   setReleaseMode: (id, mode) => ok(() => withRelease(id, (r) => setReleaseMode(r, mode, me()))),
@@ -382,6 +391,12 @@ export const mockApi: Api = {
       const r = run(id);
       approveRun(r, me());
       return r;
+    }),
+  runRetryOptions: (id) => ok(() => retryOptionsFor(run(id))),
+  retryRun: (id, mode) =>
+    ok(() => {
+      needClaude();
+      return retryRun(run(id), mode, me());
     }),
   cancelRun: (id) =>
     ok(() => {
