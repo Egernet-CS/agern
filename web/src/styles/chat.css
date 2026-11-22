@@ -959,3 +959,57 @@
     right: 10px;
   }
 }
+
+/* Generated images (factory_generate_image): one block per call, a tile per image. */
+.t-gen {
+  margin: 6px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.t-gen-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  color: var(--text-2);
+}
+.t-gen-purpose {
+  color: var(--text);
+}
+.t-gen-prompt summary {
+  cursor: pointer;
+  color: var(--text-3);
+  font-size: 12px;
+}
+.t-gen-prompt p {
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.t-gen-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.t-gen-gone {
+  display: grid;
+  place-items: center;
+  width: 120px;
+  height: 90px;
+  border: 1px dashed var(--line-2);
+  border-radius: 6px;
+  color: var(--text-3);
+  font-size: 12px;
+}
+.t-gen-sel {
+  margin: 0;
+  color: var(--amber-hi);
+  overflow-wrap: anywhere;
+}
+.t-gen-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}

@@ -1,6 +1,6 @@
 // Turns raw session events (incl. Claude Code stream-json) into renderable transcript items.
 // Everything here is defensive: unknown shapes become compact "unknown" items, never throws.
-import type { Attachment, FactoryEvent, SandboxLog, SessionStatus } from '../../api/types';
+import type { Attachment, FactoryEvent, ImagesPayload, SandboxLog, SessionStatus } from '../../api/types';
 
 export type ToolResult = { text: string; isError: boolean; images: number };
 
@@ -22,6 +22,7 @@ export type Item =
   | { k: 'result'; id: string; ok: boolean; subtype: string; costUsd: number | null; turns: number | null; durationMs: number | null; text: string | null }
   | { k: 'system'; id: string; level: 'info' | 'warn' | 'error'; text: string; sandbox?: SandboxLog }
   | { k: 'status'; id: string; status: string }
+  | { k: 'images'; id: string; images: ImagesPayload }
   | { k: 'unknown'; id: string; label: string; json: string };
 
 export type TranscriptSummary = {
@@ -72,6 +73,28 @@ export function sandboxLogOf(v: unknown): SandboxLog | undefined {
     output: str(v.output) ?? '',
     outputTruncated: v.outputTruncated === true,
     platform: str(v.platform) ?? null,
+  };
+}
+
+/** The payload of an `images` event, defensively (undefined unless well-formed). */
+export function imagesOf(v: unknown): ImagesPayload | undefined {
+  if (!isObj(v) || !Array.isArray(v.images)) return undefined;
+  const images = v.images.flatMap((i) =>
+    isObj(i) && typeof i.id === 'string'
+      ? [{ id: i.id, mediaType: str(i.mediaType) ?? 'image/png', width: num(i.width) ?? 0, height: num(i.height) ?? 0, size: num(i.size) ?? 0 }]
+      : [],
+  );
+  if (images.length === 0) return undefined;
+  const issue = num(v.issueNumber);
+  return {
+    requestId: str(v.requestId) ?? '',
+    provider: str(v.provider) ?? '',
+    providerLabel: str(v.providerLabel) ?? str(v.provider) ?? 'image AI',
+    model: str(v.model) ?? '',
+    prompt: str(v.prompt) ?? '',
+    purpose: str(v.purpose) ?? '',
+    ...(issue != null && issue > 0 ? { issueNumber: issue } : {}),
+    images,
   };
 }
 
@@ -138,6 +161,12 @@ export function buildTranscript(events: FactoryEvent[], partials: unknown[]): { 
           items.push({ k: 'status', id, status: st });
           summary.turnOpen = false;
         }
+        continue;
+      }
+      if (ev.type === 'images') {
+        const images = imagesOf(p);
+        if (images) items.push({ k: 'images', id, images });
+        else items.push({ k: 'unknown', id, label: 'images', json: compactJson(p) });
         continue;
       }
       if (ev.type !== 'claude' || !isObj(p)) {

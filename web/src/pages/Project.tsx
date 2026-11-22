@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { api, ApiError, isReleaseFinished, isReleaseOpen, isRunWorking, isSessionActive, type AgentSession, type Issue, type IssueKind, type Release, type ReleaseMode, type Run } from '../api';
 import { ChatView } from '../components/chat/ChatView';
+import { IssueImagesDialog } from '../components/images/IssueImagesDialog';
 import { REVIEWERS, roundName } from '../components/pipeline/model';
 import { sandboxSummary } from '../components/sandbox/SandboxBits';
 import { Dialog, Empty, ErrorBox, KindBadge, Loading, Notice, ReleaseStatusPill, RoleBadge, RunStatusPill, SessionStatusPill } from '../components/ui/ui';
@@ -337,6 +338,7 @@ function IssuesPanel({ repo, releases }: { repo: string; releases: Release[] }) 
   const [kind, setKind] = useState<'all' | IssueKind>('all');
   const [releaseFilter, setReleaseFilter] = useState<ReleaseFilter>('all');
   const [creating, setCreating] = useState(false);
+  const [imagesFor, setImagesFor] = useState<number | null>(null);
   const [starting, setStarting] = useState<number | null>(null);
   const [assigning, setAssigning] = useState<Set<number>>(new Set());
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -535,6 +537,11 @@ function IssuesPanel({ repo, releases }: { repo: string; releases: Release[] }) 
                 <span>{i.author}</span>
                 <span>· {timeAgo(i.updatedAt)}</span>
                 {i.comments > 0 && <span>· {i.comments} comment{i.comments === 1 ? "" : "s"}</span>}
+                {i.imageCount > 0 && (
+                  <button type="button" className="btn btn--sm btn--ghost issue-images-btn" onClick={() => setImagesFor(i.number)}>
+                    {i.imageCount} {i.imageCount === 1 ? 'image' : 'images'}
+                  </button>
+                )}
                 <span className="issue-action">
                   {pickable && (
                     <span className="release-pick">
@@ -568,6 +575,7 @@ function IssuesPanel({ repo, releases }: { repo: string; releases: Release[] }) 
         })}
       </ul>
       {!me.hasClaudeCredential && <p className="muted small pad">Starting runs needs your Claude credential. <Link to="/settings#claude">Settings</Link></p>}
+      <IssueImagesDialog repo={repo} issue={imagesFor} me={me.username} onClose={() => setImagesFor(null)} onChanged={issues.reload} />
       <NewIssueDialog repo={repo} open={creating} onClose={() => setCreating(false)} onCreated={(i) => issues.setData((d) => addIssue(d ?? [], i))} />
     </>
   );

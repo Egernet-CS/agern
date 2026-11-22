@@ -66,6 +66,8 @@ const alice: User = {
   twoFactorLockedUntil: null,
   githubTokenKind: scenario !== 'fresh' ? 'classic' : null,
   githubTokenScopes: scenario !== 'fresh' ? ['read:org', 'repo'] : null,
+  imageProvider: scenario !== 'fresh' ? 'openai' : null,
+  imageModel: scenario !== 'fresh' ? 'gpt-image-2.5-flare' : null,
 };
 const bob: User = {
   id: uid(),
@@ -80,6 +82,8 @@ const bob: User = {
   twoFactorLockedUntil: null,
   githubTokenKind: 'fine_grained',
   githubTokenScopes: null,
+  imageProvider: null,
+  imageModel: null,
 };
 const carl: User = {
   id: uid(),
@@ -94,6 +98,8 @@ const carl: User = {
   twoFactorLockedUntil: null,
   githubTokenKind: null,
   githubTokenScopes: null,
+  imageProvider: null,
+  imageModel: null,
 };
 const dora: User = {
   id: uid(),
@@ -108,6 +114,8 @@ const dora: User = {
   twoFactorLockedUntil: new Date(Date.now() + 14 * 60_000).toISOString(),
   githubTokenKind: 'classic',
   githubTokenScopes: ['public_repo'],
+  imageProvider: null,
+  imageModel: null,
 };
 
 export const db = {
@@ -260,6 +268,11 @@ export function announceIssue(repo: string, issue: Issue) {
   const listed = { ...issue };
   delete listed.body;
   feed({ type: 'issue', repo, issue: listed });
+}
+
+/** Appends (and broadcasts) a session event; exported for the image mock. */
+export function emitEvent(sessionId: string, type: FactoryEvent['type'], payload: unknown, ts: string, live = false) {
+  emit(sessionId, type, payload, ts, live);
 }
 
 function emit(sessionId: string, type: FactoryEvent['type'], payload: unknown, ts: string, live = false) {
@@ -685,7 +698,7 @@ function setRunStatus(r: Run, status: Run['status'], ts: string) {
 
 /** Like the backend: stages exist as `pending` before they run (round 0 at creation, fix rounds when they start). */
 function pendingStage(r: Run, role: StageRole, round: number): Stage {
-  const st: Stage = { id: uid(), role, round, model: effective(r.owner.username).model(role), status: 'pending', verdict: null, summary: null, findings: [], sessionId: null, startedAt: null, endedAt: null, screenshots: [] };
+  const st: Stage = { id: uid(), role, round, model: effective(r.owner.username).model(role), status: 'pending', verdict: null, summary: null, findings: [], sessionId: null, startedAt: null, endedAt: null, screenshots: [], images: [] };
   r.stages.push(st);
   return st;
 }
@@ -1612,8 +1625,9 @@ function issue(repo: string, number: number, kind: IssueKind, title: string, aut
     body: `### Context\n\nReported by @${author}.\n\n### Acceptance\n\n- [ ] Works on desktop and mobile\n- [ ] Covered by tests`,
     activeRunId: null,
     release: null,
+    imageCount: 0,
     ...extra,
-  };
+  } as Issue;
 }
 
 function seed() {
@@ -1764,7 +1778,7 @@ function seed() {
   const failed = startRun('web-shop', 44, bob, null, { changes: {}, liveFrom: never }, Date.now() - 86400_000);
   for (const st of failed.stages.slice(2)) {
     if (st.sessionId) db.sessions.delete(st.sessionId);
-    Object.assign(st, { status: 'skipped', sessionId: null, verdict: null, summary: null, findings: [], screenshots: [], startedAt: null });
+    Object.assign(st, { status: 'skipped', sessionId: null, verdict: null, summary: null, findings: [], screenshots: [], images: [], startedAt: null });
   }
   failed.stages[1].status = 'failed';
   const failedBuilder = db.sessions.get(failed.stages[1].sessionId!);
