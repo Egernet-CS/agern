@@ -73,6 +73,10 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_ATTACHMENT_MAX_COUNT` | `10` | Attachments per message (1–20) |
 | `FACTORY_SCREENSHOT_MAX_MB` | `5` | Largest single screenshot a UX or UI design reviewer attaches (1–512; §6 "Screenshots") |
 | `FACTORY_SCREENSHOT_MAX_COUNT` | `12` | Screenshots per stage, i.e. per reviewer per round (1–50) |
+| `FACTORY_IMAGE_MAX_PER_REQUEST` | `4` | Images per `factory_generate_image` call (1–10; §6 "Generated images") |
+| `FACTORY_IMAGE_MAX_PER_TURN` | `8` | Images per chat message of the owner (1–100) |
+| `FACTORY_IMAGE_MAX_PER_STAGE` | `12` | Images per pipeline stage agent (1–200; each fix round is a new stage) |
+| `FACTORY_IMAGE_MAX_EDGE` | `2048` | Longest edge an agent may ask for, in pixels (256–4096) |
 | `FACTORY_SANDBOX` | `off` | `off` or `podman`: per-run build/test sandboxes in rootless Podman (§5 "Sandboxes"). `off`: runs behave as before and the builder gets no sandbox tools; definitions can still be approved. `fake` (development and end-to-end tests only, accepted only with `FACTORY_DEV_FAKE_GITHUB`): an in-memory runtime that only pretends to run commands |
 | `FACTORY_SANDBOX_PODMAN` | `podman` | The podman binary |
 | `FACTORY_SANDBOX_PODMAN_URL` | unset | When set, every call is `podman --url <url> …` (podman-remote against a `podman system service`, e.g. `unix:///run/…/podman.sock`) |
@@ -126,15 +130,27 @@ Sessions are server-side rows in PostgreSQL referenced by an opaque random id in
   (`kind = oauth_token`, passed to agents as `CLAUDE_CODE_OAUTH_TOKEN`) or an Anthropic API key
   (`kind = api_key`, passed as `ANTHROPIC_API_KEY`).
 - *GitHub token* — a personal access token. The server calls `GET /user` to learn the login.
+- *Image provider* (optional) — one image-generation provider (OpenAI or Google Gemini) with the user's own API
+  key and a model (§6 "Generated images"). The key is checked with the provider before it is stored.
 
-Both are stored encrypted with AES-256-GCM under `FACTORY_MASTER_KEY` (random 12-byte nonce per
+All three are stored encrypted with AES-256-GCM under `FACTORY_MASTER_KEY` (random 12-byte nonce per
 value, username as associated data). They are never returned by any API, never logged, and never
 written to disk in plaintext.
 
 **The ownership rule.** An agent process always runs with the credentials of the user who started
 it — the *owner*. There is no API through which user A can cause a process to start with user B's
 credential: only the owner may send input to, resume, or approve work in their sessions and runs
-(admins may stop, never drive). Everyone else gets read-only observation.
+(admins may stop, never drive). Everyone else gets read-only observation. The same holds for images: the server
+generates them only with the image key of the owner of the chat or run whose agent asks, and the key never reaches
+an agent process.
+
+**Codex is not an image provider (yet).** The issue asked to verify first that the OpenAI Codex CLI can generate
+images non-interactively on a ChatGPT login, and how such a login could be kept per user on a shared host. Checked on
+the factory host on 2026-11-22: `codex` 0.170.0 is installed, `codex features list` reports `image_generation stable
+true`, `codex exec` runs non-interactively and `CODEX_HOME=<dir> codex login status` answers "Not logged in". No
+ChatGPT login was available, so an actual generation (its output location and error texts) could not be verified, and
+Codex was left out rather than half-implemented. The provider interface is neutral: Codex can be added as one more
+`ImageProvider` plus its login flow.
 
 **Visibility.** A user may see a project, its issues, runs, sessions and transcripts if and only if
 their own GitHub token can read that repository (`GET /repos/{org}/{repo}` → 200; cached 60 s per
@@ -1059,6 +1075,55 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   "checkRuns": [{"name", "status", "conclusion"}]}`) sets the checks of a branch while the server runs; the e2e suite
   uses it.
 
+### Generated images
+
+Agents can have graphics made by an image AI the user chose (issue #11). Claude does not generate images itself.
+
+- **Providers:** `dk.egernet.factory.images.ImageProvider` implementations — `OpenAiImageProvider` (Images API,
+  `Authorization: Bearer`), `GeminiImageProvider` (Interactions API, `x-goog-api-key`, no transparent backgrounds) and,
+  only in fake-GitHub mode, `DevFakeImageProvider` (`fake`, keys `fake-image-…`, draws PNGs; `fake:refuse` and
+  `fake:quota` in a prompt fail). Nothing outside the package knows provider names: `GET /api/config` lists the
+  catalogue and the web renders it. The HTTP providers never follow redirects (a key is never sent to another host),
+  send the key only in a header, connect within 10 s and wait at most 300 s. Model names are free text
+  (`^[A-Za-z0-9._:-]{1,100}$`); the catalogue's models are suggestions.
+- **Setting:** one provider per user (`users.image_provider`, `image_model`, `image_key_enc`), set with
+  `PUT /api/me/image-provider` after the provider accepted key and model, removed with `DELETE` (images stay).
+- **Tool:** `factory_generate_image` (§7) for the chat agent, the spec-writer and the builder (fix rounds included).
+  The service also derives the session kind from the grant and refuses any other, and for a run checks that the run
+  belongs to the grant's repository and owner. Order: who may call, arguments, provider configured, transparency
+  (JPEG has none; Gemini cannot), limits, provider call (on `Dispatchers.IO`), result checks.
+- **Limits:** per call (`FACTORY_IMAGE_MAX_PER_REQUEST`), per chat message (`…_PER_TURN`; the counter resets when the
+  owner's next non-command chat input is accepted) and per stage agent (`…_PER_STAGE`), reserved before the call and
+  released for images not delivered; edges 256…`FACTORY_IMAGE_MAX_EDGE`. In-memory counters (a restart resets them).
+  A returned image over 20 MiB, not PNG/JPEG/WebP by its magic bytes or without readable dimensions is dropped.
+  Agern never resizes or converts; the tool's `notes` say when the result differs from what was asked.
+- **No provider:** a tool error without a provider call. The chat agent tells the user to add one under
+  Settings → Image generation; a pipeline agent continues without images, says so in its summary, and the run does
+  not fail for it. Provider failures are tool errors in plain words, with the key redacted from any provider text.
+- **Storage:** table `generated_images` (bytes included; `origin` `chat` or `run`; `session_id` without a foreign key
+  so a closed chat's selected images keep it). Agent copies: chats under
+  `$FACTORY_DATA_DIR/generated-images/<sessionId>/<id8>-<slug>.<ext>` (absolute `path`), runs under
+  `<worktree>/.agern-run/images/<id8>-<slug>.<ext>` (relative `path`). Whenever the server creates
+  `<worktree>/.agern-run/` it writes `.agern-run/.gitignore` containing `*`, so git ignores the directory without any
+  change to the repository. Each generation appends an `images` event to the session (§8) and, in a run, publishes the
+  run so the run page updates.
+- **Selection:** the owner of a chat image selects it for an open issue under a short name (`PUT
+  /api/images/{id}/selection`), moves, renames or unselects it, or discards an unselected one; at most 20 per issue.
+  The conditions are part of the SQL statements. A selection belongs to the issue: any user's run of it receives it.
+- **Run hand-over:** when a run starts (after the sandbox decision) it takes all selected images of its issue
+  (`used_by_run_id`; not those held by another run that is still active or merged), writes them to
+  `.agern-run/images/prepared-<nn>-<slug of name>.<ext>` and lists them in an `<images>` block after the issue text of
+  the spec-writer's and builder's task prompts (not the fix prompt); those stages also note "Prepared images: …" in
+  their transcript. A selection is **locked** while its run is not `failed` or `cancelled`; a retry gets the same
+  images. A run for an issue without selected images, in which no agent calls the tool, has byte-identical prompts
+  and no `.agern-run` directory.
+- **Cleanup:** closing a chat deletes its unselected images and its image directory; discard deletes at once; run
+  images go with their run row (cascade) and their files with the worktree. There is no time-based reaper.
+- **Prompts:** `chat.md`, `spec-writer.md` and `builder.md` say when to use the tool (whenever graphics are asked for,
+  never otherwise), to write the prompt from the project's existing visual style, to read the returned file, and what
+  to do without a provider. The spec-writer names the needed images in the spec; the builder uses prepared images,
+  generates the rest and adds what it uses where the project keeps assets, never committing `.agern-run/`.
+
 ## 7. Chat agent ↔ factory (MCP)
 
 The server exposes an MCP endpoint (`POST /mcp`, streamable HTTP, JSON responses). Every agent
@@ -1071,7 +1136,17 @@ Tools: `factory_list_issues`, `factory_get_issue`, `factory_create_issue`, `fact
 `factory_assign_issues`, `factory_unassign_issues`, `factory_approve_release`. Pipeline-stage agents get only `factory_get_issue`
 and `factory_request_software`; with sandboxes switched on (`FACTORY_SANDBOX` not `off`) the builder also
 gets `factory_sandbox_info` and `factory_sandbox_exec`; the `ux` and `ui-design` reviewers also get
-`factory_attach_screenshot`.
+`factory_attach_screenshot`. The chat agent, the spec-writer and the builder also get `factory_generate_image`.
+
+Image tool (§6 "Generated images"), chat, spec-writer and builder only:
+- `factory_generate_image { prompt, purpose, size?, format?, count?, transparentBackground?, issueNumber? }` —
+  `prompt` 1–4000 characters; `purpose` one line, 1–200 characters (e.g. "app icon"); `size` `WIDTHxHEIGHT` (default
+  `1024x1024`, each edge 256…`FACTORY_IMAGE_MAX_EDGE`); `format` `png` (default), `jpeg` or `webp`; `count` 1…
+  `FACTORY_IMAGE_MAX_PER_REQUEST` (default 1); `issueNumber` a hint for the chat UI. Answers JSON text
+  `{ "images": [{ "id", "path", "mediaType", "width", "height", "bytes" }], "provider", "model", "notes": [...],
+  "remaining", "next" }`. Refusals and provider failures are tool errors, e.g. `No image provider is configured for
+  <user>. …`, `Limit reached: at most 8 images per chat message (0 left). …`, `<Label> rejected your API key. …`,
+  `Only the chat agent, the spec-writer and the builder can generate images`.
 
 Screenshot tool (§6 "Screenshots"), `ux` and `ui-design` reviewers only:
 - `factory_attach_screenshot { path, caption }` → text such as `Attached screenshot 2 of at most 12 for this stage:
@@ -1161,7 +1236,9 @@ type User = { id: string; username: string; displayName: string; isAdmin: boolea
   twoFactorEnabled: boolean;
   twoFactorLockedUntil: string | null;    // set while the second factor is locked (too many wrong codes)
   githubTokenKind: 'classic' | 'fine_grained' | null;  // from the prefix: ghp_ → classic, github_pat_ → fine_grained
-  githubTokenScopes: string[] | null };   // classic tokens: GitHub's X-OAuth-Scopes at registration; null otherwise
+  githubTokenScopes: string[] | null;     // classic tokens: GitHub's X-OAuth-Scopes at registration; null otherwise
+  imageProvider: string | null;           // image provider id (§6 "Generated images"); null without a stored key
+  imageModel: string | null };            // never the key
 
 type LoginStep =
   | { next: 'totp' }                                             // enter a code
@@ -1176,7 +1253,8 @@ type IssueKind = 'feature' | 'bug' | 'task';      // from labels: bug → bug; e
 type Issue = { number: number; title: string; state: 'open' | 'closed'; kind: IssueKind;
   labels: { name: string; color: string }[]; author: string; assignees: string[]; comments: number;
   createdAt: string; updatedAt: string; htmlUrl: string; body?: string; activeRunId: string | null;
-  release: { id: string; name: string } | null };  // the release it is planned in (§6 "Releases"); always present
+  release: { id: string; name: string } | null;  // the release it is planned in (§6 "Releases"); always present
+  imageCount: number };  // images selected for it in a chat (§6 "Generated images")
 
 type ReleaseIssue = { number: number; title: string; kind: IssueKind;   // title/kind as when it was assigned
   state: 'waiting' | 'running' | 'merged' | 'held' | 'skipped';
@@ -1229,7 +1307,15 @@ type Stage = { id: string; role: Exclude<SessionKind, 'chat'>;
   verdict: 'PASS' | 'CHANGES' | 'APPROVE' | 'ESCALATE' | null; summary: string | null;
   findings: { severity: string; file: string | null; detail: string }[];
   sessionId: string | null; startedAt: string | null; endedAt: string | null;
-  screenshots: Screenshot[] };  // ux / ui-design only (§6 "Screenshots"), attach order; [] for other stages
+  screenshots: Screenshot[];    // ux / ui-design only (§6 "Screenshots"), attach order; [] for other stages
+  images: GeneratedImage[] };   // images the stage's agent generated (spec-writer, builder), oldest first
+
+type GeneratedImage = { id: string; repo: string; origin: 'chat' | 'run'; sessionId: string;
+  owner: { username: string; displayName: string }; provider: string; model: string;
+  prompt: string; purpose: string;                       // untrusted text
+  mediaType: string; size: number; width: number; height: number; transparent: boolean; createdAt: string;
+  selection: { issueNumber: number; name: string; usedByRunId: string | null; locked: boolean } | null };
+// bytes at GET /api/images/{id}
 
 type Screenshot = { id: string; caption: string;   // caption: one line, untrusted (render as text)
   mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'; size: number; width: number; height: number;
@@ -1302,16 +1388,21 @@ type Attachment = { id: string; name: string;   // name: sanitised (no path, con
   inline: 'original' | 'downscaled' | 'none';     // how the model sees an image (§5); always 'none' for files
   note: string | null };                          // why an image was downscaled / is file only
 
-type ClientConfig = { attachments: { maxFileBytes: number; maxMessageBytes: number; maxCount: number; imageTypes: string[] } };
+type ClientConfig = { attachments: { maxFileBytes: number; maxMessageBytes: number; maxCount: number; imageTypes: string[] };
+  images: { providers: { id: string; label: string; models: string[]; defaultModel: string; supportsTransparency: boolean;
+      keyPlaceholder: string }[];
+    limits: { maxPerRequest: number; maxPerTurn: number; maxPerStage: number; maxEdge: number } } };
 
 type Event = { seq: number; sessionId: string; ts: string;
-  type: 'user' | 'claude' | 'system' | 'status'; payload: unknown };
+  type: 'user' | 'claude' | 'system' | 'status' | 'images'; payload: unknown };
 //  user:   { text: string, username: string, attachments?: Attachment[] }   // attachments only when there are some
 //          A message to a running pipeline agent (§6) adds: messageId: string, origin: 'direct' | 'chat',
 //          viaSessionId?: string   // the forwarding chat session when origin is 'chat'
 //  claude: one raw stream-json object from the CLI ({type:'system'|'assistant'|'user'|'result'|'stream_event', …})
 //  system: { level: 'info' | 'warn' | 'error', text: string, messageId?: string, sandbox?: SandboxLog }
 //          messageId: the agent picked that message up (info) or stopped before it did (warn)
+//  images: { requestId, provider, providerLabel, model, prompt, purpose, issueNumber?,   // one factory_generate_image
+//            images: [{ id, mediaType, width, height, size }] }                          // call (§6 "Generated images")
 //          sandbox: the full log of a sandbox setup script or command (§5 "Sandboxes"):
 //            { kind: 'setup' | 'exec', command, exitCode, timedOut, durationMs, output, outputTruncated,
 //              platform: string | null }   // null when the definition has no platforms, else 'default' or the platform
@@ -1368,6 +1459,14 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `GET /api/me/usage` | → `ClaudeUsage` | the caller's own Claude usage (§5 "Claude usage"); there is no way to read another user's, also not for admins |
 | `PUT /api/me/github-token` | `{ token }` → `User` | 422 if GitHub rejects it. `GET /user` succeeds with any scope, so the token's kind and (classic) scopes are recorded and shown; Settings warns when a classic token lacks `repo` (public repositories only, no push) and explains the grants a fine-grained token needs |
 | `DELETE /api/me/github-token` | → `User` | |
+| `PUT /api/me/image-provider` | `{ provider, model, apiKey }` → `User` | §6 "Generated images". 400 unknown provider or bad model name; 422 `image_key_invalid` (malformed, or rejected by the provider), 422 `image_model_unknown`, 502 `image_provider_unavailable`; nothing is stored on any error. The key is never returned |
+| `DELETE /api/me/image-provider` | → `User` | idempotent; images stay |
+| `GET /api/images/{id}` | → image bytes | anyone who can see the image's repository (404 otherwise and for unknown ids); the attachment headers, `Content-Disposition: inline` |
+| `PUT /api/images/{id}/selection` | `{ issueNumber, name }` → `GeneratedImage` | the image's owner, chat images only: 403 not the owner, 404 unknown image/issue, 400 name empty or over 60, 409 `run_image` / `issue_closed` / `too_many_images` (20 per issue) / `image_in_use` (locked) |
+| `DELETE /api/images/{id}/selection` | → `GeneratedImage` | as above; 409 `image_in_use` while locked |
+| `DELETE /api/images/{id}` | → 204 | discard an unselected chat image of the caller; 409 `image_selected` / `run_image` |
+| `GET /api/sessions/{id}/images` | → `GeneratedImage[]` | visibility of the session; oldest first |
+| `GET /api/projects/{repo}/issues/{number}/images` | → `GeneratedImage[]` | images selected for the issue |
 | `GET /api/me/preferences` | → `Preferences` | the caller's own model / fix-round choices and the effective values |
 | `PUT /api/me/preferences` | `PreferenceOverrides` → `Preferences` | replaces the caller's choices; 400 for an invalid model or unknown role, 422 `max_fix_rounds_out_of_range` |
 | `GET /api/projects` | → `Project[]` | repos of the org visible to the user |
@@ -1804,6 +1903,19 @@ section after its findings: a wrapping grid of lazily loaded thumbnails with the
 thumbnail is a button ("Open screenshot: <caption>") that opens a dialog with the image scaled to fit, the caption,
 its type, size and dimensions and an "Open full size ↗" link. A stage without screenshots shows nothing extra.
 Screenshots attached while the page is open arrive through the feed (`useLiveRun`), without a reload.
+Below them, a stage whose agent generated images (§6 "Generated images") shows "Generated images <n>": thumbnails
+("Open image: <purpose>") with the purpose and the prompt in a "Prompt" disclosure, a lightbox with type, size,
+dimensions, model and "Open full size ↗"; it also updates live.
+
+**Image generation.** Settings has an "Image generation" section (`#images`) between GitHub and Models: the provider
+as a segmented choice from `GET /api/config`, a password field for the API key, a model field with the provider's
+models as suggestions, Save/Replace ("Checking with <provider>…") and Remove, and the limits. In a transcript, an
+`images` event renders as a block "Generated N image(s) with <provider> · <model>", the purpose, the prompt in a
+disclosure and one tile per image (from `GET /api/sessions/{id}/images`; a discarded image shows a placeholder).
+The image's owner, for chat images, gets "Use for issue…" (a dialog with issue number and name) and "Discard", or
+`selected for #<n> as "<name>"` with "Remove from #<n>" until a run locks it; others, and stage transcripts, are
+read-only. In the issue list an issue with selected images shows an "<n> image(s)" button opening "Images for #<n>"
+(thumbnail, name, purpose, dimensions, who selected it, the run using it, Remove for the owner while unlocked).
 
 On the run page the owner of a run gets a text-only composer (the chat prompt without `/factory` commands,
 attachments or interrupt; it can send while the agent works) under the transcript of a selected spec-writer or

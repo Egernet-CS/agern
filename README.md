@@ -56,6 +56,10 @@ Models per role are a setting. The details are in [`docs/ARCHITECTURE.md`](docs/
   can watch; sessions owned by someone else are read-only.
 - **Agents can use the factory.** The chat agent gets factory tools over MCP (list and create issues,
   start, approve and cancel runs), and `/factory run|status|approve|cancel` works in the chat.
+- **Generated images.** Each person can register an image AI (OpenAI or Google Gemini, their own API
+  key and model) under Settings. When a request or issue asks for an icon, illustration or other graphics,
+  the chat agent, spec-writer and builder have them generated on the server with the owner's key; chat
+  images can be picked for an issue and are handed to its run, run images show on the run page.
 - **Build and test sandboxes (optional).** A project describes a container for its builds and tests
   in `.agern/sandbox.yml` — toolchain image, setup script, sidecar services such as PostgreSQL with a
   readiness check, caches, a non-root user, and extra *platform* images to test on. After an admin

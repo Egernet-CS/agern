@@ -3090,3 +3090,45 @@ html.app-locked #root {
   gap: 8px;
   align-items: flex-start;
 }
+/* Images selected for an issue (issue list dialog). */
+.issue-images-btn {
+  padding-block: 0;
+}
+.issue-images-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.issue-image {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+}
+.issue-image-thumb img {
+  aspect-ratio: 1;
+  object-fit: contain;
+  object-position: center;
+}
+.issue-image-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.shot-prompt summary {
+  cursor: pointer;
+  font-size: 0.82rem;
+  color: var(--text-3);
+}
+.shot-prompt p {
+  margin: 4px 0 0;
+  font-size: 0.82rem;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

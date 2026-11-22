@@ -52,6 +52,9 @@ data class UserDto(
     val githubTokenKind: String?,
     /** Classic tokens: granted OAuth scopes, e.g. `["read:org","repo"]`; null without a token or for fine-grained tokens. */
     val githubTokenScopes: List<String>?,
+    /** The image provider id and model (docs/ARCHITECTURE.md §6 "Generated images"); null without a stored key. Never the key. */
+    val imageProvider: String? = null,
+    val imageModel: String? = null,
 )
 
 @Serializable
@@ -81,6 +84,8 @@ data class IssueDto(
     val activeRunId: String?,
     /** The release the issue is planned in, or null (docs/ARCHITECTURE.md §6 "Releases"). */
     val release: IssueReleaseDto? = null,
+    /** Images selected for this issue in a chat (docs/ARCHITECTURE.md §6 "Generated images"). */
+    val imageCount: Int = 0,
 )
 
 @Serializable data class IssueReleaseDto(val id: String, val name: String)
@@ -172,6 +177,8 @@ data class StageDto(
     val startedAt: String?, val endedAt: String?,
     /** Screenshots the stage's reviewer attached (only `ux` and `ui-design`), in attach order. Never the bytes. */
     val screenshots: List<ScreenshotDto> = emptyList(),
+    /** Images the stage's agent generated, oldest first. Never the bytes. */
+    val images: List<GeneratedImageDto> = emptyList(),
 )
 
 /** A screenshot attached to a stage; the image is served by `GET /api/runs/{id}/screenshots/{sid}`. */
@@ -403,7 +410,26 @@ data class AttachmentDto(
     val note: String,
 )
 
-@Serializable data class ClientConfigDto(val attachments: AttachmentLimitsDto)
+@Serializable data class ClientConfigDto(val attachments: AttachmentLimitsDto, val images: ImageConfigDto)
+
+/** An image provider of the catalogue (`GET /api/config`); the web renders whatever is listed. */
+@Serializable data class ImageProviderInfoDto(
+    val id: String, val label: String, val models: List<String>, val defaultModel: String, val supportsTransparency: Boolean,
+    val keyPlaceholder: String,
+)
+@Serializable data class ImageLimitsDto(val maxPerRequest: Int, val maxPerTurn: Int, val maxPerStage: Int, val maxEdge: Int)
+@Serializable data class ImageConfigDto(val providers: List<ImageProviderInfoDto>, val limits: ImageLimitsDto)
+
+/** Where an image is selected for use; [locked] while a run that took it is not failed or cancelled. */
+@Serializable data class ImageSelectionDto(val issueNumber: Int, val name: String, val usedByRunId: String?, val locked: Boolean)
+
+/** A generated image (docs/ARCHITECTURE.md §6 "Generated images"); bytes at `GET /api/images/{id}`. */
+@Serializable data class GeneratedImageDto(
+    val id: String, val repo: String, val origin: String, val sessionId: String, val owner: OwnerDto,
+    val provider: String, val model: String, val prompt: String, val purpose: String,
+    val mediaType: String, val size: Long, val width: Int, val height: Int, val transparent: Boolean, val createdAt: String,
+    val selection: ImageSelectionDto?,
+)
 
 @Serializable data class FeedFrame(
     val type: String,

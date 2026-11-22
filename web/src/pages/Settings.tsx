@@ -4,7 +4,8 @@ import { api, type CredentialKind, type PreferenceOverrides, type Preferences, t
 import { CodeInput } from '../components/ui/CodeInput';
 import { RecoveryCodes } from '../components/ui/RecoveryCodes';
 import { UsageBlock } from '../components/ui/UsageBlock';
-import { CopyButton, Dialog, Notice } from '../components/ui/ui';
+import { CopyButton, Dialog, ErrorBox, Notice } from '../components/ui/ui';
+import { useAsync } from '../lib/async';
 import { useAuth, useMe } from '../lib/auth';
 
 export function SettingsPage() {
@@ -28,6 +29,7 @@ export function SettingsPage() {
       </div>
       <ClaudeSection />
       <GithubSection />
+      <ImageSection />
       <ModelsSection />
       <SecuritySection />
       <p className="muted small pad-top">Signed in as <strong>{me.username}</strong>{me.isAdmin ? ' · admin' : ''}.</p>
@@ -158,6 +160,108 @@ function GithubSection() {
           )}
         </div>
       </form>
+    </section>
+  );
+}
+
+/** The image-generation provider: one per user, its key validated by the provider before it is stored. */
+function ImageSection() {
+  const { me, setMe } = useAuth();
+  const cfg = useAsync(() => api.config(), []);
+  const [chosen, setChosen] = useState<string | null>(null);
+  const [model, setModel] = useState<string | null>(null);
+  const [key, setKey] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+  if (!me) return null;
+  const catalogue = cfg.data?.images;
+  const providers = catalogue?.providers ?? [];
+  const saved = providers.find((p) => p.id === me.imageProvider);
+  const current = providers.find((p) => p.id === chosen) ?? saved ?? providers[0];
+  // The model field follows the chosen provider: its saved model for the saved provider, else its default.
+  const modelValue = model ?? (current && current.id === me.imageProvider && me.imageModel ? me.imageModel : current?.defaultModel ?? '');
+  const choose = (id: string) => {
+    setChosen(id);
+    setModel(null);
+    setErr(null);
+    setMsg(null);
+  };
+  const save = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!current) return;
+    setBusy(true);
+    setErr(null);
+    setMsg(null);
+    try {
+      setMe(await api.putImageProvider(current.id, modelValue.trim(), key.trim()));
+      setKey('');
+      setModel(null);
+      setMsg('Saved. New image requests will use it.');
+    } catch (e2) {
+      setErr((e2 as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const remove = async () => {
+    setBusy(true);
+    setErr(null);
+    setMsg(null);
+    try {
+      setMe(await api.deleteImageProvider());
+      setMsg('Removed.');
+    } catch (e2) {
+      setErr((e2 as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const isSet = !!me.imageProvider;
+  return (
+    <section className="card settings-card" id="images" aria-labelledby="images-h">
+      <header className="sc-head">
+        <h2 id="images-h">Image generation</h2>
+        <Status on={isSet}>{isSet ? `${saved?.label ?? me.imageProvider} · ${me.imageModel}` : 'not set — agents cannot generate images'}</Status>
+      </header>
+      <p>Agents can have icons, illustrations and other graphics made by an image AI. It runs on your own API key and bills to you; the key is used only for chats and runs you own.</p>
+      {cfg.loading && !catalogue && <p className="muted small">Loading…</p>}
+      {cfg.error && <ErrorBox error={cfg.error} retry={cfg.reload} />}
+      {current && catalogue && (
+        <form className="form" onSubmit={save}>
+          <fieldset className="seg seg--wide">
+            <legend className="sr-only">Image provider</legend>
+            {providers.map((p) => (
+              <label key={p.id} className={current.id === p.id ? 'is-on' : ''}>
+                <input type="radio" name="image-provider" className="sr-only" checked={current.id === p.id} onChange={() => choose(p.id)} />
+                {p.label}
+              </label>
+            ))}
+          </fieldset>
+          <div className="field">
+            <label htmlFor="ik">API key</label>
+            <input id="ik" type="password" className="mono" autoComplete="off" spellCheck={false} placeholder={current.keyPlaceholder} value={key} onChange={(e) => setKey(e.target.value)} />
+          </div>
+          <div className="field">
+            <label htmlFor="im">Model</label>
+            <input id="im" className="mono" autoComplete="off" spellCheck={false} list="image-models" value={modelValue} onChange={(e) => setModel(e.target.value)} />
+            <datalist id="image-models">
+              {current.models.map((m) => <option key={m} value={m} />)}
+            </datalist>
+          </div>
+          {err && <p className="form-error" role="alert">{err}</p>}
+          {msg && <p className="form-ok" role="status">{msg}</p>}
+          <div className="row">
+            <button className="btn btn--primary" disabled={busy || !key.trim() || !modelValue.trim()}>
+              {busy ? `Checking with ${current.label}…` : isSet ? 'Replace' : 'Save'}
+            </button>
+            {isSet && <button type="button" className="btn btn--ghost btn--danger" onClick={() => void remove()} disabled={busy}>Remove</button>}
+          </div>
+          <p className="muted small">
+            Limits: up to {catalogue.limits.maxPerRequest} images per request, {catalogue.limits.maxPerTurn} per chat message and {catalogue.limits.maxPerStage} per run stage.
+          </p>
+        </form>
+      )}
     </section>
   );
 }
