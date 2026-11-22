@@ -56,6 +56,12 @@ Behaviour
         directory, attach it through the MCP tool factory_attach_screenshot with the caption
         "Fake <role> screenshot (<build | fix round N>)", delete the file and append "Attached 1 screenshot." (or the
         tool's error text) to their summary; other roles ignore it
+    - "fake:image" (optionally "fake:image=<n>") in a chat message calls the MCP tool factory_generate_image with the
+        purpose "app icon" (and "issueNumber" from a "#<n>" in the message) and appends "Image tool: <answer>" to the reply;
+        in a builder's prompt the builder calls it too, copies the first returned path to assets/fake-icon.png, commits
+        it with its usual commit and appends "Image tool: <answer>" to its result
+    - a spec-writer or builder whose prompt has an <images> block appends "PREPARED ok <path> <bytes>" or
+        "PREPARED missing <path>" per listed "path:" line
     - "fake:busy-<role>" makes that (stream-json) role work in Bash steps of ~0.4 s for up to ~2 minutes,
       until a message from the owner contains "finish"; each picked-up message is acknowledged with
       "Noted the owner's message: ..." and listed in the final result
@@ -64,6 +70,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -262,6 +269,40 @@ def attach_fake_screenshot(prompt):
     return text if is_error else "Attached 1 screenshot."
 
 
+def mcp_init():
+    mcp_call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake-claude", "version": "0"}}, 1)
+
+
+def generate_fake_image(text, req_id=2):
+    """fake:image[=<n>] [#<issue>]: calls factory_generate_image with purpose "app icon". Returns (answer, is_error)."""
+    m = re.search(r"fake:image=(\d+)", text)
+    args = {"prompt": "A friendly squirrel app icon, flat style (fake prompt)", "purpose": "app icon", "size": "256x256"}
+    if m:
+        args["count"] = int(m.group(1))
+    issue = re.search(r"#(\d+)", text)
+    if issue and role == "chat":
+        args["issueNumber"] = int(issue.group(1))
+    try:
+        mcp_init()
+        return mcp_tool_roundtrip("factory_generate_image", args, req_id)
+    except Exception as e:  # noqa
+        return "Image tool failed: %s" % e, True
+
+
+def prepared_report(prompt):
+    """The <images> block of a task prompt: one line per listed path, whether the file is there."""
+    block = re.search(r"<images>(.*?)</images>", prompt, re.S)
+    if not block:
+        return ""
+    lines = []
+    for path in re.findall(r"^\s*path: (\S+)\s*$", block.group(1), re.M):
+        if os.path.isfile(path):
+            lines.append("PREPARED ok %s %d" % (path, os.path.getsize(path)))
+        else:
+            lines.append("PREPARED missing %s" % path)
+    return "".join("\n" + l for l in lines)
+
+
 def image_size(data):
     """(width, height) of PNG/GIF/JPEG bytes, or None."""
     import struct
@@ -434,6 +475,9 @@ def chat_mode():
                 reply += "\n" + res["result"]["content"][0]["text"]
             except Exception as e:  # noqa
                 reply += "\nMCP call failed: %s" % e
+        if "fake:image" in content and mcp_config:
+            answer, _ = generate_fake_image(content)
+            reply += "\nImage tool: " + answer
         if "slow" in content and not forward:
             chunks = ["%d " % i for i in range(1, 41)]
             ok, sent = stream_text("".join(chunks), chunk_delay=0.25, chunks=chunks,
@@ -529,12 +573,26 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
             except Exception as e:  # noqa
                 sandbox_report = "\nSandbox MCP calls failed: %s" % e
             checkpoint()
+        image_report = ""
+        if "fake:image" in prompt and mcp_config:
+            answer, is_error = generate_fake_image(prompt, 5)
+            image_report = "\nImage tool: " + answer
+            if not is_error:
+                try:
+                    first = json.loads(answer)["images"][0]["path"]
+                    os.makedirs("assets", exist_ok=True)
+                    shutil.copyfile(first, os.path.join("assets", "fake-icon.png"))
+                except Exception as e:  # noqa
+                    image_report += "\nCopying the image failed: %s" % e
+        image_report += prepared_report(prompt)
         if os.path.isdir(".git") or os.path.isfile(".git"):
             with open("AGERN_FAKE.md", "a") as f:
                 f.write("fake build at %s\n" % time.strftime("%Y-%m-%dT%H:%M:%S"))
             subprocess.run(["git", "add", "AGERN_FAKE.md"], check=False)
+            if os.path.isfile(os.path.join("assets", "fake-icon.png")):
+                subprocess.run(["git", "add", os.path.join("assets", "fake-icon.png")], check=False)
             subprocess.run(["git", "commit", "-q", "-m", "Fake build commit"], check=False)
-        text = "Implemented the change (fake). Ran no tests because I am a stub." + sandbox_report
+        text = "Implemented the change (fake). Ran no tests because I am a stub." + sandbox_report + image_report
         if received:
             text += "\nOwner messages handled: " + "; ".join(received)
         stream_text(text)
@@ -543,6 +601,9 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
     if role == "spec-writer":
         checkpoint()
         text = "## Summary\nA fake spec.\n\n## Acceptance criteria\n- [ ] Something happens\n"
+        prepared = prepared_report(prompt)
+        if prepared:
+            text += "\n## Images" + prepared + "\n"
         if received:
             text += "\n## Notes from the owner\n" + "".join("- %s\n" % m for m in received)
         stream_text(text)
