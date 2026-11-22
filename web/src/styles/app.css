@@ -978,6 +978,14 @@ input[type='checkbox'] {
   cursor: pointer;
   text-decoration: none;
 }
+.usermenu-version {
+  padding: 8px 10px 6px;
+  margin-top: 4px;
+  border-top: 1px solid var(--line);
+  color: var(--text-3);
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
 .usermenu-pop a:hover,
 .usermenu-pop button:hover {
   background: var(--surface-3);
