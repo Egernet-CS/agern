@@ -246,6 +246,12 @@ Launch rules:
   OAuth token, …) is reported as a `system` error telling the user to update it in Settings, for
   chats and pipeline stages alike. A process the server stops itself (stop, idle, shutdown) is
   reported as a neutral notice, never as an error exit code.
+- The **advisor** (§6 "Conversation at needs human") is launched exactly like a chat — the same flags, kept alive
+  between turns, stopped by the idle reaper, resumed with `--resume` and the same failed-resume fallback — except:
+  its working directory is the run's worktree, its role prompt is `advisor`, its MCP grant is the stage tools
+  (bound to the run), and its first stream-json message of every launch starts with a `<run_context>` block rebuilt
+  from current data (over stdin, never in argv). It has no `/factory` commands, no attachments and no stage time
+  limit.
 - Each stdout line is one JSON object. Complete messages are persisted as events; partial
   `stream_event` deltas are broadcast live but not persisted.
 
@@ -649,6 +655,62 @@ Run `status`: `queued`, `spec`, `building`, `reviewing`, `approving`, `merged`, 
 Stage `role`: `spec-writer`, `builder`, `security`, `ux`, `ui-design`, `code`, `approver`.
 Stage `status`: `pending`, `running`, `done`, `failed`, `skipped`.
 Stage `verdict`: `PASS`, `CHANGES`, `APPROVE`, `ESCALATE` or null.
+
+### Conversation at needs human
+
+When a run waits at `needs_human`, its owner can talk to an agent about it — the **advisor** (session kind `advisor`,
+title `advisor · #<n>`), a new agent with both the approver's and the builder's context — before deciding to approve
+or cancel. Talking never changes the run's status and never approves anything. Messages are not posted on GitHub.
+
+- **Who.** Only the run's owner, through `POST /api/runs/{id}/conversation` (or the session input route). Everyone
+  else gets 403, admins included (they may stop the advisor and cancel the run, never drive it); a user who cannot see
+  the repository gets 404. The advisor runs on the owner's credentials: agent slot, spend, limit windows. A usage
+  limit ends the turn with a `system` warn event (with the reset time when known); nothing is lost and the
+  conversation continues with the owner's next message.
+- **Session.** The first accepted message creates the run's one advisor session (`Run.conversation.sessionId`) with
+  the owner's effective `builder` model, and records the worktree's `HEAD` as the run's *reviewed commit*. One message
+  is in flight at a time: a message while the agent answers (or while the run is reconciled after its turn) is 409
+  `agent_busy`. Refusals, in this order: 404, 403 `forbidden`, 409 `run_not_waiting`, 400 (blank or over 100 000
+  characters), 409 `review_in_progress`, 409 `agent_busy`, 422 `claude_credential_required`, 409 `too_many_agents`
+  (no live process and no free slot), 409 `run_worktree_missing`.
+- **Context.** Every new process (fresh or resumed) gets, before the owner's first message to it, a `<run_context>`
+  block rebuilt from the database and GitHub: run id, repository, issue, why it needs a human (`run.error`), branch,
+  base ref, pull request, merge target and the release note; how to inspect the change (`git diff <base>...HEAD`,
+  `git log <base>..HEAD`); the issue text (the stored title when GitHub cannot be read); `<spec>` (the spec-writer's
+  final text), `<builder_summary>` (the latest builder's), `<reviews>` (each reviewer's latest verdict with round,
+  summary and findings), `<approver>` (verdict and summary, or that it did not run), and that the run has no sandbox
+  now. Then `Message from the run owner (<username>):` and the text; later messages to the same process carry only
+  that prefix. The transcript's `user` event holds the owner's text as written; a `system` info event at each launch
+  says the agent was given the run's context. The prompt marks the context as data, not instructions.
+- **Changes.** The advisor may change code when asked, and must commit; it never pushes, merges or comments on
+  GitHub (by instruction and by having no such MCP tools — like the builder it does have the owner's git and `gh`
+  credentials). After every advisor `result` and every exit, the server *reconciles* the run before the session counts
+  as idle: if the worktree `HEAD` differs from the reviewed commit, the review state (`Run.conversation.review`)
+  becomes `running` and a **follow-up review** starts. It is idempotent and a no-op while a review runs.
+- **Follow-up review.** A coroutine of the run (cancel stops it), not the pipeline: it stops the advisor process
+  (resumable), pushes the branch with the owner's identity, creates the four reviewer stages of a new round (highest
+  round + 1, the owner's current models; `Run.round` becomes it, `followUpFrom` is the first such round) and runs them
+  exactly as in the pipeline (read-only, `--json-schema`, screenshots for `ux` and `ui-design`, the stage time limit).
+  Their prompt says the round is "after follow-up round N: changes the run owner requested in a conversation" and
+  carries the advisor's last result in `<advisor_summary>`. When all four return a verdict: the reviewed commit
+  becomes the pushed one, the state `none`, `run.error` becomes the original reason plus
+  `**Follow-up review N** (commit `<sha7>`): all four reviewers pass.` (or `<roles> still request changes.`), the
+  advisor's transcript gets a `system` event with each verdict, and the pull request one comment. A push failure, a
+  failed or timed-out reviewer, an invalid verdict or a usage limit closes the round's open stages and leaves the
+  state `required` with a `system` error in the advisor's transcript pointing to "Review again"
+  (`POST /api/runs/{id}/review`); the run stays `needs_human` with its worktree. The approver does not run again, and
+  nothing is merged: `CHANGES` verdicts do not block the owner's approval (as after exhausted fix rounds).
+- **Approval** (button, `/factory approve`, `factory_approve_run`) is refused while a follow-up review runs (409
+  `review_in_progress`), while the advisor is mid-turn (409 `agent_busy`), and when changes have not been reviewed
+  (409 `review_required`: state `required`, or `HEAD` differs from the reviewed commit — which also catches a commit
+  the agent pushed itself or one made before a restart). Otherwise a live advisor process is stopped first; the
+  session ends `done` when the run is merged and stays usable when the merge fails.
+- **Cancel** (owner, admin or a release) stops a running follow-up review and the advisor (mid-turn too) before the
+  worktree is removed; the advisor session ends `stopped`.
+- **Restart.** Advisor sessions of `needs_human` runs become `idle` (resumable); a review state `running` becomes
+  `required`; open stages of `needs_human` runs are closed. The owner uses "Review again"; nothing restarts by itself.
+- **Releases.** A release run in a conversation stays `needs_human`, so its issue stays `held` and the release cannot
+  be approved until the owner approves or cancels the run.
 
 ### Screenshots
 
@@ -1187,7 +1249,8 @@ Tools: `factory_list_issues`, `factory_get_issue`, `factory_create_issue`, `fact
 `factory_assign_issues`, `factory_unassign_issues`, `factory_approve_release`. Pipeline-stage agents get only `factory_get_issue`
 and `factory_request_software`; with sandboxes switched on (`FACTORY_SANDBOX` not `off`) the builder also
 gets `factory_sandbox_info` and `factory_sandbox_exec`; the `ux` and `ui-design` reviewers also get
-`factory_attach_screenshot`. The chat agent, the spec-writer and the builder also get `factory_generate_image`.
+`factory_attach_screenshot`. The chat agent, the spec-writer and the builder also get `factory_generate_image`. The advisor (§6 "Conversation at needs human") gets the same two stage tools, bound to its
+run, and nothing else: no approve, cancel, start, release, sandbox, screenshot or image tool.
 
 Image tool (§6 "Generated images"), chat, spec-writer and builder only:
 - `factory_generate_image { prompt, purpose, size?, format?, count?, transparentBackground?, issueNumber? }` —
@@ -1339,7 +1402,8 @@ type Release = { id: string; repo: string; name: string; description: string;
   checks: { state: 'unknown' | 'awaiting' | 'none' | 'pending' | 'passed' | 'failed';   // on the pull request's head commit
             detail: string | null; sha: string | null } | null };         // null until there is a pull request
 
-type SessionKind = 'chat' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
+type StageRole = 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
+type SessionKind = 'chat' | 'advisor' | StageRole;   // advisor: the agent a run's owner talks to at needs_human
 type SessionStatus = 'starting' | 'running' | 'idle' | 'done' | 'failed' | 'stopped';
 type AgentSession = { id: string; repo: string; kind: SessionKind; model: string; status: SessionStatus;
   owner: { username: string; displayName: string }; title: string | null;
@@ -1350,9 +1414,10 @@ type AgentSession = { id: string; repo: string; kind: SessionKind; model: string
 // status: `starting` = process launching; `running` = mid-turn (busy); `idle` = waiting for input
 // (a chat between turns, with a process if `live`, else resumed on the next input); `stopped` = stopped by
 // a person (a chat resumes on its owner's next input); `done` / `failed` = a pipeline agent finished.
+// An advisor is `idle` between turns like a chat, `done` when its run was merged, `stopped` when it was cancelled.
 
-type Stage = { id: string; role: Exclude<SessionKind, 'chat'>;
-  round: number;             // 0 = initial build/review, 1..maxRounds = fix rounds
+type Stage = { id: string; role: StageRole;
+  round: number;             // 0 = initial build/review, 1..maxRounds = fix rounds, >= conversation.followUpFrom: follow-up rounds
   model: string;             // the model the stage runs (or ran) with; set when the stage is created
   status: 'pending' | 'running' | 'done' | 'failed' | 'skipped';
   verdict: 'PASS' | 'CHANGES' | 'APPROVE' | 'ESCALATE' | null; summary: string | null;
@@ -1382,7 +1447,13 @@ type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; 
   stages: Stage[];
   sandbox: RunSandbox | null;  // the run's sandbox decision (§5 "Sandboxes"); null until the workspace is ready / older runs
   releaseId: string | null;  // the release this run builds an issue for (null: a single run, or the release was deleted)
-  baseBranch: string | null }; // the branch it starts from and merges into; null = the default branch
+  baseBranch: string | null;  // the branch it starts from and merges into; null = the default branch
+  conversation: RunConversation };  // always present; default { sessionId: null, review: 'none', followUpFrom: null }
+
+type RunConversation = {     // §6 "Conversation at needs human"
+  sessionId: string | null;                 // the advisor session, once the owner has sent a message
+  review: 'none' | 'required' | 'running';  // follow-up review of changes made in the conversation
+  followUpFrom: number | null };            // first follow-up round; rounds >= it are follow-up rounds
 
 type RunSandbox = { state: 'disabled' | 'none' | 'invalid' | 'unapproved' | 'approved';  // only 'approved' gives a sandbox
   reason: string;            // human-readable, also shown at the top of the builder's transcript
@@ -1553,7 +1624,9 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `GET /api/runs?active=true&status=<s>` | → `Run[]` | across visible repos, newest first (max 200). `active=true`: not finished, i.e. `queued`, `spec`, `building`, `reviewing`, `approving` or `needs_human`. `status`: only these statuses, repeatable and/or comma list (`?status=needs_human`); unknown status → 400. Both given: both apply |
 | `GET /api/runs/{id}` | → `Run` | |
 | `GET /api/runs/{id}/screenshots/{sid}` | → image bytes | anyone who may see the run (404 otherwise, and for a screenshot of another run). Served with the sniffed type, `nosniff`, a sandboxing CSP, `Cross-Origin-Resource-Policy: same-origin`, `Cache-Control: private, max-age=31536000, immutable` and `Content-Disposition: inline` (`screenshot-<role>-<id8>.<ext>`). There is no upload or delete route |
-| `POST /api/runs/{id}/approve` | → `Run` | owner only, only in `needs_human` |
+| `POST /api/runs/{id}/approve` | → `Run` | owner only, only in `needs_human`; 409 `review_in_progress`, `agent_busy`, `review_required` (§6 "Conversation at needs human") |
+| `POST /api/runs/{id}/conversation` | `{ text }` → 202 `{ status: 'accepted', sessionId }` | owner only (403 for everyone else, admins too), only in `needs_human` (409 `run_not_waiting`). Talks to the run's advisor; the first message creates its session. 400 blank / too long, 409 `review_in_progress`, 409 `agent_busy`, 422 `claude_credential_required`, 409 `too_many_agents`, 409 `run_worktree_missing` |
+| `POST /api/runs/{id}/review` | → `Run` | "Review again": owner only (403 admins too), only in `needs_human`; starts a follow-up review of changes from the conversation. 409 `review_in_progress`, `agent_busy`, `nothing_to_review` (no conversation, or nothing changed since the last completed review); 422 `claude_credential_required` |
 | `POST /api/runs/{id}/cancel` | → `Run` | owner or admin |
 | `GET /api/projects/{repo}/sessions?kind=chat` | → `AgentSession[]` | |
 | `POST /api/projects/{repo}/sessions` | `{ model? }` → `AgentSession` | new chat; needs Claude credential; without `model` the owner's effective `chatModel` |
@@ -1561,11 +1634,11 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `GET /api/sessions/{id}` | → `AgentSession` | |
 | `GET /api/sessions/{id}/events?after=<seq>&limit=<n>` | → `Event[]` | ascending |
 | `GET /api/config` | → `ClientConfig` | limits the frontend checks before uploading; `images.providers[]` with `id, label, models, defaultModel, supportsTransparency, keyPlaceholder, auth, available, unavailableReason` |
-| `POST /api/sessions/{id}/input` | `{ text, attachmentIds? }` → 202 | owner only. **Chat:** accepted mid-turn too (delivered after the current turn); a `stopped` or process-less chat resumes. `text` may be empty when `attachmentIds` is not. The attachments are bound to this message when it is accepted, so a message queued mid-turn keeps its own. Answer `{ status: 'accepted' }`. **Pipeline agent:** a text message for a running spec-writer or builder (§6 "Messages to running agents") → 202 `AgentMessage`; 403 for everyone but the run's owner (admins too), 409 `agent_does_not_accept_messages` (reviewers, approver), 409 `agent_not_running`, 422 `attachments_not_allowed` |
+| `POST /api/sessions/{id}/input` | `{ text, attachmentIds? }` → 202 | owner only. **Chat:** accepted mid-turn too (delivered after the current turn); a `stopped` or process-less chat resumes. `text` may be empty when `attachmentIds` is not. The attachments are bound to this message when it is accepted, so a message queued mid-turn keeps its own. Answer `{ status: 'accepted' }`. **Pipeline agent:** a text message for a running spec-writer or builder (§6 "Messages to running agents") → 202 `AgentMessage`; 403 for everyone but the run's owner (admins too), 409 `agent_does_not_accept_messages` (reviewers, approver), 409 `agent_not_running`, 422 `attachments_not_allowed`. **Advisor:** exactly as `POST /api/runs/{id}/conversation` (answer `{ status, sessionId }`); 422 `attachments_not_allowed` with attachments |
 | `POST /api/sessions/{id}/attachments?name=<file name>` | raw bytes → 201 `Attachment` | owner only, chat only; see "Attachments" below |
 | `GET /api/sessions/{id}/attachments/{aid}?preview=1` | → bytes | anyone who may see the session once it is sent; before that only its uploader. `preview=1`: the downscaled copy if there is one |
 | `DELETE /api/sessions/{id}/attachments/{aid}` | → 204 | owner only; unsent only (409 `attachment_sent`) |
-| `POST /api/sessions/{id}/interrupt` | → 202 | owner only; stops the current turn (chat only; 409 for pipeline agents — cancel the run instead) |
+| `POST /api/sessions/{id}/interrupt` | → 202 | owner only; stops the current turn (chats and advisors; 409 for pipeline agents — cancel the run instead) |
 | `POST /api/sessions/{id}/stop` | → `AgentSession` | owner or admin |
 | `DELETE /api/sessions/{id}` | → 204 | **Close a chat**: owner or admin (403 otherwise, 404 if the repo is not visible); chat only (409 `not_a_chat` for pipeline sessions — cancel the run instead). A live process is stopped first (as `stop`, up to 10 s; if it has not exited, 409 `agent_not_stopped` and nothing is deleted). Then the session is deleted permanently with its events, attachment rows and the files under `<dataDir>/attachments/<id>/`; its session sockets are closed with `4404` and the feed announces `session_closed`. Runs started from it keep running (their `startedBySessionId` becomes `null`). Afterwards every route for the id answers 404 |
 | `GET /api/admin/settings` · `PUT /api/admin/settings` | `Settings` | admin |
@@ -1594,6 +1667,10 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 - Messages to pipeline agents: reviewer/approver → 409 `agent_does_not_accept_messages`; agent not running
   (pending, finished, failed, stopped) → 409 `agent_not_running`; with attachments → 422
   `attachments_not_allowed`; not the run's owner → 403 `forbidden`.
+- The conversation at needs human (§6): `run_not_waiting`, `review_in_progress`, `agent_busy`, `too_many_agents`,
+  `run_worktree_missing`, `nothing_to_review`, `review_required` (409); `claude_credential_required` (422);
+  `forbidden` (403) for everyone but the owner. After a restart an advisor of a `needs_human` run is `idle` and
+  resumable, and an interrupted follow-up review is `required`.
 - Releases: duplicate name → 409 `release_name_taken`; assigning a closed issue → 409 `issue_closed`; a stale
   order → 409 `release_issues_changed`. Every release route answers 404 when the caller cannot see the project,
   also when addressed by release id; then 403 `forbidden` for the owner/admin rules of started releases (§6
@@ -1951,6 +2028,17 @@ UTC day rolls over (`useClaudeUsage`, `web/src/lib/usage.ts`); relative times ar
 The chat renders the Claude stream the way the terminal does: prompt line, streamed assistant
 text, tool calls as `⏺ Tool(args)` with collapsible results, thinking, cost/turn footer. Sessions
 owned by someone else are shown read-only with an "observing <user>" banner.
+
+**Conversation at needs human** (§6). On the run page the `human` node is selectable when the run is `needs_human` or
+has a conversation (`?stage=human`; the default selection of a `needs_human` run with a conversation). Its sub-line
+reads "reviewing changes", "changes not reviewed" or "waiting for owner". The owner gets "Talk to the agent" next to
+"✓ Approve & merge", which selects the node and focuses the composer; approve is disabled while the follow-up review
+is not `none` or the advisor is `starting`/`running`, with a hint linked by `aria-describedby`. The panel
+(`stage-detail` layout) shows the blurb, model, cost and turns, a `role="status"` line for the review state, "Review
+again" for the owner in state `required`, and the transcript (`ChatView` in advisor mode: text only, no `/factory`
+commands, Esc interrupts) with the owner-only composer "Message the agent". Follow-up rounds are labelled
+"follow-up N" (N = round − `followUpFrom` + 1) in the rounds strip, round tabs, node notes and the header's round
+line. On the agents page an advisor links to `?stage=human` and shows "waiting for input" when idle.
 
 On the run page, a selected stage (the selected round's stage row) that has screenshots shows a "Screenshots <n>"
 section after its findings: a wrapping grid of lazily loaded thumbnails with their captions as `figcaption`. A

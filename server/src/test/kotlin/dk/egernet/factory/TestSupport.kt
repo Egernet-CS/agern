@@ -132,6 +132,12 @@ class FakeLauncher(var stage: (FakeProcess) -> Unit = { it.init(); it.result("ok
     val launched = CopyOnWriteArrayList<FakeProcess>()
     /** Every chat `user` message written to a process (the stream-json `message.content`). */
     val chatInputs = CopyOnWriteArrayList<kotlinx.serialization.json.JsonElement>()
+    /** Answers an advisor's message (the full text written to stdin); default: echo, like a chat. Runs on its own thread. */
+    @Volatile var advisor: (FakeProcess, String) -> Unit = { proc, text ->
+        proc.init(proc.spec.resumeClaudeSessionId ?: "advisor-claude-${proc.spec.sessionId}")
+        proc.assistantText("echo: $text")
+        proc.result("echo: $text")
+    }
 
     override fun launch(spec: LaunchSpec): AgentProcess {
         val p = if (spec.interactive) {
@@ -143,9 +149,13 @@ class FakeLauncher(var stage: (FakeProcess) -> Unit = { it.init(); it.result("ok
                     val text = (content as? kotlinx.serialization.json.JsonArray)
                         ?.mapNotNull { (it as? JsonObject)?.get("text")?.jsonPrimitive?.contentOrNull }?.joinToString(" ")
                         ?: content.jsonPrimitive.content
-                    proc.init(proc.spec.resumeClaudeSessionId ?: "chat-claude-${proc.spec.sessionId}")
-                    proc.assistantText("echo: $text")
-                    proc.result("echo: $text")
+                    if (proc.spec.kind == "advisor") {
+                        thread(isDaemon = true) { advisor(proc, text) }
+                    } else {
+                        proc.init(proc.spec.resumeClaudeSessionId ?: "chat-claude-${proc.spec.sessionId}")
+                        proc.assistantText("echo: $text")
+                        proc.result("echo: $text")
+                    }
                 }
             }
         } else FakeProcess(spec)
@@ -184,6 +194,10 @@ class FakeGitOps : GitOps {
         return "origin/$baseBranch"
     }
     override fun commitsAhead(worktree: Path, baseRef: String, home: Path) = commits
+    /** What [head] answers; tests move it to simulate a commit. */
+    @Volatile var headSha = "0000000000000000000000000000000000000001"
+    override fun head(worktree: Path, home: Path) = headSha
+    override fun baseRef(baseBranch: String) = "origin/$baseBranch"
     override fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path) { pushes += branch }
     override fun listWorktrees(mainDir: Path, home: Path): List<dk.egernet.factory.git.WorktreeInfo> = emptyList()
     /** When set, [removeWorktree] deletes the directory (like the real one) and records it in [removedWorktrees]. */

@@ -22,6 +22,10 @@ interface GitOps {
      */
     fun createWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, baseBranch: String, home: Path): String
     fun commitsAhead(worktree: Path, baseRef: String, home: Path): Int
+    /** The commit the worktree has checked out (`git rev-parse HEAD`). */
+    fun head(worktree: Path, home: Path): String
+    /** The ref a worktree on [baseBranch] is created from: `origin/<baseBranch>`, or the local branch without a remote. */
+    fun baseRef(baseBranch: String): String
     fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path)
     /** The worktrees registered in [mainDir] (the main working tree included). Prunes stale entries first. */
     fun listWorktrees(mainDir: Path, home: Path): List<WorktreeInfo>
@@ -105,10 +109,10 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
             if (runCatching { git(mainDir, home, id, "rev-parse", "--verify", "--quiet", "refs/heads/$baseBranch") }.isFailure) {
                 git(mainDir, home, id, "branch", baseBranch, "HEAD")
             }
-            baseBranch
+            baseRef(baseBranch)
         } else {
             git(mainDir, home, id, "fetch", "origin", baseBranch)
-            "origin/$baseBranch"
+            baseRef(baseBranch)
         }
         Files.createDirectories(worktree.parent)
         git(mainDir, home, id, "worktree", "add", "-B", branch, worktree.toString(), base)
@@ -117,6 +121,10 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
 
     override fun commitsAhead(worktree: Path, baseRef: String, home: Path): Int =
         git(worktree, home, null, "rev-list", "--count", "$baseRef..HEAD").trim().toIntOrNull() ?: 0
+
+    override fun head(worktree: Path, home: Path): String = git(worktree, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim()
+
+    override fun baseRef(baseBranch: String): String = if (localOnly) baseBranch else "origin/$baseBranch"
 
     override fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path) {
         if (localOnly) return

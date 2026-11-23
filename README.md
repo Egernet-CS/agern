@@ -60,6 +60,9 @@ Models per role are a setting. The details are in [`docs/ARCHITECTURE.md`](docs/
   with their own API key and model, or OpenAI Codex signed in with their own ChatGPT account. When a request or issue asks for an icon, illustration or other graphics,
   the chat agent, spec-writer and builder have them generated on the server with the owner's key; chat
   images can be picked for an issue and are handed to its run, run images show on the run page.
+- **Talk to an agent when a run needs a human.** Before approving an escalated run, its owner can ask an
+  agent about the run's diff and findings, or ask it for a change, which is pushed and reviewed again by the
+  four reviewers before the run can be approved. Talking never approves anything.
 - **Build and test sandboxes (optional).** A project describes a container for its builds and tests
   in `.agern/sandbox.yml` — toolchain image, setup script, sidecar services such as PostgreSQL with a
   readiness check, caches, a non-root user, and extra *platform* images to test on. After an admin

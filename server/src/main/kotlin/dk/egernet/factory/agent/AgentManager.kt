@@ -2,7 +2,9 @@ package dk.egernet.factory.agent
 
 import dk.egernet.factory.AppJson
 import dk.egernet.factory.AgentMessageDto
+import dk.egernet.factory.ADVISOR_KIND
 import dk.egernet.factory.AttachmentDto
+import dk.egernet.factory.INTERACTIVE_KINDS
 import dk.egernet.factory.STEERABLE_ROLES
 import kotlinx.serialization.builtins.ListSerializer
 import dk.egernet.factory.Config
@@ -154,6 +156,12 @@ data class StageAgentRequest(
     val notes: List<Pair<String, String>> = emptyList(),
 )
 
+/**
+ * What an advisor process is launched with (docs/ARCHITECTURE.md §6 "Conversation at needs human"): the run's worktree,
+ * the run its MCP grant is bound to, and the `<run_context>` block its first message carries.
+ */
+data class AdvisorLaunch(val workDir: Path, val runId: UUID, val context: String)
+
 data class StageAgentResult(
     val session: SessionRecord,
     val claudeSessionId: String?,
@@ -199,6 +207,18 @@ class AgentManager(
     /** Called after a chat was closed and deleted (its generated images); blocking is fine. */
     var onChatClosed: ((sessionId: UUID) -> Unit)? = null
 
+    /**
+     * Supplies an advisor session's launch data (worktree, run, context), rebuilt from current data at each launch;
+     * throws when the run cannot be talked to any more. Wired after construction, like [commandHandler].
+     */
+    var advisorLaunch: (suspend (session: SessionRecord, owner: UserRecord) -> AdvisorLaunch)? = null
+
+    /**
+     * Called after every turn (`result`) and every exit of an advisor process, before the session counts as idle again:
+     * the orchestrator reconciles the run (a commit starts a follow-up review). Must not wait for the advisor.
+     */
+    var afterAdvisorTurn: (suspend (session: SessionRecord) -> Unit)? = null
+
     private class Live(
         val sessionId: UUID, val ownerId: UUID, val repo: String, val kind: String,
         val proc: AgentProcess, val mcpToken: String, val interactive: Boolean,
@@ -218,8 +238,11 @@ class AgentManager(
         var resumedFrom: String? = null
         @Volatile var sawInit = false
         @Volatile var authFailed = false
-        /** Usage-limit signals of a pipeline stage. */
-        val usage = UsageLimitDetector()
+        /** Usage-limit signals of a pipeline stage (of the current turn, for an advisor). */
+        @Volatile var usage = UsageLimitDetector()
+        /** Advisor: the `<run_context>` block of this launch, and whether a message carrying it has been written. */
+        var context: String? = null
+        @Volatile var contextSent = false
         /** Chat inputs (stream-json `message.content`) written to this process and not yet answered by a `result`. */
         val pending = java.util.Collections.synchronizedList(mutableListOf<JsonElement>())
 
@@ -239,6 +262,13 @@ class AgentManager(
     private val slots = ConcurrentHashMap<UUID, Semaphore>()
     /** Chats that were closed (deleted): late background work for them is dropped. */
     private val closed = ConcurrentHashMap.newKeySet<UUID>()
+    /**
+     * Advisor sessions with a message in flight: from its acceptance until the turn (or the process) has ended and the
+     * run has been reconciled. One message at a time per conversation.
+     */
+    private val advisorTurns = ConcurrentHashMap.newKeySet<UUID>()
+    /** Advisor sessions whose run ended (cancel, merge): queued input for them is dropped, no process is started. */
+    private val advisorsEnded = ConcurrentHashMap.newKeySet<UUID>()
 
     private fun slot(userId: UUID) = slots.computeIfAbsent(userId) { Semaphore(cfg.maxAgentsPerUser) }
 
@@ -395,20 +425,32 @@ class AgentManager(
             if (s.endedAt != null) sessions.reopen(sessionId)
             setStatus(sessionId, SessionStatus.STARTING)
             val identity = AgentIdentity(owner.username, owner.displayName, owner.githubLogin, access.githubToken(owner), cred)
-            val workDir = withContext(Dispatchers.IO) { workspaces.ensureMain(identity, s.repo) }
+            val advisor = s.kind == ADVISOR_KIND
+            // An advisor works in its run's worktree with the run's context; a chat in the owner's main clone.
+            val launch = if (advisor) (advisorLaunch ?: error("Advisors are not available")).invoke(s, owner) else null
+            val workDir = launch?.workDir ?: withContext(Dispatchers.IO) { workspaces.ensureMain(identity, s.repo) }
             // The attachment files are a cache of the database: put back what a cleaned data dir lost.
-            withContext(Dispatchers.IO) { attachments.materialiseSession(sessionId) }
+            if (!advisor) withContext(Dispatchers.IO) { attachments.materialiseSession(sessionId) }
             val mayInstall = settings.get().agentsMayInstallSoftware
-            val tools = if (mayInstall) McpRegistry.CHAT_TOOLS - "factory_request_software" else McpRegistry.CHAT_TOOLS
-            token = mcp.issue(McpGrant(sessionId, owner.id, s.repo, null, tools))
+            val granted = if (advisor) McpRegistry.STAGE_TOOLS else McpRegistry.CHAT_TOOLS
+            val tools = if (mayInstall) granted - "factory_request_software" else granted
+            token = mcp.issue(McpGrant(sessionId, owner.id, s.repo, launch?.runId, tools))
             val spec = LaunchSpec(
-                sessionId = sessionId, kind = "chat", model = s.model, workDir = workDir, home = workspaces.home(owner.username),
+                sessionId = sessionId, kind = s.kind, model = s.model, workDir = workDir, home = workspaces.home(owner.username),
                 identity = identity, interactive = true, resumeClaudeSessionId = s.claudeSessionId,
-                appendSystemPrompt = prompts.system("chat", s.repo, mayInstall), mcpConfigJson = mcpConfig(token),
+                appendSystemPrompt = prompts.system(if (advisor) ADVISOR_KIND else "chat", s.repo, mayInstall), mcpConfigJson = mcpConfig(token),
             )
             val proc = withContext(Dispatchers.IO) { launcher.launch(spec) }
             if (s.claudeSessionId != null) systemEvent(sessionId, "info", "Resuming conversation ${s.claudeSessionId}")
-            val l = Live(sessionId, owner.id, s.repo, "chat", proc, token, true, s.costUsd ?: 0.0, s.numTurns ?: 0, s.claudeSessionId, owner.claudeCredEnc)
+            if (advisor) {
+                systemEvent(
+                    sessionId, "info",
+                    "The agent was given this run's context: the issue, the spec, the builder's summary, the latest reviews, " +
+                        "the approver's verdict and why the run needs a human.",
+                )
+            }
+            val l = Live(sessionId, owner.id, s.repo, s.kind, proc, token, true, s.costUsd ?: 0.0, s.numTurns ?: 0, s.claudeSessionId, owner.claudeCredEnc)
+            l.context = launch?.context
             l.resumedFrom = s.claudeSessionId
             live[sessionId] = l
             scope.launch { pump(l); finishChat(l, slot) }
@@ -426,6 +468,8 @@ class AgentManager(
         mcp.revoke(l.mcpToken)
         slot.release()
         var relaunch = false
+        // An advisor's run is reconciled before the session counts as idle (a commit of the last turn is reviewed).
+        if (l.kind == ADVISOR_KIND) afterTurn(l.sessionId)
         try {
             val stderr = scrub(l.proc.stderrTail(), l)
             when {
@@ -462,10 +506,22 @@ class AgentManager(
                 else -> setStatus(l.sessionId, SessionStatus.IDLE)
             }
         } finally {
+            // A failed resume is relaunched with the same input: that turn is still in flight.
+            if (l.kind == ADVISOR_KIND && !relaunch) advisorTurns.remove(l.sessionId)
             // Completed last, so stop() returns the final status.
             l.exited.complete(code)
         }
         if (relaunch) relaunchFresh(l)
+    }
+
+    /** Runs [afterAdvisorTurn] for an advisor session; never throws. */
+    private suspend fun afterTurn(sessionId: UUID) {
+        val s = sessions.get(sessionId) ?: return
+        try {
+            withContext(NonCancellable) { afterAdvisorTurn?.invoke(s) }
+        } catch (e: Exception) {
+            log.warn("Reconciling the run of advisor {} failed: {}", sessionId, e.message)
+        }
     }
 
     /** One fresh launch (no `--resume`) after a failed resume; re-delivers the inputs the dead process never answered. */
@@ -474,17 +530,21 @@ class AgentManager(
         chatLocks.computeIfAbsent(id) { Mutex() }.withLock {
             if (id in closed) return
             val texts = synchronized(dead.pending) { dead.pending.toList() }
-            if (texts.isEmpty()) {
+            if (texts.isEmpty() || id in advisorsEnded) {
+                advisorTurns.remove(id)
                 setStatus(id, SessionStatus.IDLE)
                 return
             }
             try {
                 val owner = access.userById(dead.ownerId) ?: error("owner no longer exists")
                 val l = live[id] ?: startChat(id, owner)
+                // An advisor's first pending input already carries the run's context.
+                l.contextSent = true
                 for (t in texts) deliver(l, t)
             } catch (e: Exception) {
                 log.warn("Fresh relaunch of session {} failed: {}", id, e.message)
                 systemEvent(id, "error", "Could not start a fresh conversation: ${e.message}")
+                advisorTurns.remove(id)
                 if (!isLive(id)) setStatus(id, SessionStatus.IDLE)
             }
         }
@@ -499,7 +559,7 @@ class AgentManager(
 
     fun interrupt(user: UserRecord, s: SessionRecord) {
         if (s.ownerId != user.id) throw forbidden("Only the owner of this session can interrupt it")
-        if (s.kind != "chat") throw conflict("Pipeline agents are stopped by cancelling the run")
+        if (s.kind !in INTERACTIVE_KINDS) throw conflict("Pipeline agents are stopped by cancelling the run")
         val l = live[s.id] ?: return
         if (!l.turnActive) return
         val req = buildJsonObject {
@@ -509,6 +569,104 @@ class AgentManager(
         }
         runCatching { l.proc.send(req.toString()) }.onFailure { l.proc.kill() }
         systemEvent(s.id, "info", "Interrupted by ${user.username}")
+    }
+
+    // ------------------------------------------------------------ advisor (docs/ARCHITECTURE.md §6 "Conversation at needs human")
+
+    /** The advisor session [sessionId] is mid-turn: a message is in flight (also while starting) or the run is being reconciled. */
+    fun isAdvisorBusy(sessionId: UUID): Boolean =
+        sessionId in advisorTurns || live[sessionId]?.turnActive == true ||
+            sessions.get(sessionId)?.status in setOf(SessionStatus.STARTING, SessionStatus.RUNNING)
+
+    /** Whether [user] could start one more agent process right now. */
+    fun hasFreeSlot(user: UserRecord): Boolean = slot(user.id).availablePermits > 0
+
+    /**
+     * Accepts one message of the run's owner for its advisor and returns at once; the turn runs in the background.
+     * The orchestrator has checked the run (owner, status, review); this refuses a second message while one is in
+     * flight (409 `agent_busy`), then a missing credential and a full agent slot. The transcript shows [text] as
+     * written; the agent gets it prefixed with who wrote it, and the first message of each launch carries the context.
+     */
+    fun sendToAdvisor(user: UserRecord, s: SessionRecord, text: String) {
+        if (s.ownerId != user.id) throw forbidden("Only the owner of this run can talk to its agent")
+        if (s.kind != ADVISOR_KIND) throw conflict("Not an advisor session")
+        if (!advisorTurns.add(s.id)) throw conflict("The agent is still answering; wait for it or interrupt it", "agent_busy")
+        try {
+            if (live[s.id]?.turnActive == true) throw conflict("The agent is still answering; wait for it or interrupt it", "agent_busy")
+            if (!isLive(s.id)) {
+                if (user.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
+                if (!hasFreeSlot(user)) throw conflict("You already have ${cfg.maxAgentsPerUser} agents running", "too_many_agents")
+            }
+        } catch (e: Exception) {
+            advisorTurns.remove(s.id)
+            throw e
+        }
+        advisorsEnded.remove(s.id)
+        publish(s.id, "user", buildJsonObject { put("text", text); put("username", user.username) })
+        val forAgent = "Message from the run owner (${user.username}):\n\n$text"
+        scope.launch {
+            val mutex = chatLocks.computeIfAbsent(s.id) { Mutex() }
+            try {
+                mutex.withLock {
+                    if (s.id in advisorsEnded) {
+                        advisorTurns.remove(s.id)
+                        return@withLock
+                    }
+                    val l = live[s.id] ?: startChat(s.id, user)
+                    val content = if (!l.contextSent) {
+                        l.contextSent = true
+                        l.context.orEmpty() + "\n\n" + forAgent
+                    } else {
+                        forAgent
+                    }
+                    try {
+                        deliver(l, JsonPrimitive(content))
+                    } catch (e: Exception) {
+                        // A resume launch that already died is relaunched by finishChat with this input.
+                        if (l.resumed && !l.sawInit) return@withLock
+                        throw e
+                    }
+                }
+            } catch (e: Exception) {
+                log.warn("Advisor input for session {} failed: {}", s.id, e.message)
+                systemEvent(s.id, "error", "Could not deliver the message to the agent: ${e.message}")
+                if (!isLive(s.id)) {
+                    advisorTurns.remove(s.id)
+                    setStatus(s.id, SessionStatus.IDLE)
+                }
+            }
+        }
+    }
+
+    /**
+     * Stops the advisor process of [sessionId], if any, and waits for it (and for its run's reconcile) to finish.
+     * [ended] (cancel, merge): the run is over; the session ends `stopped` and queued input is dropped. Otherwise a
+     * server-initiated stop: the session goes idle and resumes on the owner's next message.
+     */
+    suspend fun stopAdvisor(sessionId: UUID, ended: Boolean) {
+        if (ended) advisorsEnded += sessionId
+        chatLocks.computeIfAbsent(sessionId) { Mutex() }.withLock {
+            val l = live[sessionId]
+            if (l != null) {
+                l.stopReason = if (ended) "stopped" else "server"
+                if (ended) systemEvent(sessionId, "warn", "Agent stopped because the run ended")
+                l.proc.closeInput()
+                l.proc.kill()
+                withContext(Dispatchers.IO) { withTimeoutOrNull(15_000) { l.exited.await() } }
+            } else if (ended) {
+                val st = sessions.get(sessionId)?.status
+                if (st != null && st !in setOf(SessionStatus.DONE, SessionStatus.FAILED, SessionStatus.STOPPED)) {
+                    setStatus(sessionId, SessionStatus.STOPPED, ended = true)
+                }
+            }
+        }
+    }
+
+    /** The run of advisor [sessionId] was merged: the conversation is over (`done`). */
+    fun endAdvisor(sessionId: UUID) {
+        advisorsEnded += sessionId
+        val st = sessions.get(sessionId)?.status ?: return
+        if (st != SessionStatus.DONE) setStatus(sessionId, SessionStatus.DONE, ended = true)
     }
 
     /**
@@ -521,6 +679,7 @@ class AgentManager(
      */
     fun sendToStageAgent(user: UserRecord, s: SessionRecord, text: String, viaChatSession: UUID? = null): AgentMessageDto {
         if (s.kind == "chat") throw conflict("Chat sessions take input, not agent messages")
+        if (s.kind == ADVISOR_KIND) throw conflict("Talk to the advisor through its run's conversation", "agent_does_not_accept_messages")
         if (s.ownerId != user.id) throw forbidden("Only the owner of this run can send messages to its agents")
         if (s.kind !in STEERABLE_ROLES) {
             throw conflict(
@@ -813,7 +972,7 @@ class AgentManager(
             }
         }
         publish(l.sessionId, "claude", obj)
-        if (!l.interactive) l.usage.observe(obj)
+        if (!l.interactive || l.kind == ADVISOR_KIND) l.usage.observe(obj)
         when (obj["type"]?.jsonPrimitive?.contentOrNull) {
             "rate_limit_event" -> recordLimits(l, obj)
             "system" -> if (obj["subtype"]?.jsonPrimitive?.contentOrNull == "init") {
@@ -841,7 +1000,9 @@ class AgentManager(
                 l.turns += obj["num_turns"]?.jsonPrimitive?.intOrNull ?: 0
                 sessions.setUsage(l.sessionId, cost?.let { l.baseCost + it }, l.turns)
                 if (cost != null) recordSpend(l, cost)
-                if (l.interactive) {
+                if (l.interactive && l.kind == ADVISOR_KIND) {
+                    advisorTurnEnded(l, obj)
+                } else if (l.interactive) {
                     l.turnActive = false
                     l.lastUse = System.currentTimeMillis()
                     if (l.stopReason == null) setStatus(l.sessionId, SessionStatus.IDLE) else publishFeed(l.sessionId)
@@ -866,6 +1027,31 @@ class AgentManager(
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * An advisor turn ended with [result]: say so when it failed on the owner's usage limit, then reconcile the run and
+     * only after that let the session count as idle (docs/ARCHITECTURE.md §6 "Conversation at needs human").
+     */
+    private fun advisorTurnEnded(l: Live, result: JsonObject) {
+        val failed = result["is_error"]?.jsonPrimitive?.booleanOrNull == true ||
+            (result["subtype"]?.jsonPrimitive?.contentOrNull ?: "success") != "success"
+        l.usage.result(failed)?.let { limit ->
+            val reset = limit.resetsAt?.let { " It resets at ${it.iso()}." } ?: ""
+            systemEvent(
+                l.sessionId, "warn",
+                "Your Claude usage limit was reached, so the agent could not answer.$reset Nothing is lost: the conversation continues with your next message.",
+            )
+        }
+        l.usage = UsageLimitDetector()
+        publishFeed(l.sessionId)
+        scope.launch {
+            afterTurn(l.sessionId)
+            advisorTurns.remove(l.sessionId)
+            l.turnActive = false
+            l.lastUse = System.currentTimeMillis()
+            if (l.stopReason == null && live[l.sessionId] === l) setStatus(l.sessionId, SessionStatus.IDLE) else publishFeed(l.sessionId)
         }
     }
 

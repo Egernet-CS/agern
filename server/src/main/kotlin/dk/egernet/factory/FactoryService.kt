@@ -153,6 +153,18 @@ class FactoryService(
         return runs.toDto(orchestrator.approve(user, runId))
     }
 
+    /** The owner's message for the agent of a run that needs a human (docs/ARCHITECTURE.md §6 "Conversation at needs human"). */
+    suspend fun talkToRun(user: UserRecord, runId: UUID, text: String): TalkAcceptedDto {
+        visibleRun(user, runId)
+        return TalkAcceptedDto(sessionId = orchestrator.talk(user, runId, text).toString())
+    }
+
+    /** "Review again": a follow-up review of changes made in the conversation. */
+    suspend fun reviewRun(user: UserRecord, runId: UUID): RunDto {
+        visibleRun(user, runId)
+        return runs.toDto(orchestrator.review(user, runId))
+    }
+
     suspend fun cancelRun(user: UserRecord, runId: UUID): RunDto {
         visibleRun(user, runId)
         return runs.toDto(orchestrator.cancel(user, runId))

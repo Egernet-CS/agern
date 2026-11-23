@@ -9,7 +9,12 @@ import { useLiveRuns, useLiveSessions } from '../lib/realtime';
 import { useNow } from '../lib/useNow';
 import { runStageLine } from './Project';
 
-export const transcriptLink = (s: AgentSession) => (s.kind === 'chat' ? `/p/${s.repo}?session=${s.id}` : `/p/${s.repo}/runs/${s.runId}?stage=${s.kind}`);
+export const transcriptLink = (s: AgentSession) =>
+  s.kind === 'chat'
+    ? `/p/${s.repo}?session=${s.id}`
+    : s.kind === 'advisor'
+      ? `/p/${s.repo}/runs/${s.runId}?stage=human`
+      : `/p/${s.repo}/runs/${s.runId}?stage=${s.kind}`;
 
 export function AgentsPage() {
   const me = useMe();
@@ -95,7 +100,7 @@ export function AgentsPage() {
                   <td data-label="project"><Link to={`/p/${s.repo}`}>{s.repo}</Link>{s.issueNumber && <span className="muted"> #{s.issueNumber}</span>}</td>
                   <td data-label="owner">{s.owner.username === me.username ? <strong>you</strong> : s.owner.displayName || s.owner.username}</td>
                   <td data-label="doing" className="col-doing mono">
-                    <span className="doing" title={s.lastActivity ?? ''}>{s.lastActivity ?? (s.kind === 'chat' ? 'waiting for input' : 'starting…')}</span>
+                    <span className="doing" title={s.lastActivity ?? ''}>{s.lastActivity ?? (s.kind === 'chat' || (s.kind === 'advisor' && s.status === 'idle') ? 'waiting for input' : 'starting…')}</span>
                     <span className="muted small"> · {timeAgo(s.updatedAt, now)}</span>
                   </td>
                   <td data-label="model">{modelLabel(s.model)}</td>

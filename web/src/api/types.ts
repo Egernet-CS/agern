@@ -178,8 +178,10 @@ export function releaseReadiness(r: Release): 'complete' | 'incomplete' | 'empty
   return r.issues.some((i) => i.state === 'merged') ? 'complete' : 'empty';
 }
 
-export type SessionKind = 'chat' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
-export type StageRole = Exclude<SessionKind, 'chat'>;
+/** The seven pipeline roles. */
+export type StageRole = 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
+/** `advisor`: the agent the owner talks to while a run needs a human (docs/ARCHITECTURE.md §6 "Conversation"). */
+export type SessionKind = 'chat' | 'advisor' | StageRole;
 
 /** Roles whose running agent accepts messages from the run's owner (docs/ARCHITECTURE.md §6). */
 export const STEERABLE_ROLES: StageRole[] = ['spec-writer', 'builder'];
@@ -352,6 +354,18 @@ export type Run = {
   releaseId: string | null;
   /** The branch the run branches from and merges into (`release/<name>`); null for a single run (default branch). */
   baseBranch: string | null;
+  /** The owner's conversation with the advisor while the run needs a human. Always present. */
+  conversation: RunConversation;
+};
+
+/** Follow-up review of changes made in the conversation: `required` = not reviewed yet, `running` = reviewers at work. */
+export type ConversationReview = 'none' | 'required' | 'running';
+export type RunConversation = {
+  /** The advisor session, once the owner has sent a message. */
+  sessionId: string | null;
+  review: ConversationReview;
+  /** First follow-up round; stage rounds >= it are follow-up rounds. */
+  followUpFrom: number | null;
 };
 
 /**

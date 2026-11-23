@@ -200,7 +200,25 @@ data class RunDto(
     val releaseId: String? = null,
     /** The branch the run starts from and merges into; null = the repository's default branch. */
     val baseBranch: String? = null,
+    /** The conversation with the run's advisor while it needs a human (docs/ARCHITECTURE.md §6 "Conversation at needs human"). */
+    val conversation: RunConversationDto = RunConversationDto(),
 )
+
+/**
+ * [sessionId]: the advisor session, once the owner has sent a message. [review]: `none`, `required` (changes made in
+ * the conversation are not reviewed yet) or `running` (a follow-up review is in progress). [followUpFrom]: the first
+ * follow-up round; stages of rounds >= it are follow-up rounds.
+ */
+@Serializable
+data class RunConversationDto(val sessionId: String? = null, val review: String = ReviewState.NONE, val followUpFrom: Int? = null)
+
+/** `POST /api/runs/{id}/conversation`: the message was accepted for the run's advisor session [sessionId]. */
+@Serializable data class TalkAcceptedDto(val status: String = "accepted", val sessionId: String)
+
+/** The follow-up review state of a `needs_human` run's conversation. */
+object ReviewState {
+    const val NONE = "none"; const val REQUIRED = "required"; const val RUNNING = "running"
+}
 
 /**
  * A run's sandbox decision (docs/ARCHITECTURE.md §5 "Sandboxes"), fixed when the run starts.
@@ -337,6 +355,10 @@ val REVIEWER_ROLES = listOf("security", "ux", "ui-design", "code")
 val SCREENSHOT_ROLES = setOf("ux", "ui-design")
 /** Pipeline roles whose running agent accepts messages from the run's owner (docs/ARCHITECTURE.md §6 "Messages"). */
 val STEERABLE_ROLES = setOf("spec-writer", "builder")
+/** The session kind of the agent a run's owner talks to while the run needs a human (not a pipeline role). */
+const val ADVISOR_KIND = "advisor"
+/** Interactive session kinds: kept alive between turns, resumed with `--resume`, stopped by the idle reaper. */
+val INTERACTIVE_KINDS = setOf("chat", ADVISOR_KIND)
 val DEFAULT_PIPELINE_MODELS = mapOf(
     "spec-writer" to "opus", "builder" to "opus", "security" to "opus",
     "ux" to "sonnet", "ui-design" to "sonnet", "code" to "sonnet", "approver" to "opus",

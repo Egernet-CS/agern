@@ -127,7 +127,8 @@ class Services(
         (images.provider("codex") as? dk.egernet.factory.images.CodexImageProvider)?.let {
             dk.egernet.factory.images.CodexLogins(it, images, scope, clock)
         }
-    val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes, screenshotStore, images)
+    val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes, screenshotStore,
+        sessions, events, images)
     val screenshots = dk.egernet.factory.agent.Screenshots(cfg, screenshotStore, runs, workspaces, publishRun = { orchestrator.publish(it) })
     val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
     val releaseLocks = dk.egernet.factory.pipeline.ReleaseLocks()
@@ -150,6 +151,8 @@ class Services(
 
     init {
         agents.commandHandler = { session, owner, text -> factory.handleCommand(session, owner, text) }
+        agents.advisorLaunch = { session, owner -> orchestrator.advisorLaunch(session, owner) }
+        agents.afterAdvisorTurn = { session -> session.runId?.let { orchestrator.reconcile(it) } }
         orchestrator.onReleaseRunSettled = releaseBuilder::onRunSettled
         images.publishRun = { orchestrator.publish(it) }
         agents.onChatInput = { sessionId -> images.newTurn(sessionId) }
@@ -163,6 +166,8 @@ class Services(
      */
     fun recoverAfterRestart() {
         val failed = runs.failUnfinishedAfterRestart()
+        // Runs at needs_human survive: an interrupted follow-up review must be started again, and no stage stays open.
+        runs.recoverConversationsAfterRestart()
         if (failed.isNotEmpty()) LoggerFactory.getLogger("dk.egernet.factory").warn("Marked {} unfinished run(s) as failed after restart", failed.size)
         // Order matters: first the sandboxes of runs that are no longer active (their containers bind-mount the worktrees),
         // then those worktrees, then the releases (which may start new runs). Bounded, so a hanging Podman cannot keep
