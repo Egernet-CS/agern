@@ -80,6 +80,45 @@ class MigrationGuardTest {
     // ------------------------------------------------------------ a run's pull request
 
     @Test
+    fun `a step retry of a failed merge waits for the conversation's review and checks the migrations`() {
+        gh.failMerge = true
+        val run = start()
+        val failed = await(run.id)
+        assertEquals(RunStatus.NEEDS_HUMAN, failed.status)
+        assertEquals(FailedStep.MERGE, failed.failedStep)
+
+        // Unreviewed changes from the conversation block the retry, as they block an approval.
+        gh.failMerge = false
+        s.runs.setReviewState(run.id, ReviewState.REQUIRED)
+        val e = assertFailsWith<ApiException> { runBlocking { s.orchestrator.retryStep(alice, s.runs.get(run.id)!!) } }
+        assertEquals("review_required", e.code)
+        assertEquals(RunStatus.NEEDS_HUMAN, s.runs.get(run.id)!!.status)
+        s.runs.setReviewState(run.id, ReviewState.NONE)
+
+        // The retried merge goes through the migration check; a conflict is not a step that can be retried.
+        compare({ it == failed.branch }, FileChange('A', "$dir/V16__mine.sql"))
+        runBlocking { s.orchestrator.retryStep(alice, s.runs.get(run.id)!!) }
+        eventually { s.runs.get(run.id)!!.error?.startsWith("Database migration conflict") == true }
+        val held = await(run.id)
+        assertEquals(RunStatus.NEEDS_HUMAN, held.status)
+        assertNull(held.failedStep)
+        assertEquals(emptyList(), merges())
+
+        compare({ it == failed.branch }, FileChange('A', "$dir/V17__mine.sql"))
+        runBlocking { s.orchestrator.approve(alice, run.id) }
+        assertEquals(RunStatus.MERGED, await(run.id).status)
+        assertEquals(listOf("merge demo-app #${held.prNumber}"), merges())
+    }
+
+    private fun eventually(cond: () -> Boolean) {
+        val deadline = System.nanoTime() + 10_000_000_000L
+        while (!cond()) {
+            check(System.nanoTime() < deadline) { "timed out" }
+            Thread.sleep(20)
+        }
+    }
+
+    @Test
     fun `a run adding a migration version the target already has is held, and merges once it is renumbered`() {
         compare({ it.startsWith("factory/issue-1-") }, FileChange('A', "$dir/V16__mine.sql"))
         val run = start()

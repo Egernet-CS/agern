@@ -682,7 +682,10 @@ A failed run can be retried in three ways (issue #53), depending on where it sto
   (`--resume`). The issue gets "**Agern:** retrying the failed step (<step>) of run `<id>` on branch `<branch>`.". A
   failed merge leaves the run in `needs_human` (as before) with `failedStep` `merge`; its step retry merges again — as
   the approver's decision when the approver had approved, else as the owner's — which is what the owner's approval
-  also does.
+  also does. It goes through the same gate as the approval: changes from the conversation must have been reviewed
+  (409 `review_required` / `review_in_progress` / `agent_busy`, §6 "Conversation at needs human"), and the merge
+  checks the database migrations first (§6 "Database migrations"). A migration conflict is not a failed step: it
+  clears `failedStep`, so the run offers no step retry until its branch is fixed.
 - **Continue from the commits** (`continue`): a **new run** whose worktree starts at the tip of the failed run's
   branch (local branch, else the remote one, fetched), on its own new branch (§6 "Worktrees and branches"). It reuses
   the failed run's spec (the spec-writer stage is `skipped` with summary "Spec reused from run <id>"; a failed run
@@ -774,8 +777,8 @@ branch is never changed, renamed or removed (Flyway checks applied migrations by
   the base that the head changes or removes. Paths in the texts keep only `[A-Za-z0-9._/+-]` (the rest `?`) and at
   most 200 characters; at most 5 problems are listed, then "(and N more)". A comparison that cannot be made (no
   clone, a branch missing, git failing) is logged and blocks nothing: CI is the strict gate.
-  - *A run's pull request*, before every squash merge (the approver's `APPROVE`, and the owner's approval of a
-    `needs_human` run, single and release runs alike), compares the run's branch with its target. On a problem
+  - *A run's pull request*, before every squash merge (the approver's `APPROVE`, the owner's approval of a
+    `needs_human` run and the step retry of a failed merge, single and release runs alike), compares the run's branch with its target. On a problem
     nothing is merged and the run goes to `needs_human` through the usual path (label, comment, error), with the
     reason "Database migration conflict with `<target>`: <problems>. Pull request #<n> was not merged. Migrations
     already on `<target>` must stay unchanged, and a new migration needs a version above all of them. Fix the
@@ -790,7 +793,7 @@ branch is never changed, renamed or removed (Flyway checks applied migrations by
     stay unchanged), then use "Check again".", is not announced as ready to release, is not merged automatically, and
     approval answers 409 `release_migration_conflict` with the notice and " Nothing was merged." (§6 "Releasing"). The
     next re-evaluation without a problem clears the notice.
-- **The builder's prompt.** `builder.md` and the build and fix prompts tell the builder to take a new migration's
+- **The builder's prompt.** `builder.md` and the build, continue (§6 "Retrying a run") and fix prompts tell the builder to take a new migration's
   version from the branch its pull request merges into (named in the prompt, fetched first), above every migration
   there, never to change one that exists there, and to check again before finishing, in every fix round and after
   any rebase or merge of that branch. A release run is told that its version must also be above every migration on

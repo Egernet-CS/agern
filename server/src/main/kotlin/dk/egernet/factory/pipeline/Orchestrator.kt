@@ -318,12 +318,14 @@ class Orchestrator(
         if (owner.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
         if (run.status == RunStatus.NEEDS_HUMAN && run.failedStep == FailedStep.MERGE) {
             if (run.prNumber == null) throw conflict("Run has no pull request to merge", "retry_mode_unavailable")
-            runs.setStatus(run.id, RunStatus.APPROVING, clearError = true)
+            // The same gate as an approval: changes from the conversation must have been reviewed.
+            startMerging(run.id)
             publish(run.id)
             // The approver approved before the merge failed: merging again is its decision; otherwise it is the owner's.
             val approverApproved = runs.stages(run.id).lastOrNull { it.role == "approver" }?.verdict == "APPROVE"
             launchJob(run.id) {
                 withContext(Dispatchers.IO) { merge(runs.get(run.id)!!, owner, approvedBy = if (approverApproved) null else owner.username) }
+                runs.get(run.id)?.takeIf { it.status == RunStatus.MERGED }?.advisorSessionId?.let { agents.endAdvisor(it) }
                 publish(run.id)
                 settled(run.id)
             }
@@ -348,8 +350,21 @@ class Orchestrator(
         if (run.ownerId != user.id) throw forbidden("Only the owner of this run can approve it")
         if (run.status != RunStatus.NEEDS_HUMAN) throw conflict("Run is ${run.status}, not needs_human")
         if (run.prNumber == null) throw conflict("Run has no pull request to merge")
-        // Changes made in the conversation are reviewed before the run can be approved (docs/ARCHITECTURE.md §6
-        // "Conversation at needs human"): enforced here, from server state, for every way to approve.
+        startMerging(runId)
+        publish(runId)
+        withContext(Dispatchers.IO) { merge(runs.get(runId)!!, user, approvedBy = user.username) }
+        runs.get(runId)?.takeIf { it.status == RunStatus.MERGED }?.advisorSessionId?.let { agents.endAdvisor(it) }
+        publish(runId)
+        settled(runId)
+        return runs.get(runId)!!
+    }
+
+    /**
+     * Moves a `needs_human` run to `approving` before it is merged, by the owner's approval or a retry of a failed merge.
+     * Changes made in the conversation are reviewed before the run can be merged (docs/ARCHITECTURE.md §6 "Conversation at
+     * needs human"): enforced here, from server state, for every way to merge a run that needs a human.
+     */
+    private suspend fun startMerging(runId: UUID) {
         talkLocks.computeIfAbsent(runId) { Mutex() }.withLock {
             val r = runs.get(runId)!!
             if (r.status != RunStatus.NEEDS_HUMAN) throw conflict("Run is ${r.status}, not needs_human")
@@ -372,12 +387,6 @@ class Orchestrator(
                 ending -= runId
             }
         }
-        publish(runId)
-        withContext(Dispatchers.IO) { merge(runs.get(runId)!!, user, approvedBy = user.username) }
-        runs.get(runId)?.takeIf { it.status == RunStatus.MERGED }?.advisorSessionId?.let { agents.endAdvisor(it) }
-        publish(runId)
-        settled(runId)
-        return runs.get(runId)!!
     }
 
     /** Owner or admin. */
@@ -1128,6 +1137,8 @@ class Orchestrator(
         val client = gh(owner)
         val pr = run.prNumber ?: run { needsHuman(run, owner, "There is no pull request to merge."); return }
         migrationConflict(run, owner, client, pr)?.let { reason ->
+            // Not a failed step: merging again cannot help until the branch's migrations change.
+            runs.setFailure(run.id, null, null)
             needsHuman(run, owner, reason)
             return
         }
@@ -1289,11 +1300,12 @@ class Orchestrator(
         append("run the checks the previous builder may not have completed, and commit. If `${c.baseRef}` has moved on since ")
         append("(`git log HEAD..${c.baseRef}`), merge it in and resolve any conflicts.\n")
         append("Do not push, open pull requests or merge: the factory does that after you finish.\n")
+        append(migrationLine(c)).append('\n')
         append(sandboxLine(c)).append('\n')
         previous.builderSummary?.takeIf { it.isNotBlank() }?.let {
             append("<previous_builder_summary>\n").append(it.take(4000)).append("\n</previous_builder_summary>\n\n")
         }
-        append(c.releaseNote).append(c.issueText)
+        append(c.releaseNote).append(c.issueText).append(c.imagesBlock)
         append("<spec>\n").append(spec).append("\n</spec>\n\n")
         append("When you are done, end with a short summary of what the branch now contains (the earlier commits and yours), ")
         append("how you verified it, and anything left open.")
