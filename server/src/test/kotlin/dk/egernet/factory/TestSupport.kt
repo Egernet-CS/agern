@@ -36,11 +36,11 @@ object TestDb {
     private val pg: EmbeddedPostgres by lazy { EmbeddedPostgres.builder().start() }
     private val counter = AtomicInteger()
 
-    /** A fresh, migrated database per call. */
-    fun fresh(): Db {
+    /** A fresh database per call, migrated from [migrations] (the application's own by default). */
+    fun fresh(migrations: String = Db.MIGRATIONS): Db {
         val name = "t${System.nanoTime()}_${counter.incrementAndGet()}"
         pg.postgresDatabase.connection.use { c -> c.createStatement().use { it.execute("CREATE DATABASE $name") } }
-        return Db.connect(pg.getJdbcUrl("postgres", name), "postgres", "postgres", poolSize = 5)
+        return Db.connect(pg.getJdbcUrl("postgres", name), "postgres", "postgres", poolSize = 5, migrations = migrations)
     }
 }
 

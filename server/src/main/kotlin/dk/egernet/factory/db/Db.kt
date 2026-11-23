@@ -48,7 +48,15 @@ class Db(val dataSource: DataSource) {
     suspend fun <T> io(block: () -> T): T = withContext(Dispatchers.IO) { block() }
 
     companion object {
-        fun connect(url: String, user: String, password: String, poolSize: Int = 10): Db {
+        /** Where the application's migrations live (Flyway location syntax). */
+        const val MIGRATIONS = "classpath:db/migration"
+
+        /**
+         * A pool on [url], with the schema migrated by Flyway from [migrations]. Two migrations with the same version
+         * fail before anything connects, with a message naming both files ([MigrationFiles.requireUniqueVersions]).
+         */
+        fun connect(url: String, user: String, password: String, poolSize: Int = 10, migrations: String = MIGRATIONS): Db {
+            MigrationFiles.requireUniqueVersions(migrations)
             val cfg = HikariConfig().apply {
                 jdbcUrl = url
                 username = user
@@ -57,7 +65,12 @@ class Db(val dataSource: DataSource) {
                 poolName = "agern"
             }
             val ds = HikariDataSource(cfg)
-            Flyway.configure().dataSource(ds).locations("classpath:db/migration").load().migrate()
+            try {
+                Flyway.configure().dataSource(ds).locations(migrations).load().migrate()
+            } catch (e: Exception) {
+                ds.close()
+                throw e
+            }
             return Db(ds)
         }
     }
