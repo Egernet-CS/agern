@@ -261,6 +261,26 @@ chat. A pipeline run works in a git worktree `…/<repo>/runs/<runId>` on its ow
 `factory/release-<name>/issue-<number>-<slug>-<run>`, where `<run>` is the first 8 hex digits of the run id. How
 worktrees and branches are cleaned up is in §6 "Worktrees and branches".
 
+The main clone is kept in step with `origin/<default branch>` (GitHub's current default branch, cached 60 s) so a chat
+agent does not read and report old code (`Workspaces.syncMain`, `CliGitOps.syncCheckout`). A sync runs in the
+background when a chat is created (after `ensureMain`) and before every non-command chat message (inside the chat
+lock, after the process is obtained); `/factory` commands, advisors and pipeline stages never sync, and run worktrees
+are unaffected. Under the clone's lock it fetches only `+refs/heads/<b>:refs/remotes/origin/<b>` (`--no-tags`, 30 s
+timeout; skipped when the clone was fetched by `ensureMain` or a sync less than 30 s ago; a failed fetch is logged and
+the last fetched ref is used), then reads the branch, `HEAD`, ahead/behind relative to `origin/<b>` and
+`git status --porcelain` (untracked, non-ignored files count as local changes). Not behind → `current`, nothing is
+touched whatever the branch or local state. Behind → the checkout is left exactly as it is when another branch or a
+detached HEAD is checked out (`other_branch`), it has local changes (`local_changes`) or local commits
+(`local_commits`); otherwise `git -c core.hooksPath=/dev/null merge --ff-only --quiet origin/<b>` (`updated`; a failure
+is `behind` / `update_failed`). That merge is the only state-changing command; reset, checkout, stash, clean, pull and
+rebase are never run. In fake-GitHub mode nothing is fetched or merged and the state is `current`. A sync never fails a
+chat: errors are logged and the message goes out unchanged. After a sync with a result the server publishes a
+`checkout` event (§8) unless the payload equals the last one it published for that chat, and prepends a
+`<checkout_status>` block to the content delivered to the agent (never to the `user` event): always after a
+fast-forward (old and new short sha, number of new commits, "read files again"), and when behind once per process
+launch and again whenever reason, `HEAD` or the count changes (how far behind, why, how to read `origin/<b>`, and not
+to update the checkout without asking). `prompts/chat.md` explains the block to the agent.
+
 **Known limitation (v1).** All agents run under the server's OS user with permissions bypassed.
 The factory must run on a dedicated machine or VM. Per-user OS accounts or containers are the
 planned hardening and are why `AgentLauncher` is an interface. Sandboxes (below) do not change this:
@@ -1683,7 +1703,7 @@ type ClientConfig = { attachments: { maxFileBytes: number; maxMessageBytes: numb
     limits: { maxPerRequest: number; maxPerTurn: number; maxPerStage: number; maxEdge: number } } };
 
 type Event = { seq: number; sessionId: string; ts: string;
-  type: 'user' | 'claude' | 'system' | 'status' | 'images'; payload: unknown };
+  type: 'user' | 'claude' | 'system' | 'status' | 'images' | 'checkout'; payload: unknown };
 //  user:   { text: string, username: string, attachments?: Attachment[] }   // attachments only when there are some
 //          A message to a running pipeline agent (§6) adds: messageId: string, origin: 'direct' | 'chat',
 //          viaSessionId?: string   // the forwarding chat session when origin is 'chat'
@@ -1692,6 +1712,12 @@ type Event = { seq: number; sessionId: string; ts: string;
 //          messageId: the agent picked that message up (info) or stopped before it did (warn)
 //  images: { requestId, provider, providerLabel, model, prompt, purpose, issueNumber?,   // one factory_generate_image
 //            images: [{ id, mediaType, width, height, size }] }                          // call (§6 "Generated images")
+//  checkout: { branch: string | null,          // a chat's main checkout after a sync (§5 "Workspaces"); null = detached
+//              defaultBranch: string, commit: string,  // full HEAD sha after the sync
+//              behind: number, ahead: number,  // relative to origin/<defaultBranch>
+//              status: 'current' | 'updated' | 'behind',
+//              reason: 'other_branch' | 'local_changes' | 'local_commits' | 'update_failed' | null,  // only for 'behind'
+//              updatedFrom: string | null }    // the previous HEAD, only for 'updated'
 //          sandbox: the full log of a sandbox setup script or command (§5 "Sandboxes"):
 //            { kind: 'setup' | 'exec', command, exitCode, timedOut, durationMs, output, outputTruncated,
 //              platform: string | null }   // null when the definition has no platforms, else 'default' or the platform
@@ -2199,6 +2225,11 @@ UTC day rolls over (`useClaudeUsage`, `web/src/lib/usage.ts`); relative times ar
 The chat renders the Claude stream the way the terminal does: prompt line, streamed assistant
 text, tool calls as `⏺ Tool(args)` with collapsible results, thinking, cost/turn footer. Sessions
 owned by someone else are shown read-only with an "observing <user>" banner.
+The chat header shows the latest `checkout` event next to the path (`CheckoutBadge`): `~/<repo> · <sha7>`, with the
+branch (or `detached`) before the sha when it is not the default branch, and ` · <n> behind` in amber when the checkout
+is behind; `title` and an `sr-only` span carry the full sentence (up to date, or how far behind and why it was not
+updated). Without a `checkout` event only `~/<repo>` is shown; at the narrow breakpoint it is hidden with the path.
+`checkout` events are not transcript items (a malformed one is shown as `unknown`).
 
 **Conversation at needs human** (§6). On the run page the `human` node is selectable when the run is `needs_human` or
 has a conversation (`?stage=human`; the default selection of a `needs_human` run with a conversation). Its sub-line
