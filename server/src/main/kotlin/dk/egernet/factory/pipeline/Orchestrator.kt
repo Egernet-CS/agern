@@ -979,6 +979,7 @@ class Orchestrator(
         |
         |You are in a git worktree on branch `${c.branch}`, created from `${c.baseRef}`. Commit your work to this branch.
         |Do not push, open pull requests or merge: the factory does that after you finish.
+        |${migrationLine(c)}
         |${sandboxLine(c)}
         |${c.releaseNote}${c.issueText}${c.imagesBlock}
         |<spec>
@@ -993,6 +994,7 @@ class Orchestrator(
         append("Address every finding below on the same branch (`${c.branch}`), re-run the relevant checks, and commit. ")
         append("If you are convinced a finding is wrong, do not change the code for it; explain why in your final summary ")
         append("so the reviewers see your reasoning.\n")
+        append(migrationLine(c)).append('\n')
         append(sandboxLine(c)).append('\n')
         for ((role, v) in changes) {
             append("### Reviewer: $role — ${v.verdict}\n${v.summary}\n")
@@ -1000,6 +1002,22 @@ class Orchestrator(
             append('\n')
         }
         append("End with a short summary of what you changed for each finding.")
+    }
+
+    /**
+     * The builder's rule for database migration versions, naming the branch the pull request merges into
+     * (docs/ARCHITECTURE.md §6 "Database migrations"); a release run's versions must also clear the default branch.
+     */
+    private fun migrationLine(c: RunContext): String = buildString {
+        append("Database migrations: the pull request merges into `${c.targetBranch}`. If the change adds a versioned migration ")
+        append("(e.g. Flyway `V<n>__name.sql`), take its version from `${c.baseRef}` as it is now (fetch it first): the next version ")
+        append("above every migration there. Check it again before you finish and after any rebase or merge of `${c.targetBranch}`, ")
+        append("and never change a migration that exists there.")
+        if (c.targetBranch != c.defaultBranch) {
+            append(" The release is later merged into `${c.defaultBranch}`, so the version must also be above every migration on ")
+            append("`${c.defaultBranch}`.")
+        }
+        append('\n')
     }
 
     /** One paragraph for the builder about the run's sandbox (empty line when sandboxes are off). */
