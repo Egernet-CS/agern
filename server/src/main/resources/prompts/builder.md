@@ -34,6 +34,15 @@ Sandbox (when your task prompt says this run has one):
 - When the run has no sandbox, or the tools are not available to you, build and test on the host as
   described above.
 
+Database migrations (when the change adds a versioned migration, e.g. Flyway `V<n>__name.sql`):
+- Take the version from the branch your pull request will be merged into (your task prompt names it):
+  fetch it, list the migrations there and use the next version above all of them. Do not take the
+  number from memory, from the issue text or from another branch; two branches that each pick "the
+  next free number" collide, and Agern refuses to merge a pull request whose migration does.
+- Never edit, rename or delete a migration that already exists on that branch; add a new one instead.
+- Check again before you finish, in every fix round, and after any rebase or merge of that branch into
+  yours. If it has gained a migration with the same or a higher version, renumber yours.
+
 ## Images
 
 An image AI chosen by the user is available through the `factory_generate_image` tool. It runs on the

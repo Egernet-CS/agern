@@ -12,6 +12,15 @@ class GitException(message: String) : RuntimeException(message)
 /** One entry of `git worktree list`: its path as git reports it and its branch (null when detached). */
 data class WorktreeInfo(val path: Path, val branch: String?)
 
+/** One file [headBranch] changes relative to its merge base with a base branch: [status] `A`, `M` or `D`. */
+data class FileChange(val status: Char, val path: String)
+
+/**
+ * [GitOps.compareBranches]: the files on the base branch's tip under the directories of interest, and what the head
+ * changes (relative to the merge base) in them. Renames are a removal plus an addition.
+ */
+data class BranchComparison(val baseFiles: List<String>, val changes: List<FileChange>)
+
 /** Git operations the server performs itself (the agents run git on their own). */
 interface GitOps {
     /** Clones the repo into [dir] or fetches if it is already there. */
@@ -46,6 +55,16 @@ interface GitOps {
      * other local branch and no remote-tracking branch. Never throws.
      */
     fun forgetBranch(mainDir: Path, branch: String, home: Path) {}
+    /**
+     * Compares [headBranch] with [baseBranch] in the clone at [mainDir], both as they are on GitHub (fetched first with
+     * [githubToken]): what the head changes relative to their merge base, and the files on the base's tip. Only paths
+     * for which [dirOf] names a directory count; the base is listed only under the directories the changes touch, and
+     * not at all when no change counts. Null when the comparison cannot be made (no clone, a branch is missing);
+     * throws [GitException] when git fails.
+     */
+    fun compareBranches(
+        mainDir: Path, baseBranch: String, headBranch: String, home: Path, githubToken: String?, dirOf: (String) -> String?,
+    ): BranchComparison? = null
 }
 
 /**
@@ -55,14 +74,19 @@ interface GitOps {
 class CliGitOps(private val path: String, private val gitHost: String, private val localOnly: Boolean = false) : GitOps {
     private val log = LoggerFactory.getLogger(CliGitOps::class.java)
 
-    private fun git(cwd: Path?, home: Path, id: AgentIdentity?, vararg args: String, timeoutSec: Long = 600): String {
-        val (code, out) = gitStatus(cwd, home, id, *args, timeoutSec = timeoutSec)
+    private fun git(cwd: Path?, home: Path, id: AgentIdentity?, vararg args: String, timeoutSec: Long = 600, token: String? = null): String {
+        val (code, out) = gitStatus(cwd, home, id, *args, timeoutSec = timeoutSec, token = token)
         if (code != 0) throw GitException("git ${args.take(2).joinToString(" ")} failed: ${out.takeLast(1000).trim()}")
         return out
     }
 
-    /** Runs git and returns its exit code and output instead of throwing on a non-zero exit. */
-    private fun gitStatus(cwd: Path?, home: Path, id: AgentIdentity?, vararg args: String, timeoutSec: Long = 600): Pair<Int, String> {
+    /**
+     * Runs git and returns its exit code and output instead of throwing on a non-zero exit. [token]: authenticate with
+     * this GitHub token where there is no [id] (a fetch on the server's own behalf).
+     */
+    private fun gitStatus(
+        cwd: Path?, home: Path, id: AgentIdentity?, vararg args: String, timeoutSec: Long = 600, token: String? = null,
+    ): Pair<Int, String> {
         val pb = ProcessBuilder(listOf("git") + args).redirectErrorStream(true)
         if (cwd != null) pb.directory(cwd.toFile())
         pb.environment().clear()
@@ -74,6 +98,7 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
         else {
             pb.environment()["GIT_AUTHOR_NAME"] = "Agern"; pb.environment()["GIT_COMMITTER_NAME"] = "Agern"
             pb.environment()["GIT_AUTHOR_EMAIL"] = "agern@agern.local"; pb.environment()["GIT_COMMITTER_EMAIL"] = "agern@agern.local"
+            if (token != null) pb.environment().putAll(AgentCommand.gitTokenEnvironment(token, gitHost))
         }
         Files.createDirectories(home)
         val p = pb.start()
@@ -176,6 +201,39 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
         } catch (e: Exception) {
             log.warn("Forgetting branch {} failed: {}", branch, e.message)
         }
+    }
+
+    override fun compareBranches(
+        mainDir: Path, baseBranch: String, headBranch: String, home: Path, githubToken: String?, dirOf: (String) -> String?,
+    ): BranchComparison? {
+        if (!Files.isDirectory(mainDir.resolve(".git"))) return null
+        require(!baseBranch.startsWith("-") && !headBranch.startsWith("-")) { "Invalid branch name" }
+        val (base, head) = if (localOnly) {
+            "refs/heads/$baseBranch" to "refs/heads/$headBranch"
+        } else {
+            git(
+                mainDir, home, null, "fetch", "--no-tags", "origin",
+                "+refs/heads/$baseBranch:refs/remotes/origin/$baseBranch", "+refs/heads/$headBranch:refs/remotes/origin/$headBranch",
+                token = githubToken,
+            )
+            "refs/remotes/origin/$baseBranch" to "refs/remotes/origin/$headBranch"
+        }
+        for (ref in listOf(base, head)) {
+            if (gitStatus(mainDir, home, null, "rev-parse", "--verify", "--quiet", "$ref^{commit}", timeoutSec = 60).first != 0) return null
+        }
+        // NUL-separated: <status> NUL <path> NUL ...
+        val fields = git(mainDir, home, null, "diff", "--name-status", "--no-renames", "-z", "$base...$head", "--").split('\u0000')
+        val changes = (0 until fields.size - 1 step 2).mapNotNull { i ->
+            val path = fields[i + 1]
+            if (dirOf(path) == null) return@mapNotNull null
+            val status = when (fields[i].firstOrNull()) { 'A' -> 'A'; 'D' -> 'D'; else -> 'M' }
+            FileChange(status, path)
+        }
+        val dirs = changes.mapNotNull { dirOf(it.path) }.distinct().sorted()
+        if (dirs.isEmpty()) return BranchComparison(emptyList(), emptyList())
+        val baseFiles = git(mainDir, home, null, "ls-tree", "-r", "-z", "--name-only", base, "--", *dirs.toTypedArray())
+            .split('\u0000').filter { it.isNotEmpty() && dirOf(it) != null }
+        return BranchComparison(baseFiles, changes)
     }
 
     override fun removeWorktree(mainDir: Path, worktree: Path, home: Path, keepUnpushed: Boolean) {

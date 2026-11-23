@@ -59,6 +59,25 @@ jobs:
             packaging/deb/sandbox-host-test.sh packaging/deb/sandbox-service \
             server/src/main/resources/sandbox/prepare-user.sh
 
+  migrations:
+    name: Database migrations (versions)
+    runs-on: ubuntu-latest
+    steps:
+      # On a pull request the checkout is its merge result: HEAD^1 is the tip of the base branch.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - run: scripts/check-migrations-test.sh
+      - name: Check the migrations
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = pull_request ]; then
+            scripts/check-migrations.sh HEAD^1
+          else
+            scripts/check-migrations.sh
+          fi
+
   deb:
     name: Debian package (build)
     runs-on: ubuntu-latest
@@ -152,7 +171,7 @@ jobs:
   publish-main:
     name: Publish the rolling main pre-release
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [web, server, packaging, deb, deb-smoke, sandbox]
+    needs: [web, server, packaging, migrations, deb, deb-smoke, sandbox]
     runs-on: ubuntu-latest
     permissions:
       contents: write # move the main-latest tag and update its release assets

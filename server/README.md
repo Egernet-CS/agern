@@ -36,7 +36,9 @@ sudo -u postgres createdb --owner=factory factory
 # FACTORY_DB_URL=jdbc:postgresql://localhost:5432/factory (the default), FACTORY_DB_USER/PASSWORD
 ```
 
-Flyway migrates the schema on every startup. Unfinished pipeline runs are marked `failed` when the
+Flyway migrates the schema on every startup. A new migration takes the next version on the branch it
+will be merged into, and existing migrations are never edited; `scripts/check-migrations.sh <base-ref>`
+checks this without a database (docs/ARCHITECTURE.md §6 "Database migrations"). Unfinished pipeline runs are marked `failed` when the
 server restarts (v1); chat sessions become `idle` and resume on the next input.
 
 ## Development

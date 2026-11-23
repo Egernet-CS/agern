@@ -36,11 +36,11 @@ object TestDb {
     private val pg: EmbeddedPostgres by lazy { EmbeddedPostgres.builder().start() }
     private val counter = AtomicInteger()
 
-    /** A fresh, migrated database per call. */
-    fun fresh(): Db {
+    /** A fresh database per call, migrated from [migrations] (the application's own by default). */
+    fun fresh(migrations: String = Db.MIGRATIONS): Db {
         val name = "t${System.nanoTime()}_${counter.incrementAndGet()}"
         pg.postgresDatabase.connection.use { c -> c.createStatement().use { it.execute("CREATE DATABASE $name") } }
-        return Db.connect(pg.getJdbcUrl("postgres", name), "postgres", "postgres", poolSize = 5)
+        return Db.connect(pg.getJdbcUrl("postgres", name), "postgres", "postgres", poolSize = 5, migrations = migrations)
     }
 }
 
@@ -203,6 +203,20 @@ class FakeGitOps : GitOps {
     /** When set, [removeWorktree] deletes the directory (like the real one) and records it in [removedWorktrees]. */
     @Volatile var deleteWorktrees = false
     val removedWorktrees = CopyOnWriteArrayList<Path>()
+    /**
+     * What [compareBranches] answers for (base branch, head branch), before the [dirOf] filter; null (the default) means
+     * the comparison cannot be made. A thrown exception is thrown by [compareBranches].
+     */
+    @Volatile var comparison: (base: String, head: String) -> dk.egernet.factory.git.BranchComparison? = { _, _ -> null }
+    /** Every [compareBranches], as `"<head> -> <base>"`. */
+    val comparisons = CopyOnWriteArrayList<String>()
+    override fun compareBranches(
+        mainDir: Path, baseBranch: String, headBranch: String, home: Path, githubToken: String?, dirOf: (String) -> String?,
+    ): dk.egernet.factory.git.BranchComparison? {
+        comparisons += "$headBranch -> $baseBranch"
+        val c = comparison(baseBranch, headBranch) ?: return null
+        return dk.egernet.factory.git.BranchComparison(c.baseFiles.filter { dirOf(it) != null }, c.changes.filter { dirOf(it.path) != null })
+    }
     override fun removeWorktree(mainDir: Path, worktree: Path, home: Path, keepUnpushed: Boolean) {
         if (!deleteWorktrees) return
         worktree.toFile().deleteRecursively()

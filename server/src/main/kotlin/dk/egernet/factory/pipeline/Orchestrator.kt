@@ -865,11 +865,15 @@ class Orchestrator(
 
     /**
      * Squash-merges the PR and closes the issue; a release run's issue stays open until the release is merged.
-     * On failure the run goes (back) to needs_human.
+     * On failure, or when its database migrations collide with the target's, the run goes (back) to needs_human.
      */
     private fun merge(run: RunRecord, owner: UserRecord, approvedBy: String?) {
         val client = gh(owner)
         val pr = run.prNumber ?: run { needsHuman(run, owner, "There is no pull request to merge."); return }
+        migrationConflict(run, owner, client, pr)?.let { reason ->
+            needsHuman(run, owner, reason)
+            return
+        }
         try {
             client.squashMerge(org, run.repo, pr, "${run.issueTitle} (#${run.issueNumber})")
         } catch (e: Exception) {
@@ -891,6 +895,30 @@ class Orchestrator(
         }
         cleanupWorktree(run.id, merged = true)
         runs.setStatus(run.id, RunStatus.MERGED, clearError = true)
+    }
+
+    /**
+     * Why pull request #[pr] must not be merged because of its database migrations (docs/ARCHITECTURE.md §6 "Database
+     * migrations"), or null. Compares the run's branch with its target in the owner's clone, with git. A check that
+     * cannot be made is logged and lets the merge go ahead: CI is the strict gate. Blocking; never throws.
+     */
+    private fun migrationConflict(run: RunRecord, owner: UserRecord, client: GitHubClient, pr: Int): String? = try {
+        val branch = run.branch
+        val target = run.baseBranch ?: client.getRepo(org, run.repo)?.defaultBranch
+        if (branch == null || target == null) null else {
+            val cmp = workspaces.withRepoLock(owner.username, run.repo) {
+                workspaces.git.compareBranches(
+                    workspaces.mainDir(owner.username, run.repo), target, branch, workspaces.home(owner.username),
+                    access.githubToken(owner), MigrationCheck::rootOf,
+                )
+            }
+            if (cmp == null) log.warn("Run {}: the database migrations of {} could not be compared with {}", run.id, branch, target)
+            cmp?.let { MigrationCheck.problems(it.baseFiles, it.changes) }?.takeIf { it.isNotEmpty() }
+                ?.let { MigrationCheck.runReason(target, pr, it) }
+        }
+    } catch (e: Exception) {
+        log.warn("Run {}: checking the database migrations failed, merging without the check: {}", run.id, e.message)
+        null
     }
 
     /**
@@ -979,6 +1007,7 @@ class Orchestrator(
         |
         |You are in a git worktree on branch `${c.branch}`, created from `${c.baseRef}`. Commit your work to this branch.
         |Do not push, open pull requests or merge: the factory does that after you finish.
+        |${migrationLine(c)}
         |${sandboxLine(c)}
         |${c.releaseNote}${c.issueText}${c.imagesBlock}
         |<spec>
@@ -993,6 +1022,7 @@ class Orchestrator(
         append("Address every finding below on the same branch (`${c.branch}`), re-run the relevant checks, and commit. ")
         append("If you are convinced a finding is wrong, do not change the code for it; explain why in your final summary ")
         append("so the reviewers see your reasoning.\n")
+        append(migrationLine(c)).append('\n')
         append(sandboxLine(c)).append('\n')
         for ((role, v) in changes) {
             append("### Reviewer: $role — ${v.verdict}\n${v.summary}\n")
@@ -1000,6 +1030,22 @@ class Orchestrator(
             append('\n')
         }
         append("End with a short summary of what you changed for each finding.")
+    }
+
+    /**
+     * The builder's rule for database migration versions, naming the branch the pull request merges into
+     * (docs/ARCHITECTURE.md §6 "Database migrations"); a release run's versions must also clear the default branch.
+     */
+    private fun migrationLine(c: RunContext): String = buildString {
+        append("Database migrations: the pull request merges into `${c.targetBranch}`. If the change adds a versioned migration ")
+        append("(e.g. Flyway `V<n>__name.sql`), take its version from `${c.baseRef}` as it is now (fetch it first): the next version ")
+        append("above every migration there. Check it again before you finish and after any rebase or merge of `${c.targetBranch}`, ")
+        append("and never change a migration that exists there.")
+        if (c.targetBranch != c.defaultBranch) {
+            append(" The release is later merged into `${c.defaultBranch}`, so the version must also be above every migration on ")
+            append("`${c.defaultBranch}`.")
+        }
+        append('\n')
     }
 
     /** One paragraph for the builder about the run's sandbox (empty line when sandboxes are off). */
