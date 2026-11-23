@@ -563,7 +563,8 @@ reaches the default branch only through the owner's approval of the release (§6
 - **builder** implements the spec on the run branch and commits. The orchestrator pushes the branch
   and opens a pull request after the first build. When the run has an approved sandbox (§5 "Sandboxes"),
   the builder builds and tests in it through `factory_sandbox_exec`; the sandbox is removed when the
-  build/review loop ends, before the approver runs.
+  build/review loop ends, before the approver runs. Its task and fix prompts name the branch the pull request merges
+  into and the rule for migration versions (§6 "Database migrations").
 - **reviewers** run in parallel, cannot edit files (`--disallowedTools Edit,Write,NotebookEdit`),
   and answer through `--json-schema` with
   `{ "verdict": "PASS" | "CHANGES", "summary": string, "findings": [{ "severity", "file", "detail" }] }`.
@@ -579,7 +580,8 @@ reaches the default branch only through the owner's approval of the release (§6
   wall-clock time (waiting for a free agent slot does not count). The stage becomes `failed` with
   summary "Timed out: …", and the run `failed` with error "<role> failed: Timed out: …".
 - **approver** answers `{ "verdict": "APPROVE" | "ESCALATE", "summary": string }`. `APPROVE`
-  squash-merges the PR and closes the issue. `ESCALATE` labels the issue `needs-human`, comments,
+  squash-merges the PR and closes the issue, unless its database migrations collide with the target's (§6 "Database
+  migrations"): then the run goes to `needs_human` instead. `ESCALATE` labels the issue `needs-human`, comments,
   and waits for the owner's `/factory approve`.
 - **Whose models.** Every agent runs on its owner's Claude account, so model choices are personal. The
   global settings (`chatModel`, `pipelineModels`, `maxFixRounds`) are the admin's *defaults* — the models
@@ -655,6 +657,58 @@ Run `status`: `queued`, `spec`, `building`, `reviewing`, `approving`, `merged`, 
 Stage `role`: `spec-writer`, `builder`, `security`, `ux`, `ui-design`, `code`, `approver`.
 Stage `status`: `pending`, `running`, `done`, `failed`, `skipped`.
 Stage `verdict`: `PASS`, `CHANGES`, `APPROVE`, `ESCALATE` or null.
+
+### Database migrations
+
+Two branches built independently can each add a Flyway migration with "the next free version". The files have
+different names, so git sees no conflict and both merge, but with two migrations of one version the server no longer
+starts; and the later one cannot simply be renumbered once an installation has applied the other. So a new migration
+takes its version from the branch it merges into, above every migration there, and a migration that exists on that
+branch is never changed, renamed or removed (Flyway checks applied migrations by checksum). Three guards apply this:
+
+- **CI, for Agern itself.** `scripts/check-migrations.sh [<base-ref>]` checks `server/src/main/resources/db/migration`
+  without a database (bash 3.2 or later, git, awk): every file is named `V<number>__<name>.sql`, no two share a version
+  (compared as numbers, `V011` = `V11`), and, against a base, every file not on the base is above the base's highest
+  version and every migration on the base is unchanged and still there. Problems are printed one per line naming the
+  files, exit 1. The `migrations` job in `ci.yml` runs its self-test (`scripts/check-migrations-test.sh`) and, on a pull
+  request, the check of the merge commit against `HEAD^1` (the base branch's tip); on a push, without a base.
+  `publish-main` needs it. On startup `Db.connect` lists the bundled migrations before Flyway runs and fails with
+  "Duplicate migration version 11: V11__a.sql and V11__b.sql. Renumber the one that was added later to a version above
+  every other migration." (`MigrationFilesTest`).
+- **Agern, for every project it builds.** The known layout is Flyway's default location: files at or below a
+  directory `src/main/resources/db/migration`, at the repository root or in a module (e.g.
+  `server/src/main/resources/db/migration`); each such directory is checked on its own. A versioned migration is
+  `V<version>__<description>.sql`, the version being digit groups separated by `.` or `_`, compared as Flyway does
+  (`1` = `1.0` = `01`, `1_2` < `1.10`). Other files, layouts and projects are never affected. The check
+  (`MigrationCheck`) runs with git in the owner's clone, no database and no GitHub API: both branches are fetched, and
+  the head's changes since the merge base (`git diff --name-status --no-renames <base>...<head>`; a rename is a removal
+  plus an addition) are compared with the files on the base's tip (`git ls-tree`, only under the directories the
+  changes touch, and not at all when no change touches a migration). Problems: an added migration with the same
+  version as one on the base or another added one, an added migration below the base's highest, and a migration on
+  the base that the head changes or removes. Paths in the texts keep only `[A-Za-z0-9._/+-]` (the rest `?`) and at
+  most 200 characters; at most 5 problems are listed, then "(and N more)". A comparison that cannot be made (no
+  clone, a branch missing, git failing) is logged and blocks nothing: CI is the strict gate.
+  - *A run's pull request*, before every squash merge (the approver's `APPROVE` and the owner's approval of a
+    `needs_human` run, single and release runs alike), compares the run's branch with its target. On a problem
+    nothing is merged and the run goes to `needs_human` through the usual path (label, comment, error), with the
+    reason "Database migration conflict with `<target>`: <problems>. Pull request #<n> was not merged. Migrations
+    already on `<target>` must stay unchanged, and a new migration needs a version above all of them. Fix the
+    migration on the pull request's branch and approve again, or build the issue again from the current `<target>`
+    (in a release: Retry)." In a release, the issue thereby becomes `held` with that note (§6 "Releases",
+    "Outcomes"); approving the run again checks again.
+  - *A ready release* compares `release/<name>` with the default branch at every re-evaluation once its pull request
+    is open (it becomes ready, "Check again", the periodic re-evaluation, before an approval). Its issues are already
+    merged into the release branch, so none can be held: the release stays `ready` with the notice "Database migration
+    conflict with `<default>`: <problems>. The release is not merged. Fix the migrations on `release/<name>` (merge
+    `<default>` into it; a new migration needs a version above every migration on `<default>`, and existing ones must
+    stay unchanged), then use "Check again".", is not announced as ready to release, is not merged automatically, and
+    approval answers 409 `release_migration_conflict` with the notice and " Nothing was merged." (§6 "Releasing"). The
+    next re-evaluation without a problem clears the notice.
+- **The builder's prompt.** `builder.md` and the build and fix prompts tell the builder to take a new migration's
+  version from the branch its pull request merges into (named in the prompt, fetched first), above every migration
+  there, never to change one that exists there, and to check again before finishing, in every fix round and after
+  any rebase or merge of that branch. A release run is told that its version must also be above every migration on
+  the default branch, which the release is merged into later.
 
 ### Conversation at needs human
 
@@ -910,7 +964,8 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   ignores runs no longer linked to an issue.
 - **Held issues.** The owner can approve the held run (`POST /api/runs/{id}/approve`, `/factory approve`): when it
   merges the issue becomes `merged`, if the merge fails it stays `held` with the new reason (a branch that is behind
-  is merged by GitHub's squash merge; a conflict fails). The owner can retry it, or anyone allowed can take it out.
+  is merged by GitHub's squash merge; a conflict fails; database migrations that collide with the release branch's
+  are refused before the merge, §6 "Database migrations"). The owner can retry it, or anyone allowed can take it out.
 - **Retry** (`POST /api/releases/{id}/issues/{number}/retry`, owner only): the release must be `building`,
   `paused` or `ready` (409 `release_not_building`; a `ready` one becomes `building` again, 409
   `release_already_building` while another release of the project builds), the issue `held` or `skipped` (409 `release_issue_not_held`). It becomes
@@ -1010,6 +1065,10 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   answers 409 `release_conflict` and changes nothing. The owner decides: resolve the conflict on the release branch
   (e.g. merge the default branch into it and push) and "Check again", or cancel. Agern does not resolve conflicts
   itself (issue #35); nothing here prevents that from being added as another way forward from this state.
+- **Database migrations.** A release branch whose migrations collide with the default branch's (e.g. another release
+  merged the same version first) stays `ready` with the notice of §6 "Database migrations", without the ready
+  announcement and without an automatic merge; approval answers 409 `release_migration_conflict`. The owner fixes the
+  release branch (merge the default branch into it, renumber the release's new migration) and uses "Check again".
 - **Approval** (`POST /api/releases/{id}/approve`, `/factory release approve <name>`, `factory_approve_release`):
   **only the owner**; everyone else, admins included, gets 403 `forbidden` ("Only <owner>, who started this release,
   can do this"); a caller who cannot see the project gets 404 first. Admins may still cancel (they stop, never
@@ -1019,7 +1078,8 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   out of the release first."); something merged (409 `release_empty`, "Nothing was merged into the release branch,
   so there is nothing to release."); a re-evaluation; a pull request exists (409 `release_merge_failed` with the
   notice); no conflict (409 `release_conflict`, "`release/<name>` no longer merges cleanly into `<default>`. Nothing
-  was merged."); a usable merge method (below). The pull request is read once more for its head commit, which is
+  was merged."); no database migration conflict (409 `release_migration_conflict`, the notice of §6 "Database
+  migrations" and " Nothing was merged."); a usable merge method (below). The pull request is read once more for its head commit, which is
   passed to GitHub's merge (`sha`), so a release branch that moves after the check is refused rather than merged
   unseen. Approvals of one release are serialised by its mutex; a second, concurrent approval finds it `released`
   and answers 409 `release_not_ready`. Check ("Check again", `POST …/check`) has the same owner rule.
@@ -1056,7 +1116,7 @@ release mode (#41). Single runs are unaffected and still merge into the default 
     (`ReleaseModePolicy`, below). The merge is **the approval's own code path** (`mergeLocked`): the owner's token, the
     same method, the head commit the checks were read for passed as `sha` (a branch that moved meanwhile is refused,
     not merged unseen), and the same "After the merge". No language-model agent takes part in the decision.
-  - *Blockers are never overridden*: held issues, a conflict, no usable merge method, an owner without a GitHub token
+  - *Blockers are never overridden*: held issues, a conflict, a database migration conflict, no usable merge method, an owner without a GitHub token
     and failed or unreadable checks all leave the release `ready` with the usual banner or notice. The owner can
     still approve by hand at any time (approval is never blocked by checks).
   - *Failed checks*: `notice` "Checks failed on pull request #n (<detail>), so it is not released automatically. …"
@@ -1610,7 +1670,7 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `POST /api/releases/{id}/pause` | → `Release` | owner or admin; `building` → `paused` (else 409 `release_not_building`); the running issue finishes |
 | `POST /api/releases/{id}/resume` | → `Release` | owner only; `paused` → `building` (else 409 `release_not_paused`); 422 `claude_credential_required` |
 | `POST /api/releases/{id}/cancel` | → `Release` | owner or admin; `building`/`paused`/`ready` → `cancelled` (else 409 `release_not_building`; released: 409 `release_not_editable`); cancels the release's active runs; a release pull request is left open with a comment |
-| `POST /api/releases/{id}/approve` | → `Release` | owner only (admins included in the refusal: 403); merges the ready release's pull request (rebase, or a merge commit where rebase merging is disabled; never squash), closes its merged issues and deletes `release/<name>` (§6 "Releasing"). 409 `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`, `release_merge_method_unavailable`, `release_merge_failed`; nothing changes on GitHub with any of them |
+| `POST /api/releases/{id}/approve` | → `Release` | owner only (admins included in the refusal: 403); merges the ready release's pull request (rebase, or a merge commit where rebase merging is disabled; never squash), closes its merged issues and deletes `release/<name>` (§6 "Releasing"). 409 `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`, `release_migration_conflict`, `release_merge_method_unavailable`, `release_merge_failed`; nothing changes on GitHub with any of them |
 | `PUT /api/releases/{id}/mode` | `{ mode: 'manual' \| 'automatic' }` → `Release` | §6 "Release mode": `planning` anyone; `scheduled`/started: automatic owner only, manual owner or admin (403); 400 missing or unknown mode; 409 `release_not_editable` (released), `release_closed` (cancelled), `release_mode_not_allowed`. A `ready` release is re-evaluated in the background (switched to automatic and green, it is merged) |
 | `POST /api/releases/{id}/check` | → `Release` | owner only; `ready` only (409 `release_not_ready`): re-reads the pull request (opens it when the release is complete and has none, replaces one closed without merging, finishes the release when it was merged on GitHub) and its mergeability |
 | `POST /api/releases/{id}/issues/{number}/retry` | → `Release` | owner only; release `building`/`paused`/`ready` (else 409 `release_not_building`; released: 409 `release_not_editable`), issue `held`/`skipped` (else 409 `release_issue_not_held`); it is built again (a `ready` release builds again: 409 `release_already_building` while another release of the project builds) |
@@ -1680,7 +1740,7 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   `github_push_denied`, `claude_credential_required` (422);
   scheduling: `release_not_schedulable`, `release_not_scheduled`, `release_scheduled` (409);
   releasing: `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`,
-  `release_merge_failed`, `release_merge_method_unavailable`, `release_not_editable` (409).
+  `release_migration_conflict`, `release_merge_failed`, `release_merge_method_unavailable`, `release_not_editable` (409).
 - Sandbox approval: stale hash → 409 `sandbox_definition_changed`; invalid definition → 422
   `sandbox_definition_invalid`.
 - "Needs Claude credential" → 422 `claude_credential_required`; too many agents → 409
@@ -1955,7 +2015,7 @@ anonymous (the repository is public); no token is ever used.
 
 **Channels.** `stable` is the latest GitHub release (`releases/latest` skips pre-releases). `main`
 is the rolling pre-release `main-latest`, which CI (`ci.yml`, job `publish-main`) replaces on every
-push to `main` after the tests and the package smoke tests on Debian 12, Debian 13 and Ubuntu 24.04
+push to `main` after the tests, the migration check (§6 "Database migrations") and the package smoke tests on Debian 12, Debian 13 and Ubuntu 24.04
 passed: it moves the tag `main-latest` to the commit and uploads the package and its `SHA256SUMS`
 (only when the commit is still the head of `main`). Main builds are versioned by
 `scripts/main-version.sh`: `X.Y.(Z+1)-main.<commit time UTC YYYYMMDDHHMMSS>.g<sha>` after release
