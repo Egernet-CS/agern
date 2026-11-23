@@ -82,7 +82,8 @@ data class GhComment(val user: GhLogin? = null, val body: String? = null, @Seria
 
 /**
  * One pull request as `GET /repos/{o}/{r}/pulls/{n}` returns it. [mergeable] is null while GitHub is still computing
- * it; [state] is `open` or `closed` (a merged pull request is `closed` with [merged] true).
+ * it; [rebaseable] is false when GitHub cannot rebase the head onto the base (e.g. the head holds merge commits) and
+ * null while unknown; [state] is `open` or `closed` (a merged pull request is `closed` with [merged] true).
  */
 @Serializable
 data class GhPullInfo(
@@ -91,6 +92,7 @@ data class GhPullInfo(
     val state: String = "open",
     val merged: Boolean = false,
     val mergeable: Boolean? = null,
+    val rebaseable: Boolean? = null,
     @SerialName("mergeable_state") val mergeableState: String? = null,
     val head: GhRef = GhRef(),
     val base: GhRef = GhRef(),

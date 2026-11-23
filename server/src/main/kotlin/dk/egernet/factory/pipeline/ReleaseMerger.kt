@@ -197,7 +197,8 @@ class ReleaseMerger(
 
     /**
      * Merges a `ready`, complete, conflict-free release into the default branch as its [owner] (already checked to be
-     * the owner): rebase (or a merge commit where rebase merging is disabled), never squash. Refusals change nothing
+     * the owner): rebase (or a merge commit where rebase merging is disabled or GitHub cannot rebase the branch), never
+     * squash. Refusals change nothing
      * on GitHub. Serialised per release: a second approval finds the release `released` (409 `release_not_ready`).
      */
     suspend fun approve(owner: UserRecord, id: UUID): ReleaseRecord {
@@ -356,7 +357,8 @@ class ReleaseMerger(
             else -> ReleaseMergeState.UNKNOWN
         }
         // The method first: whoever sees the merge state also sees how it would be merged.
-        io { store.setMergeMethod(id, methodFor(repo)) }
+        val method = methodFor(repo, info?.rebaseable)
+        io { store.setMergeMethod(id, method) }
         recordMergeState(withPr, state, client)
         setNotice(id, null)
         val headSha = if (info != null && info.state == "open") info.head.sha.takeIf { it.isNotEmpty() } else null
@@ -368,6 +370,12 @@ class ReleaseMerger(
                 setNotice(id, it)
                 return
             }
+        }
+        // Rebase is impossible and merge commits are not allowed: no method works (Agern never squashes). Held like a
+        // conflict: no announcement, no automatic merge; approval answers the same.
+        if (info?.rebaseable == false && method == ReleaseMergeMethod.REBASE) {
+            setNotice(id, cannotRebaseText(withPr, repo.defaultBranch, before = true))
+            return
         }
 
         if (withPr.complete && state != ReleaseMergeState.CONFLICT && io { store.claimReadyAnnouncement(id) }) {
@@ -542,14 +550,28 @@ class ReleaseMerger(
 
     /**
      * The merge method approval uses: `rebase` keeps each issue's squash commit as one commit and the history linear; a
-     * merge commit (which keeps them too, plus one merge commit) only where rebase merging is disabled; `unavailable`
-     * when the repository allows neither. A setting GitHub leaves out counts as allowed.
+     * merge commit (which keeps them too, plus one merge commit) where rebase merging is disabled or GitHub reports the
+     * pull request as not [rebaseable] (e.g. the default branch was merged into the release branch to resolve a
+     * conflict); `unavailable` when the repository allows neither. A setting GitHub leaves out counts as allowed, and so
+     * does a rebaseability it has not computed yet (null). Not rebaseable without merge commits stays `rebase`: GitHub
+     * may compute it differently once the branch changes, and the evaluation holds the release with a notice meanwhile.
      */
-    private fun methodFor(repo: GhRepo): String = when {
-        repo.allowRebaseMerge != false -> ReleaseMergeMethod.REBASE
+    private fun methodFor(repo: GhRepo, rebaseable: Boolean?): String = when {
+        repo.allowRebaseMerge != false && (rebaseable != false || repo.allowMergeCommit == false) -> ReleaseMergeMethod.REBASE
         repo.allowMergeCommit != false -> ReleaseMergeMethod.MERGE
         else -> ReleaseMergeMethod.UNAVAILABLE
     }
+
+    /** Why a release GitHub cannot rebase cannot be merged at all: merge commits are not allowed either. */
+    private fun cannotRebaseText(r: ReleaseRecord, target: String, before: Boolean): String =
+        "GitHub cannot rebase `${r.branch}` onto `$target` (it contains merge commits, e.g. from merging `$target` into it), " +
+            "and ${r.repo} does not allow merge commits; Agern never squashes a release. Allow merge commits in the " +
+            "repository's GitHub settings, or rebuild the release branch without merge commits, then " +
+            (if (before) "use \"Check again\"." else "approve again. Nothing was merged.")
+
+    /** GitHub's refusal of a rebase merge because the branch cannot be rebased (405 "This branch can't be rebased"). */
+    private fun cannotRebase(e: GitHubException) =
+        e.status == 405 && Regex("can.?t be rebased|cannot be rebased", RegexOption.IGNORE_CASE).containsMatchIn(e.message ?: "")
 
     /** Title and body of the release pull request (no closing keywords: Agern closes the issues itself). */
     private fun pullText(r: ReleaseRecord, owner: UserRecord?, target: String): Pair<String, String> {
@@ -621,26 +643,56 @@ class ReleaseMerger(
             recordMergeState(now, ReleaseMergeState.CONFLICT, client)
             throw conflict(conflictMsg, "release_conflict")
         }
+        if (head?.rebaseable == false && method == ReleaseMergeMethod.REBASE) {
+            // The evaluation found no method that works (merge commits are not allowed): refuse before merging.
+            val text = cannotRebaseText(now, target, before = false)
+            setNotice(id, text)
+            throw conflict(text, "release_merge_failed")
+        }
         mergeLocked(owner, now, pr, method, head?.head?.sha?.takeIf { it.isNotEmpty() }, client, automatic = false)
     }
 
     /**
      * The merge itself, shared by an approval and an automatic release: [method] (never squash), refused by GitHub if
-     * the head moved from [headSha], then [finishLocked]. A refusal throws the [ApiException] an approval answers.
+     * the head moved from [headSha], then [finishLocked] with the method actually used. A rebase GitHub refuses because
+     * the branch cannot be rebased (405 "can't be rebased", e.g. its rebaseability was not computed yet when it was
+     * read) is tried once more with a merge commit where the repository allows one. A refusal throws the
+     * [ApiException] an approval answers.
      */
     private suspend fun mergeLocked(
         owner: UserRecord, now: ReleaseRecord, pr: Int, method: String, headSha: String?, client: GitHubClient, automatic: Boolean,
     ) {
-        val sha = try {
-            io {
-                client.mergePull(
-                    org, now.repo, pr, method, if (method == ReleaseMergeMethod.MERGE) "Release ${now.name} (#$pr)" else null, headSha,
-                )
-            }
-        } catch (e: GitHubException) {
-            throw mergeRefused(now, pr, method, e, client)
+        suspend fun merge(m: String) = io {
+            client.mergePull(org, now.repo, pr, m, if (m == ReleaseMergeMethod.MERGE) "Release ${now.name} (#$pr)" else null, headSha)
         }
-        finishLocked(now.id, method, sha, owner, automatic)
+        var used = method
+        val sha = try {
+            merge(method)
+        } catch (e: GitHubException) {
+            if (method != ReleaseMergeMethod.REBASE || !cannotRebase(e)) throw mergeRefused(now, pr, method, e, client)
+            val repo = try {
+                io { client.getRepo(org, now.repo) }
+            } catch (re: GitHubException) {
+                null
+            }
+            val target = now.targetBranch ?: repo?.defaultBranch ?: "the default branch"
+            if (repo == null || repo.allowMergeCommit == false) {
+                val text = if (repo == null) "Merging pull request #$pr failed: ${e.message} (and ${now.repo}'s merge settings could " +
+                    "not be read to try a merge commit instead). Check again, then approve."
+                    else cannotRebaseText(now, target, before = false)
+                setNotice(now.id, text)
+                throw conflict(text, "release_merge_failed")
+            }
+            log.info("Release {}: GitHub cannot rebase pull request #{}; merging it with a merge commit instead", now.id, pr)
+            used = ReleaseMergeMethod.MERGE
+            try {
+                merge(used)
+            } catch (e2: GitHubException) {
+                throw mergeRefused(now, pr, used, e2, client)
+            }
+        }
+        if (used != method) io { store.setMergeMethod(now.id, used) }
+        finishLocked(now.id, used, sha, owner, automatic)
     }
 
     private fun methodUnavailable(msg: String) = conflict(msg, "release_merge_method_unavailable")

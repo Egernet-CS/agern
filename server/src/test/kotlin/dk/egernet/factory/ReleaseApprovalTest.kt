@@ -278,6 +278,81 @@ class ReleaseApprovalTest {
     }
 
     @Test
+    fun `a release GitHub cannot rebase is merged with a merge commit, and the method used is recorded`() {
+        // The default branch was merged into the release branch (to resolve a conflict): GitHub cannot rebase it.
+        val r0 = release("nr", listOf(issue("Merged main in", "gate")))
+        start(r0.id)
+        gh.notRebaseable += "demo-app:release/nr"
+        gates["Merged main in"] = true
+        val r = awaitReady(r0.id)
+        assertEquals(ReleaseMergeMethod.MERGE, r.mergeMethod, "shown before approval")
+        assertNull(r.notice)
+        val done = approve(r.id)
+        assertEquals(ReleaseStatus.RELEASED, done.status)
+        assertEquals(ReleaseMergeMethod.MERGE, done.mergeMethod)
+        assertEquals(listOf("merge-merge demo-app #${r.prNumber}"), gh.actions.filter { it.startsWith("merge-") })
+        val n = r.issues.single().number
+        assertEquals(listOf("Initial commit", "Merged main in (#$n)", "Release nr (#${r.prNumber})"), gh.commitsOf("demo-app", "main"))
+        eventually("released comment") { comments(n).any { it.startsWith("**Agern: released**") } }
+        assertTrue(comments(n).last().contains("merged into `main` with a merge commit, one commit per issue"), comments(n).last())
+    }
+
+    @Test
+    fun `a rebase GitHub refuses as impossible falls back once to a merge commit`() {
+        // GitHub had not computed rebaseability when it was read: approval tries rebase, which GitHub refuses (405).
+        gh.hideRebaseable = true
+        val r = readyRelease("late", "Late")
+        assertEquals(ReleaseMergeMethod.REBASE, r.mergeMethod)
+        gh.notRebaseable += "demo-app:release/late"
+        val done = approve(r.id)
+        assertEquals(ReleaseStatus.RELEASED, done.status)
+        assertEquals(ReleaseMergeMethod.MERGE, done.mergeMethod, "the method actually used")
+        assertNull(done.notice)
+        // GitHub refused the rebase (nothing recorded), then merged once with a merge commit.
+        assertEquals(listOf("merge-merge demo-app #${r.prNumber}"), gh.actions.filter { it.startsWith("merge-") })
+        val n = r.issues.single().number
+        assertEquals(listOf("Initial commit", "Late (#$n)", "Release late (#${r.prNumber})"), gh.commitsOf("demo-app", "main"))
+        eventually("released comment") { comments(n).any { it.startsWith("**Agern: released**") } }
+        assertTrue(comments(n).last().contains("with a merge commit"), comments(n).last())
+
+        // Not rebaseable and merge commits not allowed: the fallback is refused before it is tried, nothing is merged.
+        val other = readyRelease("late2", "Late two")
+        gh.notRebaseable += "demo-app:release/late2"
+        gh.allowMergeCommit = false
+        val e = assertFailsWith<ApiException> { approve(other.id) }
+        assertEquals("release_merge_failed", e.code)
+        assertTrue(e.message.contains("cannot rebase") && e.message.contains("does not allow merge commits"), e.message)
+        assertTrue(e.message.contains("Nothing was merged"), e.message)
+        assertEquals(1, gh.actions.count { it.startsWith("merge-") }, "no second merge")
+        assertEquals(ReleaseStatus.READY, s.releaseStore.get(other.id)!!.status)
+        assertEquals("open", issueState(other.issues.single().number))
+    }
+
+    @Test
+    fun `a release GitHub cannot rebase in a repository without merge commits is a clear failure, never a squash`() {
+        gh.allowMergeCommit = false
+        val r0 = release("stuck", listOf(issue("Stuck", "gate")))
+        start(r0.id)
+        gh.notRebaseable += "demo-app:release/stuck"
+        gates["Stuck"] = true
+        val r = awaitReady(r0.id)
+        assertEquals(ReleaseMergeMethod.REBASE, r.mergeMethod)
+        assertTrue(r.notice!!.contains("GitHub cannot rebase `release/stuck` onto `main`"), r.notice)
+        assertTrue(r.notice!!.contains("does not allow merge commits"), r.notice)
+        val e = assertFailsWith<ApiException> { approve(r.id) }
+        assertEquals("release_merge_failed", e.code)
+        assertTrue(e.message.contains("Allow merge commits") && e.message.contains("Nothing was merged"), e.message)
+        assertTrue(gh.actions.none { it.startsWith("merge-") }, "nothing merged, never squashed")
+        assertEquals(ReleaseStatus.READY, s.releaseStore.get(r.id)!!.status)
+        // The branch is rebuilt without merge commits: GitHub can rebase it again and approval rebases.
+        gh.notRebaseable.clear()
+        assertNull(check(r.id).notice)
+        val done = approve(r.id)
+        assertEquals(ReleaseMergeMethod.REBASE, done.mergeMethod)
+        assertTrue("merge-rebase demo-app #${r.prNumber}" in gh.actions)
+    }
+
+    @Test
     fun `only the owner approves and checks, over HTTP`() = testApplication {
         application { agernModule(s) }
         world.user("bob")

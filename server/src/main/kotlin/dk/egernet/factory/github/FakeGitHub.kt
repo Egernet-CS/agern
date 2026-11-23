@@ -49,6 +49,17 @@ class FakeGitHub(private val org: String) : GitHub {
 
     /** Head branches (`"<repo>:<branch>"`) whose pull requests do not merge cleanly (mergeable false; merging fails). */
     val conflicting: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+    /**
+     * Head branches (`"<repo>:<branch>"`) GitHub cannot rebase onto their base (e.g. the base was merged into them with
+     * a merge commit): `getPull` reports `rebaseable` false and a rebase merge is refused with 405 "can't be rebased".
+     */
+    val notRebaseable: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+    /** `getPull` reports `rebaseable` as unknown (null), as GitHub does until it has computed it. */
+    @Volatile var hideRebaseable = false
+    /** The next this many `getPull` reads fail (502), as a transient GitHub or network error does. */
+    @Volatile var getPullFailures = 0
+    /** How often a pull request was read (`getPull`). */
+    val pullReads = java.util.concurrent.atomic.AtomicInteger()
     /** The next this many `getPull` reads report mergeability as not computed yet (null). */
     @Volatile var mergeableComputing = 0
     /** The repository's merge settings, as `getRepo` reports them (null: GitHub leaves the field out). */
@@ -318,6 +329,11 @@ class FakeGitHub(private val org: String) : GitHub {
 
         override fun getPull(org: String, repo: String, number: Int): GhPullInfo? = synchronized(this@FakeGitHub) {
             repo(org, repo)
+            pullReads.incrementAndGet()
+            if (getPullFailures > 0) {
+                getPullFailures--
+                throw GitHubException(502, "GitHub GET pull request failed: 502 Bad Gateway")
+            }
             val m = pullMeta[number]?.takeIf { it.repo == repo } ?: return@synchronized null
             val computing = mergeableComputing > 0
             if (computing) mergeableComputing--
@@ -325,6 +341,7 @@ class FakeGitHub(private val org: String) : GitHub {
             GhPullInfo(
                 number = number, htmlUrl = "https://github.com/$org/$repo/pull/$number", state = m.state, merged = m.merged,
                 mergeable = if (m.state != "open" || computing) null else clean,
+                rebaseable = if (m.state != "open" || computing || hideRebaseable) null else "$repo:${m.head}" !in notRebaseable,
                 mergeableState = if (m.state != "open" || computing) "unknown" else if (clean) "clean" else "dirty",
                 head = GhRef(m.head, "sha-${m.head}-${commitList(repo, m.head).size}"), base = GhRef(m.base, "sha-${m.base}"),
                 mergeCommitSha = m.mergeCommit,
@@ -349,6 +366,7 @@ class FakeGitHub(private val org: String) : GitHub {
                 if (method == "merge" && allowMergeCommit == false) throw GitHubException(405, "Merge commits are not allowed on this repository.")
                 if (m.state != "open") throw GitHubException(405, "Pull Request is not mergeable")
                 if (failMerge || "$repo:${m.head}" in conflicting) throw GitHubException(405, "Pull Request is not mergeable")
+                if (method == "rebase" && "$repo:${m.head}" in notRebaseable) throw GitHubException(405, "This branch can't be rebased")
                 if (commitTitle != null) m.title = commitTitle
                 val sha = applyMerge(m, number, method)
                 actions += "merge-$method $repo #$number"
