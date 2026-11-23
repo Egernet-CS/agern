@@ -25,6 +25,8 @@ data class ReleaseIssueRecord(
     val state: String = ReleaseIssueState.WAITING, val runId: UUID? = null, val note: String? = null,
     /** The pull request of [runId] into the release branch. */
     val prNumber: Int? = null, val prUrl: String? = null,
+    /** `continue` or `step`: a waiting issue retried from [runId] (docs/ARCHITECTURE.md §6 "Retrying a run"). */
+    val retryMode: String? = null,
 )
 
 data class ReleaseRecord(
@@ -62,7 +64,7 @@ data class ReleaseRecord(
     fun toDto() = ReleaseDto(
         id.toString(), repo, name, description, status, OwnerDto(createdByUsername, createdByDisplayName),
         createdAt.iso(), updatedAt.iso(),
-        issues.map { ReleaseIssueDto(it.number, it.title, it.kind, it.state, it.runId?.toString(), it.note, it.prNumber, it.prUrl) },
+        issues.map { ReleaseIssueDto(it.number, it.title, it.kind, it.state, it.runId?.toString(), it.note, it.prNumber, it.prUrl, it.retryMode) },
         owner = if (ownerId != null && ownerUsername != null) OwnerDto(ownerUsername, ownerDisplayName ?: ownerUsername) else null,
         branch = branch, startedAt = startedAt?.iso(), endedAt = endedAt?.iso(),
         pause = if (status == ReleaseStatus.PAUSED && pauseReason != null) ReleasePauseDto(pauseReason, pauseNote, resumeAt?.iso()) else null,
@@ -145,13 +147,13 @@ class ReleaseStore(private val db: Db) {
     private fun mapIssue(rs: ResultSet) = ReleaseIssueRecord(
         rs.getInt("issue_number"), rs.getString("issue_title"), rs.getString("issue_kind"),
         rs.getString("state"), rs.uuidOrNull("run_id"), rs.getString("note"),
-        rs.intOrNull("pr_number"), rs.getString("pr_url"),
+        rs.intOrNull("pr_number"), rs.getString("pr_url"), rs.getString("retry_mode"),
     )
 
     private fun issuesOf(ids: List<UUID>): Map<UUID, List<ReleaseIssueRecord>> {
         if (ids.isEmpty()) return emptyMap()
         return db.query(
-            "SELECT ri.release_id, ri.issue_number, ri.issue_title, ri.issue_kind, ri.state, ri.run_id, ri.note, ru.pr_number, ru.pr_url " +
+            "SELECT ri.release_id, ri.issue_number, ri.issue_title, ri.issue_kind, ri.state, ri.run_id, ri.note, ri.retry_mode, ru.pr_number, ru.pr_url " +
                 "FROM release_issues ri LEFT JOIN runs ru ON ru.id = ri.run_id WHERE ri.release_id IN (" +
                 ids.joinToString(",") { "?" } + ") ORDER BY ri.position, ri.added_at",
             *ids.toTypedArray(),
@@ -376,15 +378,18 @@ class ReleaseStore(private val db: Db) {
     fun cleanupPending(): List<UUID> =
         db.query("SELECT id FROM releases WHERE status = 'released' AND cleanup_pending") { it.uuid("id") }
 
-    /** Sets the state, note and run link of one issue of a release. */
-    fun setIssue(releaseId: UUID, number: Int, state: String, note: String?, runId: UUID?) = db.update(
-        "UPDATE release_issues SET state = ?, note = ?, run_id = ? WHERE release_id = ? AND issue_number = ?",
-        state, note, runId, releaseId, number,
+    /**
+     * Sets the state, note, run link and retry mode of one issue of a release. [retryMode] (`continue` or `step`, for a
+     * `waiting` issue retried from [runId]) is cleared by every other change.
+     */
+    fun setIssue(releaseId: UUID, number: Int, state: String, note: String?, runId: UUID?, retryMode: String? = null) = db.update(
+        "UPDATE release_issues SET state = ?, note = ?, run_id = ?, retry_mode = ? WHERE release_id = ? AND issue_number = ?",
+        state, note, runId, retryMode, releaseId, number,
     )
 
     /** Sets state and note of the issues of [releaseId] that are in [from]; returns how many changed. */
     fun setIssuesInState(releaseId: UUID, from: String, state: String, note: String?) = db.update(
-        "UPDATE release_issues SET state = ?, note = ? WHERE release_id = ? AND state = ?", state, note, releaseId, from,
+        "UPDATE release_issues SET state = ?, note = ?, retry_mode = NULL WHERE release_id = ? AND state = ?", state, note, releaseId, from,
     )
 
     /** The release issue linked to [runId] (its latest release run), if any. */

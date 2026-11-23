@@ -125,8 +125,10 @@ class ReleaseAutomaticTest {
 
     /** Ready, with the pull request open and its checks read (the automatic decision follows under the same mutex). */
     private fun awaitChecked(id: UUID, state: String) = awaitRelease(id, "ready with checks $state") {
-        // checksSha: read for the head commit (`unknown` is also the state before the first read).
-        it.status == ReleaseStatus.READY && it.prNumber != null && it.checksSha != null && it.checksState == state
+        // checksSha is stored before the checks are read, and `unknown` is also the state before the first read:
+        // the detail is written with the result, so it marks a finished read.
+        it.status == ReleaseStatus.READY && it.prNumber != null && it.checksSha != null && it.checksDetail != null &&
+            it.checksState == state
     }
 
     private fun awaitReleased(id: UUID, services: Services = s) =

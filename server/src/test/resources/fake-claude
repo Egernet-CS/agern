@@ -52,6 +52,8 @@ Behaviour
     - approver (--json-schema with APPROVE/ESCALATE): APPROVE, unless "fake:escalate"
     - "fake:fail-<role>" anywhere in the prompt makes that role exit with status 1 and no result
     - "fake:hang-<role>" makes that role hang until it is killed (stage time limit, cancel)
+    - "fake:stop-builder" makes the builder commit and then stop with "API Error: Can't reach the API server", unless
+        the prompt is a continuation ("Do not redo that work"), which builds normally
     - "fake:slow" makes every stage take ~1.5 s, so the pipeline can be watched advancing
     - "fake:markdown" makes reviewers and the approver write their summaries and findings in Markdown
       (lists, bold, inline code with a long path, a code block, a link and literal HTML)
@@ -638,6 +640,11 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
             if os.path.isfile(os.path.join("assets", "fake-icon.png")):
                 subprocess.run(["git", "add", os.path.join("assets", "fake-icon.png")], check=False)
             subprocess.run(["git", "commit", "-q", "-m", "Fake build commit"], check=False)
+        if "fake:stop-builder" in prompt and "Do not redo that work" not in prompt:
+            text = "API Error: Can't reach the API server - check your internet or DNS (fake)"
+            stream_text(text)
+            result(text, subtype="error_during_execution", is_error=True)
+            return
         text = "Implemented the change (fake). Ran no tests because I am a stub." + sandbox_report + image_report
         if received:
             text += "\nOwner messages handled: " + "; ".join(received)

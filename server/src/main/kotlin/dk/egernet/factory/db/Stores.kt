@@ -361,6 +361,16 @@ data class RunRecord(
     /** [dk.egernet.factory.ReviewState]. */
     val reviewState: String = dk.egernet.factory.ReviewState.NONE,
     val followUpFrom: Int? = null,
+    /** The failed run this one continues from (docs/ARCHITECTURE.md §6 "Retrying a run"). */
+    val continuesRunId: UUID? = null,
+    /** The spec the builder got: written by this run's spec-writer or reused from [continuesRunId]. */
+    val spec: String? = null,
+    /** The builder's last final message (for a step retry, whose reviewers need it). */
+    val builderSummary: String? = null,
+    /** [dk.egernet.factory.FailureKind] of a failed run. */
+    val failureKind: String? = null,
+    /** [dk.egernet.factory.FailedStep] that failed after the builder finished. */
+    val failedStep: String? = null,
 )
 
 class RunStore(private val db: Db) {
@@ -377,6 +387,8 @@ class RunStore(private val db: Db) {
         rs.uuidOrNull("started_by_session_id"), rs.getString("error"), rs.instant("created_at"), rs.instant("updated_at"),
         rs.instantOrNull("ended_at"), rs.getString("sandbox"), rs.uuidOrNull("release_id"), rs.getString("base_branch"),
         rs.uuidOrNull("advisor_session_id"), rs.getString("reviewed_sha"), rs.getString("review_state"), rs.intOrNull("follow_up_from"),
+        rs.uuidOrNull("continues_run_id"), rs.getString("spec"), rs.getString("builder_summary"),
+        rs.getString("failure_kind"), rs.getString("failed_step"),
     )
 
     private fun mapStage(rs: ResultSet) = StageRecord(
@@ -392,7 +404,7 @@ class RunStore(private val db: Db) {
      */
     fun createIfNoActive(
         repo: String, issueNumber: Int, issueTitle: String, issueKind: String, maxRounds: Int, ownerId: UUID, startedBy: UUID?,
-        releaseId: UUID? = null, baseBranch: String? = null,
+        releaseId: UUID? = null, baseBranch: String? = null, continuesRunId: UUID? = null, spec: String? = null,
     ): RunRecord? {
         val id = UUID.randomUUID()
         val inserted = db.tx { c ->
@@ -404,9 +416,9 @@ class RunStore(private val db: Db) {
             if (active > 0) return@tx false
             c.prepare(
                 """INSERT INTO runs(id, repo, issue_number, issue_title, issue_kind, status, max_rounds, owner_id, started_by_session_id,
-                     release_id, base_branch)
-                   VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)""",
-                arrayOf<Any?>(id, repo, issueNumber, issueTitle, issueKind, maxRounds, ownerId, startedBy, releaseId, baseBranch),
+                     release_id, base_branch, continues_run_id, spec)
+                   VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)""",
+                arrayOf<Any?>(id, repo, issueNumber, issueTitle, issueKind, maxRounds, ownerId, startedBy, releaseId, baseBranch, continuesRunId, spec),
             ).use { it.executeUpdate() }
             true
         }
@@ -414,6 +426,42 @@ class RunStore(private val db: Db) {
     }
 
     fun get(id: UUID) = db.queryOne("$select WHERE r.id = ?", id, map = ::map)
+
+    /**
+     * A failed (or cancelled) run becomes active again for a step retry: `queued`, error, end time and failure cleared.
+     * Refused (false) when the run is not failed/cancelled any more or the issue has another active run; checked under
+     * the same lock as [createIfNoActive].
+     */
+    fun reactivate(id: UUID): Boolean = db.tx { c ->
+        val run = get(id) ?: return@tx false
+        c.prepare("SELECT pg_advisory_xact_lock(hashtext(?))", arrayOf<Any?>("${run.repo}#${run.issueNumber}")).use { it.executeQuery().close() }
+        val active = c.prepare(
+            "SELECT count(*) FROM runs WHERE repo = ? AND issue_number = ? AND id <> ? AND status IN ('queued','spec','building','reviewing','approving','needs_human')",
+            arrayOf<Any?>(run.repo, run.issueNumber, id),
+        ).use { ps -> ps.executeQuery().use { rs -> rs.next(); rs.getInt(1) } }
+        if (active > 0) return@tx false
+        c.prepare(
+            """UPDATE runs SET status = 'queued', error = NULL, ended_at = NULL, failure_kind = NULL, failed_step = NULL, updated_at = now()
+               WHERE id = ? AND status IN ('failed','cancelled')""",
+            arrayOf<Any?>(id),
+        ).use { it.executeUpdate() } == 1
+    }
+
+    /** The newest run that continues [id], if any. */
+    fun continuedBy(id: UUID): UUID? = db.queryOne(
+        "SELECT id FROM runs WHERE continues_run_id = ? ORDER BY created_at DESC LIMIT 1", id,
+    ) { it.uuid("id") }
+
+    fun setSpec(id: UUID, spec: String) = db.update("UPDATE runs SET spec = ?, updated_at = now() WHERE id = ?", spec, id)
+    fun setBuilderSummary(id: UUID, summary: String) =
+        db.update("UPDATE runs SET builder_summary = ?, updated_at = now() WHERE id = ?", summary, id)
+    fun setFailure(id: UUID, kind: String?, step: String?) =
+        db.update("UPDATE runs SET failure_kind = ?, failed_step = ?, updated_at = now() WHERE id = ?", kind, step, id)
+
+    /** For a step retry: the stages a failure skipped (reviewers, approver) are pending again. */
+    fun reopenSkippedStages(runId: UUID) = db.update(
+        "UPDATE stages SET status = 'pending', ended_at = NULL WHERE run_id = ? AND status = 'skipped' AND role <> 'spec-writer'", runId,
+    )
 
     /** [statuses]: when not null, only runs in one of these statuses (`active` = [RunStatus.ACTIVE]). */
     fun list(repo: String?, activeOnly: Boolean, limit: Int = 200, statuses: Set<String>? = null): List<RunRecord> {
@@ -564,6 +612,8 @@ class RunStore(private val db: Db) {
             sandbox = r.sandboxJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunSandboxDto.serializer(), it) }.getOrNull() },
             releaseId = r.releaseId?.toString(), baseBranch = r.baseBranch,
             conversation = dk.egernet.factory.RunConversationDto(r.advisorSessionId?.toString(), r.reviewState, r.followUpFrom),
+            continuesRunId = r.continuesRunId?.toString(), continuedByRunId = continuedBy(r.id)?.toString(),
+            failureKind = r.failureKind, failedStep = r.failedStep,
         )
     }
 
@@ -571,7 +621,8 @@ class RunStore(private val db: Db) {
     fun failUnfinishedAfterRestart(): List<UUID> {
         val ids = db.query("SELECT id FROM runs WHERE status IN ('queued','spec','building','reviewing','approving')") { it.uuid("id") }
         for (id in ids) {
-            setStatus(id, RunStatus.FAILED, "Server restarted while the run was in progress; start a new run.")
+            setStatus(id, RunStatus.FAILED, "Server restarted while the run was in progress; retry it to continue or start over.")
+            setFailure(id, dk.egernet.factory.FailureKind.RESTART, null)
             closeOpenStages(id)
         }
         return ids

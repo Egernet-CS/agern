@@ -105,6 +105,8 @@ export type ReleaseIssue = {
   /** The pull request of its run into the release branch. */
   prNumber: number | null;
   prUrl: string | null;
+  /** A waiting issue retried with `continue` or `step` from `runId`; null when it is built from scratch. */
+  retryMode?: 'continue' | 'step' | null;
 };
 
 export type ReleasePauseReason = 'manual' | 'usage_limit' | 'credentials';
@@ -356,6 +358,31 @@ export type Run = {
   baseBranch: string | null;
   /** The owner's conversation with the advisor while the run needs a human. Always present. */
   conversation: RunConversation;
+  /** The failed run this one continues from its commits (docs/ARCHITECTURE.md §6 "Retrying a run"). */
+  continuesRunId?: string | null;
+  /** The newest run that continues this one. */
+  continuedByRunId?: string | null;
+  /** Why a failed run stopped. */
+  failureKind?: FailureKind | null;
+  /** The mechanical step after the builder that failed. */
+  failedStep?: FailedStep | null;
+};
+
+export type FailureKind = 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other';
+export type FailedStep = 'push' | 'pull_request' | 'merge';
+
+/** `step`: retry the failed step on the same run; `continue`: a new run from its commits; `start_over`: from scratch. */
+export type RetryMode = 'step' | 'continue' | 'start_over';
+export type RetryOption = { mode: RetryMode; available: boolean; detail: string };
+/** How a run (or a held release issue) can be retried, and what is recommended, with a one-line reason. */
+export type RetryOptions = {
+  runId: string;
+  recommended: RetryMode;
+  reason: string;
+  options: RetryOption[];
+  step: FailedStep | null;
+  commits: number | null;
+  releaseId: string | null;
 };
 
 /** Follow-up review of changes made in the conversation: `required` = not reviewed yet, `running` = reviewers at work. */

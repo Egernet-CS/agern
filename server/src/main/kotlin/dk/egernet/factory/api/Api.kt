@@ -100,6 +100,17 @@ private val log = LoggerFactory.getLogger("dk.egernet.factory.api")
 @Serializable data class ScheduleReq(val startAt: String)
 @Serializable data class AssignReq(val issueNumbers: List<Int>, val releaseId: String? = null)
 @Serializable data class OrderReq(val issueNumbers: List<Int>)
+
+/** The body of a retry request; an empty body (older clients) is `{}`, i.e. start over. */
+private suspend fun ApplicationCall.retryReq(): dk.egernet.factory.RetryReq {
+    val text = receiveText()
+    if (text.isBlank()) return dk.egernet.factory.RetryReq()
+    return try {
+        AppJson.decodeFromString(dk.egernet.factory.RetryReq.serializer(), text)
+    } catch (e: Exception) {
+        throw badRequest("Invalid retry request: expected {\"mode\": \"step\" | \"continue\" | \"start_over\" | \"recommended\"}")
+    }
+}
 @Serializable data class CreateSessionReq(val model: String? = null)
 @Serializable data class TalkReq(val text: String = "")
 @Serializable data class InputReq(val text: String = "", val attachmentIds: List<String> = emptyList())
@@ -491,6 +502,12 @@ private fun Route.runRoutes(s: Services) {
         call.respond(HttpStatusCode.Accepted, s.factory.talkToRun(u, id, req.text))
     }
     post("/runs/{id}/review") { call.respond(s.factory.reviewRun(call.requireUser(s), uuidParam("id"))) }
+    // Retrying a failed run (docs/ARCHITECTURE.md §6 "Retrying a run"): options for anyone who can see it, retry owner only.
+    get("/runs/{id}/retry") { call.respond(s.factory.retryOptions(call.requireUser(s), uuidParam("id"))) }
+    post("/runs/{id}/retry") {
+        val u = call.requireUser(s)
+        call.respond(s.factory.retryRun(u, uuidParam("id"), call.retryReq().mode))
+    }
 }
 
 // ------------------------------------------------------------------ releases (docs/ARCHITECTURE.md §6 "Releases")
@@ -571,11 +588,18 @@ private fun Route.releaseRoutes(s: Services) {
         val u = call.requireUser(s)
         call.respond(s.releases.check(u, uuidParam("id")).toDto())
     }
+    get("/releases/{id}/issues/{number}/retry") {
+        val u = call.requireUser(s)
+        val id = uuidParam("id")
+        val number = call.parameters["number"]?.toIntOrNull()?.takeIf { it > 0 } ?: throw badRequest("Issue number must be a positive integer")
+        call.respond(s.releases.retryOptions(u, id, number))
+    }
     post("/releases/{id}/issues/{number}/retry") {
         val u = call.requireUser(s)
         val id = uuidParam("id")
         val number = call.parameters["number"]?.toIntOrNull()?.takeIf { it > 0 } ?: throw badRequest("Issue number must be a positive integer")
-        call.respond(s.releases.retry(u, id, number).toDto())
+        // No body (older clients) = start over, as before retry modes existed.
+        call.respond(s.releases.retry(u, id, number, call.retryReq().mode).toDto())
     }
     put("/releases/{id}/issues/order") {
         val u = call.requireUser(s)

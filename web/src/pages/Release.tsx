@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api, ApiError, isReleaseActive, releaseReadiness, type Release, type ReleaseChecks, type ReleaseIssue, type ReleaseMode } from '../api';
+import { RetryDialog } from '../components/ui/RetryDialog';
 import { Dialog, Empty, ErrorBox, IssueStateBadge, KindBadge, Loading, Notice, ReleaseStatusPill } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
@@ -40,6 +41,7 @@ export function ReleasePage() {
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [confirmRelease, setConfirmRelease] = useState(false);
   const [checking, setChecking] = useState(false);
+  const [retryIssue, setRetryIssue] = useState<number | null>(null);
   // Set before this user's own delete request, so they are not told "This release was deleted".
   const deletedByMe = useRef(false);
 
@@ -141,7 +143,6 @@ export function ReleasePage() {
     return planned || (release.issues[index].state === 'waiting' && other.state === 'waiting');
   };
   const remove = (n: number) => void change(() => api.assignIssues(repo, [n], null));
-  const retry = (n: number) => void change(() => api.retryReleaseIssue(release.id, n));
   const add = async (e: FormEvent) => {
     e.preventDefault();
     const n = Number(toAdd);
@@ -380,6 +381,9 @@ export function ReleasePage() {
                     {started && (i.state === 'held' || i.state === 'skipped' || i.state === 'waiting') && i.note && (
                       <span className="ro-note small">{i.note}</span>
                     )}
+                    {started && i.state === 'waiting' && i.retryMode && (
+                      <span className="ro-note small">{i.retryMode === 'step' ? 'Retries the failed step of its run' : 'Continues from the commits of its run'} when its turn comes.</span>
+                    )}
                   </span>
                   {started && <IssueStateBadge state={i.state} />}
                   {i.runId && (
@@ -394,7 +398,7 @@ export function ReleasePage() {
                   )}
                   <span className="ro-actions">
                     {may.retry(i) && (
-                      <button type="button" className="btn btn--ghost btn--sm" aria-label={`Retry #${i.number}`} title="Build it again" disabled={busy} onClick={() => retry(i.number)}>
+                      <button type="button" className="btn btn--ghost btn--sm" aria-label={`Retry #${i.number}`} title="Build it again: retry the failed step, continue from the commits, or start over" disabled={busy} onClick={() => setRetryIssue(i.number)}>
                         Retry
                       </button>
                     )}
@@ -464,6 +468,17 @@ export function ReleasePage() {
         onStarted={(r) => noteReleases([r])}
       />
       <ApproveReleaseDialog release={release} open={confirmRelease} busy={busy} onClose={() => setConfirmRelease(false)} onConfirm={() => void doRelease()} />
+      <RetryDialog
+        open={retryIssue !== null}
+        title={`Retry #${retryIssue ?? ''}?`}
+        load={() => api.releaseIssueRetryOptions(release.id, retryIssue ?? 0)}
+        onClose={() => setRetryIssue(null)}
+        onRetry={async (mode) => {
+          if (retryIssue === null) return;
+          noteReleases([await api.retryReleaseIssue(release.id, retryIssue, mode)]);
+        }}
+      />
+
       <Dialog open={confirmCancel} onClose={() => setConfirmCancel(false)} title="Cancel release?">
         <div className="form">
           <p>

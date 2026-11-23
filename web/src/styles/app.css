@@ -3132,3 +3132,46 @@ html.app-locked #root {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* ------------------------------------------------------------------ retry a failed run */
+.retry-reason {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border-radius: var(--r);
+  border: 1px solid var(--line-2);
+  background: var(--surface-2);
+  overflow-wrap: anywhere;
+}
+.retry-choice {
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.retry-choice label > span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.retry-choice label.is-disabled {
+  opacity: 0.55;
+}
+.retry-label {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+.retry-badge {
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 999px;
+  color: var(--amber-ink);
+  background: var(--amber);
+}
+.retry-detail {
+  overflow-wrap: anywhere;
+}
+.run-links {
+  margin: 0;
+}

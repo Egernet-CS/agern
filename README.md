@@ -55,7 +55,7 @@ Models per role are a setting. The details are in [`docs/ARCHITECTURE.md`](docs/
   terminal shows them (streamed text, tool calls, cost per turn). Anyone who can read the repository
   can watch; sessions owned by someone else are read-only.
 - **Agents can use the factory.** The chat agent gets factory tools over MCP (list and create issues,
-  start, approve and cancel runs), and `/factory run|status|approve|cancel` works in the chat.
+  start, approve and cancel runs), and `/factory run|status|approve|cancel|retry` works in the chat.
 - **Generated images.** Each person can register an image AI under Settings: OpenAI or Google Gemini
   with their own API key and model, or OpenAI Codex signed in with their own ChatGPT account. When a request or issue asks for an icon, illustration or other graphics,
   the chat agent, spec-writer and builder have them generated on the server with the owner's key; chat
@@ -63,6 +63,10 @@ Models per role are a setting. The details are in [`docs/ARCHITECTURE.md`](docs/
 - **Talk to an agent when a run needs a human.** Before approving an escalated run, its owner can ask an
   agent about the run's diff and findings, or ask it for a change, which is pushed and reviewed again by the
   four reviewers before the run can be approved. Talking never approves anything.
+- **Retry without losing work.** A failed run can retry just the step that failed (a refused push, a
+  pull request, a merge), continue from its commits in a new run that reuses its spec, or start over;
+  the sensible choice is preselected with a one-line reason. Builders are warned before the stage time
+  limit so they can commit and leave a hand-over note.
 - **Build and test sandboxes (optional).** A project describes a container for its builds and tests
   in `.agern/sandbox.yml` — toolchain image, setup script, sidecar services such as PostgreSQL with a
   readiness check, caches, a non-root user, and extra *platform* images to test on. After an admin

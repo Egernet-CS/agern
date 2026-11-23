@@ -14,6 +14,8 @@ import type {
   Release,
   ReleaseChecks,
   ReleaseMode,
+  RetryMode,
+  RetryOptions,
   Run,
   PendingSandbox,
   RunSandbox,
@@ -1683,7 +1685,70 @@ export function cancelRelease(r: Release, by: User) {
   return r;
 }
 
-export function retryReleaseIssue(r: Release, n: number, by: User) {
+/** Retry options as the server computes them, simplified: a mock branch "has commits" unless the builder made none. */
+export function retryOptionsFor(run: Run | undefined): RetryOptions {
+  if (!run) {
+    return {
+      runId: '', recommended: 'start_over', reason: 'The issue has no run to continue from.', step: null, commits: null, releaseId: null,
+      options: [
+        { mode: 'step', available: false, detail: 'The issue has no run.' },
+        { mode: 'continue', available: false, detail: 'The issue has no run.' },
+        { mode: 'start_over', available: true, detail: 'A new run from scratch.' },
+      ],
+    };
+  }
+  const blocked = /no commits/i.test(run.error ?? '') || run.stages.every((s) => s.role !== 'builder' || s.status !== 'done' && s.status !== 'failed');
+  const commits = blocked ? 0 : 2;
+  const canContinue = commits > 0 && ['failed', 'cancelled', 'needs_human'].includes(run.status);
+  const recommended: RetryMode = !canContinue || run.status === 'cancelled' ? 'start_over' : 'continue';
+  const reason = recommended === 'continue'
+    ? `The run failed after ${commits} commits${run.error ? ` (${run.error.split('\n')[0].slice(0, 120)})` : ''}; continue from them.`
+    : run.status === 'cancelled' && canContinue ? `The run was cancelled; its branch has ${commits} commits if you want to continue.` : "The run's branch has no commits of its own.";
+  return {
+    runId: run.id, recommended, reason, step: null, commits, releaseId: run.releaseId,
+    options: [
+      { mode: 'step', available: false, detail: 'Only when the builder finished and a later step (push, pull request, merge) failed.' },
+      { mode: 'continue', available: canContinue, detail: canContinue ? `A new run starts from branch ${run.branch} (${commits} commits), reuses the spec and finishes the work.` : "Only when the run's branch has commits of its own." },
+      { mode: 'start_over', available: true, detail: 'A new run on a new branch from scratch; the old branch is left as it is.' },
+    ],
+  };
+}
+
+function checkMode(opts: RetryOptions, mode: RetryMode | undefined): RetryMode {
+  const m = mode ?? 'start_over';
+  const o = opts.options.find((x) => x.mode === m);
+  if (!o?.available) throw new MockError(409, 'retry_mode_unavailable', `Cannot retry with '${m}': ${o?.detail ?? ''}`);
+  return m;
+}
+
+export function retryRun(r: Run, mode: RetryMode | undefined, by: User): Run {
+  if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner of this run can retry it');
+  if (r.releaseId) throw new MockError(409, 'release_run', "This run builds an issue of a release; retry the issue on the release's page");
+  if (r.status !== 'failed' && r.status !== 'cancelled') throw new MockError(409, 'run_not_retryable', `Run is ${r.status}; only failed or cancelled runs can be retried`);
+  const m = checkMode(retryOptionsFor(r), mode);
+  const next = startRun(r.repo, r.issueNumber, by);
+  if (m === 'continue') {
+    next.continuesRunId = r.id;
+    r.continuedByRunId = next.id;
+  }
+  return next;
+}
+
+export function retryReleaseIssue(r: Release, n: number, by: User, mode?: RetryMode) {
+  const held = r.issues.find((i) => i.number === n);
+  const oldRun = held?.runId ? db.runs.get(held.runId) : undefined;
+  const m = held ? checkMode(retryOptionsFor(oldRun), mode) : 'start_over';
+  const result = retryReleaseIssueOver(r, n, by);
+  const now = r.issues.find((i) => i.number === n);
+  const newRun = now?.runId ? db.runs.get(now.runId) : undefined;
+  if (m === 'continue' && oldRun && newRun) {
+    newRun.continuesRunId = oldRun.id;
+    oldRun.continuedByRunId = newRun.id;
+  }
+  return result;
+}
+
+function retryReleaseIssueOver(r: Release, n: number, by: User) {
   if (r.status === 'released') notEditable(r);
   if (!isStartedOpen(r)) throw new MockError(409, 'release_not_building', `Release "${r.name}" is not building or paused`);
   guardRelease(r, by, 'owner');

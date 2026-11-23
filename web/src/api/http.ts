@@ -138,7 +138,8 @@ export const httpApi: Api = {
   pauseRelease: (id) => post(`/api/releases/${enc(id)}/pause`),
   resumeRelease: (id) => post(`/api/releases/${enc(id)}/resume`),
   cancelRelease: (id) => post(`/api/releases/${enc(id)}/cancel`),
-  retryReleaseIssue: (id, issueNumber) => post(`/api/releases/${enc(id)}/issues/${issueNumber}/retry`),
+  retryReleaseIssue: (id, issueNumber, mode) => post(`/api/releases/${enc(id)}/issues/${issueNumber}/retry`, mode ? { mode } : {}),
+  releaseIssueRetryOptions: (id, issueNumber) => get(`/api/releases/${enc(id)}/issues/${issueNumber}/retry`),
   approveRelease: (id) => post(`/api/releases/${enc(id)}/approve`),
   checkRelease: (id) => post(`/api/releases/${enc(id)}/check`),
   setReleaseMode: (id, mode) => put(`/api/releases/${enc(id)}/mode`, { mode }),
@@ -166,6 +167,8 @@ export const httpApi: Api = {
   cancelRun: (id) => post(`/api/runs/${enc(id)}/cancel`),
   talkToRun: (id, text) => post(`/api/runs/${enc(id)}/conversation`, { text }),
   reviewRun: (id) => post(`/api/runs/${enc(id)}/review`),
+  runRetryOptions: (id) => get(`/api/runs/${enc(id)}/retry`),
+  retryRun: (id, mode) => post(`/api/runs/${enc(id)}/retry`, mode ? { mode } : {}),
 
   projectSessions: (repo, kind) => get(`/api/projects/${enc(repo)}/sessions${kind ? `?kind=${kind}` : ''}`),
   createChat: (repo, model) => post(`/api/projects/${enc(repo)}/sessions`, model ? { model } : {}),
