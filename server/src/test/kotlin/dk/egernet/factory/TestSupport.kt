@@ -175,13 +175,23 @@ class FakeGitOps : GitOps {
         return files[path]
     }
     override fun ensureClone(id: AgentIdentity, cloneUrl: String, dir: Path, home: Path) { Files.createDirectories(dir) }
-    override fun createWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, baseBranch: String, home: Path): String {
+    override fun createWorktree(
+        id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, baseBranch: String, home: Path, startFrom: String?,
+    ): String {
         Files.createDirectories(worktree)
-        worktrees += "$branch <- $baseBranch"
+        worktrees += "$branch <- ${startFrom ?: baseBranch}"
         return "origin/$baseBranch"
     }
     override fun commitsAhead(worktree: Path, baseRef: String, home: Path) = commits
-    override fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path) { pushes += branch }
+    /** What [branchCommits] answers (null: the branch is not found). */
+    @Volatile var branchCommits: Int? = 1
+    override fun branchCommits(id: AgentIdentity?, mainDir: Path, branch: String, baseBranch: String, home: Path): Int? = branchCommits
+    /** While set, [push] throws a [dk.egernet.factory.git.GitException] with this text. */
+    @Volatile var failPush: String? = null
+    override fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path) {
+        failPush?.let { throw dk.egernet.factory.git.GitException(it) }
+        pushes += branch
+    }
     override fun listWorktrees(mainDir: Path, home: Path): List<dk.egernet.factory.git.WorktreeInfo> = emptyList()
     /** When set, [removeWorktree] deletes the directory (like the real one) and records it in [removedWorktrees]. */
     @Volatile var deleteWorktrees = false
@@ -230,10 +240,12 @@ class TestWorld(
     val git = FakeGitOps()
     val cliGit: dk.egernet.factory.git.CliGitOps? =
         if (realGit) dk.egernet.factory.git.CliGitOps(System.getenv("PATH") ?: "/usr/bin:/bin", "https://github.invalid/", localOnly = true) else null
+    /** Real git ([realGit]) whose pushes fail while [FailingPushGit.failPush] is set (local-only git never pushes). */
+    val realGitOps: FailingPushGit? = cliGit?.let { FailingPushGit(it) }
     val launcher = FakeLauncher()
     val sandboxRuntime = FakeSandboxRuntime()
     val services = Services(
-        cfg, TestDb.fresh(), github, cliGit ?: git, launcher ?: this.launcher, loginThrottle = loginThrottle, clock = clock,
+        cfg, TestDb.fresh(), github, realGitOps ?: git, launcher ?: this.launcher, loginThrottle = loginThrottle, clock = clock,
         releaseStarter = releaseStarter, sandboxRuntime = if (sandbox) sandboxRuntime else null,
     )
 
@@ -268,6 +280,17 @@ class TestWorld(
     fun closeAndReleaseDb() {
         close()
         (services.db.dataSource as java.io.Closeable).close()
+    }
+}
+
+/** Delegates to [inner], except that [push] throws while [failPush] is set. */
+class FailingPushGit(private val inner: GitOps) : GitOps by inner {
+    @Volatile var failPush: String? = null
+    val pushes = CopyOnWriteArrayList<String>()
+    override fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path) {
+        failPush?.let { throw dk.egernet.factory.git.GitException(it) }
+        pushes += branch
+        inner.push(id, worktree, branch, home)
     }
 }
 

@@ -153,6 +153,18 @@ class FactoryService(
         return runs.toDto(orchestrator.cancel(user, runId))
     }
 
+    /** How a run can be retried (docs/ARCHITECTURE.md §6 "Retrying a run"); anyone who can see it may ask. */
+    suspend fun retryOptions(user: UserRecord, runId: UUID): RetryOptionsDto {
+        val run = visibleRun(user, runId)
+        return withContext(Dispatchers.IO) { orchestrator.retryOptions(run) }
+    }
+
+    /** Retries a failed or cancelled single run as its owner; [mode] null = `start_over`. Returns the run now at work. */
+    suspend fun retryRun(user: UserRecord, runId: UUID, mode: String?): RunDto {
+        visibleRun(user, runId)
+        return runs.toDto(orchestrator.retry(user, runId, mode))
+    }
+
     /**
      * A message for a running pipeline agent, addressed by run + role (role omitted: the run's running spec-writer or
      * builder) or by its session id. Visibility (404), then ownership (403, admins included), then role and liveness (409)
@@ -243,6 +255,7 @@ class FactoryService(
                 val r = cancelRun(owner, id)
                 "Run ${r.id}: ${r.status}"
             }
+            "retry" -> retryCommand(owner, repo, parts.drop(1))
             "releases" -> releases.describe(owner, repo, withIds = false)
             "release" -> releaseCommand(owner, repo, parts.drop(1))
             else -> "Unknown command '$cmd'.\n$HELP"
@@ -285,6 +298,44 @@ class FactoryService(
             else -> usage
         }
     }
+
+    /**
+     * `/factory retry <runId> [step|continue|over]`: without a mode it lists the options and the recommendation; a release
+     * run is retried through its release (its issue must be held or skipped).
+     */
+    private suspend fun retryCommand(owner: UserRecord, repo: String, args: List<String>): String {
+        val usage = "Usage: /factory retry <runId> [step|continue|over|recommended]"
+        val id = args.firstOrNull()?.let { parseUuid(it) } ?: return usage
+        val run = visibleRun(owner, id)
+        if (run.repo != repo) throw notFound("Run not found in this project")
+        val mode = when (args.getOrNull(1)?.lowercase()) {
+            null -> null
+            "step" -> RetryMode.STEP
+            "continue" -> RetryMode.CONTINUE
+            "over", "start-over", "start_over" -> RetryMode.START_OVER
+            "recommended" -> RetryMode.RECOMMENDED
+            else -> return usage
+        }
+        if (mode == null) {
+            val o = retryOptions(owner, id)
+            return buildString {
+                append("Run ${run.id} (#${run.issueNumber} ${run.issueTitle}) is ${run.status}.\n")
+                append("Recommended: ${modeWord(o.recommended)} — ${o.reason}\n")
+                o.options.forEach { append("  ${if (it.available) "•" else "×"} ${modeWord(it.mode)}: ${it.detail}\n") }
+                append("Retry with /factory retry ${run.id} ${modeWord(o.recommended)}")
+            }
+        }
+        if (run.releaseId != null) {
+            val r = releases.retry(owner, run.releaseId, run.issueNumber, mode)
+            return "Release \"${r.name}\": #${run.issueNumber} is waiting to be built again (${modeWord(mode)})."
+        }
+        val r = retryRun(owner, id, mode)
+        return if (r.id == run.id.toString()) "Run ${r.id}: retrying the failed step (status ${r.status})."
+        else "Started run ${r.id} for #${r.issueNumber}" + (if (r.continuesRunId != null) ", continuing from run ${r.continuesRunId}" else ", from scratch") +
+            " (status ${r.status})."
+    }
+
+    private fun modeWord(mode: String) = if (mode == RetryMode.START_OVER) "over" else mode
 
     private fun parseUuid(s: String): UUID = try {
         UUID.fromString(s)
@@ -331,6 +382,7 @@ class FactoryService(
             |  /factory status            list recent runs in this project
             |  /factory approve [runId]   merge a run that waits for a human (owner only)
             |  /factory cancel <runId>    cancel a run (owner or admin)
+            |  /factory retry <runId> [step|continue|over]   retry a failed run (owner only); without a mode: the options
             |  /factory releases          list the releases planned in this project
             |  /factory release create <name> [description]   plan a new release
             |  /factory release add <name> <issue>…            put issues into a release (moves them from another)

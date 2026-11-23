@@ -5,6 +5,7 @@ import dk.egernet.factory.Config
 import dk.egernet.factory.PauseReason
 import dk.egernet.factory.ReleaseIssueState
 import dk.egernet.factory.ReleaseStatus
+import dk.egernet.factory.RetryMode
 import dk.egernet.factory.RunStatus
 import dk.egernet.factory.agent.EventBus
 import dk.egernet.factory.agent.FeedItem
@@ -144,25 +145,77 @@ class ReleaseBuilder(
         for (run in io { runs.activeByRelease(id) }) cancelRun(user, run.id)
     }
 
+    /** A held or skipped issue of release [id], or 409 / 404 (the checks of [retry]). */
+    private fun retryable(id: UUID, number: Int): Pair<ReleaseRecord, dk.egernet.factory.db.ReleaseIssueRecord> {
+        val r = store.get(id) ?: throw dk.egernet.factory.notFound("Release not found")
+        if (r.status !in ReleaseStatus.ACTIVE && r.status != ReleaseStatus.READY) throw conflict("The release is not building", "release_not_building")
+        val issue = r.issues.firstOrNull { it.number == number } ?: throw dk.egernet.factory.notFound("Issue #$number is not in this release")
+        if (issue.state != ReleaseIssueState.HELD && issue.state != ReleaseIssueState.SKIPPED) {
+            throw conflict("Issue #$number is ${issue.state}; only held or skipped issues can be retried", "release_issue_not_held")
+        }
+        return r to issue
+    }
+
+    /** How the held issue #[number] of release [id] can be retried (from its linked run); null when it has none. */
+    suspend fun retryOptions(id: UUID, number: Int): dk.egernet.factory.RetryOptionsDto? {
+        val (_, issue) = io { retryable(id, number) }
+        val run = issue.runId?.let { io { runs.get(it) } } ?: return null
+        return io { orchestrator.retryOptions(run) }
+    }
+
     /**
-     * A held or skipped issue is built again: back to `waiting`, its active run (if any) cancelled. A `ready` release
+     * A held or skipped issue is built again (docs/ARCHITECTURE.md §6 "Retrying a run"). [requested] (null =
+     * `start_over`): `start_over` — back to `waiting` with run link cleared, its active run (if any) cancelled;
+     * `continue` — its active run (if any) is cancelled first, then it waits with the run linked and is built by a new run
+     * that continues from that run's commits; `step` — it waits with the run linked and that run's failed step is retried
+     * on the same run. Either way it is built in its turn ([advance]), so order and one-at-a-time hold. A `ready` release
      * builds again for it (409 `release_already_building` while another release of the project holds the slot).
      */
-    suspend fun retry(owner: UserRecord, id: UUID, number: Int) {
+    suspend fun retry(owner: UserRecord, id: UUID, number: Int, requested: String? = null) {
+        val (_, before) = io { retryable(id, number) }
+        val oldRunRecord = before.runId?.let { io { runs.get(it) } }
+        val mode = if (oldRunRecord == null) {
+            if (requested != null && requested != RetryMode.START_OVER && requested != RetryMode.RECOMMENDED) {
+                if (requested !in RetryMode.ALL) throw dk.egernet.factory.badRequest("mode must be one of step, continue, start_over, recommended")
+                throw conflict("Issue #$number has no run to continue or retry a step of", "retry_mode_unavailable")
+            }
+            RetryMode.START_OVER
+        } else {
+            orchestrator.resolveRetryMode(requested, io { orchestrator.retryOptions(oldRunRecord) })
+        }
+        if (mode == RetryMode.CONTINUE && oldRunRecord != null && oldRunRecord.status in RunStatus.ACTIVE) {
+            // Before the issue waits, so the continuing run never meets the old one still active.
+            cancelRun(owner, oldRunRecord.id)
+        }
         val oldRun = lock(id).withLock {
-            val r = io { store.get(id) } ?: throw dk.egernet.factory.notFound("Release not found")
-            if (r.status !in ReleaseStatus.ACTIVE && r.status != ReleaseStatus.READY) throw conflict("The release is not building", "release_not_building")
-            val issue = r.issues.firstOrNull { it.number == number } ?: throw dk.egernet.factory.notFound("Issue #$number is not in this release")
-            if (issue.state != ReleaseIssueState.HELD && issue.state != ReleaseIssueState.SKIPPED) {
-                throw conflict("Issue #$number is ${issue.state}; only held or skipped issues can be retried", "release_issue_not_held")
+            val (r, issue) = io { retryable(id, number) }
+            if (mode != RetryMode.START_OVER && issue.runId != oldRunRecord?.id) {
+                throw conflict("Issue #$number changed in the meantime; reload and try again", "release_issues_changed")
             }
             if (r.status == ReleaseStatus.READY) io { store.reopen(id) }
-            io { store.setIssue(id, number, ReleaseIssueState.WAITING, null, null) }
+            when (mode) {
+                RetryMode.START_OVER -> io { store.setIssue(id, number, ReleaseIssueState.WAITING, null, null) }
+                RetryMode.CONTINUE -> io {
+                    store.setIssue(id, number, ReleaseIssueState.WAITING, "Retry: continues from the commits of run ${issue.runId}", issue.runId, RetryMode.CONTINUE)
+                }
+                else -> io {
+                    store.setIssue(id, number, ReleaseIssueState.WAITING, "Retry: the failed step of run ${issue.runId}", issue.runId, RetryMode.STEP)
+                }
+            }
             issue.runId
         }
         publish(id)
-        if (oldRun != null && io { runs.get(oldRun) }?.status in RunStatus.ACTIVE) cancelRun(owner, oldRun)
+        if (mode == RetryMode.START_OVER && oldRun != null && io { runs.get(oldRun) }?.status in RunStatus.ACTIVE) cancelRun(owner, oldRun)
         advance(id)
+    }
+
+    /**
+     * After an interruption the release builds itself again (usage limit, rejected credential, restart): `continue` when
+     * the interrupted run is recommended to be continued (its branch has commits), else null (from scratch).
+     */
+    private fun autoRetryMode(run: dk.egernet.factory.db.RunRecord?): String? {
+        if (run == null || run.status != RunStatus.FAILED) return null
+        return runCatching { orchestrator.retryOptions(run) }.getOrNull()?.takeIf { it.recommended == RetryMode.CONTINUE }?.let { RetryMode.CONTINUE }
     }
 
     /** Cancels runs whose issue left a release (taken out or moved). */
@@ -224,7 +277,20 @@ class ReleaseBuilder(
                         publish(id)
                         continue
                     }
-                    val run = orchestrator.startReleaseRun(owner, r.repo, next.number, r.id, r.branch ?: "release/${r.name}")
+                    val previous = if (next.retryMode != null) next.runId?.let { io { runs.get(it) } } else null
+                    if (previous != null && next.retryMode == RetryMode.STEP && previous.status == RunStatus.MERGED) {
+                        // Approved and merged by its owner while it waited.
+                        io { store.setIssue(id, next.number, ReleaseIssueState.MERGED, null, previous.id) }
+                        publish(id)
+                        continue
+                    }
+                    val branch = r.branch ?: "release/${r.name}"
+                    val run = when {
+                        previous != null && next.retryMode == RetryMode.STEP -> orchestrator.retryStep(owner, previous)
+                        previous != null && next.retryMode == RetryMode.CONTINUE ->
+                            orchestrator.startReleaseRun(owner, r.repo, next.number, r.id, branch, continuesFrom = previous)
+                        else -> orchestrator.startReleaseRun(owner, r.repo, next.number, r.id, branch)
+                    }
                     io { store.setIssue(id, next.number, ReleaseIssueState.RUNNING, null, run.id) }
                     publish(id)
                     return
@@ -233,9 +299,9 @@ class ReleaseBuilder(
                         pauseForCredentials(r.id)
                         return
                     }
-                    holdUnstarted(id, next.number, e.message)
+                    holdUnstarted(id, next.number, e.message, next.runId.takeIf { next.retryMode != null })
                 } catch (e: Exception) {
-                    holdUnstarted(id, next.number, e.message ?: e.javaClass.simpleName)
+                    holdUnstarted(id, next.number, e.message ?: e.javaClass.simpleName, next.runId.takeIf { next.retryMode != null })
                 }
             }
         }
@@ -246,9 +312,10 @@ class ReleaseBuilder(
         if (io { store.get(id) }?.status == ReleaseStatus.READY) merger.evaluate(id, becameReady)
     }
 
-    private suspend fun holdUnstarted(id: UUID, number: Int, reason: String) {
+    /** [keepRun]: the run a retry continued or resumed, kept linked so the issue can be retried again. */
+    private suspend fun holdUnstarted(id: UUID, number: Int, reason: String, keepRun: UUID? = null) {
         log.warn("Release {}: could not start a run for #{}: {}", id, number, reason)
-        io { store.setIssue(id, number, ReleaseIssueState.HELD, "Could not start a run: ${reason.take(500)}", null) }
+        io { store.setIssue(id, number, ReleaseIssueState.HELD, "Could not start a run: ${reason.take(500)}", keepRun) }
         publish(id)
     }
 
@@ -286,7 +353,7 @@ class ReleaseBuilder(
                     RunStatus.NEEDS_HUMAN -> io { store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.HELD, note, run.id) }
                     RunStatus.FAILED, RunStatus.CANCELLED -> when {
                         outcome.usageLimit != null && run.status == RunStatus.FAILED -> {
-                            io { store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.WAITING, USAGE_LIMIT_ISSUE_NOTE, run.id) }
+                            io { store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.WAITING, USAGE_LIMIT_ISSUE_NOTE, run.id, autoRetryMode(run)) }
                             val (pauseNote, resumeAt) = usageLimitPause(outcome.usageLimit, Instant.now())
                             if (io { store.pause(ref.releaseId, PauseReason.USAGE_LIMIT, pauseNote, resumeAt) }) {
                                 publish(ref.releaseId)
@@ -294,7 +361,7 @@ class ReleaseBuilder(
                             }
                         }
                         outcome.credentialRejected && run.status == RunStatus.FAILED -> {
-                            io { store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.WAITING, CREDENTIALS_ISSUE_NOTE, run.id) }
+                            io { store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.WAITING, CREDENTIALS_ISSUE_NOTE, run.id, autoRetryMode(run)) }
                             pauseForCredentials(ref.releaseId)
                         }
                         else -> io { store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.HELD, note, run.id) }
@@ -346,7 +413,7 @@ class ReleaseBuilder(
             when (run?.status) {
                 RunStatus.MERGED -> store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.MERGED, null, run.id)
                 RunStatus.NEEDS_HUMAN -> store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.HELD, run.error ?: "Run failed", run.id)
-                else -> store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.WAITING, RESTART_NOTE, ref.runId)
+                else -> store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.WAITING, RESTART_NOTE, ref.runId, autoRetryMode(run))
             }
         }
         val building = store.building()

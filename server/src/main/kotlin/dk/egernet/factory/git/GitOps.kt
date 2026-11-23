@@ -18,9 +18,19 @@ interface GitOps {
     fun ensureClone(id: AgentIdentity, cloneUrl: String, dir: Path, home: Path)
     /**
      * Creates a worktree on a new branch from the up-to-date [baseBranch] (the default branch, or `release/<name>`
-     * for a release run). Returns the base ref used.
+     * for a release run). Returns the base ref used. With [startFrom] the branch starts at the tip of that branch
+     * instead — its local branch, else the remote one (fetched) — while the returned base ref is still [baseBranch]'s:
+     * a run that continues another run's commits, or a step retry that re-creates its own worktree ([startFrom] =
+     * [branch]). Throws [GitException] when [startFrom] exists neither locally nor on the remote.
      */
-    fun createWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, baseBranch: String, home: Path): String
+    fun createWorktree(
+        id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, baseBranch: String, home: Path, startFrom: String? = null,
+    ): String
+    /**
+     * The number of commits on [branch] (local, else remote-tracking after a best-effort fetch with [id]) that are not
+     * on [baseBranch]; null when the branch is found neither locally nor on the remote. Never throws.
+     */
+    fun branchCommits(id: AgentIdentity?, mainDir: Path, branch: String, baseBranch: String, home: Path): Int? = null
     fun commitsAhead(worktree: Path, baseRef: String, home: Path): Int
     fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path)
     /** The worktrees registered in [mainDir] (the main working tree included). Prunes stale entries first. */
@@ -99,7 +109,9 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
         }
     }
 
-    override fun createWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, baseBranch: String, home: Path): String {
+    override fun createWorktree(
+        id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, baseBranch: String, home: Path, startFrom: String?,
+    ): String {
         val base = if (localOnly) {
             // Fake GitHub: a release branch exists only on the fake; create it locally from the clone's HEAD.
             if (runCatching { git(mainDir, home, id, "rev-parse", "--verify", "--quiet", "refs/heads/$baseBranch") }.isFailure) {
@@ -110,9 +122,36 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
             git(mainDir, home, id, "fetch", "origin", baseBranch)
             "origin/$baseBranch"
         }
+        val start = if (startFrom == null) base else branchRef(id, mainDir, startFrom, home)
+            ?: throw GitException("Branch $startFrom was found neither locally nor on the remote")
         Files.createDirectories(worktree.parent)
-        git(mainDir, home, id, "worktree", "add", "-B", branch, worktree.toString(), base)
+        git(mainDir, home, id, "worktree", "add", "-B", branch, worktree.toString(), start)
         return base
+    }
+
+    /** `refs/heads/<branch>` when it exists, else `refs/remotes/origin/<branch>` (fetched first when [id] is given), else null. */
+    private fun branchRef(id: AgentIdentity?, mainDir: Path, branch: String, home: Path): String? {
+        require(!branch.startsWith("-") && branch.isNotBlank()) { "Invalid branch" }
+        fun exists(ref: String) = gitStatus(mainDir, home, null, "rev-parse", "--verify", "--quiet", "$ref^{commit}", timeoutSec = 60).first == 0
+        if (exists("refs/heads/$branch")) return "refs/heads/$branch"
+        if (localOnly) return null
+        if (id != null) {
+            runCatching { git(mainDir, home, id, "fetch", "origin", "+refs/heads/$branch:refs/remotes/origin/$branch") }
+                .onFailure { log.info("Fetching {} failed: {}", branch, it.message) }
+        }
+        return "refs/remotes/origin/$branch".takeIf { exists(it) }
+    }
+
+    override fun branchCommits(id: AgentIdentity?, mainDir: Path, branch: String, baseBranch: String, home: Path): Int? = try {
+        if (!Files.isDirectory(mainDir.resolve(".git")) || baseBranch.startsWith("-")) null
+        else branchRef(id, mainDir, branch, home)?.let { ref ->
+            val base = if (localOnly) "refs/heads/$baseBranch" else "refs/remotes/origin/$baseBranch"
+            val (code, out) = gitStatus(mainDir, home, null, "rev-list", "--count", ref, "--not", base, timeoutSec = 60)
+            if (code == 0) out.trim().toIntOrNull() else null
+        }
+    } catch (e: Exception) {
+        log.warn("Counting the commits of {} failed: {}", branch, e.message)
+        null
     }
 
     override fun commitsAhead(worktree: Path, baseRef: String, home: Path): Int =

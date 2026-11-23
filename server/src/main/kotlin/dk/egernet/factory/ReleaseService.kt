@@ -265,13 +265,35 @@ class ReleaseService(
         return io { store.get(id) } ?: throw notFound("Release not found")
     }
 
-    suspend fun retry(user: UserRecord, id: UUID, number: Int): ReleaseRecord {
+    /**
+     * Retries a held or skipped issue; [mode] null = `start_over` (docs/ARCHITECTURE.md §6 "Retrying a run"). Owner only;
+     * continuing and step retries need the owner's Claude credential (422) like any run.
+     */
+    suspend fun retry(user: UserRecord, id: UUID, number: Int, mode: String? = null): ReleaseRecord {
         val r = visible(user, id)
         if (r.started) requireOwner(user, r)
         if (r.status == ReleaseStatus.RELEASED) throw releasedNotEditable(r.name)
         if (r.status !in ReleaseStatus.ACTIVE && r.status != ReleaseStatus.READY) throw conflict("The release is not building", "release_not_building")
-        builder.retry(user, id, number)
+        builder.retry(user, id, number, mode)
         return io { store.get(id) } ?: throw notFound("Release not found")
+    }
+
+    /**
+     * How a held or skipped issue can be retried: the options of its linked run, or only `start_over` when it has none.
+     * Anyone who can see the release may ask; only the owner may retry.
+     */
+    suspend fun retryOptions(user: UserRecord, id: UUID, number: Int): dk.egernet.factory.RetryOptionsDto {
+        val r = visible(user, id)
+        if (r.status == ReleaseStatus.RELEASED) throw releasedNotEditable(r.name)
+        return builder.retryOptions(id, number) ?: dk.egernet.factory.RetryOptionsDto(
+            runId = "", recommended = dk.egernet.factory.RetryMode.START_OVER, reason = "The issue has no run to continue from.",
+            options = listOf(
+                dk.egernet.factory.RetryOptionDto(dk.egernet.factory.RetryMode.STEP, false, "The issue has no run."),
+                dk.egernet.factory.RetryOptionDto(dk.egernet.factory.RetryMode.CONTINUE, false, "The issue has no run."),
+                dk.egernet.factory.RetryOptionDto(dk.egernet.factory.RetryMode.START_OVER, true, "A new run from scratch."),
+            ),
+            releaseId = id.toString(),
+        )
     }
 
     // ------------------------------------------------------------ releasing (§6 "Releasing")

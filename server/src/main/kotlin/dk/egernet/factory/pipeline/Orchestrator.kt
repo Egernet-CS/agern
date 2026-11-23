@@ -2,6 +2,11 @@ package dk.egernet.factory.pipeline
 
 import dk.egernet.factory.AppJson
 import dk.egernet.factory.Config
+import dk.egernet.factory.FailedStep
+import dk.egernet.factory.FailureKind
+import dk.egernet.factory.RetryMode
+import dk.egernet.factory.RetryOptionDto
+import dk.egernet.factory.RetryOptionsDto
 import dk.egernet.factory.FindingDto
 import dk.egernet.factory.REVIEWER_ROLES
 import dk.egernet.factory.RunStatus
@@ -62,11 +67,16 @@ object Schemas {
         """"required":["verdict","summary"]}"""
 }
 
-/** A stage (or the run's set-up) failed; carries what the stage agent reported about usage limits and credentials. */
+/**
+ * A stage (or the run's set-up, or a step after the builder) failed; carries what the stage agent reported about usage
+ * limits and credentials, the [FailureKind] and, for a mechanical step after the builder, the [FailedStep].
+ */
 private class StageFailed(
     message: String,
     val usageLimit: UsageLimit? = null,
     val credentialRejected: Boolean = false,
+    val kind: String = FailureKind.OTHER,
+    val step: String? = null,
 ) : RuntimeException(message)
 
 /**
@@ -94,6 +104,7 @@ class Orchestrator(
     private val scope: CoroutineScope,
     private val preferences: dk.egernet.factory.db.PreferenceStore,
     private val sandboxes: dk.egernet.factory.sandbox.SandboxManager,
+    private val sessions: dk.egernet.factory.db.SessionStore,
 ) {
     private val log = LoggerFactory.getLogger(Orchestrator::class.java)
     private val jobs = ConcurrentHashMap<UUID, Job>()
@@ -132,11 +143,17 @@ class Orchestrator(
      * Starts a release run as the release's [owner]: it branches from and merges into [baseBranch] (`release/<name>`)
      * and does not close its issue (docs/ARCHITECTURE.md §6 "Releases").
      */
-    suspend fun startReleaseRun(owner: UserRecord, repo: String, issueNumber: Int, releaseId: UUID, baseBranch: String): RunRecord =
-        create(owner, repo, issueNumber, null, releaseId, baseBranch)
+    suspend fun startReleaseRun(
+        owner: UserRecord, repo: String, issueNumber: Int, releaseId: UUID, baseBranch: String, continuesFrom: RunRecord? = null,
+    ): RunRecord = create(owner, repo, issueNumber, null, releaseId, baseBranch, continuesFrom)
 
+    /**
+     * [continuesFrom]: a failed run whose branch the new run's worktree starts from and whose spec it reuses
+     * (docs/ARCHITECTURE.md §6 "Retrying a run").
+     */
     private suspend fun create(
         owner: UserRecord, repo: String, issueNumber: Int, startedBySession: UUID?, releaseId: UUID?, baseBranch: String?,
+        continuesFrom: RunRecord? = null,
     ): RunRecord {
         if (owner.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
         access.requireVisible(owner, repo)
@@ -146,13 +163,160 @@ class Orchestrator(
         val eff = preferences.effective(owner.id)
         val run = runs.createIfNoActive(
             repo, issueNumber, issue.title, issueKindFromLabels(issue.labels.map { it.name }), eff.maxFixRounds, owner.id, startedBySession,
-            releaseId, baseBranch,
+            releaseId, baseBranch, continuesFrom?.id, continuesFrom?.spec,
         ) ?: throw conflict("Issue #$issueNumber already has an active run", "active_run_exists")
         for (role in listOf("spec-writer", "builder") + REVIEWER_ROLES + "approver") runs.createStage(run.id, role, 0, eff.model(role))
         publish(run.id)
-        val job = scope.launch { execute(run.id) }
-        jobs[run.id] = job
-        job.invokeOnCompletion { jobs.remove(run.id) }
+        launchJob(run.id) { execute(run.id) }
+        return runs.get(run.id)!!
+    }
+
+    private fun launchJob(runId: UUID, block: suspend () -> Unit) {
+        val job = scope.launch { block() }
+        jobs[runId] = job
+        job.invokeOnCompletion { jobs.remove(runId) }
+    }
+
+    // ------------------------------------------------------------ retry (docs/ARCHITECTURE.md §6 "Retrying a run")
+
+    /**
+     * How [run] can be retried and what is recommended, with a one-line reason. Looks at the run's branch in its owner's
+     * clone (local branch, else the remote one). Blocking.
+     */
+    fun retryOptions(run: RunRecord): RetryOptionsDto {
+        val owner = users.byId(run.ownerId)
+        val commits = if (owner == null || run.branch == null) null else runCatching {
+            val client = access.client(owner)
+            val base = run.baseBranch ?: client?.let { c -> runCatching { c.getRepo(org, run.repo)?.defaultBranch }.getOrNull() } ?: "main"
+            val id = runCatching { identity(owner) }.getOrNull()
+            workspaces.git.branchCommits(id, workspaces.mainDir(owner.username, run.repo), run.branch, base, workspaces.home(owner.username))
+        }.getOrNull()
+        val hasCommits = (commits ?: 0) > 0
+        val stepAvailable = when {
+            run.status == RunStatus.FAILED && run.failedStep in setOf(FailedStep.PUSH, FailedStep.PULL_REQUEST) -> hasCommits
+            run.status == RunStatus.NEEDS_HUMAN && run.failedStep == FailedStep.MERGE -> run.prNumber != null
+            else -> false
+        }
+        val retryable = run.status == RunStatus.FAILED || run.status == RunStatus.CANCELLED || run.status == RunStatus.NEEDS_HUMAN
+        val continueAvailable = retryable && hasCommits
+        val stepName = when (run.failedStep) {
+            FailedStep.PUSH -> "push"; FailedStep.PULL_REQUEST -> "pull request"; FailedStep.MERGE -> "merge"; else -> null
+        }
+        val error = run.error?.lineSequence()?.firstOrNull()?.trim()?.let { if (it.length > 160) it.take(157) + "…" else it }
+        val n = commits ?: 0
+        val withCommits = "$n commit${if (n == 1) "" else "s"}"
+        val (recommended, reason) = when {
+            stepAvailable -> RetryMode.STEP to "The builder finished; only the $stepName failed" + (error?.let { ": $it" } ?: ".")
+            !continueAvailable -> RetryMode.START_OVER to when {
+                run.failureKind == FailureKind.BLOCKED -> "The builder made no commits" + (run.error?.substringAfter("The builder said: ", "")
+                    ?.takeIf { it.isNotBlank() }?.let { ": ${it.take(140)}" } ?: ".")
+                run.branch == null -> "The run stopped before it had a branch."
+                commits == null -> "The run's branch ${run.branch} was found neither locally nor on GitHub."
+                else -> "The run's branch has no commits of its own."
+            }
+            run.status == RunStatus.CANCELLED -> RetryMode.START_OVER to "The run was cancelled; its branch has $withCommits if you want to continue."
+            run.failureKind == FailureKind.BLOCKED -> RetryMode.START_OVER to "The builder reported that it could not go on" + (error?.let { ": $it" } ?: ".")
+            run.failureKind in FailureKind.INTERRUPTED -> RetryMode.CONTINUE to
+                "Stopped by ${interruption(run.failureKind)} after $withCommits; continue from them."
+            run.status == RunStatus.NEEDS_HUMAN -> RetryMode.CONTINUE to "The branch has $withCommits; a new builder continues from them" +
+                (error?.let { " ($it)" } ?: "") + "."
+            else -> RetryMode.CONTINUE to "The run failed after $withCommits" + (error?.let { " ($it)" } ?: "") + "; continue from them."
+        }
+        val options = listOf(
+            RetryOptionDto(
+                RetryMode.STEP, stepAvailable,
+                if (stepAvailable) "Retry the $stepName on this run and continue the pipeline from there; no new spec or build."
+                else "Only when the builder finished and a later step (push, pull request, merge) failed.",
+            ),
+            RetryOptionDto(
+                RetryMode.CONTINUE, continueAvailable,
+                if (continueAvailable) "A new run starts from branch ${run.branch} ($withCommits), reuses the spec and finishes the work."
+                else "Only when the run's branch has commits of its own.",
+            ),
+            RetryOptionDto(RetryMode.START_OVER, true, "A new run on a new branch from scratch; the old branch is left as it is."),
+        )
+        return RetryOptionsDto(
+            run.id.toString(), recommended, reason, options, step = run.failedStep?.takeIf { stepAvailable }, commits = commits,
+            releaseId = run.releaseId?.toString(),
+        )
+    }
+
+    private fun interruption(kind: String?) = when (kind) {
+        FailureKind.TIME_LIMIT -> "the stage time limit"
+        FailureKind.USAGE_LIMIT -> "the Claude usage limit"
+        FailureKind.RESTART -> "a server restart"
+        FailureKind.API_UNREACHABLE -> "the Claude API being unreachable"
+        else -> "an interruption"
+    }
+
+    /**
+     * [requested] (null = `start_over`, `recommended` = what [opts] recommends) checked against [opts]: 400 for an
+     * unknown mode, 409 `retry_mode_unavailable` for one that is not possible for the run now.
+     */
+    fun resolveRetryMode(requested: String?, opts: RetryOptionsDto): String {
+        val mode = when (requested) {
+            null, "" -> RetryMode.START_OVER
+            RetryMode.RECOMMENDED -> opts.recommended
+            in RetryMode.ALL -> requested
+            else -> throw dk.egernet.factory.badRequest("mode must be one of step, continue, start_over, recommended")
+        }
+        val opt = opts.options.first { it.mode == mode }
+        if (!opt.available) throw conflict("Cannot retry with '$mode': ${opt.detail}", "retry_mode_unavailable")
+        return mode
+    }
+
+    /**
+     * Retries a single (non-release) failed or cancelled run as its owner (docs/ARCHITECTURE.md §6 "Retrying a run"):
+     * the failed step on the same run, a new run continuing from its commits, or a new run from scratch. Returns the run
+     * that now works on the issue.
+     */
+    suspend fun retry(user: UserRecord, runId: UUID, requested: String?): RunRecord {
+        val run = runs.get(runId) ?: throw notFound("Run not found")
+        if (run.ownerId != user.id) throw forbidden("Only the owner of this run can retry it")
+        if (run.releaseId != null) {
+            throw conflict("This run builds an issue of a release; retry the issue on the release's page", "release_run")
+        }
+        if (run.status != RunStatus.FAILED && run.status != RunStatus.CANCELLED) {
+            throw conflict("Run is ${run.status}; only failed or cancelled runs can be retried", "run_not_retryable")
+        }
+        val opts = withContext(Dispatchers.IO) { retryOptions(run) }
+        return when (resolveRetryMode(requested, opts)) {
+            RetryMode.STEP -> retryStep(user, run)
+            RetryMode.CONTINUE -> create(user, run.repo, run.issueNumber, null, null, null, continuesFrom = run)
+            else -> create(user, run.repo, run.issueNumber, null, null, null)
+        }
+    }
+
+    /**
+     * Retries the failed step of [run] as [owner] (its owner): a failed push or pull request reactivates the failed run,
+     * re-creates its worktree on its own branch and goes on from the push; a failed merge of a `needs_human` run merges
+     * again. 409 `active_run_exists` when the issue got another active run meanwhile.
+     */
+    suspend fun retryStep(owner: UserRecord, run: RunRecord): RunRecord {
+        if (owner.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
+        if (run.status == RunStatus.NEEDS_HUMAN && run.failedStep == FailedStep.MERGE) {
+            if (run.prNumber == null) throw conflict("Run has no pull request to merge", "retry_mode_unavailable")
+            runs.setStatus(run.id, RunStatus.APPROVING, clearError = true)
+            publish(run.id)
+            // The approver approved before the merge failed: merging again is its decision; otherwise it is the owner's.
+            val approverApproved = runs.stages(run.id).lastOrNull { it.role == "approver" }?.verdict == "APPROVE"
+            launchJob(run.id) {
+                withContext(Dispatchers.IO) { merge(runs.get(run.id)!!, owner, approvedBy = if (approverApproved) null else owner.username) }
+                publish(run.id)
+                settled(run.id)
+            }
+            return runs.get(run.id)!!
+        }
+        val step = run.failedStep?.takeIf { it == FailedStep.PUSH || it == FailedStep.PULL_REQUEST }
+            ?: throw conflict("The run has no failed step to retry", "retry_mode_unavailable")
+        if (!runs.reactivate(run.id)) {
+            val current = runs.get(run.id)
+            if (current?.status !in setOf(RunStatus.FAILED, RunStatus.CANCELLED)) throw conflict("Run is ${current?.status}", "run_not_retryable")
+            throw conflict("Issue #${run.issueNumber} already has an active run", "active_run_exists")
+        }
+        runs.reopenSkippedStages(run.id)
+        publish(run.id)
+        launchJob(run.id) { execute(run.id, step) }
         return runs.get(run.id)!!
     }
 
@@ -194,21 +358,25 @@ class Orchestrator(
 
     // ------------------------------------------------------------ the state machine
 
-    private suspend fun execute(runId: UUID) {
+    /** [step]: a step retry, which resumes the run at that step ([FailedStep.PUSH] or [FailedStep.PULL_REQUEST]). */
+    private suspend fun execute(runId: UUID, step: String? = null) {
         try {
-            run(runId)
+            run(runId, step)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             log.warn("Run {} failed: {}", runId, e.message)
             val reason = e.message ?: e.javaClass.simpleName
+            val sf = e as? StageFailed
+            val kind = sf?.kind?.takeIf { it != FailureKind.OTHER }
+                ?: if (e is java.io.IOException || FailureKind.looksUnreachable(reason)) FailureKind.API_UNREACHABLE else FailureKind.OTHER
+            runs.setFailure(runId, kind, sf?.step)
             // Clean up first, so a run shown as ended has left nothing behind: the sandbox (it bind-mounts the worktree),
             // then the worktree.
             withContext(NonCancellable) { sandboxes.release(runId) }
             withContext(Dispatchers.IO) { cleanupWorktree(runId, merged = false) }
             fail(runId, reason)
             withContext(Dispatchers.IO) { commentEnded(runId, "**Agern:** run `$runId` failed: $reason") }
-            val sf = e as? StageFailed
             settled(runId, sf?.usageLimit, sf?.credentialRejected == true)
             return
         } finally {
@@ -234,7 +402,7 @@ class Orchestrator(
         val run = runs.get(runId) ?: return
         val owner = users.byId(run.ownerId) ?: return
         val left = if (run.prUrl == null) "" else "\n\nIts pull request ${run.prUrl} (branch `${run.branch}`) is left open as it is; " +
-            "a new run of this issue starts on a new branch with a new pull request."
+            "retrying the run in Agern can retry the failed step, continue from its commits on a new branch, or start over."
         bestEffort { gh(owner).comment(org, run.repo, run.issueNumber, headline + left) }
     }
 
@@ -256,7 +424,7 @@ class Orchestrator(
 
     private fun identity(owner: UserRecord) = AgentIdentity(
         owner.username, owner.displayName, owner.githubLogin, access.githubToken(owner),
-        access.claudeCredential(owner) ?: throw StageFailed("The run owner has no Claude credential", credentialRejected = true),
+        access.claudeCredential(owner) ?: throw StageFailed("The run owner has no Claude credential", credentialRejected = true, kind = FailureKind.CREDENTIALS),
     )
 
     private fun setStatus(runId: UUID, status: String) {
@@ -264,12 +432,19 @@ class Orchestrator(
         publish(runId)
     }
 
-    private suspend fun run(runId: UUID) {
+    /**
+     * The pipeline of one run. [step] set: a step retry that resumes the (reactivated) run at the push or pull request of
+     * its current round, with its own branch, spec and builder summary. A run that continues another ([RunRecord.continuesRunId])
+     * starts its worktree from that run's branch and reuses its spec.
+     */
+    private suspend fun run(runId: UUID, step: String? = null) {
         var run = runs.get(runId)!!
         val owner = owner(run)
         val id = identity(owner)
         val client = gh(owner)
         val maxRounds = run.maxRounds
+        val resuming = step != null
+        val previous = if (resuming) null else run.continuesRunId?.let { runs.get(it) }
 
         // Workspace: owner's clone + a worktree on the run branch.
         val repoInfo = withContext(Dispatchers.IO) { client.getRepo(org, run.repo) } ?: throw StageFailed("Repository not accessible")
@@ -278,17 +453,24 @@ class Orchestrator(
         // A release run starts from and merges into its release branch; a single run uses the default branch.
         val target = run.baseBranch ?: repoInfo.defaultBranch
         val releaseName = run.baseBranch?.takeIf { run.releaseId != null }?.removePrefix("release/")
-        val branch = runBranch(run.issueNumber, issue.title, releaseName, run.id)
+        val branch = if (resuming) run.branch ?: throw StageFailed("The run has no branch to retry") else runBranch(run.issueNumber, issue.title, releaseName, run.id)
+        // A step retry re-creates the worktree on its own branch; a continuation starts at the tip of the earlier run's branch.
+        val startFrom = if (resuming) branch else previous?.branch
         val worktree = workspaces.runDir(owner.username, run.repo, run.id)
         val baseRef = withContext(Dispatchers.IO) {
             val main = workspaces.ensureMain(id, run.repo)
             workspaces.withRepoLock(owner.username, run.repo) {
                 // Leftovers of runs that have ended (e.g. after a crash) never block a new run; live runs keep theirs.
                 workspaces.reapRunWorktrees(owner.username, run.repo) { it != run.id && keepWorktree(it) }
-                workspaces.git.createWorktree(id, main, worktree, branch, target, workspaces.home(owner.username))
+                try {
+                    workspaces.git.createWorktree(id, main, worktree, branch, target, workspaces.home(owner.username), startFrom)
+                } catch (e: dk.egernet.factory.git.GitException) {
+                    if (startFrom == null) throw e
+                    throw StageFailed("Could not start from branch $startFrom: ${e.message}")
+                }
             }
         }
-        runs.setBranch(run.id, branch)
+        if (!resuming) runs.setBranch(run.id, branch)
         // The sandbox decision is made once, from the base commit (a run cannot approve its own change to the file). A
         // release run reads it from the default branch, as fetched with the clone, not from the release branch it starts
         // from: earlier runs of the release merge into that branch without a human, and approvals are of the default
@@ -301,52 +483,106 @@ class Orchestrator(
         val ctx = RunContext(
             run.id, run.repo, issue, issueText(issue, comments), branch, baseRef, target, worktree, releaseName, repoInfo.defaultBranch, sandbox,
         )
+        val inherited = if (previous == null) 0 else withContext(Dispatchers.IO) {
+            workspaces.git.commitsAhead(worktree, baseRef, workspaces.home(owner.username))
+        }
 
-        // 1. Spec
-        setStatus(run.id, RunStatus.SPEC)
-        val specRes = stage(run.id, "spec-writer", 0, owner, ctx, specPrompt(ctx),
-            disallowed = READ_ONLY_TOOLS)
-        val spec = specRes.resultText?.trim().takeUnless { it.isNullOrEmpty() } ?: throw StageFailed("spec-writer produced no spec")
-        finishStage(run.id, "spec-writer", 0, null, firstParagraph(spec), emptyList())
-        withContext(Dispatchers.IO) {
-            client.comment(org, run.repo, run.issueNumber, "**Agern: spec ready** (run `${run.id}`)\n\n$spec")
+        // 1. Spec: written by the spec-writer, or the spec of the run this one retries or continues.
+        val spec: String
+        val stored = runs.get(run.id)!!.spec?.takeIf { it.isNotBlank() }
+        if (stored != null) {
+            spec = stored
+            if (resuming) {
+                bestEffort {
+                    withContext(Dispatchers.IO) {
+                        client.comment(org, run.repo, run.issueNumber,
+                            "**Agern:** retrying the failed step (${stepLabel(step)}) of run `${run.id}` on branch `$branch`.")
+                    }
+                }
+            } else {
+                runs.stages(run.id).filter { it.role == "spec-writer" && it.status == "pending" }.forEach {
+                    runs.finishStage(it.id, "skipped", null, "Spec reused from run ${previous?.id ?: run.continuesRunId}", emptyList())
+                }
+                publish(run.id)
+                bestEffort {
+                    withContext(Dispatchers.IO) {
+                        client.comment(org, run.repo, run.issueNumber,
+                            "**Agern:** run `${run.id}` continues run `${previous?.id}` from its branch `${previous?.branch}` " +
+                                "($inherited commit${if (inherited == 1) "" else "s"}); the spec of that run is reused.")
+                    }
+                }
+            }
+        } else {
+            if (resuming) throw StageFailed("The run has no spec to retry with")
+            setStatus(run.id, RunStatus.SPEC)
+            val specRes = stage(run.id, "spec-writer", 0, owner, ctx, specPrompt(ctx),
+                disallowed = READ_ONLY_TOOLS)
+            spec = specRes.resultText?.trim().takeUnless { it.isNullOrEmpty() } ?: throw StageFailed("spec-writer produced no spec")
+            runs.setSpec(run.id, spec)
+            finishStage(run.id, "spec-writer", 0, null, firstParagraph(spec), emptyList())
+            withContext(Dispatchers.IO) {
+                client.comment(org, run.repo, run.issueNumber, "**Agern: spec ready** (run `${run.id}`)\n\n$spec")
+            }
         }
 
         // 2. Build / review loop
-        var round = 0
+        var round = if (resuming) run.round else 0
         var builderClaudeSession: String? = null
         var builderSessionId: UUID? = null
+        if (resuming) {
+            // A later fix round resumes the builder conversation of the round whose step failed.
+            runs.stages(run.id).lastOrNull { it.role == "builder" && it.round == round }?.sessionId?.let { sid ->
+                builderSessionId = sid
+                builderClaudeSession = sessions.get(sid)?.claudeSessionId
+            }
+        }
+        var skipBuild = resuming
         var findingsForBuilder: Map<String, Verdict> = emptyMap()
         var lastReviews: Map<String, Verdict>
         while (true) {
             runs.setRound(run.id, round)
-            setStatus(run.id, RunStatus.BUILDING)
-            if (round > 0) {
-                val eff = preferences.effective(owner.id)
-                runs.createStage(run.id, "builder", round, eff.model("builder"))
-                REVIEWER_ROLES.forEach { runs.createStage(run.id, it, round, eff.model(it)) }
-                publish(run.id)
+            val builderSummary: String
+            if (skipBuild) {
+                builderSummary = runs.get(run.id)!!.builderSummary ?: ""
+                skipBuild = false
+            } else {
+                setStatus(run.id, RunStatus.BUILDING)
+                if (round > 0) {
+                    val eff = preferences.effective(owner.id)
+                    runs.createStage(run.id, "builder", round, eff.model("builder"))
+                    REVIEWER_ROLES.forEach { runs.createStage(run.id, it, round, eff.model(it)) }
+                    publish(run.id)
+                }
+                val prompt = when {
+                    round > 0 -> fixPrompt(ctx, round, maxRounds, findingsForBuilder)
+                    previous != null -> continuePrompt(ctx, spec, previous, inherited)
+                    else -> buildPrompt(ctx, spec)
+                }
+                val b = stage(run.id, "builder", round, owner, ctx, prompt,
+                    resume = builderClaudeSession, parent = builderSessionId,
+                    extraTools = if (sandboxes.enabled) dk.egernet.factory.sandbox.SandboxManager.TOOLS else emptySet(),
+                    notes = (ctx.sandbox?.takeIf { sandboxes.enabled }?.let { listOf((if (it.state == "approved") "info" else "warn") to "Sandbox: ${it.reason}") }
+                        ?: emptyList()) + (if (round == 0 && previous != null) listOf("info" to "Continues run ${previous.id} from branch ${previous.branch} ($inherited commit(s))") else emptyList()))
+                builderClaudeSession = b.claudeSessionId ?: builderClaudeSession
+                builderSessionId = b.session.id
+                builderSummary = b.resultText?.trim() ?: ""
+                val ahead = withContext(Dispatchers.IO) { workspaces.git.commitsAhead(worktree, baseRef, workspaces.home(owner.username)) }
+                if (ahead == 0) {
+                    // The builder's own words say why (e.g. the issue is blocked on another one); show them with the failure.
+                    val why = firstParagraph(builderSummary).takeIf { it.isNotEmpty() }
+                    finishStage(run.id, "builder", round, null, why?.let { "No commits on the branch. $it" } ?: "No commits on the branch", emptyList(), failed = true)
+                    throw StageFailed("The builder made no commits on $branch" + (why?.let { ". The builder said: $it" } ?: ""), kind = FailureKind.BLOCKED)
+                }
+                finishStage(run.id, "builder", round, null, firstParagraph(builderSummary), emptyList())
+                runs.setBuilderSummary(run.id, builderSummary)
             }
-            val prompt = if (round == 0) buildPrompt(ctx, spec) else fixPrompt(ctx, round, maxRounds, findingsForBuilder)
-            val b = stage(run.id, "builder", round, owner, ctx, prompt,
-                resume = builderClaudeSession, parent = builderSessionId,
-                extraTools = if (sandboxes.enabled) dk.egernet.factory.sandbox.SandboxManager.TOOLS else emptySet(),
-                notes = ctx.sandbox?.takeIf { sandboxes.enabled }?.let { listOf((if (it.state == "approved") "info" else "warn") to "Sandbox: ${it.reason}") }
-                    ?: emptyList())
-            builderClaudeSession = b.claudeSessionId ?: builderClaudeSession
-            builderSessionId = b.session.id
-            val builderSummary = b.resultText?.trim() ?: ""
-            val ahead = withContext(Dispatchers.IO) { workspaces.git.commitsAhead(worktree, baseRef, workspaces.home(owner.username)) }
-            if (ahead == 0) {
-                // The builder's own words say why (e.g. the issue is blocked on another one); show them with the failure.
-                val why = firstParagraph(builderSummary).takeIf { it.isNotEmpty() }
-                finishStage(run.id, "builder", round, null, why?.let { "No commits on the branch. $it" } ?: "No commits on the branch", emptyList(), failed = true)
-                throw StageFailed("The builder made no commits on $branch" + (why?.let { ". The builder said: $it" } ?: ""))
-            }
-            finishStage(run.id, "builder", round, null, firstParagraph(builderSummary), emptyList())
 
             withContext(Dispatchers.IO) {
-                workspaces.git.push(id, worktree, branch, workspaces.home(owner.username))
+                try {
+                    workspaces.git.push(id, worktree, branch, workspaces.home(owner.username))
+                } catch (e: Exception) {
+                    throw StageFailed("Pushing branch $branch failed: ${e.message}", kind = FailureKind.STEP, step = FailedStep.PUSH)
+                }
                 run = runs.get(run.id)!!
                 if (run.prNumber == null) {
                     // A release run's pull request must not close the issue: that happens when the release is merged.
@@ -355,11 +591,21 @@ class Orchestrator(
                         .takeIf { it.isNotEmpty() }
                         ?.let { prs -> "Earlier runs of this issue left " + prs.joinToString(", ") { "#$it" } + " open; close them if this one supersedes them.\n\n" }
                         .orEmpty()
-                    val pr = client.findOpenPull(org, run.repo, branch) ?: client.createPull(
-                        org, run.repo, branch, target, "${issue.title} (#${issue.number})",
-                        "$lead\n\nBuilt by Agern run `${run.id}` for @${owner.githubLogin ?: owner.username}.\n\n" + earlier +
-                            "<details><summary>Spec</summary>\n\n$spec\n\n</details>",
-                    )
+                    val continues = runs.get(run.id)!!.continuesRunId?.let { prevId ->
+                        val prev = runs.get(prevId)
+                        "Continues Agern run `$prevId`" + (prev?.branch?.let { " (branch `$it`)" } ?: "") +
+                            (prev?.error?.let { ", which stopped: ${it.lineSequence().first().take(300)}" } ?: "") +
+                            ". Its commits are part of this pull request.\n\n"
+                    }.orEmpty()
+                    val pr = try {
+                        client.findOpenPull(org, run.repo, branch) ?: client.createPull(
+                            org, run.repo, branch, target, "${issue.title} (#${issue.number})",
+                            "$lead\n\nBuilt by Agern run `${run.id}` for @${owner.githubLogin ?: owner.username}.\n\n" + continues + earlier +
+                                "<details><summary>Spec</summary>\n\n$spec\n\n</details>",
+                        )
+                    } catch (e: Exception) {
+                        throw StageFailed("Opening the pull request for $branch failed: ${e.message}", kind = FailureKind.STEP, step = FailedStep.PULL_REQUEST)
+                    }
                     runs.setPr(run.id, pr.number, pr.htmlUrl)
                     bestEffort { client.comment(org, run.repo, run.issueNumber, "**Agern:** pull request ${pr.htmlUrl} is open; reviews are running.") }
                 }
@@ -423,6 +669,10 @@ class Orchestrator(
         }
     }
 
+    private fun stepLabel(step: String?) = when (step) {
+        FailedStep.PUSH -> "push"; FailedStep.PULL_REQUEST -> "pull request"; FailedStep.MERGE -> "merge"; else -> step ?: "step"
+    }
+
     /** [targetBranch]: where the pull request merges; [releaseName] is set for a release run. */
     private data class RunContext(
         val runId: UUID, val repo: String, val issue: GhIssue, val issueText: String, val branch: String,
@@ -464,7 +714,14 @@ class Orchestrator(
         if (!res.ok) {
             runs.finishStage(st.id, "failed", null, res.error, emptyList())
             publish(runId)
-            throw StageFailed("$role failed: ${res.error}", res.usageLimit, res.credentialRejected)
+            val kind = when {
+                res.timedOut -> FailureKind.TIME_LIMIT
+                res.usageLimit != null -> FailureKind.USAGE_LIMIT
+                res.credentialRejected -> FailureKind.CREDENTIALS
+                FailureKind.looksUnreachable(res.error) -> FailureKind.API_UNREACHABLE
+                else -> FailureKind.OTHER
+            }
+            throw StageFailed("$role failed: ${res.error}", res.usageLimit, res.credentialRejected, kind)
         }
         return res
     }
@@ -510,6 +767,8 @@ class Orchestrator(
         try {
             client.squashMerge(org, run.repo, pr, "${run.issueTitle} (#${run.issueNumber})")
         } catch (e: Exception) {
+            // A retry of the run can retry the merge (docs/ARCHITECTURE.md §6 "Retrying a run"); so can the owner's approval.
+            runs.setFailure(run.id, null, FailedStep.MERGE)
             needsHuman(run, owner, "Merging pull request #$pr failed: ${e.message}")
             return
         }
@@ -527,6 +786,7 @@ class Orchestrator(
             bestEffort { client.closeIssue(org, run.repo, run.issueNumber) }
         }
         cleanupWorktree(run.id, merged = true)
+        runs.setFailure(run.id, null, null)
         runs.setStatus(run.id, RunStatus.MERGED, clearError = true)
     }
 
@@ -624,6 +884,28 @@ class Orchestrator(
         |
         |When you are done, end with a short summary of what you changed, how you verified it, and anything left open.
     """.trimMargin()
+
+    /** Round 0 of a run that continues [previous] from its commits (docs/ARCHITECTURE.md §6 "Retrying a run"). */
+    private fun continuePrompt(c: RunContext, spec: String, previous: RunRecord, inherited: Int) = buildString {
+        append("Continue the implementation of issue #${c.issue.number} in ${org}/${c.repo} according to the spec below.\n\n")
+        append("An earlier run of this issue (`${previous.id}`) did not finish. ")
+        append("It stopped with: ${previous.error?.trim()?.take(1500) ?: "(no reason recorded)"}\n\n")
+        append("You are in a git worktree on branch `${c.branch}`. It starts at the tip of that run's branch `${previous.branch}`, ")
+        append("so it already holds $inherited commit${if (inherited == 1) "" else "s"} on top of `${c.baseRef}`. ")
+        append("Do not redo that work. First find out what exists: `git log ${c.baseRef}..HEAD` (a commit message may hold a hand-over ")
+        append("note from the previous builder), `git diff ${c.baseRef}...HEAD` and `git status`. Then finish what is missing, ")
+        append("run the checks the previous builder may not have completed, and commit. If `${c.baseRef}` has moved on since ")
+        append("(`git log HEAD..${c.baseRef}`), merge it in and resolve any conflicts.\n")
+        append("Do not push, open pull requests or merge: the factory does that after you finish.\n")
+        append(sandboxLine(c)).append('\n')
+        previous.builderSummary?.takeIf { it.isNotBlank() }?.let {
+            append("<previous_builder_summary>\n").append(it.take(4000)).append("\n</previous_builder_summary>\n\n")
+        }
+        append(c.releaseNote).append(c.issueText)
+        append("<spec>\n").append(spec).append("\n</spec>\n\n")
+        append("When you are done, end with a short summary of what the branch now contains (the earlier commits and yours), ")
+        append("how you verified it, and anything left open.")
+    }
 
     private fun fixPrompt(c: RunContext, round: Int, maxRounds: Int, changes: Map<String, Verdict>) = buildString {
         append("The reviewers requested changes. This is fix round $round of at most $maxRounds.\n")

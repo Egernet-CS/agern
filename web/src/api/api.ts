@@ -16,6 +16,8 @@ import type {
   Release,
   ReleaseMode,
   Run,
+  RetryMode,
+  RetryOptions,
   RunStatus,
   PendingSandbox,
   SandboxOverview,
@@ -89,8 +91,14 @@ export interface Api {
   resumeRelease(id: string): Promise<Release>;
   /** Owner or admin; 409 `release_not_building`. Stops the running issue; what was merged stays on the branch. */
   cancelRelease(id: string): Promise<Release>;
-  /** Owner only: a held or skipped issue is built again. 409 `release_not_building` / `release_issue_not_held`. */
-  retryReleaseIssue(id: string, issueNumber: number): Promise<Release>;
+  /**
+   * Owner only: a held or skipped issue is built again — `mode` omitted = start over (as before retry modes), `continue`
+   * from its run's commits or the run's failed `step`, in its turn. 409 `release_not_building` / `release_issue_not_held` /
+   * `retry_mode_unavailable`.
+   */
+  retryReleaseIssue(id: string, issueNumber: number, mode?: RetryMode): Promise<Release>;
+  /** How a held or skipped issue can be retried (from its linked run). */
+  releaseIssueRetryOptions(id: string, issueNumber: number): Promise<RetryOptions>;
   /**
    * Owner only (403 for everyone else, admins included): merges a `ready` release into the default branch, one commit per
    * issue, closes its issues and deletes its branch. 409 `release_not_ready` / `release_incomplete` / `release_empty` /
@@ -138,6 +146,13 @@ export interface Api {
   run(id: string): Promise<Run>;
   approveRun(id: string): Promise<Run>;
   cancelRun(id: string): Promise<Run>;
+  /** How a run can be retried, with the recommendation and its reason. */
+  runRetryOptions(id: string): Promise<RetryOptions>;
+  /**
+   * Owner only, failed or cancelled single runs: retries it (mode omitted = start over). Answers the run now at work: the
+   * same run for `step`, a new one otherwise. 409 `run_not_retryable` / `release_run` / `retry_mode_unavailable` / `active_run_exists`.
+   */
+  retryRun(id: string, mode?: RetryMode): Promise<Run>;
 
   projectSessions(repo: string, kind?: 'chat'): Promise<AgentSession[]>;
   createChat(repo: string, model?: string): Promise<AgentSession>;

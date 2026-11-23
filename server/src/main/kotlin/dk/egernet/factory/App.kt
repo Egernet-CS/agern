@@ -107,7 +107,7 @@ class Services(
             { repo -> fake.fileOf(repo, dk.egernet.factory.sandbox.SANDBOX_FILE) }
         },
     )
-    val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes)
+    val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes, sessions)
     val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
     val releaseLocks = dk.egernet.factory.pipeline.ReleaseLocks()
     val releaseMerger = dk.egernet.factory.pipeline.ReleaseMerger(

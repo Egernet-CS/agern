@@ -53,6 +53,9 @@ import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
+/** A steerable stage agent is warned when this share of the stage time limit has passed (docs/ARCHITECTURE.md §6). */
+const val TIME_LIMIT_WARNING_PERCENT = 80L
+
 /** CLI output that means the Claude credential was rejected (bad, revoked or expired token / key). */
 private val AUTH_FAILURE = Regex(
     "(?i)invalid api key|please run /login|authentication[_ ](error|failed)|unauthori[sz]ed|oauth token (has )?(expired|revoked)|invalid (x-api-key|bearer token)",
@@ -165,6 +168,8 @@ data class StageAgentResult(
     val usageLimit: UsageLimit? = null,
     /** The stage failed because Claude rejected the owner's credential (or there was none). */
     val credentialRejected: Boolean = false,
+    /** The stage was stopped at the stage time limit. */
+    val timedOut: Boolean = false,
 ) {
     val resultText: String? get() = result?.get("result")?.jsonPrimitive?.contentOrNull
     val structuredOutput: JsonElement? get() = result?.get("structured_output")?.takeIf { it !is kotlinx.serialization.json.JsonNull }
@@ -702,9 +707,18 @@ class AgentManager(
             }
             live[s.id] = lv
             setStatus(s.id, SessionStatus.RUNNING)
-            val code = withTimeoutOrNull(cfg.stageTimeoutMs) {
-                pump(lv)
-                proc.awaitExit()
+            // A steerable agent is told shortly before the time limit, so it can commit and leave a hand-over note.
+            val warning = if (steerable) scope.launch {
+                delay(cfg.stageTimeoutMs * TIME_LIMIT_WARNING_PERCENT / 100)
+                warnTimeLimit(lv)
+            } else null
+            val code = try {
+                withTimeoutOrNull(cfg.stageTimeoutMs) {
+                    pump(lv)
+                    proc.awaitExit()
+                }
+            } finally {
+                warning?.cancel()
             } ?: withContext(NonCancellable) {
                 lv.stopReason = "timeout"
                 systemEvent(s.id, "warn", "Stage time limit of ${describeTimeout()} reached; stopping the agent")
@@ -732,6 +746,7 @@ class AgentManager(
                 s, lv, err,
                 usageLimit = if (stopped) null else lv.usage.result(failed = err != null),
                 credentialRejected = !stopped && err != null && credentialRejected,
+                timedOut = lv.stopReason == "timeout",
             )
         } catch (e: CancellationException) {
             withContext(NonCancellable) {
@@ -752,19 +767,44 @@ class AgentManager(
         }
     }
 
+    /**
+     * Writes the time-limit warning to a running steerable agent's stdin, like an owner's message (docs/ARCHITECTURE.md §6
+     * "Time limit"); its pickup is confirmed the same way. Nothing happens when stdin is already closed.
+     */
+    private fun warnTimeLimit(l: Live) {
+        val left = describeDuration(cfg.stageTimeoutMs - cfg.stageTimeoutMs * TIME_LIMIT_WARNING_PERCENT / 100)
+        val text = "Message from Agern: this stage stops at its time limit in about $left. Commit the work you have now " +
+            "(a work-in-progress commit is fine) so nothing is lost. Put a hand-over note in that commit's message: what is " +
+            "done, what is left, and how to verify it — a later run may continue from your commits. Then go on if time allows."
+        val id = UUID.randomUUID().toString()
+        synchronized(l.inputLock) {
+            if (l.inputClosed) return
+            try {
+                l.proc.send(userLine(JsonPrimitive(text)))
+            } catch (e: Exception) {
+                return
+            }
+            l.awaiting.addLast(id to "Agern")
+        }
+        systemEvent(l.sessionId, "warn", "Stage time limit: ${TIME_LIMIT_WARNING_PERCENT} % used; asked the agent to commit and leave a hand-over note")
+        log.info("Time-limit warning sent to {} session {}", l.kind, l.sessionId)
+    }
+
     private fun finishStage(
         s: SessionRecord, l: Live?, error: String?, usageLimit: UsageLimit? = null, credentialRejected: Boolean = false,
+        timedOut: Boolean = false,
     ): StageAgentResult {
         closeSteering(l)
         if (error != null) systemEvent(s.id, "error", error)
         val status = if (l?.stopReason == "stopped") SessionStatus.STOPPED else if (error == null) SessionStatus.DONE else SessionStatus.FAILED
         setStatus(s.id, status, ended = true)
         val rec = sessions.get(s.id)!!
-        return StageAgentResult(rec, l?.claudeSessionId ?: rec.claudeSessionId, l?.lastResult, error == null, error, usageLimit, credentialRejected)
+        return StageAgentResult(rec, l?.claudeSessionId ?: rec.claudeSessionId, l?.lastResult, error == null, error, usageLimit, credentialRejected, timedOut)
     }
 
-    private fun describeTimeout(): String {
-        val ms = cfg.stageTimeoutMs
+    private fun describeTimeout(): String = describeDuration(cfg.stageTimeoutMs)
+
+    private fun describeDuration(ms: Long): String {
         return if (ms % 60_000 == 0L) "${ms / 60_000} minute" + (if (ms == 60_000L) "" else "s") else "${ms / 1000.0} seconds"
     }
 
