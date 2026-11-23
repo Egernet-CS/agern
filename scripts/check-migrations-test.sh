@@ -116,7 +116,8 @@ repo V1__init.sql
 check "invalid base ref" 2 "no-such-ref" "does not resolve to a commit"
 
 cd "$work" || exit 1
-export GIT_CEILING_DIRECTORIES="$(dirname "$work")"
+GIT_CEILING_DIRECTORIES=$(dirname "$work")
+export GIT_CEILING_DIRECTORIES
 check "not inside a git repository" 2 "" "not inside a git repository"
 
 if [ "$failures" -gt 0 ]; then
