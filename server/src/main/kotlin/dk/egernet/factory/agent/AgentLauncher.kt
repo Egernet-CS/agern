@@ -119,15 +119,19 @@ object AgentCommand {
             "GIT_AUTHOR_EMAIL" to authorEmail(id),
             "GIT_COMMITTER_EMAIL" to authorEmail(id),
         )
-        val token = id.githubToken
-        if (token != null) {
-            val basic = Base64.getEncoder().encodeToString("x-access-token:$token".toByteArray())
-            env["GIT_CONFIG_COUNT"] = "1"
-            env["GIT_CONFIG_KEY_0"] = "http.$gitHost.extraheader"
-            env["GIT_CONFIG_VALUE_0"] = "AUTHORIZATION: basic $basic"
-            env["GH_TOKEN"] = token
-        }
+        id.githubToken?.let { env.putAll(gitTokenEnvironment(it, gitHost)) }
         return env
+    }
+
+    /** The part of [gitEnvironment] that authenticates with a GitHub [token] (also used without an agent identity). */
+    fun gitTokenEnvironment(token: String, gitHost: String): Map<String, String> {
+        val basic = Base64.getEncoder().encodeToString("x-access-token:$token".toByteArray())
+        return linkedMapOf(
+            "GIT_CONFIG_COUNT" to "1",
+            "GIT_CONFIG_KEY_0" to "http.$gitHost.extraheader",
+            "GIT_CONFIG_VALUE_0" to "AUTHORIZATION: basic $basic",
+            "GH_TOKEN" to token,
+        )
     }
 
     private fun authorEmail(id: AgentIdentity) =

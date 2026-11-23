@@ -2,6 +2,7 @@ import { memo, useState } from 'react';
 import { cost, duration, modelLabel } from '../../lib/format';
 import { SandboxLogBlock } from '../sandbox/SandboxLog';
 import { MessageAttachments } from './attachments';
+import { GeneratedImages } from './generated';
 import { Markdown } from './Markdown';
 import { toolArgs, toolDisplayName, toolSummary, type Item } from './model';
 
@@ -140,6 +141,8 @@ const TranscriptItem = memo(function TranscriptItem({ item, me, sessionId }: { i
       );
     case 'status':
       return <div className="t-meta t-meta--status">— session {item.status} —</div>;
+    case 'images':
+      return <GeneratedImages sessionId={sessionId} payload={item.images} me={me} />;
     default:
       return (
         <div className="t-unknown" title={item.json}>

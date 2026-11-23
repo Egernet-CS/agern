@@ -4,6 +4,8 @@ import type {
   Attachment,
   ClaudeUsage,
   ClientConfig,
+  CodexLogin,
+  GeneratedImage,
   PreferenceOverrides,
   Preferences,
   CredentialKind,
@@ -57,6 +59,16 @@ export interface Api {
   /** The caller's own Claude usage (limit windows for an OAuth token, spend through Agern); never anyone else's. */
   usage(): Promise<ClaudeUsage>;
   deleteGithubToken(): Promise<User>;
+  /**
+   * Validates the key and model with the provider, then stores them (replacing any earlier setting). 400 unknown
+   * provider or bad model name, 422 `image_key_invalid` / `image_model_unknown`, 502 `image_provider_unavailable`.
+   */
+  putImageProvider(provider: string, model: string, apiKey: string): Promise<User>;
+  deleteImageProvider(): Promise<User>;
+  /** Starts a Codex device login (cancels a pending one). */
+  startCodexLogin(): Promise<CodexLogin>;
+  codexLogin(): Promise<CodexLogin>;
+  cancelCodexLogin(): Promise<CodexLogin>;
 
   projects(): Promise<Project[]>;
   project(repo: string): Promise<Project>;
@@ -102,7 +114,7 @@ export interface Api {
   /**
    * Owner only (403 for everyone else, admins included): merges a `ready` release into the default branch, one commit per
    * issue, closes its issues and deletes its branch. 409 `release_not_ready` / `release_incomplete` / `release_empty` /
-   * `release_conflict` / `release_merge_failed` / `release_merge_method_unavailable`.
+   * `release_conflict` / `release_migration_conflict` / `release_merge_failed` / `release_merge_method_unavailable`.
    */
   approveRelease(id: string): Promise<Release>;
   /** Owner only: "Check again" — re-reads (or opens) the release pull request and its mergeability. 409 `release_not_ready`. */
@@ -146,6 +158,14 @@ export interface Api {
   run(id: string): Promise<Run>;
   approveRun(id: string): Promise<Run>;
   cancelRun(id: string): Promise<Run>;
+  /**
+   * Owner only (403 for everyone else, admins included): a message to the run's advisor while it needs a human. 409
+   * `run_not_waiting` / `review_in_progress` / `agent_busy` / `too_many_agents` / `run_worktree_missing`, 422
+   * `claude_credential_required`.
+   */
+  talkToRun(id: string, text: string): Promise<{ status: 'accepted'; sessionId: string }>;
+  /** Owner only: reviews changes from the conversation again. 409 `nothing_to_review` / `review_in_progress` / `agent_busy`. */
+  reviewRun(id: string): Promise<Run>;
   /** How a run can be retried, with the recommendation and its reason. */
   runRetryOptions(id: string): Promise<RetryOptions>;
   /**
@@ -172,6 +192,23 @@ export interface Api {
   deleteAttachment(sessionId: string, id: string): Promise<void>;
   /** URL of the bytes; `preview` serves the downscaled copy when there is one. */
   attachmentUrl(sessionId: string, id: string, opts?: { preview?: boolean }): string;
+  /** Images generated in a session (chat or stage), oldest first. */
+  sessionImages(sessionId: string): Promise<GeneratedImage[]>;
+  /** Images selected for an issue. */
+  issueImages(repo: string, issueNumber: number): Promise<GeneratedImage[]>;
+  /**
+   * Owner of a chat image only: selects it for an open issue under a name (or moves/renames it). 403 not the owner,
+   * 404 unknown image or issue, 400 bad name, 409 `run_image` / `issue_closed` / `too_many_images` / `image_in_use`.
+   */
+  selectImage(id: string, issueNumber: number, name: string): Promise<GeneratedImage>;
+  /** 409 `image_in_use` while a run uses it. */
+  unselectImage(id: string): Promise<GeneratedImage>;
+  /** Deletes an unselected chat image; 409 `image_selected`. */
+  discardImage(id: string): Promise<void>;
+  /** URL of a generated image's bytes (same visibility as its project). */
+  imageUrl(id: string): string;
+  /** URL of a stage screenshot's image (same visibility as the run). */
+  screenshotUrl(runId: string, id: string): string;
   /** Server limits for the client (attachments). */
   config(): Promise<ClientConfig>;
   interrupt(id: string): Promise<void>;

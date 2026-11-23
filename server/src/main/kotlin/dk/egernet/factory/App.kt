@@ -71,6 +71,8 @@ class Services(
     releaseStarter: ReleaseStarter? = null,
     /** Whether a project allows automatic releases: the seam for #24 (every project does until it exists). */
     val releaseModePolicy: dk.egernet.factory.pipeline.ReleaseModePolicy = dk.egernet.factory.pipeline.ReleaseModePolicy.ALLOW_ALL,
+    /** The image providers offered in Settings; null = OpenAI and Gemini (plus the fake one in fake-GitHub mode). Tests inject fakes. */
+    imageProviders: List<dk.egernet.factory.images.ImageProvider>? = null,
 ) {
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     val box = SecretBox(cfg.masterKey)
@@ -107,7 +109,27 @@ class Services(
             { repo -> fake.fileOf(repo, dk.egernet.factory.sandbox.SANDBOX_FILE) }
         },
     )
-    val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes, sessions)
+    val screenshotStore = dk.egernet.factory.db.ScreenshotStore(db)
+    val images = dk.egernet.factory.images.ImageService(
+        cfg,
+        imageProviders ?: (
+            listOf(
+                dk.egernet.factory.images.OpenAiImageProvider(), dk.egernet.factory.images.GeminiImageProvider(),
+                dk.egernet.factory.images.CodexImageProvider(cfg.codexBin, cfg.agentPath, cfg.dataDir.resolve("codex")),
+            ) + if (cfg.fakeGithub) listOf(dk.egernet.factory.images.DevFakeImageProvider()) else emptyList()
+            ),
+        dk.egernet.factory.db.ImageStore(db), users, sessions, runs, access, box, workspaces,
+        publishEvent = { sessionId, type, payload -> agents.publish(sessionId, type, payload) },
+        clock = clock,
+    )
+    /** Codex device logins; null when the catalogue has no Codex provider (the login routes then answer 409). */
+    val codexLogins: dk.egernet.factory.images.CodexLogins? =
+        (images.provider("codex") as? dk.egernet.factory.images.CodexImageProvider)?.let {
+            dk.egernet.factory.images.CodexLogins(it, images, scope, clock)
+        }
+    val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes, screenshotStore,
+        sessions, events, images)
+    val screenshots = dk.egernet.factory.agent.Screenshots(cfg, screenshotStore, runs, workspaces, publishRun = { orchestrator.publish(it) })
     val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
     val releaseLocks = dk.egernet.factory.pipeline.ReleaseLocks()
     val releaseMerger = dk.egernet.factory.pipeline.ReleaseMerger(
@@ -122,14 +144,20 @@ class Services(
         releaseStarter ?: ReleaseStarter { release, owner -> releases.startScheduled(owner, release.id) },
     )
     val releases: ReleaseService = ReleaseService(cfg, access, releaseStore, bus, releaseBuilder, releaseScheduler, releaseMerger, releaseModePolicy)
-    val factory = FactoryService(cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases)
-    val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes)
+    val factory = FactoryService(cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases, images.store)
+    val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes, screenshots, images)
 
     /** The start-up removal of leftover sandboxes (runs in the background; tests wait for it). */
 
     init {
         agents.commandHandler = { session, owner, text -> factory.handleCommand(session, owner, text) }
+        agents.advisorLaunch = { session, owner -> orchestrator.advisorLaunch(session, owner) }
+        agents.afterAdvisorTurn = { session -> session.runId?.let { orchestrator.reconcile(it) } }
         orchestrator.onReleaseRunSettled = releaseBuilder::onRunSettled
+        images.publishRun = { orchestrator.publish(it) }
+        agents.onChatInput = { sessionId -> images.newTurn(sessionId) }
+        agents.onChatClosed = { sessionId -> images.removeSession(sessionId) }
+        codexLogins?.let { logins -> images.onSettingChanged = { userId -> logins.cancel(userId) } }
     }
 
     /**
@@ -138,6 +166,8 @@ class Services(
      */
     fun recoverAfterRestart() {
         val failed = runs.failUnfinishedAfterRestart()
+        // Runs at needs_human survive: an interrupted follow-up review must be started again, and no stage stays open.
+        runs.recoverConversationsAfterRestart()
         if (failed.isNotEmpty()) LoggerFactory.getLogger("dk.egernet.factory").warn("Marked {} unfinished run(s) as failed after restart", failed.size)
         // Order matters: first the sandboxes of runs that are no longer active (their containers bind-mount the worktrees),
         // then those worktrees, then the releases (which may start new runs). Bounded, so a hanging Podman cannot keep
@@ -166,6 +196,7 @@ class Services(
     }
 
     fun stop() {
+        codexLogins?.close()
         agents.shutdown()
         runCatching { runBlocking { withTimeoutOrNull(30_000) { sandboxes.shutdown() } } }
         scope.cancel()

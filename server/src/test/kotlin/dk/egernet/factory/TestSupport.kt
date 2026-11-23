@@ -36,11 +36,11 @@ object TestDb {
     private val pg: EmbeddedPostgres by lazy { EmbeddedPostgres.builder().start() }
     private val counter = AtomicInteger()
 
-    /** A fresh, migrated database per call. */
-    fun fresh(): Db {
+    /** A fresh database per call, migrated from [migrations] (the application's own by default). */
+    fun fresh(migrations: String = Db.MIGRATIONS): Db {
         val name = "t${System.nanoTime()}_${counter.incrementAndGet()}"
         pg.postgresDatabase.connection.use { c -> c.createStatement().use { it.execute("CREATE DATABASE $name") } }
-        return Db.connect(pg.getJdbcUrl("postgres", name), "postgres", "postgres", poolSize = 5)
+        return Db.connect(pg.getJdbcUrl("postgres", name), "postgres", "postgres", poolSize = 5, migrations = migrations)
     }
 }
 
@@ -132,6 +132,12 @@ class FakeLauncher(var stage: (FakeProcess) -> Unit = { it.init(); it.result("ok
     val launched = CopyOnWriteArrayList<FakeProcess>()
     /** Every chat `user` message written to a process (the stream-json `message.content`). */
     val chatInputs = CopyOnWriteArrayList<kotlinx.serialization.json.JsonElement>()
+    /** Answers an advisor's message (the full text written to stdin); default: echo, like a chat. Runs on its own thread. */
+    @Volatile var advisor: (FakeProcess, String) -> Unit = { proc, text ->
+        proc.init(proc.spec.resumeClaudeSessionId ?: "advisor-claude-${proc.spec.sessionId}")
+        proc.assistantText("echo: $text")
+        proc.result("echo: $text")
+    }
 
     override fun launch(spec: LaunchSpec): AgentProcess {
         val p = if (spec.interactive) {
@@ -143,9 +149,13 @@ class FakeLauncher(var stage: (FakeProcess) -> Unit = { it.init(); it.result("ok
                     val text = (content as? kotlinx.serialization.json.JsonArray)
                         ?.mapNotNull { (it as? JsonObject)?.get("text")?.jsonPrimitive?.contentOrNull }?.joinToString(" ")
                         ?: content.jsonPrimitive.content
-                    proc.init(proc.spec.resumeClaudeSessionId ?: "chat-claude-${proc.spec.sessionId}")
-                    proc.assistantText("echo: $text")
-                    proc.result("echo: $text")
+                    if (proc.spec.kind == "advisor") {
+                        thread(isDaemon = true) { advisor(proc, text) }
+                    } else {
+                        proc.init(proc.spec.resumeClaudeSessionId ?: "chat-claude-${proc.spec.sessionId}")
+                        proc.assistantText("echo: $text")
+                        proc.result("echo: $text")
+                    }
                 }
             }
         } else FakeProcess(spec)
@@ -175,14 +185,21 @@ class FakeGitOps : GitOps {
         return files[path]
     }
     override fun ensureClone(id: AgentIdentity, cloneUrl: String, dir: Path, home: Path) { Files.createDirectories(dir) }
+    /** Runs on every worktree right after it is created (e.g. to plant files a repository could contain). */
+    @Volatile var afterWorktree: (Path) -> Unit = {}
     override fun createWorktree(
         id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, baseBranch: String, home: Path, startFrom: String?,
     ): String {
         Files.createDirectories(worktree)
+        afterWorktree(worktree)
         worktrees += "$branch <- ${startFrom ?: baseBranch}"
         return "origin/$baseBranch"
     }
     override fun commitsAhead(worktree: Path, baseRef: String, home: Path) = commits
+    /** What [head] answers; tests move it to simulate a commit. */
+    @Volatile var headSha = "0000000000000000000000000000000000000001"
+    override fun head(worktree: Path, home: Path) = headSha
+    override fun baseRef(baseBranch: String) = "origin/$baseBranch"
     /** What [branchCommits] answers (null: the branch is not found). */
     @Volatile var branchCommits: Int? = 1
     override fun branchCommits(id: AgentIdentity?, mainDir: Path, branch: String, baseBranch: String, home: Path): Int? = branchCommits
@@ -196,6 +213,20 @@ class FakeGitOps : GitOps {
     /** When set, [removeWorktree] deletes the directory (like the real one) and records it in [removedWorktrees]. */
     @Volatile var deleteWorktrees = false
     val removedWorktrees = CopyOnWriteArrayList<Path>()
+    /**
+     * What [compareBranches] answers for (base branch, head branch), before the [dirOf] filter; null (the default) means
+     * the comparison cannot be made. A thrown exception is thrown by [compareBranches].
+     */
+    @Volatile var comparison: (base: String, head: String) -> dk.egernet.factory.git.BranchComparison? = { _, _ -> null }
+    /** Every [compareBranches], as `"<head> -> <base>"`. */
+    val comparisons = CopyOnWriteArrayList<String>()
+    override fun compareBranches(
+        mainDir: Path, baseBranch: String, headBranch: String, home: Path, githubToken: String?, dirOf: (String) -> String?,
+    ): dk.egernet.factory.git.BranchComparison? {
+        comparisons += "$headBranch -> $baseBranch"
+        val c = comparison(baseBranch, headBranch) ?: return null
+        return dk.egernet.factory.git.BranchComparison(c.baseFiles.filter { dirOf(it) != null }, c.changes.filter { dirOf(it.path) != null })
+    }
     override fun removeWorktree(mainDir: Path, worktree: Path, home: Path, keepUnpushed: Boolean) {
         if (!deleteWorktrees) return
         worktree.toFile().deleteRecursively()
@@ -233,6 +264,8 @@ class TestWorld(
     releaseStarter: ReleaseStarter? = null,
     /** Use the real git CLI in fake-GitHub mode (local clone, no pushes) instead of [FakeGitOps]. */
     realGit: Boolean = false,
+    /** The image providers (null: the production default list). */
+    imageProviders: List<dk.egernet.factory.images.ImageProvider>? = null,
 ) {
     val dataDir: Path = Files.createTempDirectory("agern-test")
     val cfg = tweak(testConfig(dataDir, twoFactor).let { if (sandbox) it.copy(sandbox = it.sandbox.copy(mode = "podman")) else it })
@@ -246,7 +279,7 @@ class TestWorld(
     val sandboxRuntime = FakeSandboxRuntime()
     val services = Services(
         cfg, TestDb.fresh(), github, realGitOps ?: git, launcher ?: this.launcher, loginThrottle = loginThrottle, clock = clock,
-        releaseStarter = releaseStarter, sandboxRuntime = if (sandbox) sandboxRuntime else null,
+        releaseStarter = releaseStarter, sandboxRuntime = if (sandbox) sandboxRuntime else null, imageProviders = imageProviders,
     )
 
     /** Puts `.agern/sandbox.yml` on the default branch (GitHub API and git alike); null removes it. */

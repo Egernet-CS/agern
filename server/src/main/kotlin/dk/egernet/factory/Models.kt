@@ -52,6 +52,9 @@ data class UserDto(
     val githubTokenKind: String?,
     /** Classic tokens: granted OAuth scopes, e.g. `["read:org","repo"]`; null without a token or for fine-grained tokens. */
     val githubTokenScopes: List<String>?,
+    /** The image provider id and model (docs/ARCHITECTURE.md §6 "Generated images"); null without a stored key. Never the key. */
+    val imageProvider: String? = null,
+    val imageModel: String? = null,
 )
 
 @Serializable
@@ -81,6 +84,8 @@ data class IssueDto(
     val activeRunId: String?,
     /** The release the issue is planned in, or null (docs/ARCHITECTURE.md §6 "Releases"). */
     val release: IssueReleaseDto? = null,
+    /** Images selected for this issue in a chat (docs/ARCHITECTURE.md §6 "Generated images"). */
+    val imageCount: Int = 0,
 )
 
 @Serializable data class IssueReleaseDto(val id: String, val name: String)
@@ -172,6 +177,17 @@ data class StageDto(
     val id: String, val role: String, val round: Int, val model: String, val status: String, val verdict: String?,
     val summary: String?, val findings: List<FindingDto>, val sessionId: String?,
     val startedAt: String?, val endedAt: String?,
+    /** Screenshots the stage's reviewer attached (only `ux` and `ui-design`), in attach order. Never the bytes. */
+    val screenshots: List<ScreenshotDto> = emptyList(),
+    /** Images the stage's agent generated, oldest first. Never the bytes. */
+    val images: List<GeneratedImageDto> = emptyList(),
+)
+
+/** A screenshot attached to a stage; the image is served by `GET /api/runs/{id}/screenshots/{sid}`. */
+@Serializable
+data class ScreenshotDto(
+    val id: String, val caption: String, val mediaType: String, val size: Long, val width: Int, val height: Int,
+    val createdAt: String,
 )
 
 @Serializable
@@ -186,6 +202,8 @@ data class RunDto(
     val releaseId: String? = null,
     /** The branch the run starts from and merges into; null = the repository's default branch. */
     val baseBranch: String? = null,
+    /** The conversation with the run's advisor while it needs a human (docs/ARCHITECTURE.md §6 "Conversation at needs human"). */
+    val conversation: RunConversationDto = RunConversationDto(),
     /** The failed run this one continues from its commits (docs/ARCHITECTURE.md §6 "Retrying a run"). */
     val continuesRunId: String? = null,
     /** The newest run that continues this one, if any. */
@@ -261,6 +279,22 @@ data class RetryOptionsDto(
 /** Body of the retry endpoints; [mode] omitted = `start_over` (as before retry modes existed). */
 @Serializable
 data class RetryReq(val mode: String? = null)
+
+/**
+ * [sessionId]: the advisor session, once the owner has sent a message. [review]: `none`, `required` (changes made in
+ * the conversation are not reviewed yet) or `running` (a follow-up review is in progress). [followUpFrom]: the first
+ * follow-up round; stages of rounds >= it are follow-up rounds.
+ */
+@Serializable
+data class RunConversationDto(val sessionId: String? = null, val review: String = ReviewState.NONE, val followUpFrom: Int? = null)
+
+/** `POST /api/runs/{id}/conversation`: the message was accepted for the run's advisor session [sessionId]. */
+@Serializable data class TalkAcceptedDto(val status: String = "accepted", val sessionId: String)
+
+/** The follow-up review state of a `needs_human` run's conversation. */
+object ReviewState {
+    const val NONE = "none"; const val REQUIRED = "required"; const val RUNNING = "running"
+}
 
 /**
  * A run's sandbox decision (docs/ARCHITECTURE.md §5 "Sandboxes"), fixed when the run starts.
@@ -393,8 +427,14 @@ data class SettingsDto(
 
 val PIPELINE_ROLES = listOf("spec-writer", "builder", "security", "ux", "ui-design", "code", "approver")
 val REVIEWER_ROLES = listOf("security", "ux", "ui-design", "code")
+/** Reviewer roles that may attach screenshots to their stage (docs/ARCHITECTURE.md §6 "Screenshots"). */
+val SCREENSHOT_ROLES = setOf("ux", "ui-design")
 /** Pipeline roles whose running agent accepts messages from the run's owner (docs/ARCHITECTURE.md §6 "Messages"). */
 val STEERABLE_ROLES = setOf("spec-writer", "builder")
+/** The session kind of the agent a run's owner talks to while the run needs a human (not a pipeline role). */
+const val ADVISOR_KIND = "advisor"
+/** Interactive session kinds: kept alive between turns, resumed with `--resume`, stopped by the idle reaper. */
+val INTERACTIVE_KINDS = setOf("chat", ADVISOR_KIND)
 val DEFAULT_PIPELINE_MODELS = mapOf(
     "spec-writer" to "opus", "builder" to "opus", "security" to "opus",
     "ux" to "sonnet", "ui-design" to "sonnet", "code" to "sonnet", "approver" to "opus",
@@ -468,7 +508,39 @@ data class AttachmentDto(
     val note: String,
 )
 
-@Serializable data class ClientConfigDto(val attachments: AttachmentLimitsDto)
+@Serializable data class ClientConfigDto(val attachments: AttachmentLimitsDto, val images: ImageConfigDto)
+
+/** An image provider of the catalogue (`GET /api/config`); the web renders whatever is listed. */
+@Serializable data class ImageProviderInfoDto(
+    val id: String, val label: String, val models: List<String>, val defaultModel: String, val supportsTransparency: Boolean,
+    val keyPlaceholder: String,
+    /** `api_key` or `device_login` (connected through the `/me/image-provider/codex/login` flow). */
+    val auth: String = "api_key",
+    val available: Boolean = true,
+    val unavailableReason: String? = null,
+)
+
+/** A Codex device login of the caller (`/api/me/image-provider/codex/login`); URL and code only while `pending`. */
+@Serializable data class CodexLoginDto(
+    val status: String,
+    val verificationUrl: String? = null,
+    val userCode: String? = null,
+    val expiresAt: String? = null,
+    val error: String? = null,
+)
+@Serializable data class ImageLimitsDto(val maxPerRequest: Int, val maxPerTurn: Int, val maxPerStage: Int, val maxEdge: Int)
+@Serializable data class ImageConfigDto(val providers: List<ImageProviderInfoDto>, val limits: ImageLimitsDto)
+
+/** Where an image is selected for use; [locked] while a run that took it is not failed or cancelled. */
+@Serializable data class ImageSelectionDto(val issueNumber: Int, val name: String, val usedByRunId: String?, val locked: Boolean)
+
+/** A generated image (docs/ARCHITECTURE.md §6 "Generated images"); bytes at `GET /api/images/{id}`. */
+@Serializable data class GeneratedImageDto(
+    val id: String, val repo: String, val origin: String, val sessionId: String, val owner: OwnerDto,
+    val provider: String, val model: String, val prompt: String, val purpose: String,
+    val mediaType: String, val size: Long, val width: Int, val height: Int, val transparent: Boolean, val createdAt: String,
+    val selection: ImageSelectionDto?,
+)
 
 @Serializable data class FeedFrame(
     val type: String,

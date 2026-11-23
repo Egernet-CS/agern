@@ -1,10 +1,11 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { useLocation } from 'react-router-dom';
-import { api, type CredentialKind, type PreferenceOverrides, type Preferences, type StageRole } from '../api';
+import { api, type CodexLogin, type CredentialKind, type PreferenceOverrides, type Preferences, type StageRole } from '../api';
 import { CodeInput } from '../components/ui/CodeInput';
 import { RecoveryCodes } from '../components/ui/RecoveryCodes';
 import { UsageBlock } from '../components/ui/UsageBlock';
-import { CopyButton, Dialog, Notice } from '../components/ui/ui';
+import { CopyButton, Dialog, ErrorBox, Notice } from '../components/ui/ui';
+import { useAsync } from '../lib/async';
 import { useAuth, useMe } from '../lib/auth';
 
 export function SettingsPage() {
@@ -28,6 +29,7 @@ export function SettingsPage() {
       </div>
       <ClaudeSection />
       <GithubSection />
+      <ImageSection />
       <ModelsSection />
       <SecuritySection />
       <p className="muted small pad-top">Signed in as <strong>{me.username}</strong>{me.isAdmin ? ' · admin' : ''}.</p>
@@ -159,6 +161,242 @@ function GithubSection() {
         </div>
       </form>
     </section>
+  );
+}
+
+/**
+ * The image-generation provider: one per user. API-key providers are validated by the provider before the key is
+ * stored; a device-login provider (Codex) is connected by signing in with ChatGPT ([CodexConnect]).
+ */
+function ImageSection() {
+  const { me, setMe } = useAuth();
+  const cfg = useAsync(() => api.config(), []);
+  const [chosen, setChosen] = useState<string | null>(null);
+  const [model, setModel] = useState<string | null>(null);
+  const [key, setKey] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+  if (!me) return null;
+  const catalogue = cfg.data?.images;
+  const providers = catalogue?.providers ?? [];
+  const saved = providers.find((p) => p.id === me.imageProvider);
+  const current = providers.find((p) => p.id === chosen) ?? saved ?? providers.find((p) => p.available) ?? providers[0];
+  // The model field follows the chosen provider: its saved model for the saved provider, else its default.
+  const modelValue = model ?? (current && current.id === me.imageProvider && me.imageModel ? me.imageModel : current?.defaultModel ?? '');
+  // Why a provider cannot be chosen: shown for the saved provider, or when it is the only such reason.
+  const reasons = providers.filter((p) => !p.available && p.unavailableReason);
+  const reason = reasons.find((p) => p.id === me.imageProvider) ?? (reasons.length === 1 ? reasons[0] : undefined);
+  const choose = (id: string) => {
+    setChosen(id);
+    setModel(null);
+    setErr(null);
+    setMsg(null);
+  };
+  const save = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!current || current.auth !== 'api_key') return;
+    setBusy(true);
+    setErr(null);
+    setMsg(null);
+    try {
+      setMe(await api.putImageProvider(current.id, modelValue.trim(), key.trim()));
+      setKey('');
+      setModel(null);
+      setMsg('Saved. New image requests will use it.');
+    } catch (e2) {
+      setErr((e2 as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const remove = async () => {
+    setBusy(true);
+    setErr(null);
+    setMsg(null);
+    try {
+      setMe(await api.deleteImageProvider());
+      setMsg('Removed.');
+    } catch (e2) {
+      setErr((e2 as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const isSet = !!me.imageProvider;
+  const status = !isSet
+    ? 'not set — agents cannot generate images'
+    : saved?.auth === 'device_login'
+      ? `${saved.label} · ChatGPT login`
+      : `${saved?.label ?? me.imageProvider} · ${me.imageModel}`;
+  return (
+    <section className="card settings-card" id="images" aria-labelledby="images-h">
+      <header className="sc-head">
+        <h2 id="images-h">Image generation</h2>
+        <Status on={isSet}>{status}</Status>
+      </header>
+      <p>Agents can have icons, illustrations and other graphics made by an image AI. It runs on your own account and bills to you; your credential is used only for chats and runs you own.</p>
+      {cfg.loading && !catalogue && <p className="muted small">Loading…</p>}
+      {cfg.error && <ErrorBox error={cfg.error} retry={cfg.reload} />}
+      {current && catalogue && (
+        <form className="form" onSubmit={save}>
+          <fieldset className="seg seg--wide">
+            <legend className="sr-only">Image provider</legend>
+            {providers.map((p) => (
+              <label key={p.id} className={current.id === p.id ? 'is-on' : ''}>
+                <input type="radio" name="image-provider" className="sr-only" checked={current.id === p.id} disabled={!p.available} onChange={() => choose(p.id)} />
+                {p.label}
+              </label>
+            ))}
+          </fieldset>
+          {reason && <p className="muted small">{reason.label}: {reason.unavailableReason}</p>}
+          {current.auth === 'device_login' ? (
+            <CodexConnect connected={me.imageProvider === current.id} available={current.available} removing={busy} onRemove={remove} />
+          ) : (
+            <>
+              <div className="field">
+                <label htmlFor="ik">API key</label>
+                <input id="ik" type="password" className="mono" autoComplete="off" spellCheck={false} placeholder={current.keyPlaceholder} value={key} onChange={(e) => setKey(e.target.value)} />
+              </div>
+              <div className="field">
+                <label htmlFor="im">Model</label>
+                <input id="im" className="mono" autoComplete="off" spellCheck={false} list="image-models" value={modelValue} onChange={(e) => setModel(e.target.value)} />
+                <datalist id="image-models">
+                  {current.models.map((m) => <option key={m} value={m} />)}
+                </datalist>
+              </div>
+            </>
+          )}
+          {err && <p className="form-error" role="alert">{err}</p>}
+          {msg && <p className="form-ok" role="status">{msg}</p>}
+          {current.auth === 'api_key' && (
+            <div className="row">
+              <button className="btn btn--primary" disabled={busy || !key.trim() || !modelValue.trim() || !current.available}>
+                {busy ? `Checking with ${current.label}…` : isSet ? 'Replace' : 'Save'}
+              </button>
+              {isSet && <button type="button" className="btn btn--ghost btn--danger" onClick={() => void remove()} disabled={busy}>Remove</button>}
+            </div>
+          )}
+          <p className="muted small">
+            Limits: up to {catalogue.limits.maxPerRequest} images per request, {catalogue.limits.maxPerTurn} per chat message and {catalogue.limits.maxPerStage} per run stage.
+          </p>
+        </form>
+      )}
+    </section>
+  );
+}
+
+/**
+ * Connecting Codex with the user's own ChatGPT login: a device code the user enters at OpenAI, polled every 3 s until
+ * the server reports the login connected, failed or expired.
+ */
+function CodexConnect({ connected, available, removing, onRemove }: {
+  connected: boolean;
+  available: boolean;
+  removing: boolean;
+  onRemove: () => Promise<void>;
+}) {
+  const { setMe } = useAuth();
+  const [login, setLogin] = useState<CodexLogin | null>(null);
+  const [working, setWorking] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+  const pending = login?.status === 'pending';
+
+  // A login started earlier (e.g. before a reload) is picked up again.
+  useEffect(() => {
+    let gone = false;
+    api.codexLogin().then((s) => { if (!gone && s.status === 'pending') setLogin(s); }, () => {});
+    return () => { gone = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!pending) return;
+    let gone = false;
+    const t = window.setInterval(async () => {
+      try {
+        const s = await api.codexLogin();
+        if (gone) return;
+        setLogin(s);
+        if (s.status === 'connected') {
+          setMe(await api.me());
+          setMsg('Connected. New image requests will use it.');
+        }
+      } catch (e) {
+        if (!gone) setErr((e as Error).message);
+      }
+    }, 3000);
+    return () => {
+      gone = true;
+      window.clearInterval(t);
+    };
+  }, [pending, setMe]);
+
+  const start = async () => {
+    setWorking(true);
+    setErr(null);
+    setMsg(null);
+    try {
+      setLogin(await api.startCodexLogin());
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setWorking(false);
+    }
+  };
+  const cancel = async () => {
+    setWorking(true);
+    setErr(null);
+    try {
+      setLogin(await api.cancelCodexLogin());
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setWorking(false);
+    }
+  };
+  const remove = async () => {
+    setLogin(null);
+    setMsg(null);
+    setErr(null);
+    await onRemove();
+  };
+  const failure = login?.status === 'expired' ? 'The code expired. Start again.' : login?.status === 'failed' ? login.error ?? 'Codex sign-in failed. Try again.' : null;
+
+  if (pending) {
+    return (
+      <div className="codex-login">
+        <p>1. Open <a href={login.verificationUrl ?? undefined} target="_blank" rel="noreferrer">{login.verificationUrl}</a></p>
+        <p className="row">2. Enter this code <code>{login.userCode}</code> {login.userCode && <CopyButton text={login.userCode} />}</p>
+        <p className="muted small" role="status">Waiting for you to finish signing in…</p>
+        {err && <p className="form-error" role="alert">{err}</p>}
+        <div className="row">
+          <button type="button" className="btn btn--ghost" onClick={() => void cancel()} disabled={working}>Cancel</button>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="codex-login">
+      {!connected && (
+        <p>
+          Codex generates images on your own ChatGPT account. Sign in once; Agern stores the login encrypted and uses it only for chats and runs you own. Device code login must be enabled in your ChatGPT security settings.
+        </p>
+      )}
+      {failure && <p className="form-error" role="alert">{failure}</p>}
+      {err && <p className="form-error" role="alert">{err}</p>}
+      {msg && <p className="form-ok" role="status">{msg}</p>}
+      <div className="row">
+        {connected ? (
+          <>
+            <button type="button" className="btn btn--primary" onClick={() => void start()} disabled={working || removing || !available}>{working ? 'Starting…' : 'Reconnect'}</button>
+            <button type="button" className="btn btn--ghost btn--danger" onClick={() => void remove()} disabled={working || removing}>Remove</button>
+          </>
+        ) : (
+          <button type="button" className="btn btn--primary" onClick={() => void start()} disabled={working || !available}>{working ? 'Starting…' : 'Connect ChatGPT'}</button>
+        )}
+      </div>
+    </div>
   );
 }
 

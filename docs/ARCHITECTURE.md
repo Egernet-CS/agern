@@ -35,7 +35,8 @@ throwaway database.
 | Agents | The `claude` CLI in headless mode (`-p`, stream-json in and out) |
 | Realtime | WebSocket for output, REST for input |
 
-All persistent state lives in PostgreSQL. The only things on disk are git workspaces, the
+All persistent state lives in PostgreSQL, including the bytes of chat attachments and of the screenshots
+reviewers attach to their stage (§6 "Screenshots"). The only things on disk are git workspaces, the
 per-user Claude home directories and the agents' copies of chat attachments (a cache of the database,
 §5), all under `FACTORY_DATA_DIR` — plus, with sandboxes on, the service user's Podman storage (images,
 per-run containers, per-project cache volumes; §5 "Sandboxes").
@@ -59,6 +60,7 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_DATA_DIR` | `./data` | Workspaces and per-user homes |
 | `FACTORY_WEB_DIR` | unset | Built frontend directory, served with SPA fallback. Unset: the frontend embedded in `agern.jar` (classpath `web/`) is served; with neither, non-API paths answer 404 |
 | `FACTORY_CLAUDE_BIN` | `claude` | Path of the Claude CLI (tests point this at a stub) |
+| `FACTORY_CODEX_BIN` | `codex` | The OpenAI Codex CLI for the image provider `codex` (§4 "Codex login"); a bare name is resolved on `FACTORY_AGENT_PATH`. Optional: without it Codex is listed as unavailable. Tests and the e2e suite point it at `server/src/test/resources/fake-codex` |
 | `FACTORY_PUBLIC_URL` | `http://localhost:8080` | The URL browsers use. Cookie is `Secure` only when it is `https`; mutating requests and WebSocket upgrades with a different `Origin` are rejected (403). Agents reach MCP over loopback (`http://127.0.0.1:<port>/mcp`), not through this URL Text Agern writes on GitHub (comments, pull request bodies) links to its pages only when this is a public address; with an internal one (loopback, a private network, a name without a public domain) it names the page instead, so no internal address is published. |
 | `FACTORY_ALLOWED_ORIGINS` | empty | Extra allowed browser origins, comma list (e.g. `http://localhost:5173` for the Vite dev server) |
 | `FACTORY_MAX_AGENTS_PER_USER` | `8` | Concurrent agent processes per user |
@@ -70,6 +72,12 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_ATTACHMENT_MAX_MB` | `20` | Largest single chat attachment (1–512) |
 | `FACTORY_ATTACHMENT_MAX_MESSAGE_MB` | `50` | All attachments of one message together (1–512, at least the per-file limit) |
 | `FACTORY_ATTACHMENT_MAX_COUNT` | `10` | Attachments per message (1–20) |
+| `FACTORY_SCREENSHOT_MAX_MB` | `5` | Largest single screenshot a UX or UI design reviewer attaches (1–512; §6 "Screenshots") |
+| `FACTORY_SCREENSHOT_MAX_COUNT` | `12` | Screenshots per stage, i.e. per reviewer per round (1–50) |
+| `FACTORY_IMAGE_MAX_PER_REQUEST` | `4` | Images per `factory_generate_image` call (1–10; §6 "Generated images") |
+| `FACTORY_IMAGE_MAX_PER_TURN` | `8` | Images per chat message of the owner (1–100) |
+| `FACTORY_IMAGE_MAX_PER_STAGE` | `12` | Images per pipeline stage agent (1–200; each fix round is a new stage) |
+| `FACTORY_IMAGE_MAX_EDGE` | `2048` | Longest edge an agent may ask for, in pixels (256–4096) |
 | `FACTORY_SANDBOX` | `off` | `off` or `podman`: per-run build/test sandboxes in rootless Podman (§5 "Sandboxes"). `off`: runs behave as before and the builder gets no sandbox tools; definitions can still be approved. `fake` (development and end-to-end tests only, accepted only with `FACTORY_DEV_FAKE_GITHUB`): an in-memory runtime that only pretends to run commands |
 | `FACTORY_SANDBOX_PODMAN` | `podman` | The podman binary |
 | `FACTORY_SANDBOX_PODMAN_URL` | unset | When set, every call is `podman --url <url> …` (podman-remote against a `podman system service`, e.g. `unix:///run/…/podman.sock`) |
@@ -123,15 +131,63 @@ Sessions are server-side rows in PostgreSQL referenced by an opaque random id in
   (`kind = oauth_token`, passed to agents as `CLAUDE_CODE_OAUTH_TOKEN`) or an Anthropic API key
   (`kind = api_key`, passed as `ANTHROPIC_API_KEY`).
 - *GitHub token* — a personal access token. The server calls `GET /user` to learn the login.
+- *Image provider* (optional) — one image-generation provider (OpenAI or Google Gemini) with the user's own API
+  key and a model (§6 "Generated images"), or OpenAI Codex with the user's own ChatGPT login (below). An API key is
+  checked with the provider before it is stored.
 
-Both are stored encrypted with AES-256-GCM under `FACTORY_MASTER_KEY` (random 12-byte nonce per
+All three are stored encrypted with AES-256-GCM under `FACTORY_MASTER_KEY` (random 12-byte nonce per
 value, username as associated data). They are never returned by any API, never logged, and never
 written to disk in plaintext.
 
 **The ownership rule.** An agent process always runs with the credentials of the user who started
 it — the *owner*. There is no API through which user A can cause a process to start with user B's
 credential: only the owner may send input to, resume, or approve work in their sessions and runs
-(admins may stop, never drive). Everyone else gets read-only observation.
+(admins may stop, never drive). Everyone else gets read-only observation. The same holds for images: the server
+generates them only with the image key of the owner of the chat or run whose agent asks, and the key never reaches
+an agent process.
+
+**Codex login.** The image provider `codex` (`CodexImageProvider`) runs the OpenAI Codex CLI on the server with the
+user's own ChatGPT login instead of an API key.
+
+- *Connecting:* `POST /api/me/image-provider/codex/login` runs `codex login --device-auth -c
+  cli_auth_credentials_store="file"` in a fresh directory and answers the verification URL (only
+  `https://auth.openai.com/…` is accepted) and the one-time code once the CLI printed them (ANSI codes stripped; 502
+  `codex_login_failed` if none within 20 s). The web polls `GET …/codex/login` (`pending`, `connected`, `failed`,
+  `expired` after 15 minutes, `none`). When the CLI exits 0 and `$CODEX_HOME/auth.json` is a regular file of 1 byte to
+  64 KiB holding a JSON object, its text is stored like an API key (`users.image_key_enc`, AES-GCM, username as
+  associated data) with `image_provider = 'codex'`, `image_model = 'default'`. Pending logins live in memory
+  (`CodexLogins`), one per user; a new start, `DELETE …/codex/login`, saving or removing the provider setting, expiry
+  and server shutdown kill the process. `PUT /api/me/image-provider` refuses `codex` (409 `codex_login_required`).
+  Starts are limited to 5 per user per 15 minutes (429). The URL, the code and `auth.json` are never logged; only
+  the two login responses to their owner contain the code.
+- *Generating:* each call gets `$FACTORY_DATA_DIR/codex/<uuid>/` (`0700`) with `home/` (`HOME` and `CODEX_HOME`, the
+  login written as `auth.json`, `0600`) and `work/`, and runs `codex exec --skip-git-repo-check --ignore-user-config
+  --json --color never -s read-only -C <work> -c cli_auth_credentials_store="file" -` with an environment built from
+  scratch (`PATH`, `HOME`, `CODEX_HOME`, `LANG`, `TERM`, `NO_COLOR` only — no Claude, GitHub or factory variable). The
+  instruction, a fixed template ending in the agent's prompt, goes to stdin only. Size and format are wishes (the
+  tool's `notes` report what came back). Images are collected from regular files (no symlinks) under
+  `home/generated_images/` and `work/`, oldest first. The directory is deleted afterwards in every case; leftovers are
+  deleted at server start. 600 s timeout.
+- *Plaintext on disk:* the login is the one secret that exists in plaintext on disk, only while its `codex` process
+  runs, in that `0700` directory. Codex runs as the server's OS user, like every agent (the v1 limitation of §5).
+- *Refreshed tokens:* Codex may refresh and rewrite `auth.json`. One login must not be used by two processes, so one
+  user's Codex generations run one at a time (a per-user lock; the stored login is read after taking it). If the file
+  changed — on success or failure — the new text replaces the stored login by compare-and-set
+  (`UPDATE … WHERE image_provider = 'codex' AND image_key_enc = <what was read>`), so a re-login or removal made
+  during the call wins.
+- *Errors:* CLI output never leaves the provider. Without an image, the output is matched loosely: `401`/unauthorized/
+  not logged in/refresh token/expired token → "Your sign-in to OpenAI Codex is no longer valid. Connect it again under
+  Settings → Image generation."; usage limit/rate limit/quota → quota; content policy/safety/moderation → refused;
+  otherwise "answered without a usable image".
+- *Verification (factory host, 2026-11-22):* `codex` 0.170.0 is installed; `codex features list` reports
+  `image_generation stable true`; the bundled `imagegen` skill says the built-in `image_gen` tool needs no
+  `OPENAI_API_KEY` and saves under `$CODEX_HOME/generated_images/…`; `codex exec` is non-interactive and reads the
+  prompt from stdin; `codex login --device-auth` runs headless and prints the URL and code shown above. **Not
+  verified**, because no ChatGPT login was available to the pipeline: a real generation on a given ChatGPT plan, that
+  the file appears under `generated_images` with `-s read-only`, and the CLI's exact error texts. The owner's first
+  real use is the acceptance test for these; if it fails, removing `CodexImageProvider` from the list in `App.kt`
+  removes the provider without touching the rest. The user must enable device-code login in their ChatGPT security
+  settings.
 
 **Visibility.** A user may see a project, its issues, runs, sessions and transcripts if and only if
 their own GitHub token can read that repository (`GET /repos/{org}/{repo}` → 200; cached 60 s per
@@ -190,6 +246,12 @@ Launch rules:
   OAuth token, …) is reported as a `system` error telling the user to update it in Settings, for
   chats and pipeline stages alike. A process the server stops itself (stop, idle, shutdown) is
   reported as a neutral notice, never as an error exit code.
+- The **advisor** (§6 "Conversation at needs human") is launched exactly like a chat — the same flags, kept alive
+  between turns, stopped by the idle reaper, resumed with `--resume` and the same failed-resume fallback — except:
+  its working directory is the run's worktree, its role prompt is `advisor`, its MCP grant is the stage tools
+  (bound to the run), and its first stream-json message of every launch starts with a `<run_context>` block rebuilt
+  from current data (over stdin, never in argv). It has no `/factory` commands, no attachments and no stage time
+  limit.
 - Each stdout line is one JSON object. Complete messages are persisted as events; partial
   `stream_event` deltas are broadcast live but not persisted.
 
@@ -501,7 +563,8 @@ reaches the default branch only through the owner's approval of the release (§6
 - **builder** implements the spec on the run branch and commits. The orchestrator pushes the branch
   and opens a pull request after the first build. When the run has an approved sandbox (§5 "Sandboxes"),
   the builder builds and tests in it through `factory_sandbox_exec`; the sandbox is removed when the
-  build/review loop ends, before the approver runs.
+  build/review loop ends, before the approver runs. Its task and fix prompts name the branch the pull request merges
+  into and the rule for migration versions (§6 "Database migrations").
 - **reviewers** run in parallel, cannot edit files (`--disallowedTools Edit,Write,NotebookEdit`),
   and answer through `--json-schema` with
   `{ "verdict": "PASS" | "CHANGES", "summary": string, "findings": [{ "severity", "file", "detail" }] }`.
@@ -529,7 +592,8 @@ reaches the default branch only through the owner's approval of the release (§6
     limit that is too short for a large issue; a per-project override (e.g. in `.agern/`) can be added later if a real
     project needs one, and is a configuration change only (`AgentManager.runStageAgent` takes the limit from `Config`).
 - **approver** answers `{ "verdict": "APPROVE" | "ESCALATE", "summary": string }`. `APPROVE`
-  squash-merges the PR and closes the issue. `ESCALATE` labels the issue `needs-human`, comments,
+  squash-merges the PR and closes the issue, unless its database migrations collide with the target's (§6 "Database
+  migrations"): then the run goes to `needs_human` instead. `ESCALATE` labels the issue `needs-human`, comments,
   and waits for the owner's `/factory approve`.
 - **Whose models.** Every agent runs on its owner's Claude account, so model choices are personal. The
   global settings (`chatModel`, `pipelineModels`, `maxFixRounds`) are the admin's *defaults* — the models
@@ -618,7 +682,10 @@ A failed run can be retried in three ways (issue #53), depending on where it sto
   (`--resume`). The issue gets "**Agern:** retrying the failed step (<step>) of run `<id>` on branch `<branch>`.". A
   failed merge leaves the run in `needs_human` (as before) with `failedStep` `merge`; its step retry merges again — as
   the approver's decision when the approver had approved, else as the owner's — which is what the owner's approval
-  also does.
+  also does. It goes through the same gate as the approval: changes from the conversation must have been reviewed
+  (409 `review_required` / `review_in_progress` / `agent_busy`, §6 "Conversation at needs human"), and the merge
+  checks the database migrations first (§6 "Database migrations"). A migration conflict is not a failed step: it
+  clears `failedStep`, so the run offers no step retry until its branch is fixed.
 - **Continue from the commits** (`continue`): a **new run** whose worktree starts at the tip of the failed run's
   branch (local branch, else the remote one, fetched), on its own new branch (§6 "Worktrees and branches"). It reuses
   the failed run's spec (the spec-writer stage is `skipped` with summary "Spec reused from run <id>"; a failed run
@@ -679,6 +746,147 @@ Run `status`: `queued`, `spec`, `building`, `reviewing`, `approving`, `merged`, 
 Stage `role`: `spec-writer`, `builder`, `security`, `ux`, `ui-design`, `code`, `approver`.
 Stage `status`: `pending`, `running`, `done`, `failed`, `skipped`.
 Stage `verdict`: `PASS`, `CHANGES`, `APPROVE`, `ESCALATE` or null.
+
+### Database migrations
+
+Two branches built independently can each add a Flyway migration with "the next free version". The files have
+different names, so git sees no conflict and both merge, but with two migrations of one version the server no longer
+starts; and the later one cannot simply be renumbered once an installation has applied the other. So a new migration
+takes its version from the branch it merges into, above every migration there, and a migration that exists on that
+branch is never changed, renamed or removed (Flyway checks applied migrations by checksum). Three guards apply this:
+
+- **CI, for Agern itself.** `scripts/check-migrations.sh [<base-ref>]` checks `server/src/main/resources/db/migration`
+  without a database (bash 3.2 or later, git, awk): every file is named `V<number>__<name>.sql`, no two share a version
+  (compared as numbers, `V011` = `V11`), and, against a base, every file not on the base is above the base's highest
+  version and every migration on the base is unchanged and still there. Problems are printed one per line naming the
+  files, exit 1. The `migrations` job in `ci.yml` runs its self-test (`scripts/check-migrations-test.sh`) and, on a pull
+  request, the check of the merge commit against `HEAD^1` (the base branch's tip); on a push, without a base.
+  `publish-main` needs it. On startup `Db.connect` lists the bundled migrations before Flyway runs and fails with
+  "Duplicate migration version 11: V11__a.sql and V11__b.sql. Renumber the one that was added later to a version above
+  every other migration." (`MigrationFilesTest`).
+- **Agern, for every project it builds.** The known layout is Flyway's default location: files at or below a
+  directory `src/main/resources/db/migration`, at the repository root or in a module (e.g.
+  `server/src/main/resources/db/migration`); each such directory is checked on its own. A versioned migration is
+  `V<version>__<description>.sql`, the version being digit groups separated by `.` or `_`, compared as Flyway does
+  (`1` = `1.0` = `01`, `1_2` < `1.10`). Other files, layouts and projects are never affected. The check
+  (`MigrationCheck`) runs with git in the owner's clone, no database and no GitHub API: both branches are fetched, and
+  the head's changes since the merge base (`git diff --name-status --no-renames <base>...<head>`; a rename is a removal
+  plus an addition) are compared with the files on the base's tip (`git ls-tree`, only under the directories the
+  changes touch, and not at all when no change touches a migration). Problems: an added migration with the same
+  version as one on the base or another added one, an added migration below the base's highest, and a migration on
+  the base that the head changes or removes. Paths in the texts keep only `[A-Za-z0-9._/+-]` (the rest `?`) and at
+  most 200 characters; at most 5 problems are listed, then "(and N more)". A comparison that cannot be made (no
+  clone, a branch missing, git failing) is logged and blocks nothing: CI is the strict gate.
+  - *A run's pull request*, before every squash merge (the approver's `APPROVE`, the owner's approval of a
+    `needs_human` run and the step retry of a failed merge, single and release runs alike), compares the run's branch with its target. On a problem
+    nothing is merged and the run goes to `needs_human` through the usual path (label, comment, error), with the
+    reason "Database migration conflict with `<target>`: <problems>. Pull request #<n> was not merged. Migrations
+    already on `<target>` must stay unchanged, and a new migration needs a version above all of them. Fix the
+    migration on the pull request's branch and approve again, or build the issue again from the current `<target>`
+    (in a release: Retry)." In a release, the issue thereby becomes `held` with that note (§6 "Releases",
+    "Outcomes"); approving the run again checks again.
+  - *A ready release* compares `release/<name>` with the default branch at every re-evaluation once its pull request
+    is open (it becomes ready, "Check again", the periodic re-evaluation, before an approval). Its issues are already
+    merged into the release branch, so none can be held: the release stays `ready` with the notice "Database migration
+    conflict with `<default>`: <problems>. The release is not merged. Fix the migrations on `release/<name>` (merge
+    `<default>` into it; a new migration needs a version above every migration on `<default>`, and existing ones must
+    stay unchanged), then use "Check again".", is not announced as ready to release, is not merged automatically, and
+    approval answers 409 `release_migration_conflict` with the notice and " Nothing was merged." (§6 "Releasing"). The
+    next re-evaluation without a problem clears the notice.
+- **The builder's prompt.** `builder.md` and the build, continue (§6 "Retrying a run") and fix prompts tell the builder to take a new migration's
+  version from the branch its pull request merges into (named in the prompt, fetched first), above every migration
+  there, never to change one that exists there, and to check again before finishing, in every fix round and after
+  any rebase or merge of that branch. A release run is told that its version must also be above every migration on
+  the default branch, which the release is merged into later.
+
+### Conversation at needs human
+
+When a run waits at `needs_human`, its owner can talk to an agent about it — the **advisor** (session kind `advisor`,
+title `advisor · #<n>`), a new agent with both the approver's and the builder's context — before deciding to approve
+or cancel. Talking never changes the run's status and never approves anything. Messages are not posted on GitHub.
+
+- **Who.** Only the run's owner, through `POST /api/runs/{id}/conversation` (or the session input route). Everyone
+  else gets 403, admins included (they may stop the advisor and cancel the run, never drive it); a user who cannot see
+  the repository gets 404. The advisor runs on the owner's credentials: agent slot, spend, limit windows. A usage
+  limit ends the turn with a `system` warn event (with the reset time when known); nothing is lost and the
+  conversation continues with the owner's next message.
+- **Session.** The first accepted message creates the run's one advisor session (`Run.conversation.sessionId`) with
+  the owner's effective `builder` model, and records the worktree's `HEAD` as the run's *reviewed commit*. One message
+  is in flight at a time: a message while the agent answers (or while the run is reconciled after its turn) is 409
+  `agent_busy`. Refusals, in this order: 404, 403 `forbidden`, 409 `run_not_waiting`, 400 (blank or over 100 000
+  characters), 409 `review_in_progress`, 409 `agent_busy`, 422 `claude_credential_required`, 409 `too_many_agents`
+  (no live process and no free slot), 409 `run_worktree_missing`.
+- **Context.** Every new process (fresh or resumed) gets, before the owner's first message to it, a `<run_context>`
+  block rebuilt from the database and GitHub: run id, repository, issue, why it needs a human (`run.error`), branch,
+  base ref, pull request, merge target and the release note; how to inspect the change (`git diff <base>...HEAD`,
+  `git log <base>..HEAD`); the issue text (the stored title when GitHub cannot be read); `<spec>` (the spec-writer's
+  final text), `<builder_summary>` (the latest builder's), `<reviews>` (each reviewer's latest verdict with round,
+  summary and findings), `<approver>` (verdict and summary, or that it did not run), and that the run has no sandbox
+  now. Then `Message from the run owner (<username>):` and the text; later messages to the same process carry only
+  that prefix. The transcript's `user` event holds the owner's text as written; a `system` info event at each launch
+  says the agent was given the run's context. The prompt marks the context as data, not instructions.
+- **Changes.** The advisor may change code when asked, and must commit; it never pushes, merges or comments on
+  GitHub (by instruction and by having no such MCP tools — like the builder it does have the owner's git and `gh`
+  credentials). After every advisor `result` and every exit, the server *reconciles* the run before the session counts
+  as idle: if the worktree `HEAD` differs from the reviewed commit, the review state (`Run.conversation.review`)
+  becomes `running` and a **follow-up review** starts. It is idempotent and a no-op while a review runs.
+- **Follow-up review.** A coroutine of the run (cancel stops it), not the pipeline: it stops the advisor process
+  (resumable), pushes the branch with the owner's identity, creates the four reviewer stages of a new round (highest
+  round + 1, the owner's current models; `Run.round` becomes it, `followUpFrom` is the first such round) and runs them
+  exactly as in the pipeline (read-only, `--json-schema`, screenshots for `ux` and `ui-design`, the stage time limit).
+  Their prompt says the round is "after follow-up round N: changes the run owner requested in a conversation" and
+  carries the advisor's last result in `<advisor_summary>`. When all four return a verdict: the reviewed commit
+  becomes the pushed one, the state `none`, `run.error` becomes the original reason plus
+  `**Follow-up review N** (commit `<sha7>`): all four reviewers pass.` (or `<roles> still request changes.`), the
+  advisor's transcript gets a `system` event with each verdict, and the pull request one comment. A push failure, a
+  failed or timed-out reviewer, an invalid verdict or a usage limit closes the round's open stages and leaves the
+  state `required` with a `system` error in the advisor's transcript pointing to "Review again"
+  (`POST /api/runs/{id}/review`); the run stays `needs_human` with its worktree. The approver does not run again, and
+  nothing is merged: `CHANGES` verdicts do not block the owner's approval (as after exhausted fix rounds).
+- **Approval** (button, `/factory approve`, `factory_approve_run`) is refused while a follow-up review runs (409
+  `review_in_progress`), while the advisor is mid-turn (409 `agent_busy`), and when changes have not been reviewed
+  (409 `review_required`: state `required`, or `HEAD` differs from the reviewed commit — which also catches a commit
+  the agent pushed itself or one made before a restart). Otherwise a live advisor process is stopped first; the
+  session ends `done` when the run is merged and stays usable when the merge fails.
+- **Cancel** (owner, admin or a release) stops a running follow-up review and the advisor (mid-turn too) before the
+  worktree is removed; the advisor session ends `stopped`.
+- **Restart.** Advisor sessions of `needs_human` runs become `idle` (resumable); a review state `running` becomes
+  `required`; open stages of `needs_human` runs are closed. The owner uses "Review again"; nothing restarts by itself.
+- **Releases.** A release run in a conversation stays `needs_human`, so its issue stays `held` and the release cannot
+  be approved until the owner approves or cancels the run.
+
+### Screenshots
+
+For a change that affects a UI, the **ux** and **ui-design** reviewers run the app and attach captioned screenshots
+of the screens they reviewed to their stage with the MCP tool `factory_attach_screenshot` (§7); the builder and the
+other roles do not get the tool. Their prompts (`prompts/ux.md`, `prompts/ui-design.md`) tell them to start the app
+on a free port (the four reviewers share the worktree), capture each added or altered screen in the states that
+matter (empty/filled, error/loading, light/dark, narrow width), give each a one-line caption, quote the caption in a
+finding the screenshot supports, delete the files after attaching and never commit them — and to say in their
+summary how many they attached, that the change has no UI, or why they could not take any. Missing screenshots are
+never a reason for `CHANGES` and never fail the stage.
+
+- **Who:** decided from the MCP grant — the token's session must be the session of a `ux` or `ui-design` stage of the
+  token's run, in the token's repository — never from tool arguments.
+- **Per round:** a screenshot belongs to the caller's stage row, so to its role and round. Each fix round creates new
+  stage rows: screenshots of a fix round belong to that round, earlier rounds keep theirs.
+- **Storage:** table `stage_screenshots` in PostgreSQL (bytes included), removed with the stage and with the run
+  (`ON DELETE CASCADE`). Nothing goes into the repository or to GitHub.
+- **Limits:** only PNG, JPEG, GIF and WebP (type sniffed from the bytes, never the extension, with readable
+  dimensions); at most `FACTORY_SCREENSHOT_MAX_MB` per image (checked before reading) and
+  `FACTORY_SCREENSHOT_MAX_COUNT` per stage (checked under a per-stage lock); the file must resolve, symlinks
+  followed, to a regular file inside the run worktree; the caption is required, made one line (control and format
+  characters removed, whitespace collapsed) and at most 200 characters.
+- **Shown** on the run page with the stage (§10), live: each attach publishes the run on the feed. Served by
+  `GET /api/runs/{id}/screenshots/{sid}` (§8) to whoever may see the run.
+- **Pull request note:** after the reviewers of a round have all returned a verdict, if that round's stages have
+  screenshots and the run has a pull request, Agern comments on it once (best effort): `**Agern: screenshots** — the
+  reviewers attached <n> screenshot(s) of this change (<build | fix round N>). See them on <run page>:` followed by
+  `- **<role>:** <caption>` per screenshot (reviewers in pipeline order, each in attach order). The run page is
+  linked only when `FACTORY_PUBLIC_URL` is public (`Config.pageRef`), otherwise named. Images are never uploaded.
+- **Prerequisite:** reviewers run the app on the factory host, so for projects with a web UI a headless browser
+  (e.g. Chromium via Playwright) must be installed there by an administrator. Without it the reviewers report that
+  they could not take screenshots, and the run continues as usual.
 
 ### Releases
 
@@ -847,7 +1055,8 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   ignores runs no longer linked to an issue.
 - **Held issues.** The owner can approve the held run (`POST /api/runs/{id}/approve`, `/factory approve`): when it
   merges the issue becomes `merged`, if the merge fails it stays `held` with the new reason (a branch that is behind
-  is merged by GitHub's squash merge; a conflict fails). The owner can retry it, or anyone allowed can take it out.
+  is merged by GitHub's squash merge; a conflict fails; database migrations that collide with the release branch's
+  are refused before the merge, §6 "Database migrations"). The owner can retry it, or anyone allowed can take it out.
 - **Retry** (`POST /api/releases/{id}/issues/{number}/retry`, owner only): the release must be `building`,
   `paused` or `ready` (409 `release_not_building`; a `ready` one becomes `building` again, 409
   `release_already_building` while another release of the project builds), the issue `held` or `skipped` (409 `release_issue_not_held`). It becomes
@@ -949,6 +1158,10 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   answers 409 `release_conflict` and changes nothing. The owner decides: resolve the conflict on the release branch
   (e.g. merge the default branch into it and push) and "Check again", or cancel. Agern does not resolve conflicts
   itself (issue #35); nothing here prevents that from being added as another way forward from this state.
+- **Database migrations.** A release branch whose migrations collide with the default branch's (e.g. another release
+  merged the same version first) stays `ready` with the notice of §6 "Database migrations", without the ready
+  announcement and without an automatic merge; approval answers 409 `release_migration_conflict`. The owner fixes the
+  release branch (merge the default branch into it, renumber the release's new migration) and uses "Check again".
 - **Approval** (`POST /api/releases/{id}/approve`, `/factory release approve <name>`, `factory_approve_release`):
   **only the owner**; everyone else, admins included, gets 403 `forbidden` ("Only <owner>, who started this release,
   can do this"); a caller who cannot see the project gets 404 first. Admins may still cancel (they stop, never
@@ -958,7 +1171,8 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   out of the release first."); something merged (409 `release_empty`, "Nothing was merged into the release branch,
   so there is nothing to release."); a re-evaluation; a pull request exists (409 `release_merge_failed` with the
   notice); no conflict (409 `release_conflict`, "`release/<name>` no longer merges cleanly into `<default>`. Nothing
-  was merged."); a usable merge method (below). The pull request is read once more for its head commit, which is
+  was merged."); no database migration conflict (409 `release_migration_conflict`, the notice of §6 "Database
+  migrations" and " Nothing was merged."); a usable merge method (below). The pull request is read once more for its head commit, which is
   passed to GitHub's merge (`sha`), so a release branch that moves after the check is refused rather than merged
   unseen. Approvals of one release are serialised by its mutex; a second, concurrent approval finds it `released`
   and answers 409 `release_not_ready`. Check ("Check again", `POST …/check`) has the same owner rule.
@@ -995,7 +1209,7 @@ release mode (#41). Single runs are unaffected and still merge into the default 
     (`ReleaseModePolicy`, below). The merge is **the approval's own code path** (`mergeLocked`): the owner's token, the
     same method, the head commit the checks were read for passed as `sha` (a branch that moved meanwhile is refused,
     not merged unseen), and the same "After the merge". No language-model agent takes part in the decision.
-  - *Blockers are never overridden*: held issues, a conflict, no usable merge method, an owner without a GitHub token
+  - *Blockers are never overridden*: held issues, a conflict, a database migration conflict, no usable merge method, an owner without a GitHub token
     and failed or unreadable checks all leave the release `ready` with the usual banner or notice. The owner can
     still approve by hand at any time (approval is never blocked by checks).
   - *Failed checks*: `notice` "Checks failed on pull request #n (<detail>), so it is not released automatically. …"
@@ -1113,6 +1327,69 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   "checkRuns": [{"name", "status", "conclusion"}]}`) sets the checks of a branch while the server runs; the e2e suite
   uses it.
 
+### Generated images
+
+Agents can have graphics made by an image AI the user chose (issue #11). Claude does not generate images itself.
+
+- **Providers:** `dk.egernet.factory.images.ImageProvider` implementations — `OpenAiImageProvider` (Images API,
+  `Authorization: Bearer`), `GeminiImageProvider` (Interactions API, `x-goog-api-key`, no transparent backgrounds) and,
+  only in fake-GitHub mode, `DevFakeImageProvider` (`fake`, keys `fake-image-…`, draws PNGs; `fake:refuse` and
+  `fake:quota` in a prompt fail). Nothing outside the package knows provider names: `GET /api/config` lists the
+  catalogue and the web renders it. The HTTP providers never follow redirects (a key is never sent to another host),
+  send the key only in a header, connect within 10 s and wait at most 300 s. Model names are free text
+  (`^[A-Za-z0-9._:-]{1,100}$`); the catalogue's models are suggestions.
+- **Setting:** one provider per user (`users.image_provider`, `image_model`, `image_key_enc`), set with
+  `PUT /api/me/image-provider` after the provider accepted key and model, removed with `DELETE` (images stay). Codex
+  is connected by its device login instead (§4 "Codex login"). Each catalogue entry says how it is connected
+  (`auth`: `api_key` or `device_login`) and whether it can be used on this server (`available`,
+  `unavailableReason`; Codex is unavailable when `FACTORY_CODEX_BIN --version` does not exit 0 within 10 s, checked
+  at most once a minute).
+- **Key throttle:** a key the provider rejects counts against its user; after 5 within 15 minutes, further `PUT
+  /api/me/image-provider` calls answer 429 `too_many_attempts` (`lockedUntil` = when the oldest counted rejection is 15
+  minutes old) without calling the provider, so the route cannot be used to test stolen keys. Malformed input does not
+  count and a successful save does not reset the count. In memory (`AttemptLimiter`).
+- **Tool:** `factory_generate_image` (§7) for the chat agent, the spec-writer and the builder (fix rounds included).
+  The service also derives the session kind from the grant and refuses any other, and for a run checks that the run
+  belongs to the grant's repository and owner. Order: who may call, arguments, provider configured, transparency
+  (JPEG has none; Gemini cannot), limits, provider call (on `Dispatchers.IO`), result checks.
+- **Limits:** per call (`FACTORY_IMAGE_MAX_PER_REQUEST`), per chat message (`…_PER_TURN`; the counter resets when the
+  owner's next non-command chat input is accepted) and per stage agent (`…_PER_STAGE`), reserved before the call and
+  released for images not delivered; edges 256…`FACTORY_IMAGE_MAX_EDGE`. In-memory counters (a restart resets them).
+  A returned image over 20 MiB, not PNG/JPEG/WebP by its magic bytes or without readable dimensions is dropped.
+  Agern never resizes or converts; the tool's `notes` say when the result differs from what was asked.
+- **No provider:** a tool error without a provider call. The chat agent tells the user to add one under
+  Settings → Image generation; a pipeline agent continues without images, says so in its summary, and the run does
+  not fail for it. Provider failures are tool errors in plain words, with the key redacted from any provider text.
+- **Storage:** table `generated_images` (bytes included; `origin` `chat` or `run`; `session_id` without a foreign key
+  so a closed chat's selected images keep it). Agent copies: chats under
+  `$FACTORY_DATA_DIR/generated-images/<sessionId>/<id8>-<slug>.<ext>` (absolute `path`), runs under
+  `<worktree>/.agern-run/images/<id8>-<slug>.<ext>` (relative `path`). Whenever the server creates
+  `<worktree>/.agern-run/` it writes `.agern-run/.gitignore` containing `*`, so git ignores the directory without any
+  change to the repository. **Symlinks are never followed:** `.agern-run` and `.agern-run/images` must be absent or
+  real directories (checked with `NOFOLLOW_LINKS`) whose real path lies inside the worktree's; a file is written by
+  removing whatever is at its name (a symlink itself, not its target) and creating it with `CREATE_NEW` and
+  `NOFOLLOW_LINKS`. The tool checks this before the limits and the provider call ("Images cannot be written:
+  `.agern-run` in this working directory is not a plain directory."); the run hand-over fails the run ("Prepared
+  images could not be handed over: …"), which unlocks the selection. Directory removal walks the tree without
+  following links. Each generation appends an `images` event to the session (§8) and, in a run, publishes the
+  run so the run page updates.
+- **Selection:** the owner of a chat image selects it for an open issue under a short name (`PUT
+  /api/images/{id}/selection`), moves, renames or unselects it, or discards an unselected one; at most 20 per issue.
+  The conditions are part of the SQL statements. A selection belongs to the issue: any user's run of it receives it.
+- **Run hand-over:** when a run starts (after the sandbox decision) it takes all selected images of its issue
+  (`used_by_run_id`; not those held by another run that is still active or merged), writes them to
+  `.agern-run/images/prepared-<nn>-<slug of name>.<ext>` and lists them in an `<images>` block after the issue text of
+  the spec-writer's and builder's task prompts (not the fix prompt); those stages also note "Prepared images: …" in
+  their transcript. A selection is **locked** while its run is not `failed` or `cancelled`; a retry gets the same
+  images. A run for an issue without selected images, in which no agent calls the tool, has byte-identical prompts
+  and no `.agern-run` directory.
+- **Cleanup:** closing a chat deletes its unselected images and its image directory; discard deletes at once; run
+  images go with their run row (cascade) and their files with the worktree. There is no time-based reaper.
+- **Prompts:** `chat.md`, `spec-writer.md` and `builder.md` say when to use the tool (whenever graphics are asked for,
+  never otherwise), to write the prompt from the project's existing visual style, to read the returned file, and what
+  to do without a provider. The spec-writer names the needed images in the spec; the builder uses prepared images,
+  generates the rest and adds what it uses where the project keeps assets, never committing `.agern-run/`.
+
 ## 7. Chat agent ↔ factory (MCP)
 
 The server exposes an MCP endpoint (`POST /mcp`, streamable HTTP, JSON responses). Every agent
@@ -1124,7 +1401,30 @@ Tools: `factory_list_issues`, `factory_get_issue`, `factory_create_issue`, `fact
 `factory_send_to_agent`, `factory_request_software`, `factory_list_releases`, `factory_create_release`,
 `factory_assign_issues`, `factory_unassign_issues`, `factory_approve_release`. Pipeline-stage agents get only `factory_get_issue`
 and `factory_request_software`; with sandboxes switched on (`FACTORY_SANDBOX` not `off`) the builder also
-gets `factory_sandbox_info` and `factory_sandbox_exec`.
+gets `factory_sandbox_info` and `factory_sandbox_exec`; the `ux` and `ui-design` reviewers also get
+`factory_attach_screenshot`. The chat agent, the spec-writer and the builder also get `factory_generate_image`. The advisor (§6 "Conversation at needs human") gets the same two stage tools, bound to its
+run, and nothing else: no approve, cancel, start, release, sandbox, screenshot or image tool.
+
+Image tool (§6 "Generated images"), chat, spec-writer and builder only:
+- `factory_generate_image { prompt, purpose, size?, format?, count?, transparentBackground?, issueNumber? }` —
+  `prompt` 1–4000 characters; `purpose` one line, 1–200 characters (e.g. "app icon"); `size` `WIDTHxHEIGHT` (default
+  `1024x1024`, each edge 256…`FACTORY_IMAGE_MAX_EDGE`); `format` `png` (default), `jpeg` or `webp`; `count` 1…
+  `FACTORY_IMAGE_MAX_PER_REQUEST` (default 1); `issueNumber` a hint for the chat UI. Answers JSON text
+  `{ "images": [{ "id", "path", "mediaType", "width", "height", "bytes" }], "provider", "model", "notes": [...],
+  "remaining", "next" }`. Refusals and provider failures are tool errors, e.g. `No image provider is configured for
+  <user>. …`, `Limit reached: at most 8 images per chat message (0 left). …`, `<Label> rejected your API key. …`,
+  `Only the chat agent, the spec-writer and the builder can generate images`.
+
+Screenshot tool (§6 "Screenshots"), `ux` and `ui-design` reviewers only:
+- `factory_attach_screenshot { path, caption }` → text such as `Attached screenshot 2 of at most 12 for this stage:
+  "<caption>" (image/png, 1440×900, 212.4 KB).` `path` is relative to the agent's working directory (the run
+  worktree) or absolute inside it; the file is copied and left as it is. Refusals are tool errors (`isError`), never
+  JSON-RPC errors: `Only the ux and ui-design reviewers can attach screenshots` (also for a hand-built grant whose
+  session is not a `ux`/`ui-design` stage of its run, or has no run), `path must be a file inside your working
+  directory` (outside, `..`, a symlink pointing out, a directory), `No such file: <path>`, `caption is required: say
+  what the screenshot shows`, `caption is too long (at most 200 characters)`, `The image is larger than <size>`,
+  `The file is empty`, `Only PNG, JPEG, GIF or WebP images are accepted`, `This stage already has <n> screenshots
+  (the maximum)`.
 
 Sandbox tools (§5 "Sandboxes"), builder only; they act on the sandbox of the token's run, and a token
 without a run (a chat) is refused:
@@ -1205,7 +1505,9 @@ type User = { id: string; username: string; displayName: string; isAdmin: boolea
   twoFactorEnabled: boolean;
   twoFactorLockedUntil: string | null;    // set while the second factor is locked (too many wrong codes)
   githubTokenKind: 'classic' | 'fine_grained' | null;  // from the prefix: ghp_ → classic, github_pat_ → fine_grained
-  githubTokenScopes: string[] | null };   // classic tokens: GitHub's X-OAuth-Scopes at registration; null otherwise
+  githubTokenScopes: string[] | null;     // classic tokens: GitHub's X-OAuth-Scopes at registration; null otherwise
+  imageProvider: string | null;           // image provider id (§6 "Generated images"); null without a stored key
+  imageModel: string | null };            // never the key
 
 type LoginStep =
   | { next: 'totp' }                                             // enter a code
@@ -1220,7 +1522,8 @@ type IssueKind = 'feature' | 'bug' | 'task';      // from labels: bug → bug; e
 type Issue = { number: number; title: string; state: 'open' | 'closed'; kind: IssueKind;
   labels: { name: string; color: string }[]; author: string; assignees: string[]; comments: number;
   createdAt: string; updatedAt: string; htmlUrl: string; body?: string; activeRunId: string | null;
-  release: { id: string; name: string } | null };  // the release it is planned in (§6 "Releases"); always present
+  release: { id: string; name: string } | null;  // the release it is planned in (§6 "Releases"); always present
+  imageCount: number };  // images selected for it in a chat (§6 "Generated images")
 
 type ReleaseIssue = { number: number; title: string; kind: IssueKind;   // title/kind as when it was assigned
   state: 'waiting' | 'running' | 'merged' | 'held' | 'skipped';
@@ -1255,7 +1558,8 @@ type Release = { id: string; repo: string; name: string; description: string;
   checks: { state: 'unknown' | 'awaiting' | 'none' | 'pending' | 'passed' | 'failed';   // on the pull request's head commit
             detail: string | null; sha: string | null } | null };         // null until there is a pull request
 
-type SessionKind = 'chat' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
+type StageRole = 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
+type SessionKind = 'chat' | 'advisor' | StageRole;   // advisor: the agent a run's owner talks to at needs_human
 type SessionStatus = 'starting' | 'running' | 'idle' | 'done' | 'failed' | 'stopped';
 type AgentSession = { id: string; repo: string; kind: SessionKind; model: string; status: SessionStatus;
   owner: { username: string; displayName: string }; title: string | null;
@@ -1266,14 +1570,28 @@ type AgentSession = { id: string; repo: string; kind: SessionKind; model: string
 // status: `starting` = process launching; `running` = mid-turn (busy); `idle` = waiting for input
 // (a chat between turns, with a process if `live`, else resumed on the next input); `stopped` = stopped by
 // a person (a chat resumes on its owner's next input); `done` / `failed` = a pipeline agent finished.
+// An advisor is `idle` between turns like a chat, `done` when its run was merged, `stopped` when it was cancelled.
 
-type Stage = { id: string; role: Exclude<SessionKind, 'chat'>;
-  round: number;             // 0 = initial build/review, 1..maxRounds = fix rounds
+type Stage = { id: string; role: StageRole;
+  round: number;             // 0 = initial build/review, 1..maxRounds = fix rounds, >= conversation.followUpFrom: follow-up rounds
   model: string;             // the model the stage runs (or ran) with; set when the stage is created
   status: 'pending' | 'running' | 'done' | 'failed' | 'skipped';
   verdict: 'PASS' | 'CHANGES' | 'APPROVE' | 'ESCALATE' | null; summary: string | null;
   findings: { severity: string; file: string | null; detail: string }[];
-  sessionId: string | null; startedAt: string | null; endedAt: string | null };
+  sessionId: string | null; startedAt: string | null; endedAt: string | null;
+  screenshots: Screenshot[];    // ux / ui-design only (§6 "Screenshots"), attach order; [] for other stages
+  images: GeneratedImage[] };   // images the stage's agent generated (spec-writer, builder), oldest first
+
+type GeneratedImage = { id: string; repo: string; origin: 'chat' | 'run'; sessionId: string;
+  owner: { username: string; displayName: string }; provider: string; model: string;
+  prompt: string; purpose: string;                       // untrusted text
+  mediaType: string; size: number; width: number; height: number; transparent: boolean; createdAt: string;
+  selection: { issueNumber: number; name: string; usedByRunId: string | null; locked: boolean } | null };
+// bytes at GET /api/images/{id}
+
+type Screenshot = { id: string; caption: string;   // caption: one line, untrusted (render as text)
+  mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'; size: number; width: number; height: number;
+  createdAt: string };
 
 type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; issueKind: IssueKind;
   status: 'queued' | 'spec' | 'building' | 'reviewing' | 'approving' | 'merged' | 'needs_human' | 'failed' | 'cancelled';
@@ -1286,6 +1604,7 @@ type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; 
   sandbox: RunSandbox | null;  // the run's sandbox decision (§5 "Sandboxes"); null until the workspace is ready / older runs
   releaseId: string | null;  // the release this run builds an issue for (null: a single run, or the release was deleted)
   baseBranch: string | null;  // the branch it starts from and merges into; null = the default branch
+  conversation: RunConversation;  // always present; default { sessionId: null, review: 'none', followUpFrom: null }
   continuesRunId: string | null;   // the failed run this one continues from its commits (§6 "Retrying a run")
   continuedByRunId: string | null; // the newest run that continues this one
   failureKind: 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | null;
@@ -1297,6 +1616,11 @@ type RetryOptions = { runId: string;       // '' for a release issue without a r
   step: 'push' | 'pull_request' | 'merge' | null;   // what a step retry repeats, when available
   commits: number | null;    // commits of the run's branch not on its base; null: branch not found
   releaseId: string | null };
+
+type RunConversation = {     // §6 "Conversation at needs human"
+  sessionId: string | null;                 // the advisor session, once the owner has sent a message
+  review: 'none' | 'required' | 'running';  // follow-up review of changes made in the conversation
+  followUpFrom: number | null };            // first follow-up round; rounds >= it are follow-up rounds
 
 type RunSandbox = { state: 'disabled' | 'none' | 'invalid' | 'unapproved' | 'approved';  // only 'approved' gives a sandbox
   reason: string;            // human-readable, also shown at the top of the builder's transcript
@@ -1353,16 +1677,21 @@ type Attachment = { id: string; name: string;   // name: sanitised (no path, con
   inline: 'original' | 'downscaled' | 'none';     // how the model sees an image (§5); always 'none' for files
   note: string | null };                          // why an image was downscaled / is file only
 
-type ClientConfig = { attachments: { maxFileBytes: number; maxMessageBytes: number; maxCount: number; imageTypes: string[] } };
+type ClientConfig = { attachments: { maxFileBytes: number; maxMessageBytes: number; maxCount: number; imageTypes: string[] };
+  images: { providers: { id: string; label: string; models: string[]; defaultModel: string; supportsTransparency: boolean;
+      keyPlaceholder: string }[];
+    limits: { maxPerRequest: number; maxPerTurn: number; maxPerStage: number; maxEdge: number } } };
 
 type Event = { seq: number; sessionId: string; ts: string;
-  type: 'user' | 'claude' | 'system' | 'status'; payload: unknown };
+  type: 'user' | 'claude' | 'system' | 'status' | 'images'; payload: unknown };
 //  user:   { text: string, username: string, attachments?: Attachment[] }   // attachments only when there are some
 //          A message to a running pipeline agent (§6) adds: messageId: string, origin: 'direct' | 'chat',
 //          viaSessionId?: string   // the forwarding chat session when origin is 'chat'
 //  claude: one raw stream-json object from the CLI ({type:'system'|'assistant'|'user'|'result'|'stream_event', …})
 //  system: { level: 'info' | 'warn' | 'error', text: string, messageId?: string, sandbox?: SandboxLog }
 //          messageId: the agent picked that message up (info) or stopped before it did (warn)
+//  images: { requestId, provider, providerLabel, model, prompt, purpose, issueNumber?,   // one factory_generate_image
+//            images: [{ id, mediaType, width, height, size }] }                          // call (§6 "Generated images")
 //          sandbox: the full log of a sandbox setup script or command (§5 "Sandboxes"):
 //            { kind: 'setup' | 'exec', command, exitCode, timedOut, durationMs, output, outputTruncated,
 //              platform: string | null }   // null when the definition has no platforms, else 'default' or the platform
@@ -1404,7 +1733,7 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 
 | Method & path | Body → Response | Notes |
 |---|---|---|
-| `GET /api/health` | → `{ status: 'ok', version, name: 'agern' }` | no auth |
+| `GET /api/health` | → `{ status: 'ok', version, name: 'agern' }` | no auth; the web UI shows `version` in the user menu |
 | `GET /api/internal/activity` | → `{ idle, activeRuns, busyAgents, version }` | no auth, **host-local only**: answered only when the TCP peer is a loopback address and no proxy header (`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP`) is present; anyone else gets the generic 404. `activeRuns`: runs in `queued`/`spec`/`building`/`reviewing`/`approving` (a restart fails them); `busyAgents`: sessions `starting`/`running` (pipeline agents, chats mid-turn). `needs_human` runs and chats between turns survive a restart and do not count. Used by the upgrade timer (§9) |
 | `GET /api/auth/providers` | → `{ providers: string[], org: string, twoFactor: boolean }` | no auth |
 | `POST /api/auth/login` | `{ username, password }` → `LoginStep` | sets cookie (pending until 2FA passes) |
@@ -1419,6 +1748,17 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `GET /api/me/usage` | → `ClaudeUsage` | the caller's own Claude usage (§5 "Claude usage"); there is no way to read another user's, also not for admins |
 | `PUT /api/me/github-token` | `{ token }` → `User` | 422 if GitHub rejects it. `GET /user` succeeds with any scope, so the token's kind and (classic) scopes are recorded and shown; Settings warns when a classic token lacks `repo` (public repositories only, no push) and explains the grants a fine-grained token needs |
 | `DELETE /api/me/github-token` | → `User` | |
+| `PUT /api/me/image-provider` | `{ provider, model, apiKey }` → `User` | §6 "Generated images". 400 unknown provider or bad model name; 409 `codex_login_required` (a `device_login` provider), 409 `image_provider_unavailable_here`; 422 `image_key_invalid` (malformed, or rejected by the provider), 422 `image_model_unknown`, 429 `too_many_attempts` (5 rejected keys per 15 minutes), 502 `image_provider_unavailable`; nothing is stored on any error. The key is never returned |
+| `DELETE /api/me/image-provider` | → `User` | idempotent; images stay; cancels a pending Codex login |
+| `POST /api/me/image-provider/codex/login` | → `CodexLogin` | §4 "Codex login". Starts a device login (cancels a pending one); answers `{ status: "pending", verificationUrl, userCode, expiresAt }`, or `{ status: "failed", error }` for a refused URL. 409 `image_provider_unavailable_here` (no Codex CLI), 429 `too_many_attempts` (5 starts per 15 minutes), 502 `codex_login_failed` (no code within 20 s) |
+| `GET /api/me/image-provider/codex/login` | → `CodexLogin` | `{ status: none\|pending\|connected\|failed\|expired, verificationUrl?, userCode?, expiresAt?, error? }`; URL and code only while `pending` |
+| `DELETE /api/me/image-provider/codex/login` | → `CodexLogin` | cancels a pending login (`none`); idempotent |
+| `GET /api/images/{id}` | → image bytes | anyone who can see the image's repository (404 otherwise and for unknown ids); the attachment headers, `Content-Disposition: inline` |
+| `PUT /api/images/{id}/selection` | `{ issueNumber, name }` → `GeneratedImage` | the image's owner, chat images only: 403 not the owner, 404 unknown image/issue, 400 name empty or over 60, 409 `run_image` / `issue_closed` / `too_many_images` (20 per issue) / `image_in_use` (locked) |
+| `DELETE /api/images/{id}/selection` | → `GeneratedImage` | as above; 409 `image_in_use` while locked |
+| `DELETE /api/images/{id}` | → 204 | discard an unselected chat image of the caller; 409 `image_selected` / `run_image` |
+| `GET /api/sessions/{id}/images` | → `GeneratedImage[]` | visibility of the session; oldest first |
+| `GET /api/projects/{repo}/issues/{number}/images` | → `GeneratedImage[]` | images selected for the issue |
 | `GET /api/me/preferences` | → `Preferences` | the caller's own model / fix-round choices and the effective values |
 | `PUT /api/me/preferences` | `PreferenceOverrides` → `Preferences` | replaces the caller's choices; 400 for an invalid model or unknown role, 422 `max_fix_rounds_out_of_range` |
 | `GET /api/projects` | → `Project[]` | repos of the org visible to the user |
@@ -1437,7 +1777,7 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `POST /api/releases/{id}/pause` | → `Release` | owner or admin; `building` → `paused` (else 409 `release_not_building`); the running issue finishes |
 | `POST /api/releases/{id}/resume` | → `Release` | owner only; `paused` → `building` (else 409 `release_not_paused`); 422 `claude_credential_required` |
 | `POST /api/releases/{id}/cancel` | → `Release` | owner or admin; `building`/`paused`/`ready` → `cancelled` (else 409 `release_not_building`; released: 409 `release_not_editable`); cancels the release's active runs; a release pull request is left open with a comment |
-| `POST /api/releases/{id}/approve` | → `Release` | owner only (admins included in the refusal: 403); merges the ready release's pull request (rebase, or a merge commit where rebase merging is disabled; never squash), closes its merged issues and deletes `release/<name>` (§6 "Releasing"). 409 `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`, `release_merge_method_unavailable`, `release_merge_failed`; nothing changes on GitHub with any of them |
+| `POST /api/releases/{id}/approve` | → `Release` | owner only (admins included in the refusal: 403); merges the ready release's pull request (rebase, or a merge commit where rebase merging is disabled; never squash), closes its merged issues and deletes `release/<name>` (§6 "Releasing"). 409 `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`, `release_migration_conflict`, `release_merge_method_unavailable`, `release_merge_failed`; nothing changes on GitHub with any of them |
 | `PUT /api/releases/{id}/mode` | `{ mode: 'manual' \| 'automatic' }` → `Release` | §6 "Release mode": `planning` anyone; `scheduled`/started: automatic owner only, manual owner or admin (403); 400 missing or unknown mode; 409 `release_not_editable` (released), `release_closed` (cancelled), `release_mode_not_allowed`. A `ready` release is re-evaluated in the background (switched to automatic and green, it is merged) |
 | `POST /api/releases/{id}/check` | → `Release` | owner only; `ready` only (409 `release_not_ready`): re-reads the pull request (opens it when the release is complete and has none, replaces one closed without merging, finishes the release when it was merged on GitHub) and its mergeability |
 | `GET /api/releases/{id}/issues/{number}/retry` | → `RetryOptions` | anyone who can see the release; the issue must be `held`/`skipped` (409 `release_issue_not_held`); the options of its linked run, or only `start_over` when it has none |
@@ -1451,7 +1791,10 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `POST /api/projects/{repo}/runs` | `{ issueNumber }` → `Run` | needs Claude credential; 409 if the issue has an active run |
 | `GET /api/runs?active=true&status=<s>` | → `Run[]` | across visible repos, newest first (max 200). `active=true`: not finished, i.e. `queued`, `spec`, `building`, `reviewing`, `approving` or `needs_human`. `status`: only these statuses, repeatable and/or comma list (`?status=needs_human`); unknown status → 400. Both given: both apply |
 | `GET /api/runs/{id}` | → `Run` | |
-| `POST /api/runs/{id}/approve` | → `Run` | owner only, only in `needs_human` |
+| `GET /api/runs/{id}/screenshots/{sid}` | → image bytes | anyone who may see the run (404 otherwise, and for a screenshot of another run). Served with the sniffed type, `nosniff`, a sandboxing CSP, `Cross-Origin-Resource-Policy: same-origin`, `Cache-Control: private, max-age=31536000, immutable` and `Content-Disposition: inline` (`screenshot-<role>-<id8>.<ext>`). There is no upload or delete route |
+| `POST /api/runs/{id}/approve` | → `Run` | owner only, only in `needs_human`; 409 `review_in_progress`, `agent_busy`, `review_required` (§6 "Conversation at needs human") |
+| `POST /api/runs/{id}/conversation` | `{ text }` → 202 `{ status: 'accepted', sessionId }` | owner only (403 for everyone else, admins too), only in `needs_human` (409 `run_not_waiting`). Talks to the run's advisor; the first message creates its session. 400 blank / too long, 409 `review_in_progress`, 409 `agent_busy`, 422 `claude_credential_required`, 409 `too_many_agents`, 409 `run_worktree_missing` |
+| `POST /api/runs/{id}/review` | → `Run` | "Review again": owner only (403 admins too), only in `needs_human`; starts a follow-up review of changes from the conversation. 409 `review_in_progress`, `agent_busy`, `nothing_to_review` (no conversation, or nothing changed since the last completed review); 422 `claude_credential_required` |
 | `POST /api/runs/{id}/cancel` | → `Run` | owner or admin |
 | `GET /api/runs/{id}/retry` | → `RetryOptions` | anyone who can see the run; how it can be retried and what is recommended (§6 "Retrying a run") |
 | `POST /api/runs/{id}/retry` | `{ mode?: 'step' \| 'continue' \| 'start_over' \| 'recommended' }` (body optional) → `Run` | owner only (admins included: 403), single runs that are `failed` or `cancelled` (409 `run_not_retryable`; a release run: 409 `release_run`); no mode = `start_over`; 409 `retry_mode_unavailable`, `active_run_exists`; 400 unknown mode; 422 `claude_credential_required`. Answers the run now at work: the same run for `step`, a new one otherwise |
@@ -1460,12 +1803,12 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `GET /api/agents?active=true` | → `AgentSession[]` | all kinds, across visible repos. `active=true`: `live` (a process exists, e.g. a chat idling between turns) or `starting`/`running` |
 | `GET /api/sessions/{id}` | → `AgentSession` | |
 | `GET /api/sessions/{id}/events?after=<seq>&limit=<n>` | → `Event[]` | ascending |
-| `GET /api/config` | → `ClientConfig` | limits the frontend checks before uploading |
-| `POST /api/sessions/{id}/input` | `{ text, attachmentIds? }` → 202 | owner only. **Chat:** accepted mid-turn too (delivered after the current turn); a `stopped` or process-less chat resumes. `text` may be empty when `attachmentIds` is not. The attachments are bound to this message when it is accepted, so a message queued mid-turn keeps its own. Answer `{ status: 'accepted' }`. **Pipeline agent:** a text message for a running spec-writer or builder (§6 "Messages to running agents") → 202 `AgentMessage`; 403 for everyone but the run's owner (admins too), 409 `agent_does_not_accept_messages` (reviewers, approver), 409 `agent_not_running`, 422 `attachments_not_allowed` |
+| `GET /api/config` | → `ClientConfig` | limits the frontend checks before uploading; `images.providers[]` with `id, label, models, defaultModel, supportsTransparency, keyPlaceholder, auth, available, unavailableReason` |
+| `POST /api/sessions/{id}/input` | `{ text, attachmentIds? }` → 202 | owner only. **Chat:** accepted mid-turn too (delivered after the current turn); a `stopped` or process-less chat resumes. `text` may be empty when `attachmentIds` is not. The attachments are bound to this message when it is accepted, so a message queued mid-turn keeps its own. Answer `{ status: 'accepted' }`. **Pipeline agent:** a text message for a running spec-writer or builder (§6 "Messages to running agents") → 202 `AgentMessage`; 403 for everyone but the run's owner (admins too), 409 `agent_does_not_accept_messages` (reviewers, approver), 409 `agent_not_running`, 422 `attachments_not_allowed`. **Advisor:** exactly as `POST /api/runs/{id}/conversation` (answer `{ status, sessionId }`); 422 `attachments_not_allowed` with attachments |
 | `POST /api/sessions/{id}/attachments?name=<file name>` | raw bytes → 201 `Attachment` | owner only, chat only; see "Attachments" below |
 | `GET /api/sessions/{id}/attachments/{aid}?preview=1` | → bytes | anyone who may see the session once it is sent; before that only its uploader. `preview=1`: the downscaled copy if there is one |
 | `DELETE /api/sessions/{id}/attachments/{aid}` | → 204 | owner only; unsent only (409 `attachment_sent`) |
-| `POST /api/sessions/{id}/interrupt` | → 202 | owner only; stops the current turn (chat only; 409 for pipeline agents — cancel the run instead) |
+| `POST /api/sessions/{id}/interrupt` | → 202 | owner only; stops the current turn (chats and advisors; 409 for pipeline agents — cancel the run instead) |
 | `POST /api/sessions/{id}/stop` | → `AgentSession` | owner or admin |
 | `DELETE /api/sessions/{id}` | → 204 | **Close a chat**: owner or admin (403 otherwise, 404 if the repo is not visible); chat only (409 `not_a_chat` for pipeline sessions — cancel the run instead). A live process is stopped first (as `stop`, up to 10 s; if it has not exited, 409 `agent_not_stopped` and nothing is deleted). Then the session is deleted permanently with its events, attachment rows and the files under `<dataDir>/attachments/<id>/`; its session sockets are closed with `4404` and the feed announces `session_closed`. Runs started from it keep running (their `startedBySessionId` becomes `null`). Afterwards every route for the id answers 404 |
 | `GET /api/admin/settings` · `PUT /api/admin/settings` | `Settings` | admin |
@@ -1494,6 +1837,10 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 - Messages to pipeline agents: reviewer/approver → 409 `agent_does_not_accept_messages`; agent not running
   (pending, finished, failed, stopped) → 409 `agent_not_running`; with attachments → 422
   `attachments_not_allowed`; not the run's owner → 403 `forbidden`.
+- The conversation at needs human (§6): `run_not_waiting`, `review_in_progress`, `agent_busy`, `too_many_agents`,
+  `run_worktree_missing`, `nothing_to_review`, `review_required` (409); `claude_credential_required` (422);
+  `forbidden` (403) for everyone but the owner. After a restart an advisor of a `needs_human` run is `idle` and
+  resumable, and an interrupted follow-up review is `required`.
 - Releases: duplicate name → 409 `release_name_taken`; assigning a closed issue → 409 `issue_closed`; a stale
   order → 409 `release_issues_changed`. Every release route answers 404 when the caller cannot see the project,
   also when addressed by release id; then 403 `forbidden` for the owner/admin rules of started releases (§6
@@ -1503,7 +1850,7 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   `github_push_denied`, `claude_credential_required` (422);
   scheduling: `release_not_schedulable`, `release_not_scheduled`, `release_scheduled` (409);
   releasing: `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`,
-  `release_merge_failed`, `release_merge_method_unavailable`, `release_not_editable` (409).
+  `release_migration_conflict`, `release_merge_failed`, `release_merge_method_unavailable`, `release_not_editable` (409).
 - Sandbox approval: stale hash → 409 `sandbox_definition_changed`; invalid definition → 422
   `sandbox_definition_invalid`.
 - "Needs Claude credential" → 422 `claude_credential_required`; too many agents → 409
@@ -1778,7 +2125,7 @@ anonymous (the repository is public); no token is ever used.
 
 **Channels.** `stable` is the latest GitHub release (`releases/latest` skips pre-releases). `main`
 is the rolling pre-release `main-latest`, which CI (`ci.yml`, job `publish-main`) replaces on every
-push to `main` after the tests and the package smoke tests on Debian 12, Debian 13 and Ubuntu 24.04
+push to `main` after the tests, the migration check (§6 "Database migrations") and the package smoke tests on Debian 12, Debian 13 and Ubuntu 24.04
 passed: it moves the tag `main-latest` to the commit and uploads the package and its `SHA256SUMS`
 (only when the commit is still the head of `main`). Main builds are versioned by
 `scripts/main-version.sh`: `X.Y.(Z+1)-main.<commit time UTC YYYYMMDDHHMMSS>.g<sha>` after release
@@ -1851,6 +2198,41 @@ UTC day rolls over (`useClaudeUsage`, `web/src/lib/usage.ts`); relative times ar
 The chat renders the Claude stream the way the terminal does: prompt line, streamed assistant
 text, tool calls as `⏺ Tool(args)` with collapsible results, thinking, cost/turn footer. Sessions
 owned by someone else are shown read-only with an "observing <user>" banner.
+
+**Conversation at needs human** (§6). On the run page the `human` node is selectable when the run is `needs_human` or
+has a conversation (`?stage=human`; the default selection of a `needs_human` run with a conversation). Its sub-line
+reads "reviewing changes", "changes not reviewed" or "waiting for owner". The owner gets "Talk to the agent" next to
+"✓ Approve & merge", which selects the node and focuses the composer; approve is disabled while the follow-up review
+is not `none` or the advisor is `starting`/`running`, with a hint linked by `aria-describedby`. The panel
+(`stage-detail` layout) shows the blurb, model, cost and turns, a `role="status"` line for the review state, "Review
+again" for the owner in state `required`, and the transcript (`ChatView` in advisor mode: text only, no `/factory`
+commands, Esc interrupts) with the owner-only composer "Message the agent". Follow-up rounds are labelled
+"follow-up N" (N = round − `followUpFrom` + 1) in the rounds strip, round tabs, node notes and the header's round
+line. On the agents page an advisor links to `?stage=human` and shows "waiting for input" when idle.
+
+On the run page, a selected stage (the selected round's stage row) that has screenshots shows a "Screenshots <n>"
+section after its findings: a wrapping grid of lazily loaded thumbnails with their captions as `figcaption`. A
+thumbnail is a button ("Open screenshot: <caption>") that opens a dialog with the image scaled to fit, the caption,
+its type, size and dimensions and an "Open full size ↗" link. A stage without screenshots shows nothing extra.
+Screenshots attached while the page is open arrive through the feed (`useLiveRun`), without a reload.
+Below them, a stage whose agent generated images (§6 "Generated images") shows "Generated images <n>": thumbnails
+("Open image: <purpose>") with the purpose and the prompt in a "Prompt" disclosure, a lightbox with type, size,
+dimensions, model and "Open full size ↗"; it also updates live.
+
+**Image generation.** Settings has an "Image generation" section (`#images`) between GitHub and Models: the provider
+as a segmented choice from `GET /api/config`, a password field for the API key, a model field with the provider's
+models as suggestions, Save/Replace ("Checking with <provider>…") and Remove, and the limits. An unavailable
+provider's choice is disabled (its reason shown muted when it is the saved provider or the only one). For OpenAI Codex
+the key and model fields are replaced by the device login (`CodexConnect`): an explanation and "Connect ChatGPT";
+while pending "1. Open <link>", "2. Enter this code <code>" with a copy button, "Waiting for you to finish signing in…"
+and Cancel, polling every 3 s; then "Connected. New image requests will use it." and the status "OpenAI Codex ·
+ChatGPT login" with Reconnect and Remove; a failed or expired login shows its error and "Connect ChatGPT" again. In a transcript, an
+`images` event renders as a block "Generated N image(s) with <provider> · <model>", the purpose, the prompt in a
+disclosure and one tile per image (from `GET /api/sessions/{id}/images`; a discarded image shows a placeholder).
+The image's owner, for chat images, gets "Use for issue…" (a dialog with issue number and name) and "Discard", or
+`selected for #<n> as "<name>"` with "Remove from #<n>" until a run locks it; others, and stage transcripts, are
+read-only. In the issue list an issue with selected images shows an "<n> image(s)" button opening "Images for #<n>"
+(thumbnail, name, purpose, dimensions, who selected it, the run using it, Remove for the owner while unlocked).
 
 On the run page the owner of a run gets a text-only composer (the chat prompt without `/factory` commands,
 attachments or interrupt; it can send while the agent works) under the transcript of a selected spec-writer or

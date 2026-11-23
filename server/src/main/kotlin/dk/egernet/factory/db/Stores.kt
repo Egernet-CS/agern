@@ -34,6 +34,7 @@ data class UserRecord(
     val totpEnabled: Boolean = false, val totpSecretEnc: ByteArray? = null, val totpPendingEnc: ByteArray? = null,
     val totpLastStep: Long? = null, val totpFailures: Int = 0, val totpLockedUntil: Instant? = null,
     val githubTokenKind: String? = null, val githubTokenScopes: List<String>? = null,
+    val imageProvider: String? = null, val imageModel: String? = null, val imageKeyEnc: ByteArray? = null,
 ) {
     fun toDto() = UserDto(
         id = id.toString(), username = username, displayName = displayName, isAdmin = isAdmin,
@@ -43,6 +44,8 @@ data class UserRecord(
         twoFactorLockedUntil = totpLockedUntil?.takeIf { it.isAfter(Instant.now()) }?.iso(),
         githubTokenKind = if (githubTokenEnc != null) githubTokenKind else null,
         githubTokenScopes = if (githubTokenEnc != null) githubTokenScopes else null,
+        imageProvider = if (imageKeyEnc != null) imageProvider else null,
+        imageModel = if (imageKeyEnc != null) imageModel else null,
     )
     fun owner() = OwnerDto(username, displayName)
     override fun toString() = "UserRecord($username)"
@@ -58,6 +61,7 @@ class UserStore(private val db: Db) {
         rs.instantOrNull("totp_locked_until"),
         rs.getString("github_token_kind"),
         rs.getString("github_token_scopes")?.let { s -> s.split(',').filter { it.isNotEmpty() } },
+        rs.getString("image_provider"), rs.getString("image_model"), rs.getBytes("image_key_enc"),
     )
 
     fun byId(id: UUID) = db.queryOne("SELECT * FROM users WHERE id = ?", id, map = ::map)
@@ -87,6 +91,19 @@ class UserStore(private val db: Db) {
         c.prepare("DELETE FROM claude_usage_windows WHERE user_id = ?", arrayOf<Any?>(id)).use { it.executeUpdate() }
         n
     }
+
+    /** Replaces (or with nulls removes) the image provider setting; [keyEnc] is the encrypted API key. */
+    fun setImageProvider(id: UUID, provider: String?, model: String?, keyEnc: ByteArray?) = db.update(
+        "UPDATE users SET image_provider = ?, image_model = ?, image_key_enc = ? WHERE id = ?", provider, model, keyEnc, id,
+    )
+
+    /**
+     * Replaces the stored image credential only if the row still holds [oldEnc] for [provider] (compare-and-set, so a
+     * re-login or removal made meanwhile wins). Returns whether it changed.
+     */
+    fun replaceImageKey(id: UUID, provider: String, oldEnc: ByteArray, newEnc: ByteArray): Boolean = db.update(
+        "UPDATE users SET image_key_enc = ? WHERE id = ? AND image_provider = ? AND image_key_enc = ?", newEnc, id, provider, oldEnc,
+    ) > 0
 
     fun setTotpPending(id: UUID, enc: ByteArray?) = db.update("UPDATE users SET totp_pending_enc = ? WHERE id = ?", enc, id)
 
@@ -263,12 +280,20 @@ class SessionStore(private val db: Db) {
     fun countBusy(): Int =
         db.queryOne("SELECT count(*) AS n FROM agent_sessions WHERE status IN ('starting','running')") { it.getInt("n") } ?: 0
 
-    /** On startup no process can be alive: chats become idle (resumable), stage agents failed. */
+    /**
+     * On startup no process can be alive: chats become idle (resumable), and so do the advisors of runs that still need
+     * a human; every other unfinished session (stage agents, advisors of ended runs) fails.
+     */
     fun recoverAfterRestart() {
         db.update("UPDATE agent_sessions SET status = 'idle', updated_at = now() WHERE kind = 'chat' AND status IN ('starting','running')")
         db.update(
-            "UPDATE agent_sessions SET status = 'failed', updated_at = now(), ended_at = now() " +
-                "WHERE kind <> 'chat' AND status IN ('starting','running','idle')",
+            """UPDATE agent_sessions s SET status = 'idle', updated_at = now() FROM runs r
+               WHERE s.kind = 'advisor' AND s.status IN ('starting','running','idle') AND r.id = s.run_id AND r.status = 'needs_human'""",
+        )
+        db.update(
+            """UPDATE agent_sessions s SET status = 'failed', updated_at = now(), ended_at = now()
+               WHERE s.kind <> 'chat' AND s.status IN ('starting','running','idle')
+                 AND NOT (s.kind = 'advisor' AND EXISTS (SELECT 1 FROM runs r WHERE r.id = s.run_id AND r.status = 'needs_human'))""",
         )
     }
 }
@@ -293,6 +318,13 @@ class EventStore(private val db: Db) {
         return EventDto(seq, sessionId.toString(), ts.iso(), type, payload)
     }
 
+    /** The `result` text of the session's last `claude` event of type `result`, or null. */
+    fun lastResultText(sessionId: UUID): String? = db.queryOne(
+        """SELECT payload->>'result' AS r FROM events WHERE session_id = ? AND type = 'claude' AND payload->>'type' = 'result'
+           ORDER BY seq DESC LIMIT 1""",
+        sessionId,
+    ) { it.getString("r") }
+
     fun list(sessionId: UUID, after: Long, limit: Int): List<EventDto> = db.query(
         "SELECT seq, ts, type, payload::text AS p FROM events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?",
         sessionId, after, limit,
@@ -305,8 +337,9 @@ data class StageRecord(
     val id: UUID, val runId: UUID, val role: String, val round: Int, val model: String, val status: String, val verdict: String?,
     val summary: String?, val findings: List<FindingDto>, val sessionId: UUID?, val startedAt: Instant?, val endedAt: Instant?,
 ) {
-    fun toDto() = StageDto(
+    fun toDto(screenshots: List<dk.egernet.factory.ScreenshotDto> = emptyList(), images: List<dk.egernet.factory.GeneratedImageDto> = emptyList()) = StageDto(
         id.toString(), role, round, model, status, verdict, summary, findings, sessionId?.toString(), startedAt?.iso(), endedAt?.iso(),
+        screenshots, images,
     )
 }
 
@@ -321,6 +354,13 @@ data class RunRecord(
     val releaseId: UUID? = null,
     /** The branch the run starts from and merges into; null = the repository's default branch. */
     val baseBranch: String? = null,
+    /** The run's advisor session (docs/ARCHITECTURE.md §6 "Conversation at needs human"). */
+    val advisorSessionId: UUID? = null,
+    /** The worktree HEAD the last completed review saw; set when the conversation starts. */
+    val reviewedSha: String? = null,
+    /** [dk.egernet.factory.ReviewState]. */
+    val reviewState: String = dk.egernet.factory.ReviewState.NONE,
+    val followUpFrom: Int? = null,
     /** The failed run this one continues from (docs/ARCHITECTURE.md §6 "Retrying a run"). */
     val continuesRunId: UUID? = null,
     /** The spec the builder got: written by this run's spec-writer or reused from [continuesRunId]. */
@@ -334,6 +374,8 @@ data class RunRecord(
 )
 
 class RunStore(private val db: Db) {
+    private val screenshots = ScreenshotStore(db)
+    private val images = ImageStore(db)
     private val findingsSer = ListSerializer(FindingDto.serializer())
     private val select = """SELECT r.*, u.username AS owner_username, u.display_name AS owner_display_name
         FROM runs r JOIN users u ON u.id = r.owner_id"""
@@ -344,6 +386,7 @@ class RunStore(private val db: Db) {
         rs.getString("pr_url"), rs.uuid("owner_id"), rs.getString("owner_username"), rs.getString("owner_display_name"),
         rs.uuidOrNull("started_by_session_id"), rs.getString("error"), rs.instant("created_at"), rs.instant("updated_at"),
         rs.instantOrNull("ended_at"), rs.getString("sandbox"), rs.uuidOrNull("release_id"), rs.getString("base_branch"),
+        rs.uuidOrNull("advisor_session_id"), rs.getString("reviewed_sha"), rs.getString("review_state"), rs.intOrNull("follow_up_from"),
         rs.uuidOrNull("continues_run_id"), rs.getString("spec"), rs.getString("builder_summary"),
         rs.getString("failure_kind"), rs.getString("failed_step"),
     )
@@ -498,6 +541,36 @@ class RunStore(private val db: Db) {
     fun setPr(id: UUID, number: Int, url: String) =
         db.update("UPDATE runs SET pr_number = ?, pr_url = ?, updated_at = now() WHERE id = ?", number, url, id)
 
+    /**
+     * Binds [sessionId] as the run's advisor unless it already has one (concurrent first messages); records
+     * [headSha] as the reviewed commit when none is recorded yet. Returns the run's advisor session id afterwards.
+     */
+    fun bindAdvisor(id: UUID, sessionId: UUID, headSha: String?): UUID? {
+        db.update(
+            """UPDATE runs SET advisor_session_id = ?, reviewed_sha = COALESCE(reviewed_sha, ?), updated_at = now()
+               WHERE id = ? AND advisor_session_id IS NULL""",
+            sessionId, headSha, id,
+        )
+        return get(id)?.advisorSessionId
+    }
+
+    fun setReviewState(id: UUID, state: String) =
+        db.update("UPDATE runs SET review_state = ?, updated_at = now() WHERE id = ?", state, id)
+
+    /** Moves the review state from [from] to [to]; false when it was not [from] (another caller won). */
+    fun casReviewState(id: UUID, from: String, to: String): Boolean =
+        db.update("UPDATE runs SET review_state = ?, updated_at = now() WHERE id = ? AND review_state = ?", to, id, from) == 1
+
+    fun setReviewedSha(id: UUID, sha: String) =
+        db.update("UPDATE runs SET reviewed_sha = ?, updated_at = now() WHERE id = ?", sha, id)
+
+    /** A follow-up round starts: the run's round becomes [round], and the first one is remembered. */
+    fun startFollowUp(id: UUID, round: Int) = db.update(
+        "UPDATE runs SET round = ?, follow_up_from = COALESCE(follow_up_from, ?), updated_at = now() WHERE id = ?", round, round, id,
+    )
+
+    fun setError(id: UUID, error: String) = db.update("UPDATE runs SET error = ?, updated_at = now() WHERE id = ?", error, id)
+
     fun createStage(runId: UUID, role: String, round: Int, model: String): StageRecord {
         val id = UUID.randomUUID()
         db.update("INSERT INTO stages(id, run_id, role, round, model, status) VALUES (?, ?, ?, ?, ?, 'pending')", id, runId, role, round, model)
@@ -526,17 +599,23 @@ class RunStore(private val db: Db) {
         db.update("UPDATE stages SET status = 'failed', ended_at = now() WHERE run_id = ? AND status = 'running'", runId)
     }
 
-    fun toDto(r: RunRecord) = RunDto(
-        id = r.id.toString(), repo = r.repo, issueNumber = r.issueNumber, issueTitle = r.issueTitle, issueKind = r.issueKind,
-        status = r.status, round = r.round, maxRounds = r.maxRounds, branch = r.branch, prNumber = r.prNumber, prUrl = r.prUrl,
-        owner = OwnerDto(r.ownerUsername, r.ownerDisplayName), startedBySessionId = r.startedBySessionId?.toString(),
-        error = r.error, createdAt = r.createdAt.iso(), updatedAt = r.updatedAt.iso(), endedAt = r.endedAt?.iso(),
-        stages = stages(r.id).map { it.toDto() },
-        sandbox = r.sandboxJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunSandboxDto.serializer(), it) }.getOrNull() },
-        releaseId = r.releaseId?.toString(), baseBranch = r.baseBranch,
-        continuesRunId = r.continuesRunId?.toString(), continuedByRunId = continuedBy(r.id)?.toString(),
-        failureKind = r.failureKind, failedStep = r.failedStep,
-    )
+    /** Stage screenshots are read with one query per run, never one per stage. */
+    fun toDto(r: RunRecord): RunDto {
+        val shots = screenshots.forRun(r.id).groupBy({ it.stageId }, { it.toDto() })
+        val imgs = images.forRun(r.id).groupBy({ it.sessionId }, { it.toDto() })
+        return RunDto(
+            id = r.id.toString(), repo = r.repo, issueNumber = r.issueNumber, issueTitle = r.issueTitle, issueKind = r.issueKind,
+            status = r.status, round = r.round, maxRounds = r.maxRounds, branch = r.branch, prNumber = r.prNumber, prUrl = r.prUrl,
+            owner = OwnerDto(r.ownerUsername, r.ownerDisplayName), startedBySessionId = r.startedBySessionId?.toString(),
+            error = r.error, createdAt = r.createdAt.iso(), updatedAt = r.updatedAt.iso(), endedAt = r.endedAt?.iso(),
+            stages = stages(r.id).map { it.toDto(shots[it.id].orEmpty(), it.sessionId?.let { s -> imgs[s] }.orEmpty()) },
+            sandbox = r.sandboxJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunSandboxDto.serializer(), it) }.getOrNull() },
+            releaseId = r.releaseId?.toString(), baseBranch = r.baseBranch,
+            conversation = dk.egernet.factory.RunConversationDto(r.advisorSessionId?.toString(), r.reviewState, r.followUpFrom),
+            continuesRunId = r.continuesRunId?.toString(), continuedByRunId = continuedBy(r.id)?.toString(),
+            failureKind = r.failureKind, failedStep = r.failedStep,
+        )
+    }
 
     /** v1: runs cannot survive a restart. needs_human runs have no process and stay as they are. */
     fun failUnfinishedAfterRestart(): List<UUID> {
@@ -546,6 +625,17 @@ class RunStore(private val db: Db) {
             setFailure(id, dk.egernet.factory.FailureKind.RESTART, null)
             closeOpenStages(id)
         }
+        return ids
+    }
+
+    /**
+     * After a restart, for runs that survived it (`needs_human`): an interrupted follow-up review must be started again
+     * (`running` → `required`), and no stage of theirs is left open. Returns the runs whose review was interrupted.
+     */
+    fun recoverConversationsAfterRestart(): List<UUID> {
+        val ids = db.query("SELECT id FROM runs WHERE review_state = 'running'") { it.uuid("id") }
+        db.update("UPDATE runs SET review_state = 'required', updated_at = now() WHERE review_state = 'running'")
+        db.query("SELECT id FROM runs WHERE status = 'needs_human'") { it.uuid("id") }.forEach { closeOpenStages(it) }
         return ids
     }
 }

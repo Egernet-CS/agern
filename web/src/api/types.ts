@@ -18,6 +18,9 @@ export type User = {
   githubTokenKind: 'classic' | 'fine_grained' | null;
   /** Classic tokens: the OAuth scopes GitHub reports for it; null without a token or for fine-grained tokens. */
   githubTokenScopes: string[] | null;
+  /** The image provider id (from `ClientConfig.images.providers`) and model; null without a stored key. Never the key. */
+  imageProvider: string | null;
+  imageModel: string | null;
 };
 
 /** Login is multi-step: password → (totp | enroll) → done. See §4 "Two-factor authentication". */
@@ -58,6 +61,8 @@ export type Issue = {
   activeRunId: string | null;
   /** The release the issue is planned in; null when it is in none. */
   release: { id: string; name: string } | null;
+  /** Images selected for this issue in a chat. */
+  imageCount: number;
 };
 
 /**
@@ -175,8 +180,10 @@ export function releaseReadiness(r: Release): 'complete' | 'incomplete' | 'empty
   return r.issues.some((i) => i.state === 'merged') ? 'complete' : 'empty';
 }
 
-export type SessionKind = 'chat' | 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
-export type StageRole = Exclude<SessionKind, 'chat'>;
+/** The seven pipeline roles. */
+export type StageRole = 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
+/** `advisor`: the agent the owner talks to while a run needs a human (docs/ARCHITECTURE.md §6 "Conversation"). */
+export type SessionKind = 'chat' | 'advisor' | StageRole;
 
 /** Roles whose running agent accepts messages from the run's owner (docs/ARCHITECTURE.md §6). */
 export const STEERABLE_ROLES: StageRole[] = ['spec-writer', 'builder'];
@@ -233,6 +240,83 @@ export type Stage = {
   sessionId: string | null;
   startedAt: string | null;
   endedAt: string | null;
+  /** Screenshots the stage's reviewer attached (only `ux` and `ui-design`), in attach order; empty for every other stage. */
+  screenshots: Screenshot[];
+  /** Images the stage's agent generated (only the spec-writer and the builder can), oldest first. */
+  images: GeneratedImage[];
+};
+
+/** Where a chat image is selected; `locked` while a run that took it is not failed or cancelled. */
+export type ImageSelection = { issueNumber: number; name: string; usedByRunId: string | null; locked: boolean };
+
+/** An image an agent generated; the bytes are at `api.imageUrl(id)`. Prompt and purpose are untrusted text. */
+export type GeneratedImage = {
+  id: string;
+  repo: string;
+  origin: 'chat' | 'run';
+  sessionId: string;
+  owner: { username: string; displayName: string };
+  provider: string;
+  model: string;
+  prompt: string;
+  purpose: string;
+  /** image/png, image/jpeg or image/webp (sniffed by the server). */
+  mediaType: string;
+  size: number;
+  width: number;
+  height: number;
+  transparent: boolean;
+  createdAt: string;
+  selection: ImageSelection | null;
+};
+
+export type ImageProviderInfo = {
+  id: string;
+  label: string;
+  /** Suggestions; any model name may be saved. */
+  models: string[];
+  defaultModel: string;
+  supportsTransparency: boolean;
+  keyPlaceholder: string;
+  /** `device_login`: connected by signing in (Codex), not with an API key. */
+  auth: 'api_key' | 'device_login';
+  /** False when the provider cannot be used on this server (e.g. the CLI is not installed). */
+  available: boolean;
+  unavailableReason: string | null;
+};
+
+/** The caller's Codex device login; the URL and code are present only while `pending`. */
+export type CodexLogin = {
+  status: 'none' | 'pending' | 'connected' | 'failed' | 'expired';
+  verificationUrl?: string | null;
+  userCode?: string | null;
+  expiresAt?: string | null;
+  error?: string | null;
+};
+
+/** Payload of an `images` event: one successful `factory_generate_image` call. */
+export type ImagesPayload = {
+  requestId: string;
+  provider: string;
+  providerLabel: string;
+  model: string;
+  prompt: string;
+  purpose: string;
+  issueNumber?: number;
+  images: { id: string; mediaType: string; width: number; height: number; size: number }[];
+};
+
+/** A screenshot a UX or UI design reviewer attached to its stage; the image is at `api.screenshotUrl(runId, id)`. */
+export type Screenshot = {
+  id: string;
+  /** One line saying what the screenshot shows (untrusted text: render as plain text). */
+  caption: string;
+  /** image/png, image/jpeg, image/gif or image/webp (sniffed by the server). */
+  mediaType: string;
+  size: number;
+  width: number;
+  height: number;
+  createdAt: string;
 };
 
 export type RunStatus =
@@ -272,6 +356,8 @@ export type Run = {
   releaseId: string | null;
   /** The branch the run branches from and merges into (`release/<name>`); null for a single run (default branch). */
   baseBranch: string | null;
+  /** The owner's conversation with the advisor while the run needs a human. Always present. */
+  conversation: RunConversation;
   /** The failed run this one continues from its commits (docs/ARCHITECTURE.md §6 "Retrying a run"). */
   continuesRunId?: string | null;
   /** The newest run that continues this one. */
@@ -297,6 +383,16 @@ export type RetryOptions = {
   step: FailedStep | null;
   commits: number | null;
   releaseId: string | null;
+};
+
+/** Follow-up review of changes made in the conversation: `required` = not reviewed yet, `running` = reviewers at work. */
+export type ConversationReview = 'none' | 'required' | 'running';
+export type RunConversation = {
+  /** The advisor session, once the owner has sent a message. */
+  sessionId: string | null;
+  review: ConversationReview;
+  /** First follow-up round; stage rounds >= it are follow-up rounds. */
+  followUpFrom: number | null;
 };
 
 /**
@@ -425,7 +521,7 @@ export type SandboxLog = {
   platform?: string | null;
 };
 
-export type EventType = 'user' | 'claude' | 'system' | 'status';
+export type EventType = 'user' | 'claude' | 'system' | 'status' | 'images';
 
 export type FactoryEvent = {
   seq: number;
@@ -454,6 +550,10 @@ export type Attachment = {
 
 export type ClientConfig = {
   attachments: { maxFileBytes: number; maxMessageBytes: number; maxCount: number; imageTypes: string[] };
+  images: {
+    providers: ImageProviderInfo[];
+    limits: { maxPerRequest: number; maxPerTurn: number; maxPerStage: number; maxEdge: number };
+  };
 };
 
 export type UserPayload = { text: string; username: string; attachments?: Attachment[] };

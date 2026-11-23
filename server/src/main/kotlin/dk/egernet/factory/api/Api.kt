@@ -90,6 +90,8 @@ private val log = LoggerFactory.getLogger("dk.egernet.factory.api")
 @Serializable data class CodeReq(val code: String)
 @Serializable data class ClaudeCredReq(val kind: String, val value: String)
 @Serializable data class GithubTokenReq(val token: String)
+@Serializable data class ImageProviderReq(val provider: String, val model: String, val apiKey: String)
+@Serializable data class ImageSelectionReq(val issueNumber: Int, val name: String)
 @Serializable data class CreateIssueReq(val title: String, val body: String = "", val kind: String = "task")
 @Serializable data class CreateRunReq(val issueNumber: Int)
 @Serializable data class CreateReleaseReq(val name: String, val description: String = "", val mode: String? = null)
@@ -110,6 +112,7 @@ private suspend fun ApplicationCall.retryReq(): dk.egernet.factory.RetryReq {
     }
 }
 @Serializable data class CreateSessionReq(val model: String? = null)
+@Serializable data class TalkReq(val text: String = "")
 @Serializable data class InputReq(val text: String = "", val attachmentIds: List<String> = emptyList())
 @Serializable data class ResolveReq(val status: String, val note: String? = null)
 @Serializable data class ApproveSandboxReq(val sha256: String)
@@ -247,6 +250,8 @@ fun Application.installApi(s: Services) {
                 call.respond(
                     dk.egernet.factory.ClientConfigDto(
                         dk.egernet.factory.AttachmentLimitsDto(cfg.attachmentMaxBytes, cfg.attachmentMaxMessageBytes, cfg.attachmentMaxCount, INLINE_IMAGE_TYPES),
+                        // May run `codex --version` (at most once a minute): off the request thread.
+                        withContext(Dispatchers.IO) { s.images.catalogue() },
                     ),
                 )
             }
@@ -256,6 +261,7 @@ fun Application.installApi(s: Services) {
             runRoutes(s)
             releaseRoutes(s)
             sessionRoutes(s)
+            imageRoutes(s)
             adminRoutes(s)
             wsRoutes(s)
             route("{...}") {
@@ -379,6 +385,30 @@ private fun Route.meRoutes(s: Services) {
         s.access.invalidate(u.id)
         call.respond(s.users.byId(u.id)!!.toDto())
     }
+    // The image provider (docs/ARCHITECTURE.md §6 "Generated images"): validated with the provider before it is stored.
+    put("/me/image-provider") {
+        val u = call.requireUser(s)
+        val req = call.receive<ImageProviderReq>()
+        call.respond(s.images.save(u, req.provider, req.model, req.apiKey).toDto())
+    }
+    delete("/me/image-provider") { call.respond(s.images.remove(call.requireUser(s)).toDto()) }
+    // The Codex device login (docs/ARCHITECTURE.md §4 "Codex login"): the URL and code go only to their owner.
+    post("/me/image-provider/codex/login") {
+        val u = call.requireUser(s)
+        val logins = s.codexLogins ?: throw conflict(dk.egernet.factory.images.CodexImageProvider.UNAVAILABLE, "image_provider_unavailable_here")
+        call.respond(logins.start(u.id))
+    }
+    get("/me/image-provider/codex/login") {
+        val u = call.requireUser(s)
+        val logins = s.codexLogins ?: throw conflict(dk.egernet.factory.images.CodexImageProvider.UNAVAILABLE, "image_provider_unavailable_here")
+        call.respond(logins.status(u.id))
+    }
+    delete("/me/image-provider/codex/login") {
+        val u = call.requireUser(s)
+        val logins = s.codexLogins ?: throw conflict(dk.egernet.factory.images.CodexImageProvider.UNAVAILABLE, "image_provider_unavailable_here")
+        logins.cancel(u.id)
+        call.respond(logins.status(u.id))
+    }
     get("/me/preferences") { call.respond(s.preferences.dto(call.requireUser(s).id)) }
     put("/me/preferences") {
         val u = call.requireUser(s)
@@ -450,8 +480,28 @@ private fun Route.runRoutes(s: Services) {
         val u = call.requireUser(s)
         call.respond(s.runs.toDto(s.factory.visibleRun(u, uuidParam("id"))))
     }
+    // A stage screenshot (docs/ARCHITECTURE.md §6 "Screenshots"): visible to whoever may see the run.
+    get("/runs/{id}/screenshots/{sid}") {
+        val u = call.requireUser(s)
+        val run = s.factory.visibleRun(u, uuidParam("id"))
+        val sid = uuidParam("sid")
+        val m = withContext(Dispatchers.IO) { s.screenshotStore.get(sid) }?.takeIf { it.runId == run.id }
+            ?: throw notFound("Screenshot not found")
+        val (bytes, role) = withContext(Dispatchers.IO) { s.screenshotStore.data(m.id) to s.runs.stage(m.stageId)?.role }
+        if (bytes == null || m.mediaType !in INLINE_IMAGE_TYPES) throw notFound("Screenshot not found")
+        val name = "screenshot-${role ?: "stage"}-${m.id.toString().take(8)}.${dk.egernet.factory.agent.Screenshots.extension(m.mediaType)}"
+        call.respondStoredFile(bytes, m.mediaType, "inline", name)
+    }
     post("/runs/{id}/approve") { call.respond(s.factory.approveRun(call.requireUser(s), uuidParam("id"))) }
     post("/runs/{id}/cancel") { call.respond(s.factory.cancelRun(call.requireUser(s), uuidParam("id"))) }
+    // The conversation while a run needs a human (docs/ARCHITECTURE.md §6 "Conversation at needs human").
+    post("/runs/{id}/conversation") {
+        val u = call.requireUser(s)
+        val id = uuidParam("id")
+        val req = call.receive<TalkReq>()
+        call.respond(HttpStatusCode.Accepted, s.factory.talkToRun(u, id, req.text))
+    }
+    post("/runs/{id}/review") { call.respond(s.factory.reviewRun(call.requireUser(s), uuidParam("id"))) }
     // Retrying a failed run (docs/ARCHITECTURE.md §6 "Retrying a run"): options for anyone who can see it, retry owner only.
     get("/runs/{id}/retry") { call.respond(s.factory.retryOptions(call.requireUser(s), uuidParam("id"))) }
     post("/runs/{id}/retry") {
@@ -605,6 +655,14 @@ private fun Route.sessionRoutes(s: Services) {
         val rec = visibleSession(s, u, uuidParam("id"))
         val req = call.receive<InputReq>()
         val ids = req.attachmentIds.map { runCatching { UUID.fromString(it) }.getOrNull() ?: throw badRequest("Invalid attachment id") }
+        if (rec.kind == dk.egernet.factory.ADVISOR_KIND) {
+            // The run's conversation, exactly as POST /runs/{id}/conversation (text only).
+            val runId = rec.runId ?: throw notFound("Run not found")
+            s.factory.visibleRun(u, runId)
+            if (rec.ownerId == u.id && ids.isNotEmpty()) throw unprocessable("Messages to the agent are text only", "attachments_not_allowed")
+            call.respond(HttpStatusCode.Accepted, s.factory.talkToRun(u, runId, req.text))
+            return@post
+        }
         if (rec.kind != "chat") {
             // A message for a running pipeline agent (spec-writer / builder), from its owner directly.
             if (rec.ownerId == u.id && ids.isNotEmpty()) throw unprocessable("Messages to pipeline agents are text only", "attachments_not_allowed")
@@ -646,12 +704,7 @@ private fun Route.sessionRoutes(s: Services) {
         // is an opaque download, so an attachment can never run script in our origin.
         val image = m.kind == "image" && m.mediaType in INLINE_IMAGE_TYPES
         val type = if (!image) "application/octet-stream" else if (preview) m.inlineMediaType ?: m.mediaType else m.mediaType
-        call.response.header("X-Content-Type-Options", "nosniff")
-        call.response.header("Content-Security-Policy", "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox")
-        call.response.header("Cross-Origin-Resource-Policy", "same-origin")
-        call.response.header(HttpHeaders.CacheControl, "private, max-age=31536000, immutable")
-        call.response.header(HttpHeaders.ContentDisposition, contentDisposition(if (image) "inline" else "attachment", m.name))
-        call.respondBytes(bytes, ContentType.parse(type))
+        call.respondStoredFile(bytes, type, if (image) "inline" else "attachment", m.name)
     }
     delete("/sessions/{id}/attachments/{aid}") {
         val u = call.requireUser(s)
@@ -700,6 +753,56 @@ private suspend fun readLimited(ch: io.ktor.utils.io.ByteReadChannel, max: Long)
         }
     }
     return out.toByteArray()
+}
+
+/**
+ * Sends stored bytes (attachments, screenshots, generated images) with the headers that keep them inert in our origin:
+ * no sniffing, a CSP without script, same-origin only, cached privately (the bytes of an id never change).
+ */
+private suspend fun ApplicationCall.respondStoredFile(bytes: ByteArray, mediaType: String, disposition: String, name: String) {
+    response.header("X-Content-Type-Options", "nosniff")
+    response.header("Content-Security-Policy", "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox")
+    response.header("Cross-Origin-Resource-Policy", "same-origin")
+    response.header(HttpHeaders.CacheControl, "private, max-age=31536000, immutable")
+    response.header(HttpHeaders.ContentDisposition, contentDisposition(disposition, name))
+    respondBytes(bytes, ContentType.parse(mediaType))
+}
+
+// ------------------------------------------------------------------ generated images (docs/ARCHITECTURE.md §6 "Generated images")
+
+private fun Route.imageRoutes(s: Services) {
+    get("/images/{id}") {
+        val u = call.requireUser(s)
+        val m = s.images.visible(u, uuidParam("id"))
+        val bytes = withContext(Dispatchers.IO) { s.images.store.data(m.id) }
+        if (bytes == null || m.mediaType !in dk.egernet.factory.images.ImageService.STORED_TYPES) throw notFound("Image not found")
+        val name = "${dk.egernet.factory.images.ImageService.slug(m.name ?: m.purpose)}-${m.id.toString().take(8)}." +
+            dk.egernet.factory.agent.Screenshots.extension(m.mediaType)
+        call.respondStoredFile(bytes, m.mediaType, "inline", name)
+    }
+    put("/images/{id}/selection") {
+        val u = call.requireUser(s)
+        val id = uuidParam("id")
+        val req = call.receive<ImageSelectionReq>()
+        call.respond(s.images.select(u, id, req.issueNumber, req.name))
+    }
+    delete("/images/{id}/selection") { call.respond(s.images.unselect(call.requireUser(s), uuidParam("id"))) }
+    delete("/images/{id}") {
+        s.images.discard(call.requireUser(s), uuidParam("id"))
+        call.respond(HttpStatusCode.NoContent)
+    }
+    get("/sessions/{id}/images") {
+        val u = call.requireUser(s)
+        val rec = visibleSession(s, u, uuidParam("id"))
+        call.respond(s.images.forSession(rec.id))
+    }
+    get("/projects/{repo}/issues/{number}/images") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        val n = call.parameters["number"]?.toIntOrNull() ?: throw notFound("Issue not found")
+        withContext(Dispatchers.IO) { s.access.requireVisible(u, repo) }
+        call.respond(s.images.forIssue(repo, n))
+    }
 }
 
 /** `inline|attachment; filename="ascii"; filename*=UTF-8''…` (RFC 6266 / 5987). */

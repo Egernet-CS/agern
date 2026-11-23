@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""
+fake-codex: a stand-in for the OpenAI Codex CLI as Agern uses it for image generation (docs/ARCHITECTURE.md §4
+"Codex login"). Point FACTORY_CODEX_BIN at it to develop or test without a ChatGPT login.
+
+  --version                 prints "codex-cli 0.0.0-fake"
+  login --device-auth ...   prints the real device-code text (with ANSI colours) and the code FAKE-12345, then
+                            follows FAKE_CODEX_LOGIN:
+                              unset/approve -> waits 1 s, writes $CODEX_HOME/auth.json, exits 0
+                              wait          -> sleeps until killed
+                              nocode        -> prints nothing and sleeps
+                              fail          -> exits 1 after the text
+                              badurl        -> prints https://evil.example/device instead of the real URL
+  exec ... -                reads the instruction from stdin. Without $CODEX_HOME/auth.json: "401 Unauthorized", exit 1.
+                            Otherwise writes "Number of images: N" PNGs to $CODEX_HOME/generated_images/s1/.
+                            Switches in the prompt:
+                              fake:refresh -> also rewrites auth.json (refresh token fake-refresh-2)
+                              fake:limit   -> "You've hit your usage limit", exit 1, no image
+                              fake:none    -> exit 0, no image
+                              fake:symlink -> writes a symlink instead of an image
+                              fake:slow    -> sleeps 30 s first
+                              fake:dump    -> writes its environment and argv to dump.json in $FAKE_CODEX_DUMP (or
+                                              the -C working directory)
+"""
+import json
+import os
+import re
+import struct
+import sys
+import time
+import zlib
+
+
+def png(width, height, shade):
+    raw = b"".join(b"\x00" + bytes([shade, 0x80, 0x40]) * width for _ in range(height))
+
+    def chunk(kind, data):
+        c = struct.pack(">I", len(data)) + kind + data
+        return c + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def login():
+    mode = os.environ.get("FAKE_CODEX_LOGIN", "approve")
+    home = os.environ["CODEX_HOME"]
+    if mode == "nocode":
+        time.sleep(3600)
+        return 0
+    url = "https://evil.example/device" if mode == "badurl" else "https://auth.openai.com/codex/device"
+    sys.stdout.write("\x1b[1mWelcome to Codex\x1b[0m \x1b[2mv0.0.0-fake\x1b[0m\n\n")
+    sys.stdout.write("Follow these steps to sign in with ChatGPT using device code authorization:\n")
+    sys.stdout.write("1. Open this link in your browser and sign in to your account\n")
+    sys.stdout.write("   \x1b[94m%s\x1b[0m\n" % url)
+    sys.stdout.write("2. Enter this one-time code \x1b[2m(expires in 15 minutes)\x1b[0m\n")
+    sys.stdout.write("   \x1b[94mFAKE-12345\x1b[0m\n")
+    sys.stdout.flush()
+    if mode == "fail":
+        return 1
+    if mode == "wait":
+        time.sleep(3600)
+        return 0
+    time.sleep(1)
+    with open(os.path.join(home, "auth.json"), "w") as f:
+        json.dump({"tokens": {"refresh_token": "fake-refresh-1"}}, f)
+    print("Successfully logged in")
+    return 0
+
+
+def exec_(args):
+    prompt = sys.stdin.read()
+    home = os.environ["CODEX_HOME"]
+    auth = os.path.join(home, "auth.json")
+    work = args[args.index("-C") + 1] if "-C" in args else os.getcwd()
+    if "fake:dump" in prompt:
+        with open(os.path.join(os.environ.get("FAKE_CODEX_DUMP", work), "dump.json"), "w") as f:
+            json.dump({"env": dict(os.environ), "argv": sys.argv}, f)
+    if not os.path.isfile(auth):
+        print("ERROR: 401 Unauthorized")
+        return 1
+    if "fake:slow" in prompt:
+        time.sleep(30)
+    if "fake:refresh" in prompt:
+        with open(auth, "w") as f:
+            json.dump({"tokens": {"refresh_token": "fake-refresh-2"}}, f)
+    if "fake:limit" in prompt:
+        print("You've hit your usage limit. Try again later.")
+        return 1
+    if "fake:none" in prompt:
+        print('{"type":"turn.completed"}')
+        return 0
+    m = re.search(r"Number of images: (\d+)", prompt)
+    n = int(m.group(1)) if m else 1
+    out = os.path.join(home, "generated_images", "s1")
+    os.makedirs(out, exist_ok=True)
+    if "fake:symlink" in prompt:
+        os.symlink("/etc/hostname", os.path.join(out, "ig_1.png"))
+        return 0
+    size = re.search(r"Wanted size: (\d+)x(\d+)", prompt)
+    w, h = (int(size.group(1)), int(size.group(2))) if size else (256, 256)
+    for i in range(n):
+        with open(os.path.join(out, "ig_%d.png" % (i + 1)), "wb") as f:
+            f.write(png(w, h, (i * 60) % 256))
+        time.sleep(0.01)
+    print('{"type":"turn.completed"}')
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ["--version"]:
+        print("codex-cli 0.0.0-fake")
+        return 0
+    if args[:1] == ["login"]:
+        return login()
+    if args[:1] == ["exec"]:
+        return exec_(args)
+    print("fake-codex: unsupported arguments", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

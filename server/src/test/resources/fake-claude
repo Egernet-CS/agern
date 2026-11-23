@@ -28,6 +28,13 @@ Behaviour
         "usage-ok"    -> unifiedWindows five_hour 0.42 and seven_day 0.18, both "allowed"
         "usage-high"  -> unifiedWindows five_hour 0.86 "allowed_warning" and seven_day 0.18 "allowed"
         "usage-limit" -> top-level status "rejected", rateLimitType "five_hour", utilization 1.0, resetsAt now + 2 h
+  Advisor (interactive, "# Role: advisor"): the agent a run's owner talks to at needs human, using the chat loop.
+    Every message is answered "Advisor: <the owner's text>", followed by the "Needs a human because:" line and the
+    reviewer headings ("### ...") found in the <run_context> block the server sent to this process, and the output
+    of `git diff --stat <baseRef>...HEAD` (baseRef taken from the context).
+    - text containing "please change" -> appends a line to AGERN_FAKE.md and commits it (the server then pushes and
+                                 reviews it again)
+    - "slow" and "crash" behave as in chat
   Conversations are remembered under $HOME/.fake-claude/sessions/<id>. Like the real CLI,
   --resume <id> of an unknown conversation fails at once ("No conversation found with session ID").
   A Claude credential containing "invalid" is rejected like a bad key ("Invalid API key").
@@ -54,6 +61,16 @@ Behaviour
         "echo built in the sandbox && ls") like a real agent (tool_use + tool_result events) and report both answers
         in its result ("Sandbox info: ..." / "Sandbox exec: ..."); with "fake:platform=<name>" it then runs the same
         command once more with that platform ("Sandbox exec on <name>: ...")
+    - "fake:screenshots" makes the ux and ui-design reviewers, before answering, write a small PNG into their working
+        directory, attach it through the MCP tool factory_attach_screenshot with the caption
+        "Fake <role> screenshot (<build | fix round N>)", delete the file and append "Attached 1 screenshot." (or the
+        tool's error text) to their summary; other roles ignore it
+    - "fake:image" (optionally "fake:image=<n>") in a chat message calls the MCP tool factory_generate_image with the
+        purpose "app icon" (and "issueNumber" from a "#<n>" in the message) and appends "Image tool: <answer>" to the reply;
+        in a builder's prompt the builder calls it too, copies the first returned path to assets/fake-icon.png, commits
+        it with its usual commit and appends "Image tool: <answer>" to its result
+    - a spec-writer or builder whose prompt has an <images> block appends "PREPARED ok <path> <bytes>" or
+        "PREPARED missing <path>" per listed "path:" line
     - "fake:busy-<role>" makes that (stream-json) role work in Bash steps of ~0.4 s for up to ~2 minutes,
       until a message from the owner contains "finish"; each picked-up message is acknowledged with
       "Noted the owner's message: ..." and listed in the final result
@@ -62,12 +79,15 @@ import json
 import os
 import queue
 import re
+import shutil
+import struct
 import subprocess
 import sys
 import threading
 import time
 import urllib.request
 import uuid
+import zlib
 
 args = sys.argv[1:]
 
@@ -228,6 +248,70 @@ def mcp_tool_roundtrip(tool, arguments, req_id):
     return text, is_error
 
 
+def tiny_png(width=4, height=3, rgb=(0x2B, 0x6C, 0xB0)):
+    """A valid, uncompressed-colour PNG of one solid colour (no dependencies)."""
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    raw = b"".join(b"\x00" + bytes(rgb) * width for _ in range(height))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def attach_fake_screenshot(prompt):
+    """fake:screenshots: one screenshot through factory_attach_screenshot; returns the line for the summary."""
+    m = re.search(r"after fix round (\d+)", prompt)
+    when = "fix round %s" % m.group(1) if m else "build"
+    name = "agern-fake-screenshot-%s.png" % role
+    try:
+        with open(name, "wb") as f:
+            f.write(tiny_png())
+        mcp_call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake-claude", "version": "0"}}, 1)
+        text, is_error = mcp_tool_roundtrip("factory_attach_screenshot",
+                                            {"path": name, "caption": "Fake %s screenshot (%s)" % (role, when)}, 2)
+    except Exception as e:  # noqa
+        text, is_error = "Screenshot failed: %s" % e, True
+    finally:
+        try:
+            os.remove(name)
+        except OSError:
+            pass
+    return text if is_error else "Attached 1 screenshot."
+
+
+def mcp_init():
+    mcp_call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake-claude", "version": "0"}}, 1)
+
+
+def generate_fake_image(text, req_id=2):
+    """fake:image[=<n>] [#<issue>]: calls factory_generate_image with purpose "app icon". Returns (answer, is_error)."""
+    m = re.search(r"fake:image=(\d+)", text)
+    args = {"prompt": "A friendly squirrel app icon, flat style (fake prompt)", "purpose": "app icon", "size": "256x256"}
+    if m:
+        args["count"] = int(m.group(1))
+    issue = re.search(r"#(\d+)", text)
+    if issue and role == "chat":
+        args["issueNumber"] = int(issue.group(1))
+    try:
+        mcp_init()
+        return mcp_tool_roundtrip("factory_generate_image", args, req_id)
+    except Exception as e:  # noqa
+        return "Image tool failed: %s" % e, True
+
+
+def prepared_report(prompt):
+    """The <images> block of a task prompt: one line per listed path, whether the file is there."""
+    block = re.search(r"<images>(.*?)</images>", prompt, re.S)
+    if not block:
+        return ""
+    lines = []
+    for path in re.findall(r"^\s*path: (\S+)\s*$", block.group(1), re.M):
+        if os.path.isfile(path):
+            lines.append("PREPARED ok %s %d" % (path, os.path.getsize(path)))
+        else:
+            lines.append("PREPARED missing %s" % path)
+    return "".join("\n" + l for l in lines)
+
+
 def image_size(data):
     """(width, height) of PNG/GIF/JPEG bytes, or None."""
     import struct
@@ -289,6 +373,32 @@ def describe_blocks(blocks):
 
 
 # --------------------------------------------------------------------------- chat mode
+
+advisor_context = {}
+
+
+def advisor_reply(text, context):
+    """The advisor's answer: the owner's words, what the run context says, and the actual diff."""
+    lines = ["Advisor: " + text]
+    for line in context.splitlines():
+        if line.startswith("Needs a human because:") or line.startswith("### "):
+            lines.append(line)
+    base = re.search(r"git diff (\S+)\.\.\.HEAD", context)
+    if "please change" in text and (os.path.isdir(".git") or os.path.isfile(".git")):
+        with open("AGERN_FAKE.md", "a") as f:
+            f.write("change requested in the conversation at %s\n" % time.strftime("%Y-%m-%dT%H:%M:%S"))
+        subprocess.run(["git", "add", "AGERN_FAKE.md"], check=False)
+        subprocess.run(["git", "commit", "-q", "-m", "Apply the change the run owner asked for (fake)"], check=False)
+        lines.append("Committed the change; the factory pushes it and has it reviewed again. Only you can approve the run.")
+    if base:
+        ref = base.group(1).strip("`")
+        try:
+            stat = subprocess.run(["git", "diff", "--stat", "%s...HEAD" % ref], capture_output=True, text=True, timeout=30).stdout.strip()
+        except Exception as e:  # noqa
+            stat = "git diff failed: %s" % e
+        lines.append("Diff: " + (stat or "(no changes)"))
+    return "\n".join(lines)
+
 
 def chat_mode():
     inbox = queue.Queue()
@@ -371,9 +481,22 @@ def chat_mode():
             stream_text(reply)
             result(reply)
             continue
+        if role == "advisor":
+            context = advisor_context.get("text", "")
+            m_ctx = re.search(r"<run_context>[\s\S]*?</run_context>", content)
+            if m_ctx:
+                context = m_ctx.group(0)
+                advisor_context["text"] = context
+            content = re.sub(r"<run_context>[\s\S]*?</run_context>\s*", "", content)
+            content = owner_text(content.strip())
         if "crash" in content:
             sys.stderr.write("fake-claude: crashing as requested\n")
             sys.exit(3)
+        if role == "advisor" and "slow" not in content:
+            reply = advisor_reply(content, advisor_context.get("text", ""))
+            stream_text(reply)
+            result(reply)
+            continue
         rate_limit_event(content)
         if "tool" in content:
             tool_roundtrip("echo hello from fake-claude && pwd")
@@ -400,6 +523,9 @@ def chat_mode():
                 reply += "\n" + res["result"]["content"][0]["text"]
             except Exception as e:  # noqa
                 reply += "\nMCP call failed: %s" % e
+        if "fake:image" in content and mcp_config:
+            answer, _ = generate_fake_image(content)
+            reply += "\nImage tool: " + answer
         if "slow" in content and not forward:
             chunks = ["%d " % i for i in range(1, 41)]
             ok, sent = stream_text("".join(chunks), chunk_delay=0.25, chunks=chunks,
@@ -463,15 +589,18 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
         result(json.dumps(out), structured=out)
         return
     if schema and "PASS" in schema:
+        shot = ""
+        if "fake:screenshots" in prompt and role in ("ux", "ui-design") and mcp_config:
+            shot = " " + attach_fake_screenshot(prompt)
         changes = "fake:always-changes" in prompt or ("fake:changes" in prompt and "after fix round" not in prompt)
         if changes:
             detail = "Fake finding from %s." % role
             if markdown:
                 detail += "\n\n- rename `oldName` to **newName**"
-            out = {"verdict": "CHANGES", "summary": "Fake %s reviewer wants changes." % role + md_tail,
+            out = {"verdict": "CHANGES", "summary": "Fake %s reviewer wants changes." % role + shot + md_tail,
                    "findings": [{"severity": "major", "file": "AGERN_FAKE.md", "detail": detail}]}
         else:
-            out = {"verdict": "PASS", "summary": "Fake %s reviewer is happy." % role + md_tail, "findings": []}
+            out = {"verdict": "PASS", "summary": "Fake %s reviewer is happy." % role + shot + md_tail, "findings": []}
         stream_text("Reviewed the diff.")
         result(json.dumps(out), structured=out)
         return
@@ -492,17 +621,31 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
             except Exception as e:  # noqa
                 sandbox_report = "\nSandbox MCP calls failed: %s" % e
             checkpoint()
+        image_report = ""
+        if "fake:image" in prompt and mcp_config:
+            answer, is_error = generate_fake_image(prompt, 5)
+            image_report = "\nImage tool: " + answer
+            if not is_error:
+                try:
+                    first = json.loads(answer)["images"][0]["path"]
+                    os.makedirs("assets", exist_ok=True)
+                    shutil.copyfile(first, os.path.join("assets", "fake-icon.png"))
+                except Exception as e:  # noqa
+                    image_report += "\nCopying the image failed: %s" % e
+        image_report += prepared_report(prompt)
         if os.path.isdir(".git") or os.path.isfile(".git"):
             with open("AGERN_FAKE.md", "a") as f:
                 f.write("fake build at %s\n" % time.strftime("%Y-%m-%dT%H:%M:%S"))
             subprocess.run(["git", "add", "AGERN_FAKE.md"], check=False)
+            if os.path.isfile(os.path.join("assets", "fake-icon.png")):
+                subprocess.run(["git", "add", os.path.join("assets", "fake-icon.png")], check=False)
             subprocess.run(["git", "commit", "-q", "-m", "Fake build commit"], check=False)
         if "fake:stop-builder" in prompt and "Do not redo that work" not in prompt:
             text = "API Error: Can't reach the API server - check your internet or DNS (fake)"
             stream_text(text)
             result(text, subtype="error_during_execution", is_error=True)
             return
-        text = "Implemented the change (fake). Ran no tests because I am a stub." + sandbox_report
+        text = "Implemented the change (fake). Ran no tests because I am a stub." + sandbox_report + image_report
         if received:
             text += "\nOwner messages handled: " + "; ".join(received)
         stream_text(text)
@@ -511,6 +654,9 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
     if role == "spec-writer":
         checkpoint()
         text = "## Summary\nA fake spec.\n\n## Acceptance criteria\n- [ ] Something happens\n"
+        prepared = prepared_report(prompt)
+        if prepared:
+            text += "\n## Images" + prepared + "\n"
         if received:
             text += "\n## Notes from the owner\n" + "".join("- %s\n" % m for m in received)
         stream_text(text)
@@ -614,7 +760,7 @@ if __name__ == "__main__":
         emit({"type": "result", "subtype": "success", "is_error": True, "duration_ms": 10, "num_turns": 1,
               "result": "Invalid API key · Please run /login", "session_id": session_id, "total_cost_usd": 0})
         sys.exit(1)
-    if interactive and role != "chat":
+    if interactive and role not in ("chat", "advisor"):
         stage_stream_mode()
     elif interactive:
         chat_mode()

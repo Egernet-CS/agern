@@ -122,6 +122,8 @@ function Shell() {
   useEffect(() => setMenu(false), [loc.pathname]);
   const appShell = APP_SHELL.test(loc.pathname);
   useAppShell(appShell);
+  const health = useAsync(() => api.health(), []);
+  const version = typeof health.data?.version === 'string' ? health.data.version.trim() : '';
   if (!me) return null;
   return (
     <div className={`shell ${appShell ? 'shell--app' : ''}`}>
@@ -151,6 +153,11 @@ function Shell() {
                 </div>
                 <NavLink role="menuitem" to="/settings">Credentials & security</NavLink>
                 <button role="menuitem" type="button" onClick={() => void logout()}>Sign out</button>
+                {version && (
+                  <div className="usermenu-version">
+                    Agern <span className="mono">{version}</span>
+                  </div>
+                )}
               </div>
             )}
           </div>

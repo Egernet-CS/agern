@@ -34,6 +34,38 @@ Sandbox (when your task prompt says this run has one):
 - When the run has no sandbox, or the tools are not available to you, build and test on the host as
   described above.
 
+Database migrations (when the change adds a versioned migration, e.g. Flyway `V<n>__name.sql`):
+- Take the version from the branch your pull request will be merged into (your task prompt names it):
+  fetch it, list the migrations there and use the next version above all of them. Do not take the
+  number from memory, from the issue text or from another branch; two branches that each pick "the
+  next free number" collide, and Agern refuses to merge a pull request whose migration does.
+- Never edit, rename or delete a migration that already exists on that branch; add a new one instead.
+- Check again before you finish, in every fix round, and after any rebase or merge of that branch into
+  yours. If it has gained a migration with the same or a higher version, renumber yours.
+
+## Images
+
+An image AI chosen by the user is available through the `factory_generate_image` tool. It runs on the
+Agern server with the key of the user who owns this run; you never see the key.
+
+- **When:** whenever the spec or the issue asks for an icon, illustration, logo, empty-state art, hero image or
+  other graphics, even if they do not mention the image AI or the tool. Do not hand-draw a crude
+  placeholder (SVG doodles, ASCII art, emoji) and do not skip the graphics.
+- **Never** generate images when nothing in the request or issue calls for graphics.
+- **Prompt:** write the image prompt yourself from the request and the project's context. Look at the
+  existing assets first (icons, logos, illustrations, colours, sizes and formats the project uses) and
+  keep new graphics consistent with them; say in the prompt what style and colours to use.
+- **Look at the result** by reading the file at the returned `path`.
+- **Prepared images:** when the task prompt has an `<images>` block, use those files for their purpose
+  and do not generate replacements for the same purpose.
+- Generate the images the spec asks for that were not prepared.
+- Add the images you use to the repository where the project keeps such assets, in the formats and
+  sizes the project needs (resize or convert with the project's tools; Agern does not). Never commit
+  `.agern-run/`: it is ignored by git and only holds the server's copies.
+- **No provider:** if the tool answers that no image provider is configured, continue without generated
+  images: do not fail the task for this and do not draw placeholder art.
+- List in your summary which images you added (path, purpose) and which are missing.
+
 Hard rules:
 - Stay on the branch you were given. Do not push, open or merge pull requests, rewrite published
   history, or touch other branches — the factory pushes and opens the pull request for you.

@@ -1,6 +1,16 @@
 package dk.egernet.factory.pipeline
 
+import dk.egernet.factory.ADVISOR_KIND
 import dk.egernet.factory.AppJson
+import dk.egernet.factory.ReviewState
+import dk.egernet.factory.SessionStatus
+import dk.egernet.factory.badRequest
+import dk.egernet.factory.agent.AdvisorLaunch
+import dk.egernet.factory.db.EventStore
+import dk.egernet.factory.db.SessionRecord
+import dk.egernet.factory.db.SessionStore
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import dk.egernet.factory.Config
 import dk.egernet.factory.FailedStep
 import dk.egernet.factory.FailureKind
@@ -9,12 +19,14 @@ import dk.egernet.factory.RetryOptionDto
 import dk.egernet.factory.RetryOptionsDto
 import dk.egernet.factory.FindingDto
 import dk.egernet.factory.REVIEWER_ROLES
+import dk.egernet.factory.SCREENSHOT_ROLES
 import dk.egernet.factory.RunStatus
 import dk.egernet.factory.agent.AgentIdentity
 import dk.egernet.factory.agent.AgentManager
 import dk.egernet.factory.agent.EventBus
 import dk.egernet.factory.agent.FeedItem
 import dk.egernet.factory.agent.Prompts
+import dk.egernet.factory.agent.Screenshots
 import dk.egernet.factory.agent.StageAgentRequest
 import dk.egernet.factory.agent.StageAgentResult
 import dk.egernet.factory.agent.UsageLimit
@@ -22,6 +34,7 @@ import dk.egernet.factory.agent.Workspaces
 import dk.egernet.factory.conflict
 import dk.egernet.factory.db.RunRecord
 import dk.egernet.factory.db.RunStore
+import dk.egernet.factory.db.ScreenshotStore
 import dk.egernet.factory.db.SettingsStore
 import dk.egernet.factory.db.StageRecord
 import dk.egernet.factory.db.UserRecord
@@ -104,10 +117,19 @@ class Orchestrator(
     private val scope: CoroutineScope,
     private val preferences: dk.egernet.factory.db.PreferenceStore,
     private val sandboxes: dk.egernet.factory.sandbox.SandboxManager,
-    private val sessions: dk.egernet.factory.db.SessionStore,
+    private val screenshots: ScreenshotStore,
+    private val sessions: SessionStore,
+    private val events: EventStore,
+    private val images: dk.egernet.factory.images.ImageService,
 ) {
     private val log = LoggerFactory.getLogger(Orchestrator::class.java)
     private val jobs = ConcurrentHashMap<UUID, Job>()
+    /** Per run: serialises the conversation's commands (talk, review, approve's checks) against each other. */
+    private val talkLocks = ConcurrentHashMap<UUID, Mutex>()
+    /** Per run: serialises reconciles (after a turn and after an exit of the same process). */
+    private val reconcileLocks = ConcurrentHashMap<UUID, Mutex>()
+    /** Runs being cancelled or approved: no follow-up review may start for them meanwhile. */
+    private val ending = ConcurrentHashMap.newKeySet<UUID>()
     private val org get() = cfg.githubOrg
 
     fun job(runId: UUID): Job? = jobs[runId]
@@ -174,7 +196,7 @@ class Orchestrator(
     private fun launchJob(runId: UUID, block: suspend () -> Unit) {
         val job = scope.launch { block() }
         jobs[runId] = job
-        job.invokeOnCompletion { jobs.remove(runId) }
+        job.invokeOnCompletion { jobs.remove(runId, job) }
     }
 
     // ------------------------------------------------------------ retry (docs/ARCHITECTURE.md §6 "Retrying a run")
@@ -296,12 +318,14 @@ class Orchestrator(
         if (owner.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
         if (run.status == RunStatus.NEEDS_HUMAN && run.failedStep == FailedStep.MERGE) {
             if (run.prNumber == null) throw conflict("Run has no pull request to merge", "retry_mode_unavailable")
-            runs.setStatus(run.id, RunStatus.APPROVING, clearError = true)
+            // The same gate as an approval: changes from the conversation must have been reviewed.
+            startMerging(run.id)
             publish(run.id)
             // The approver approved before the merge failed: merging again is its decision; otherwise it is the owner's.
             val approverApproved = runs.stages(run.id).lastOrNull { it.role == "approver" }?.verdict == "APPROVE"
             launchJob(run.id) {
                 withContext(Dispatchers.IO) { merge(runs.get(run.id)!!, owner, approvedBy = if (approverApproved) null else owner.username) }
+                runs.get(run.id)?.takeIf { it.status == RunStatus.MERGED }?.advisorSessionId?.let { agents.endAdvisor(it) }
                 publish(run.id)
                 settled(run.id)
             }
@@ -326,12 +350,43 @@ class Orchestrator(
         if (run.ownerId != user.id) throw forbidden("Only the owner of this run can approve it")
         if (run.status != RunStatus.NEEDS_HUMAN) throw conflict("Run is ${run.status}, not needs_human")
         if (run.prNumber == null) throw conflict("Run has no pull request to merge")
-        runs.setStatus(runId, RunStatus.APPROVING, clearError = true)
+        startMerging(runId)
         publish(runId)
         withContext(Dispatchers.IO) { merge(runs.get(runId)!!, user, approvedBy = user.username) }
+        runs.get(runId)?.takeIf { it.status == RunStatus.MERGED }?.advisorSessionId?.let { agents.endAdvisor(it) }
         publish(runId)
         settled(runId)
         return runs.get(runId)!!
+    }
+
+    /**
+     * Moves a `needs_human` run to `approving` before it is merged, by the owner's approval or a retry of a failed merge.
+     * Changes made in the conversation are reviewed before the run can be merged (docs/ARCHITECTURE.md §6 "Conversation at
+     * needs human"): enforced here, from server state, for every way to merge a run that needs a human.
+     */
+    private suspend fun startMerging(runId: UUID) {
+        talkLocks.computeIfAbsent(runId) { Mutex() }.withLock {
+            val r = runs.get(runId)!!
+            if (r.status != RunStatus.NEEDS_HUMAN) throw conflict("Run is ${r.status}, not needs_human")
+            if (r.reviewState == ReviewState.RUNNING) {
+                throw conflict("The changes from the conversation are being reviewed; approve when the reviews are in", "review_in_progress")
+            }
+            r.advisorSessionId?.let { if (agents.isAdvisorBusy(it)) throw agentBusy() }
+            if (r.reviewState == ReviewState.REQUIRED) throw reviewRequired()
+            if (r.reviewedSha != null && headOf(r).let { it != null && it != r.reviewedSha }) {
+                // A commit the review has not seen (e.g. a restart in the middle of a turn): it must be reviewed first.
+                runs.casReviewState(runId, ReviewState.NONE, ReviewState.REQUIRED)
+                publish(runId)
+                throw reviewRequired()
+            }
+            ending += runId
+            try {
+                r.advisorSessionId?.let { agents.stopAdvisor(it, ended = false) }
+                runs.setStatus(runId, RunStatus.APPROVING, clearError = true)
+            } finally {
+                ending -= runId
+            }
+        }
     }
 
     /** Owner or admin. */
@@ -339,12 +394,19 @@ class Orchestrator(
         val run = runs.get(runId) ?: throw notFound("Run not found")
         if (run.ownerId != user.id && !user.isAdmin) throw forbidden("Only the owner or an admin can cancel this run")
         if (run.status in RunStatus.TERMINAL) throw conflict("Run is already ${run.status}")
-        jobs[runId]?.let { it.cancel(); it.join() }
-        sandboxes.release(runId)
-        val after = runs.get(runId)!!
-        if (after.status in RunStatus.TERMINAL) return after
-        withContext(Dispatchers.IO) { cleanupWorktree(runId, merged = false) }
-        runs.setStatus(runId, RunStatus.CANCELLED, "Cancelled by ${user.username}")
+        ending += runId
+        try {
+            // The pipeline or a follow-up review, then the advisor (mid-turn included): nothing works in the worktree after this.
+            jobs[runId]?.let { it.cancel(); it.join() }
+            runs.get(runId)?.advisorSessionId?.let { agents.stopAdvisor(it, ended = true) }
+            sandboxes.release(runId)
+            val after = runs.get(runId)!!
+            if (after.status in RunStatus.TERMINAL) return after
+            withContext(Dispatchers.IO) { cleanupWorktree(runId, merged = false) }
+            runs.setStatus(runId, RunStatus.CANCELLED, "Cancelled by ${user.username}")
+        } finally {
+            ending -= runId
+        }
         runs.closeOpenStages(runId)
         val owner = users.byId(run.ownerId)!!
         withContext(Dispatchers.IO) {
@@ -354,6 +416,290 @@ class Orchestrator(
         publish(runId)
         settled(runId)
         return runs.get(runId)!!
+    }
+
+    // ------------------------------------------------------------ conversation at needs human (docs/ARCHITECTURE.md §6)
+
+    private fun agentBusy() = conflict("The agent is still answering; wait for it or interrupt it", "agent_busy")
+    private fun reviewRequired() =
+        conflict("Changes from the conversation have not been reviewed yet; review them again before approving", "review_required")
+    private fun reviewInProgress() =
+        conflict("The changes from the conversation are being reviewed; continue when the reviews are in", "review_in_progress")
+
+    private fun requireWaiting(run: RunRecord) {
+        if (run.status != RunStatus.NEEDS_HUMAN) {
+            throw conflict("Run is ${run.status}; the agent can only be talked to while the run needs a human", "run_not_waiting")
+        }
+    }
+
+    private fun worktreeOf(run: RunRecord): Path = workspaces.runDir(run.ownerUsername, run.repo, run.id)
+
+    /** The worktree's HEAD, or null when it cannot be read (e.g. the worktree is gone). Blocking-safe. */
+    private suspend fun headOf(run: RunRecord): String? = withContext(Dispatchers.IO) {
+        val wt = worktreeOf(run)
+        if (!java.nio.file.Files.isDirectory(wt)) null
+        else runCatching { workspaces.git.head(wt, workspaces.home(run.ownerUsername)) }
+            .onFailure { log.warn("Could not read HEAD of run {}: {}", run.id, it.message) }.getOrNull()
+    }
+
+    /**
+     * The owner's message for the run's advisor. Owner only (admins included in the refusal), only at `needs_human`,
+     * one message at a time. The first message creates the run's advisor session. Returns its id.
+     */
+    suspend fun talk(user: UserRecord, runId: UUID, text: String): UUID {
+        val run = runs.get(runId) ?: throw notFound("Run not found")
+        if (run.ownerId != user.id) throw forbidden("Only the owner of this run can talk to its agent")
+        requireWaiting(run)
+        if (text.isBlank()) throw badRequest("text must not be empty")
+        if (text.length > 100_000) throw badRequest("text is too long")
+        return talkLocks.computeIfAbsent(runId) { Mutex() }.withLock {
+            val r = runs.get(runId) ?: throw notFound("Run not found")
+            requireWaiting(r)
+            if (r.reviewState == ReviewState.RUNNING) throw reviewInProgress()
+            r.advisorSessionId?.let { if (agents.isAdvisorBusy(it)) throw agentBusy() }
+            if (user.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
+            if (r.advisorSessionId?.let { agents.isLive(it) } != true && !agents.hasFreeSlot(user)) {
+                throw conflict("You already have ${cfg.maxAgentsPerUser} agents running", "too_many_agents")
+            }
+            val worktree = worktreeOf(r)
+            if (!withContext(Dispatchers.IO) { java.nio.file.Files.isDirectory(worktree) }) {
+                throw conflict("The run's worktree is gone, so the agent cannot work on it; start a new run instead", "run_worktree_missing")
+            }
+            val sessionId = r.advisorSessionId ?: createAdvisor(r, user)
+            agents.sendToAdvisor(user, sessions.get(sessionId) ?: throw notFound("Agent session not found"), text)
+            sessionId
+        }
+    }
+
+    /** Creates the run's advisor session (called under the run's talk lock) and records the reviewed commit. */
+    private suspend fun createAdvisor(run: RunRecord, owner: UserRecord): UUID {
+        val head = headOf(run)
+        val model = preferences.effective(owner.id).model("builder")
+        val s = sessions.create(
+            run.repo, ADVISOR_KIND, model, SessionStatus.IDLE, owner.id, "advisor · #${run.issueNumber}", run.id, null, run.issueNumber,
+        )
+        val bound = runs.bindAdvisor(run.id, s.id, head) ?: s.id
+        agents.publishFeed(bound)
+        publish(run.id)
+        return bound
+    }
+
+    /** "Review again": owner only, at `needs_human`, when changes from the conversation have not been reviewed. */
+    suspend fun review(user: UserRecord, runId: UUID): RunRecord {
+        val run = runs.get(runId) ?: throw notFound("Run not found")
+        if (run.ownerId != user.id) throw forbidden("Only the owner of this run can have its changes reviewed")
+        requireWaiting(run)
+        talkLocks.computeIfAbsent(runId) { Mutex() }.withLock {
+            reconcileLocks.computeIfAbsent(runId) { Mutex() }.withLock {
+                val r = runs.get(runId) ?: throw notFound("Run not found")
+                requireWaiting(r)
+                if (r.reviewState == ReviewState.RUNNING) throw reviewInProgress()
+                r.advisorSessionId?.let { if (agents.isAdvisorBusy(it)) throw agentBusy() }
+                if (user.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
+                val head = headOf(r)
+                if (r.advisorSessionId == null || r.reviewedSha == null || (r.reviewState == ReviewState.NONE && head == r.reviewedSha)) {
+                    throw conflict("There are no unreviewed changes from the conversation", "nothing_to_review")
+                }
+                if (!runs.casReviewState(runId, r.reviewState, ReviewState.RUNNING)) throw reviewInProgress()
+                launchFollowUp(runId)
+            }
+        }
+        publish(runId)
+        return runs.get(runId)!!
+    }
+
+    /**
+     * After every advisor turn and exit: a `needs_human` run whose worktree HEAD moved past the reviewed commit needs a
+     * follow-up review, which starts at once. Idempotent; a no-op while a review runs or the run is ending.
+     */
+    suspend fun reconcile(runId: UUID) {
+        reconcileLocks.computeIfAbsent(runId) { Mutex() }.withLock {
+            val run = runs.get(runId) ?: return
+            if (run.status != RunStatus.NEEDS_HUMAN || runId in ending || run.reviewedSha == null) return
+            if (run.reviewState == ReviewState.RUNNING) return
+            val head = headOf(run) ?: return
+            if (head == run.reviewedSha) return
+            if (!runs.casReviewState(runId, run.reviewState, ReviewState.RUNNING)) return
+            launchFollowUp(runId)
+        }
+        publish(runId)
+    }
+
+    /** Starts the follow-up review job, registered in [jobs] so that cancel stops it. */
+    private fun launchFollowUp(runId: UUID) {
+        val job = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) { followUp(runId) }
+        jobs[runId] = job
+        job.invokeOnCompletion { jobs.remove(runId, job) }
+        job.start()
+    }
+
+    /**
+     * The follow-up review of changes made in the conversation: push, then the four reviewers in a new round, exactly
+     * as in the pipeline. Never fails the run, never merges, and leaves the worktree; a failure leaves the review
+     * `required` for "Review again".
+     */
+    private suspend fun followUp(runId: UUID) {
+        val start = runs.get(runId) ?: return
+        val advisor = start.advisorSessionId
+        try {
+            publish(runId)
+            // The advisor must not commit while the reviewers read the tree; it resumes on the owner's next message.
+            advisor?.let { agents.stopAdvisor(it, ended = false) }
+            val owner = owner(start)
+            val id = identity(owner)
+            val client = gh(owner)
+            val ctx = runContext(start, owner)
+            val home = workspaces.home(owner.username)
+            val head = withContext(Dispatchers.IO) { workspaces.git.head(ctx.worktree, home) }
+            withContext(Dispatchers.IO) { workspaces.git.push(id, ctx.worktree, ctx.branch, home) }
+            val round = (runs.stages(runId).maxOfOrNull { it.round } ?: 0) + 1
+            val eff = preferences.effective(owner.id)
+            REVIEWER_ROLES.forEach { runs.createStage(runId, it, round, eff.model(it)) }
+            runs.startFollowUp(runId, round)
+            publish(runId)
+            val n = round - (runs.get(runId)!!.followUpFrom ?: round) + 1
+            val spec = specText(runId).orEmpty()
+            val summary = advisor?.let { events.lastResultText(it) }?.trim().orEmpty()
+            val reviews = coroutineScope {
+                REVIEWER_ROLES.map { role ->
+                    async {
+                        val r = stage(runId, role, round, owner, ctx, reviewPrompt(ctx, role, round, spec, summary, followUp = n), schema = Schemas.REVIEW,
+                            disallowed = READ_ONLY_TOOLS, extraTools = if (role in SCREENSHOT_ROLES) Screenshots.TOOLS else emptySet())
+                        val v = parseVerdict(r, setOf("PASS", "CHANGES"))
+                        if (v == null) {
+                            finishStage(runId, role, round, null, "No valid verdict in the agent's output", emptyList(), failed = true)
+                            null
+                        } else {
+                            finishStage(runId, role, round, v.verdict, v.summary, v.findings)
+                            role to v
+                        }
+                    }
+                }.awaitAll()
+            }.let { list ->
+                if (list.any { it == null }) throw StageFailed("A reviewer did not return a valid verdict")
+                list.filterNotNull().toMap()
+            }
+            withContext(Dispatchers.IO) { bestEffort { screenshotNote(runs.get(runId)!!, client, round) } }
+            val sha7 = head.take(7)
+            val changes = REVIEWER_ROLES.filter { reviews[it]?.verdict == "CHANGES" }
+            val verdicts = REVIEWER_ROLES.joinToString(", ") { "$it ${reviews.getValue(it).verdict}" }
+            runs.setReviewedSha(runId, head)
+            val reason = originalReason(runs.get(runId)!!.error)
+            val outcome = if (changes.isEmpty()) "all four reviewers pass." else "${changes.joinToString(", ")} still request changes."
+            runs.setError(runId, (if (reason.isEmpty()) "" else "$reason\n\n") + "**Follow-up review $n** (commit `$sha7`): $outcome")
+            advisor?.let { agents.systemEvent(it, "info", "Follow-up review $n of commit $sha7: $verdicts.") }
+            // Last: `none` tells clients (and approve) that the review and everything it records is complete.
+            runs.setReviewState(runId, ReviewState.NONE)
+            publish(runId)
+            val pr = runs.get(runId)?.prNumber
+            if (pr != null) withContext(Dispatchers.IO) {
+                bestEffort {
+                    client.comment(org, start.repo, pr,
+                        "**Agern:** changes requested by the run owner in a conversation were pushed ($sha7) and reviewed again: $verdicts.")
+                }
+            }
+        } catch (e: CancellationException) {
+            withContext(NonCancellable) { runs.casReviewState(runId, ReviewState.RUNNING, ReviewState.REQUIRED) }
+            throw e
+        } catch (e: Exception) {
+            log.warn("Follow-up review of run {} failed: {}", runId, e.message)
+            runs.closeOpenStages(runId)
+            runs.casReviewState(runId, ReviewState.RUNNING, ReviewState.REQUIRED)
+            val why = e.message ?: e.javaClass.simpleName
+            advisor?.let {
+                agents.systemEvent(
+                    it, "error",
+                    "The follow-up review of the changes did not complete: $why. The run still needs a human; use \"Review again\" " +
+                        "on the run page to review the changes before approving.",
+                )
+            }
+            publish(runId)
+        }
+    }
+
+    /** The needs-human reason without the follow-up paragraphs added after it. */
+    private fun originalReason(error: String?): String = (error ?: "").substringBefore("\n\n**Follow-up review ").trim()
+
+    /** The final result text of the run's spec-writer. */
+    private fun specText(runId: UUID): String? =
+        runs.stages(runId).firstOrNull { it.role == "spec-writer" }?.sessionId?.let { events.lastResultText(it) }
+
+    /** Launch data for the run's advisor, rebuilt from current data (AgentManager.advisorLaunch). */
+    suspend fun advisorLaunch(session: SessionRecord, owner: UserRecord): AdvisorLaunch {
+        val run = session.runId?.let { runs.get(it) } ?: throw notFound("Run not found")
+        requireWaiting(run)
+        val ctx = runContext(run, owner)
+        if (!withContext(Dispatchers.IO) { java.nio.file.Files.isDirectory(ctx.worktree) }) {
+            throw conflict("The run's worktree is gone, so the agent cannot work on it", "run_worktree_missing")
+        }
+        return AdvisorLaunch(ctx.worktree, run.id, advisorContext(runs.get(run.id)!!, ctx))
+    }
+
+    /**
+     * The run's [RunContext], rebuilt from the run record, GitHub (issue, comments, default branch) and the stored
+     * sandbox decision. When GitHub cannot be read, the stored title stands in for the issue.
+     */
+    private suspend fun runContext(run: RunRecord, owner: UserRecord): RunContext = withContext(Dispatchers.IO) {
+        val client = access.client(owner)
+        val repoInfo = runCatching { client?.getRepo(org, run.repo) }.getOrNull()
+        val issue = runCatching { client?.getIssue(org, run.repo, run.issueNumber) }.getOrNull()
+        val comments = if (issue == null) emptyList() else runCatching { client?.listComments(org, run.repo, run.issueNumber) }.getOrNull().orEmpty()
+        val text = if (issue != null) issueText(issue, comments)
+            else "Issue #${run.issueNumber}: ${run.issueTitle}\n(The issue body is unavailable: GitHub could not be read.)\n"
+        val defaultBranch = repoInfo?.defaultBranch ?: "main"
+        val target = run.baseBranch ?: defaultBranch
+        val releaseName = run.baseBranch?.takeIf { run.releaseId != null }?.removePrefix("release/")
+        RunContext(
+            run.id, run.repo,
+            issue ?: GhIssue(run.issueNumber, run.issueTitle, "open", createdAt = "", updatedAt = "", htmlUrl = ""),
+            text, run.branch ?: "", workspaces.git.baseRef(target), target, worktreeOf(run), releaseName, defaultBranch,
+            run.sandboxJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunSandboxDto.serializer(), it) }.getOrNull() },
+        )
+    }
+
+    /** Human name of a stage round: build, fix round N or follow-up N. */
+    private fun roundName(run: RunRecord, round: Int): String {
+        val from = run.followUpFrom
+        return when {
+            from != null && round >= from -> "follow-up ${round - from + 1}"
+            round == 0 -> "build"
+            else -> "fix round $round"
+        }
+    }
+
+    /** The `<run_context>` block an advisor's first message carries. Untrusted parts are data for the agent. */
+    private fun advisorContext(run: RunRecord, c: RunContext): String = buildString {
+        val stages = runs.stages(run.id)
+        append("<run_context>\n")
+        append("Run `${run.id}` in ${org}/${c.repo} for issue #${run.issueNumber}. Status: needs a human.\n")
+        append("Needs a human because: ${run.error?.trim().orEmpty().ifEmpty { "(no reason recorded)" }}\n")
+        append("Branch `${c.branch}`, created from `${c.baseRef}`; pull request ${run.prUrl ?: "(none)"}; it merges into `${c.targetBranch}`.\n")
+        append(c.releaseNote)
+        append("Inspect the change with `git diff ${c.baseRef}...HEAD` and `git log ${c.baseRef}..HEAD`, and by reading the code.\n")
+        append("This run has no sandbox at this point: build and run checks on the host.\n\n")
+        append(c.issueText)
+        append("\n<spec>\n").append(specText(run.id)?.trim().orEmpty().ifEmpty { "(none)" }).append("\n</spec>\n")
+        val builder = stages.filter { it.role == "builder" && it.sessionId != null }.maxByOrNull { it.round }
+        val summary = builder?.sessionId?.let { events.lastResultText(it) }?.trim().orEmpty()
+        append("\n<builder_summary>\n").append(summary.ifEmpty { "(none)" }).append("\n</builder_summary>\n")
+        append("\n<reviews>\n")
+        for (role in REVIEWER_ROLES) {
+            val st = stages.filter { it.role == role && it.verdict != null }.maxByOrNull { it.round }
+            if (st == null) {
+                append("### $role — no verdict\n\n")
+                continue
+            }
+            append("### $role — ${roundName(run, st.round)} — ${st.verdict}\n${st.summary.orEmpty()}\n")
+            st.findings.forEach { f -> append("- [${f.severity}] ${f.file ?: "(general)"}: ${f.detail}\n") }
+            append('\n')
+        }
+        append("</reviews>\n")
+        val approver = stages.lastOrNull { it.role == "approver" }
+        append("\n<approver>\n")
+        if (approver?.verdict != null) append("${approver.verdict}: ${approver.summary.orEmpty()}\n")
+        else append("The approver did not run (${approver?.status ?: "no stage"}).\n")
+        append("</approver>\n")
+        append("</run_context>")
     }
 
     // ------------------------------------------------------------ the state machine
@@ -479,10 +825,15 @@ class Orchestrator(
         val definitionRef = if (run.baseBranch == null || target == repoInfo.defaultBranch) baseRef
             else baseRef.removeSuffix(target) + repoInfo.defaultBranch
         val sandbox = sandboxes.prepare(run.id, run.repo, worktree, definitionRef, workspaces.home(owner.username))
+        // Images selected for the issue in a chat go into the worktree (docs/ARCHITECTURE.md §6 "Generated images").
+        val prepared = withContext(Dispatchers.IO) { images.handOver(runs.get(run.id)!!, worktree) }
         publish(run.id)
         val ctx = RunContext(
             run.id, run.repo, issue, issueText(issue, comments), branch, baseRef, target, worktree, releaseName, repoInfo.defaultBranch, sandbox,
+            prepared,
         )
+        val imageNotes = if (prepared.isEmpty()) emptyList()
+            else listOf("info" to "Prepared images: ${prepared.size} (${prepared.joinToString(", ") { it.meta.name ?: it.meta.purpose }})")
         val inherited = if (previous == null) 0 else withContext(Dispatchers.IO) {
             workspaces.git.commitsAhead(worktree, baseRef, workspaces.home(owner.username))
         }
@@ -516,7 +867,7 @@ class Orchestrator(
             if (resuming) throw StageFailed("The run has no spec to retry with")
             setStatus(run.id, RunStatus.SPEC)
             val specRes = stage(run.id, "spec-writer", 0, owner, ctx, specPrompt(ctx),
-                disallowed = READ_ONLY_TOOLS)
+                disallowed = READ_ONLY_TOOLS, extraTools = dk.egernet.factory.images.ImageService.TOOLS, notes = imageNotes)
             spec = specRes.resultText?.trim().takeUnless { it.isNullOrEmpty() } ?: throw StageFailed("spec-writer produced no spec")
             runs.setSpec(run.id, spec)
             finishStage(run.id, "spec-writer", 0, null, firstParagraph(spec), emptyList())
@@ -560,9 +911,11 @@ class Orchestrator(
                 }
                 val b = stage(run.id, "builder", round, owner, ctx, prompt,
                     resume = builderClaudeSession, parent = builderSessionId,
-                    extraTools = if (sandboxes.enabled) dk.egernet.factory.sandbox.SandboxManager.TOOLS else emptySet(),
+                    extraTools = (if (sandboxes.enabled) dk.egernet.factory.sandbox.SandboxManager.TOOLS else emptySet()) +
+                        dk.egernet.factory.images.ImageService.TOOLS,
                     notes = (ctx.sandbox?.takeIf { sandboxes.enabled }?.let { listOf((if (it.state == "approved") "info" else "warn") to "Sandbox: ${it.reason}") }
-                        ?: emptyList()) + (if (round == 0 && previous != null) listOf("info" to "Continues run ${previous.id} from branch ${previous.branch} ($inherited commit(s))") else emptyList()))
+                        ?: emptyList()) + (if (round == 0) imageNotes else emptyList()) +
+                        (if (round == 0 && previous != null) listOf("info" to "Continues run ${previous.id} from branch ${previous.branch} ($inherited commit(s))") else emptyList()))
                 builderClaudeSession = b.claudeSessionId ?: builderClaudeSession
                 builderSessionId = b.session.id
                 builderSummary = b.resultText?.trim() ?: ""
@@ -617,7 +970,8 @@ class Orchestrator(
             lastReviews = coroutineScope {
                 REVIEWER_ROLES.map { role ->
                     async {
-                        val r = stage(run.id, role, round, owner, ctx, reviewPrompt(ctx, role, round, spec, builderSummary), schema = Schemas.REVIEW, disallowed = READ_ONLY_TOOLS)
+                        val r = stage(run.id, role, round, owner, ctx, reviewPrompt(ctx, role, round, spec, builderSummary), schema = Schemas.REVIEW,
+                            disallowed = READ_ONLY_TOOLS, extraTools = if (role in SCREENSHOT_ROLES) Screenshots.TOOLS else emptySet())
                         val v = parseVerdict(r, setOf("PASS", "CHANGES"))
                         if (v == null) {
                             finishStage(run.id, role, round, null, "No valid verdict in the agent's output", emptyList(), failed = true)
@@ -632,6 +986,7 @@ class Orchestrator(
                 if (list.any { it == null }) throw StageFailed("A reviewer did not return a valid verdict")
                 list.filterNotNull().toMap()
             }
+            withContext(Dispatchers.IO) { bestEffort { screenshotNote(runs.get(run.id)!!, client, round) } }
             val changes = lastReviews.filterValues { it.verdict == "CHANGES" }
             if (changes.isEmpty()) break
             if (round >= maxRounds) {
@@ -669,6 +1024,17 @@ class Orchestrator(
         }
     }
 
+    /**
+     * After a review round: one comment on the pull request listing the screenshots the reviewers of [round] attached,
+     * pointing at the run page (docs/ARCHITECTURE.md §6 "Screenshots"). Nothing for a round without screenshots; the
+     * images themselves never go to GitHub. Blocking.
+     */
+    private fun screenshotNote(run: RunRecord, client: GitHubClient, round: Int) {
+        val pr = run.prNumber ?: return
+        screenshotNoteText(cfg, run.repo, run.id, round, runs.stages(run.id), screenshots.forRun(run.id))
+            ?.let { client.comment(org, run.repo, pr, it) }
+    }
+
     private fun stepLabel(step: String?) = when (step) {
         FailedStep.PUSH -> "push"; FailedStep.PULL_REQUEST -> "pull request"; FailedStep.MERGE -> "merge"; else -> step ?: "step"
     }
@@ -680,7 +1046,13 @@ class Orchestrator(
         val releaseName: String? = null, val defaultBranch: String = targetBranch,
         /** The run's sandbox decision; null when sandboxes are switched off. */
         val sandbox: dk.egernet.factory.RunSandboxDto? = null,
+        /** Images selected for the issue in a chat, written into the worktree; empty for most runs. */
+        val prepared: List<dk.egernet.factory.images.PreparedImage> = emptyList(),
     ) {
+        /** The `<images>` block for the spec-writer's and builder's task prompts; empty (no change at all) without images. */
+        val imagesBlock: String
+            get() = if (prepared.isEmpty()) "" else dk.egernet.factory.images.ImageService.promptBlock(prepared)
+
         /** For release runs: the sentence that names the release branch as the merge target. */
         val releaseNote: String
             get() = if (releaseName == null) "" else
@@ -759,11 +1131,17 @@ class Orchestrator(
 
     /**
      * Squash-merges the PR and closes the issue; a release run's issue stays open until the release is merged.
-     * On failure the run goes (back) to needs_human.
+     * On failure, or when its database migrations collide with the target's, the run goes (back) to needs_human.
      */
     private fun merge(run: RunRecord, owner: UserRecord, approvedBy: String?) {
         val client = gh(owner)
         val pr = run.prNumber ?: run { needsHuman(run, owner, "There is no pull request to merge."); return }
+        migrationConflict(run, owner, client, pr)?.let { reason ->
+            // Not a failed step: merging again cannot help until the branch's migrations change.
+            runs.setFailure(run.id, null, null)
+            needsHuman(run, owner, reason)
+            return
+        }
         try {
             client.squashMerge(org, run.repo, pr, "${run.issueTitle} (#${run.issueNumber})")
         } catch (e: Exception) {
@@ -788,6 +1166,30 @@ class Orchestrator(
         cleanupWorktree(run.id, merged = true)
         runs.setFailure(run.id, null, null)
         runs.setStatus(run.id, RunStatus.MERGED, clearError = true)
+    }
+
+    /**
+     * Why pull request #[pr] must not be merged because of its database migrations (docs/ARCHITECTURE.md §6 "Database
+     * migrations"), or null. Compares the run's branch with its target in the owner's clone, with git. A check that
+     * cannot be made is logged and lets the merge go ahead: CI is the strict gate. Blocking; never throws.
+     */
+    private fun migrationConflict(run: RunRecord, owner: UserRecord, client: GitHubClient, pr: Int): String? = try {
+        val branch = run.branch
+        val target = run.baseBranch ?: client.getRepo(org, run.repo)?.defaultBranch
+        if (branch == null || target == null) null else {
+            val cmp = workspaces.withRepoLock(owner.username, run.repo) {
+                workspaces.git.compareBranches(
+                    workspaces.mainDir(owner.username, run.repo), target, branch, workspaces.home(owner.username),
+                    access.githubToken(owner), MigrationCheck::rootOf,
+                )
+            }
+            if (cmp == null) log.warn("Run {}: the database migrations of {} could not be compared with {}", run.id, branch, target)
+            cmp?.let { MigrationCheck.problems(it.baseFiles, it.changes) }?.takeIf { it.isNotEmpty() }
+                ?.let { MigrationCheck.runReason(target, pr, it) }
+        }
+    } catch (e: Exception) {
+        log.warn("Run {}: checking the database migrations failed, merging without the check: {}", run.id, e.message)
+        null
     }
 
     /**
@@ -865,7 +1267,7 @@ class Orchestrator(
     private fun specPrompt(c: RunContext) = """
         |Write the implementation spec for this issue in ${org}/${c.repo}.
         |
-        |${c.issueText}
+        |${c.issueText}${c.imagesBlock}
         |Your working directory is a checkout of the repository at `${c.baseRef}`. Explore it (read-only) before writing.
         |Your final message must be the spec in Markdown and nothing else: it is posted verbatim as a comment on the issue
         |and handed to the builder.
@@ -876,8 +1278,9 @@ class Orchestrator(
         |
         |You are in a git worktree on branch `${c.branch}`, created from `${c.baseRef}`. Commit your work to this branch.
         |Do not push, open pull requests or merge: the factory does that after you finish.
+        |${migrationLine(c)}
         |${sandboxLine(c)}
-        |${c.releaseNote}${c.issueText}
+        |${c.releaseNote}${c.issueText}${c.imagesBlock}
         |<spec>
         |$spec
         |</spec>
@@ -897,11 +1300,12 @@ class Orchestrator(
         append("run the checks the previous builder may not have completed, and commit. If `${c.baseRef}` has moved on since ")
         append("(`git log HEAD..${c.baseRef}`), merge it in and resolve any conflicts.\n")
         append("Do not push, open pull requests or merge: the factory does that after you finish.\n")
+        append(migrationLine(c)).append('\n')
         append(sandboxLine(c)).append('\n')
         previous.builderSummary?.takeIf { it.isNotBlank() }?.let {
             append("<previous_builder_summary>\n").append(it.take(4000)).append("\n</previous_builder_summary>\n\n")
         }
-        append(c.releaseNote).append(c.issueText)
+        append(c.releaseNote).append(c.issueText).append(c.imagesBlock)
         append("<spec>\n").append(spec).append("\n</spec>\n\n")
         append("When you are done, end with a short summary of what the branch now contains (the earlier commits and yours), ")
         append("how you verified it, and anything left open.")
@@ -912,6 +1316,7 @@ class Orchestrator(
         append("Address every finding below on the same branch (`${c.branch}`), re-run the relevant checks, and commit. ")
         append("If you are convinced a finding is wrong, do not change the code for it; explain why in your final summary ")
         append("so the reviewers see your reasoning.\n")
+        append(migrationLine(c)).append('\n')
         append(sandboxLine(c)).append('\n')
         for ((role, v) in changes) {
             append("### Reviewer: $role — ${v.verdict}\n${v.summary}\n")
@@ -919,6 +1324,22 @@ class Orchestrator(
             append('\n')
         }
         append("End with a short summary of what you changed for each finding.")
+    }
+
+    /**
+     * The builder's rule for database migration versions, naming the branch the pull request merges into
+     * (docs/ARCHITECTURE.md §6 "Database migrations"); a release run's versions must also clear the default branch.
+     */
+    private fun migrationLine(c: RunContext): String = buildString {
+        append("Database migrations: the pull request merges into `${c.targetBranch}`. If the change adds a versioned migration ")
+        append("(e.g. Flyway `V<n>__name.sql`), take its version from `${c.baseRef}` as it is now (fetch it first): the next version ")
+        append("above every migration there. Check it again before you finish and after any rebase or merge of `${c.targetBranch}`, ")
+        append("and never change a migration that exists there.")
+        if (c.targetBranch != c.defaultBranch) {
+            append(" The release is later merged into `${c.defaultBranch}`, so the version must also be above every migration on ")
+            append("`${c.defaultBranch}`.")
+        }
+        append('\n')
     }
 
     /** One paragraph for the builder about the run's sandbox (empty line when sandboxes are off). */
@@ -935,8 +1356,16 @@ class Orchestrator(
         }
     }
 
-    private fun reviewPrompt(c: RunContext, role: String, round: Int, spec: String, builderSummary: String) = """
-        |Review the changes on branch `${c.branch}` for issue #${c.issue.number} in ${org}/${c.repo}${if (round > 0) " (after fix round $round)" else ""}.
+    /** [followUp]: the follow-up round number when this reviews changes from the conversation ([builderSummary] is then the advisor's). */
+    private fun reviewPrompt(c: RunContext, role: String, round: Int, spec: String, builderSummary: String, followUp: Int? = null): String {
+        val after = when {
+            followUp != null -> " (after follow-up round $followUp: changes the run owner requested in a conversation)"
+            round > 0 -> " (after fix round $round)"
+            else -> ""
+        }
+        val tag = if (followUp != null) "advisor_summary" else "builder_summary"
+        return """
+        |Review the changes on branch `${c.branch}` for issue #${c.issue.number} in ${org}/${c.repo}$after.
         |Your focus: **$role** (see your role instructions). You cannot edit files.
         |
         |Inspect the change with `git diff ${c.baseRef}...HEAD`, `git log ${c.baseRef}..HEAD` and by reading the code; run tests or
@@ -947,13 +1376,14 @@ class Orchestrator(
         |$spec
         |</spec>
         |
-        |<builder_summary>
+        |<$tag>
         |${builderSummary.ifEmpty { "(none)" }}
-        |</builder_summary>
+        |</$tag>
         |
         |Answer through the structured output: verdict `PASS` or `CHANGES`, a summary, and findings
         |(severity blocker|major|minor|nit, file or null, detail). Use `CHANGES` only for findings that must be fixed before merge.
     """.trimMargin()
+    }
 
     private fun approvalPrompt(c: RunContext, spec: String, reviews: Map<String, Verdict>, round: Int, maxRounds: Int, prUrl: String?) = buildString {
         append("Decide whether the pull request for issue #${c.issue.number} in ${org}/${c.repo} may be squash-merged into `${c.targetBranch}`.\n")
@@ -988,5 +1418,25 @@ class Orchestrator(
             title.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-').take(40).trim('-').ifEmpty { "work" }
 
         fun firstParagraph(s: String): String = s.trim().split(Regex("\n\\s*\n")).first().take(500)
+
+        /**
+         * The pull request note for the screenshots of review [round] (null when there are none): the count, a pointer to
+         * the run page ([Config.pageRef], so an internal address is never published) and one line per screenshot,
+         * reviewers in [REVIEWER_ROLES] order, each in attach order. Captions are single-line already (sanitised on attach).
+         */
+        fun screenshotNoteText(
+            cfg: Config, repo: String, runId: UUID, round: Int, stages: List<StageRecord>, shots: List<dk.egernet.factory.db.ScreenshotMeta>,
+        ): String? {
+            val byStage = shots.groupBy { it.stageId }
+            val lines = REVIEWER_ROLES.flatMap { role ->
+                stages.filter { it.role == role && it.round == round }.flatMap { st -> byStage[st.id].orEmpty().map { role to it.caption } }
+            }
+            if (lines.isEmpty()) return null
+            val n = lines.size
+            val what = if (round == 0) "build" else "fix round $round"
+            val ref = cfg.pageRef("p/$repo/runs/$runId", "the page of run `$runId`")
+            return "**Agern: screenshots** — the reviewers attached $n ${if (n == 1) "screenshot" else "screenshots"} of this change " +
+                "($what). See them on $ref:\n\n" + lines.joinToString("\n") { (role, caption) -> "- **$role:** $caption" }
+        }
     }
 }

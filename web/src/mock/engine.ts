@@ -68,6 +68,8 @@ const alice: User = {
   twoFactorLockedUntil: null,
   githubTokenKind: scenario !== 'fresh' ? 'classic' : null,
   githubTokenScopes: scenario !== 'fresh' ? ['read:org', 'repo'] : null,
+  imageProvider: scenario !== 'fresh' ? 'openai' : null,
+  imageModel: scenario !== 'fresh' ? 'gpt-image-2.5-flare' : null,
 };
 const bob: User = {
   id: uid(),
@@ -82,6 +84,8 @@ const bob: User = {
   twoFactorLockedUntil: null,
   githubTokenKind: 'fine_grained',
   githubTokenScopes: null,
+  imageProvider: null,
+  imageModel: null,
 };
 const carl: User = {
   id: uid(),
@@ -96,6 +100,8 @@ const carl: User = {
   twoFactorLockedUntil: null,
   githubTokenKind: null,
   githubTokenScopes: null,
+  imageProvider: null,
+  imageModel: null,
 };
 const dora: User = {
   id: uid(),
@@ -110,6 +116,8 @@ const dora: User = {
   twoFactorLockedUntil: new Date(Date.now() + 14 * 60_000).toISOString(),
   githubTokenKind: 'classic',
   githubTokenScopes: ['public_repo'],
+  imageProvider: null,
+  imageModel: null,
 };
 
 export const db = {
@@ -262,6 +270,11 @@ export function announceIssue(repo: string, issue: Issue) {
   const listed = { ...issue };
   delete listed.body;
   feed({ type: 'issue', repo, issue: listed });
+}
+
+/** Appends (and broadcasts) a session event; exported for the image mock. */
+export function emitEvent(sessionId: string, type: FactoryEvent['type'], payload: unknown, ts: string, live = false) {
+  emit(sessionId, type, payload, ts, live);
 }
 
 function emit(sessionId: string, type: FactoryEvent['type'], payload: unknown, ts: string, live = false) {
@@ -443,7 +456,8 @@ function newSession(
     id: uid(),
     repo,
     kind,
-    model: kind === 'chat' ? effective(owner.username).chatModel : effective(owner.username).model(kind as StageRole),
+    // The advisor runs on the owner's builder model (it may change code that is merged).
+    model: kind === 'chat' ? effective(owner.username).chatModel : effective(owner.username).model(kind === 'advisor' ? 'builder' : (kind as StageRole)),
     status: 'starting',
     owner: ownerOf(owner),
     title: null,
@@ -648,6 +662,24 @@ const passSummary: Record<string, string> = {
   code: 'Clear naming, good test coverage, transactions are scoped correctly.',
 };
 
+/**
+ * Like the backend: the ux and ui-design reviewers attach captioned screenshots to their stage while they run
+ * (docs/ARCHITECTURE.md §6 "Screenshots"). The mock serves one small PNG for all of them (see `screenshotUrl`).
+ */
+const screenshotCaptions: Record<string, (round: number) => string[]> = {
+  ux: (round) => round === 0
+    ? ['Cart drawer, empty state, dark theme', 'Cart drawer with three items after signing in, dark theme']
+    : ['Cart drawer after the fix: merge toast shown on sign-in, dark theme'],
+  'ui-design': (round) => round === 0
+    ? ['Cart drawer at 375 px width, light theme']
+    : ['Cart drawer at 375 px width after the fix, light theme'],
+};
+
+function attachScreenshot(r: Run, stage: Stage, caption: string, ts: string) {
+  stage.screenshots.push({ id: uid(), caption, mediaType: 'image/png', size: 97, width: 16, height: 10, createdAt: ts });
+  touchRun(r, ts);
+}
+
 function findRun(idOrPrefix: string) {
   return db.runs.get(idOrPrefix) ?? [...db.runs.values()].find((r) => r.id.startsWith(idOrPrefix));
 }
@@ -669,7 +701,7 @@ function setRunStatus(r: Run, status: Run['status'], ts: string) {
 
 /** Like the backend: stages exist as `pending` before they run (round 0 at creation, fix rounds when they start). */
 function pendingStage(r: Run, role: StageRole, round: number): Stage {
-  const st: Stage = { id: uid(), role, round, model: effective(r.owner.username).model(role), status: 'pending', verdict: null, summary: null, findings: [], sessionId: null, startedAt: null, endedAt: null };
+  const st: Stage = { id: uid(), role, round, model: effective(r.owner.username).model(role), status: 'pending', verdict: null, summary: null, findings: [], sessionId: null, startedAt: null, endedAt: null, screenshots: [], images: [] };
   r.stages.push(st);
   return st;
 }
@@ -730,6 +762,15 @@ function runStage(r: Run, role: StageRole, round: number, plan: Plan, startMs: n
         : [];
     steps = reviewerScript(role, verdict, summary);
     if (live) steps = [{ kind: 'pause', ms: reviewerMs[role] * 1500 }, ...steps];
+    const captions = screenshotCaptions[role]?.(round) ?? [];
+    if (captions.length) summary += ` Attached ${captions.length} screenshot${captions.length > 1 ? 's' : ''}.`;
+    captions.forEach((caption, i) => {
+      if (!live) attachScreenshot(r, stage, caption, iso(p.endMs));
+      // While the stage runs, one after the other, so the run page shows them arriving.
+      else setTimeout(() => {
+        if (stage.status === 'running' && stage.sessionId === s.id) attachScreenshot(r, stage, caption, iso(Date.now()));
+      }, reviewerMs[role] * 1500 * ((i + 1) / (captions.length + 1)));
+    });
   }
   play(s, steps, p, {
     init: true,
@@ -943,6 +984,7 @@ function makeRun(repo: string, issue: Issue, owner: User, createdMs: number, sta
     sandbox: runSandboxFor(repo),
     releaseId: release?.id ?? null,
     baseBranch: release ? `release/${release.name}` : null,
+    conversation: { sessionId: null, review: 'none', followUpFrom: null },
   };
   for (const role of ['spec-writer', 'builder', ...reviewers, 'approver'] as StageRole[]) pendingStage(r, role, 0);
   db.runs.set(r.id, r);
@@ -976,11 +1018,19 @@ export function startRun(repo: string, issueNumber: number, owner: User, started
 export function approveRun(r: Run, by: User) {
   if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner can approve this run.');
   if (r.status !== 'needs_human') throw new MockError(409, 'conflict', 'Run is not waiting for a human.');
+  const adv = r.conversation.sessionId ? db.sessions.get(r.conversation.sessionId) : undefined;
+  if (r.conversation.review === 'running') throw new MockError(409, 'review_in_progress', 'Changes from the conversation are being reviewed; wait for the reviews.');
+  if (adv && (adv.status === 'running' || adv.status === 'starting')) throw new MockError(409, 'agent_busy', 'The agent is still answering; wait for it or interrupt it');
+  if (r.conversation.review === 'required') throw new MockError(409, 'review_required', 'Changes from the conversation have not been reviewed yet. Review them again first.');
+  if (adv) setStatus(adv, 'done', iso(Date.now()));
   r.error = null;
   setRunStatus(r, 'merged', iso(Date.now()));
 }
 
 export function cancelRun(r: Run) {
+  const adv = r.conversation.sessionId ? db.sessions.get(r.conversation.sessionId) : undefined;
+  if (adv && !['done', 'failed', 'stopped'].includes(adv.status)) stopSession(adv);
+  if (r.conversation.review === 'running') r.conversation.review = 'required';
   for (const st of r.stages) {
     if (st.status === 'running' && st.sessionId) {
       const s = db.sessions.get(st.sessionId);
@@ -994,6 +1044,94 @@ export function cancelRun(r: Run) {
   }
   dropSandbox(r.id);
   setRunStatus(r, 'cancelled', iso(Date.now()));
+}
+
+// ---------------------------------------------------------------- conversation (docs/ARCHITECTURE.md §6 "Conversation")
+
+const shortSha = () => Math.random().toString(16).slice(2, 9).padEnd(7, '0');
+
+/** Like the backend: the owner's message to the run's advisor while it needs a human. Same checks and codes. */
+export function talkToRun(r: Run, text: string, by: User): { status: 'accepted'; sessionId: string } {
+  if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner of this run can talk to its agent');
+  if (r.status !== 'needs_human') throw new MockError(409, 'run_not_waiting', `Run is ${r.status}; the agent can only be talked to while the run needs a human`);
+  if (!text.trim()) throw new MockError(400, 'bad_request', 'text must not be empty');
+  if (text.length > 100_000) throw new MockError(400, 'bad_request', 'text is too long');
+  if (r.conversation.review === 'running') throw new MockError(409, 'review_in_progress', 'Changes from the conversation are being reviewed; wait for the reviews.');
+  let s = r.conversation.sessionId ? db.sessions.get(r.conversation.sessionId) : undefined;
+  if (s && (s.status === 'running' || s.status === 'starting' || db.players.has(s.id))) throw new MockError(409, 'agent_busy', 'The agent is still answering; wait for it or interrupt it');
+  if (!by.claudeCredentialKind) throw new MockError(422, 'claude_credential_required', 'Register a Claude credential in Settings first');
+  const ts = iso(Date.now());
+  if (!s) {
+    s = newSession(r.repo, 'advisor', by, { runId: r.id, issueNumber: r.issueNumber, title: `advisor · #${r.issueNumber}` });
+    r.conversation.sessionId = s.id;
+    touchRun(r, ts);
+  }
+  const first = (db.events.get(s.id) ?? []).every((e) => e.type !== 'claude');
+  if (first || !s.live) emit(s.id, 'system', { level: 'info', text: 'The agent was given the run’s context: the issue, the spec, the diff, the reviewers’ findings and why the run needs a human.' }, ts);
+  const change = /change/i.test(text);
+  const reason = r.error?.split('\n\n')[0] ?? 'The run needs a human.';
+  const steps: Step[] = change
+    ? [
+        { kind: 'think', text: 'The owner asks for a change. Keep it minimal, run the checks, commit.' },
+        { kind: 'tool', name: 'Bash', input: { command: 'git diff --stat origin/main...HEAD' }, result: ' AGERN_FAKE.md | 1 +\n 1 file changed, 1 insertion(+)' },
+        { kind: 'tool', name: 'Bash', input: { command: 'git commit -am "Apply the change the run owner asked for"' }, result: '[factory 3f2a1c9] Apply the change the run owner asked for\n 1 file changed, 1 insertion(+)' },
+        { kind: 'text', text: 'Done: I committed the change. The factory pushes it and the four reviewers look at it again; only you can approve the run.' },
+      ]
+    : [
+        { kind: 'tool', name: 'Bash', input: { command: 'git diff --stat origin/main...HEAD' }, result: ' AGERN_FAKE.md | 1 +\n 1 file changed, 1 insertion(+)' },
+        { kind: 'text', text: `Advisor: ${text}\n\n${reason}\n\nThe diff touches \`AGERN_FAKE.md\`. The reviewers' findings are in the rounds above; ask me for a change if you want one before approving.` },
+      ];
+  const p = new Player('live', Date.now());
+  db.players.set(s.id, p);
+  const sess = s;
+  play(sess, steps, p, {
+    userText: text,
+    init: true,
+    onDone: () => {
+      db.players.delete(sess.id);
+      setStatus(sess, 'idle', iso(Date.now()));
+      if (change && r.status === 'needs_human') followUpReview(r, by);
+    },
+  });
+  return { status: 'accepted', sessionId: s.id };
+}
+
+/** Like the backend's follow-up review: four reviewers in a new round; the approver does not run again. */
+function followUpReview(r: Run, owner: User) {
+  const round = Math.max(...r.stages.map((x) => x.round)) + 1;
+  r.round = round;
+  r.conversation.followUpFrom ??= round;
+  r.conversation.review = 'running';
+  for (const role of reviewers) pendingStage(r, role, round);
+  touchRun(r, iso(Date.now()));
+  const plan: Plan = { changes: {}, approver: 'APPROVE', liveFrom: () => true };
+  let pending = reviewers.length;
+  const sha = shortSha();
+  const n = round - r.conversation.followUpFrom + 1;
+  for (const role of reviewers) {
+    runStage(r, role, round, plan, Date.now(), owner, () => {
+      if (--pending > 0 || r.status !== 'needs_human') return;
+      const changes = r.stages.filter((x) => x.round === round && x.verdict === 'CHANGES').map((x) => x.role);
+      const base = (r.error ?? '').split('\n\n**Follow-up review')[0];
+      r.error = `${base}\n\n**Follow-up review ${n}** (commit \`${sha}\`): ${changes.length ? `${changes.join(', ')} still request changes.` : 'all four reviewers pass.'}`;
+      r.conversation.review = 'none';
+      const adv = r.conversation.sessionId;
+      if (adv) emit(adv, 'system', { level: 'info', text: `Follow-up review ${n}: ${reviewers.map((x) => `${x} ${r.stages.find((st) => st.role === x && st.round === round)?.verdict ?? '—'}`).join(', ')}.` }, iso(Date.now()));
+      touchRun(r, iso(Date.now()));
+    });
+  }
+}
+
+/** Like the backend's "Review again". */
+export function reviewRun(r: Run, by: User) {
+  if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner of this run can review it again');
+  if (r.status !== 'needs_human') throw new MockError(409, 'run_not_waiting', `Run is ${r.status}; the agent can only be talked to while the run needs a human`);
+  if (r.conversation.review === 'running') throw new MockError(409, 'review_in_progress', 'Changes from the conversation are being reviewed; wait for the reviews.');
+  const s = r.conversation.sessionId ? db.sessions.get(r.conversation.sessionId) : undefined;
+  if (s && (s.status === 'running' || s.status === 'starting')) throw new MockError(409, 'agent_busy', 'The agent is still answering; wait for it or interrupt it');
+  if (!by.claudeCredentialKind) throw new MockError(422, 'claude_credential_required', 'Register a Claude credential in Settings first');
+  if (r.conversation.review === 'none' || !s) throw new MockError(409, 'nothing_to_review', 'Nothing changed since the last review.');
+  followUpReview(r, by);
 }
 
 // ---------------------------------------------------------------- releases (same rules and error codes as the server)
@@ -1650,8 +1788,9 @@ function issue(repo: string, number: number, kind: IssueKind, title: string, aut
     body: `### Context\n\nReported by @${author}.\n\n### Acceptance\n\n- [ ] Works on desktop and mobile\n- [ ] Covered by tests`,
     activeRunId: null,
     release: null,
+    imageCount: 0,
     ...extra,
-  };
+  } as Issue;
 }
 
 function seed() {
@@ -1802,7 +1941,7 @@ function seed() {
   const failed = startRun('web-shop', 44, bob, null, { changes: {}, liveFrom: never }, Date.now() - 86400_000);
   for (const st of failed.stages.slice(2)) {
     if (st.sessionId) db.sessions.delete(st.sessionId);
-    Object.assign(st, { status: 'skipped', sessionId: null, verdict: null, summary: null, findings: [], startedAt: null });
+    Object.assign(st, { status: 'skipped', sessionId: null, verdict: null, summary: null, findings: [], screenshots: [], images: [], startedAt: null });
   }
   failed.stages[1].status = 'failed';
   const failedBuilder = db.sessions.get(failed.stages[1].sessionId!);
