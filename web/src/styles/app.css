@@ -1450,18 +1450,39 @@ html.app-locked #root {
 }
 .issue-meta {
   display: flex;
-  gap: 5px;
+  flex-wrap: wrap;
+  gap: 4px 5px;
   align-items: center;
   font-size: 0.76rem;
   color: var(--text-3);
   margin-top: 6px;
   min-height: 28px;
 }
+/* Meta items never break inside; when the row is too narrow the row wraps between them instead. */
+.issue-meta > * {
+  white-space: nowrap;
+}
+.issue-meta > span:not(.issue-action),
+.issue-meta > .issue-images-btn {
+  flex: none;
+}
+/* Pushed to the right edge; when it doesn't fit it moves as a unit to its own line (still right-aligned), and its
+   own items wrap if even that line is too narrow (the release picker above the button). */
 .issue-action {
   margin-left: auto;
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+}
+.issue-action:empty {
+  display: none;
 }
 .run-link {
   display: inline-flex;
+  white-space: nowrap;
   align-items: center;
   gap: 6px;
   font: 600 0.75rem var(--font-mono);
@@ -2760,11 +2781,6 @@ html.app-locked #root {
   max-width: 130px;
   font-family: var(--font-mono);
   font-size: 0.72rem;
-}
-.issue-action {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
 }
 .issue-check {
   margin-top: 3px;
