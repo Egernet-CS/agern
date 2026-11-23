@@ -865,11 +865,15 @@ class Orchestrator(
 
     /**
      * Squash-merges the PR and closes the issue; a release run's issue stays open until the release is merged.
-     * On failure the run goes (back) to needs_human.
+     * On failure, or when its database migrations collide with the target's, the run goes (back) to needs_human.
      */
     private fun merge(run: RunRecord, owner: UserRecord, approvedBy: String?) {
         val client = gh(owner)
         val pr = run.prNumber ?: run { needsHuman(run, owner, "There is no pull request to merge."); return }
+        migrationConflict(run, owner, client, pr)?.let { reason ->
+            needsHuman(run, owner, reason)
+            return
+        }
         try {
             client.squashMerge(org, run.repo, pr, "${run.issueTitle} (#${run.issueNumber})")
         } catch (e: Exception) {
@@ -891,6 +895,30 @@ class Orchestrator(
         }
         cleanupWorktree(run.id, merged = true)
         runs.setStatus(run.id, RunStatus.MERGED, clearError = true)
+    }
+
+    /**
+     * Why pull request #[pr] must not be merged because of its database migrations (docs/ARCHITECTURE.md §6 "Database
+     * migrations"), or null. Compares the run's branch with its target in the owner's clone, with git. A check that
+     * cannot be made is logged and lets the merge go ahead: CI is the strict gate. Blocking; never throws.
+     */
+    private fun migrationConflict(run: RunRecord, owner: UserRecord, client: GitHubClient, pr: Int): String? = try {
+        val branch = run.branch
+        val target = run.baseBranch ?: client.getRepo(org, run.repo)?.defaultBranch
+        if (branch == null || target == null) null else {
+            val cmp = workspaces.withRepoLock(owner.username, run.repo) {
+                workspaces.git.compareBranches(
+                    workspaces.mainDir(owner.username, run.repo), target, branch, workspaces.home(owner.username),
+                    access.githubToken(owner), MigrationCheck::rootOf,
+                )
+            }
+            if (cmp == null) log.warn("Run {}: the database migrations of {} could not be compared with {}", run.id, branch, target)
+            cmp?.let { MigrationCheck.problems(it.baseFiles, it.changes) }?.takeIf { it.isNotEmpty() }
+                ?.let { MigrationCheck.runReason(target, pr, it) }
+        }
+    } catch (e: Exception) {
+        log.warn("Run {}: checking the database migrations failed, merging without the check: {}", run.id, e.message)
+        null
     }
 
     /**

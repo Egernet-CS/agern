@@ -106,7 +106,7 @@ export interface Api {
   /**
    * Owner only (403 for everyone else, admins included): merges a `ready` release into the default branch, one commit per
    * issue, closes its issues and deletes its branch. 409 `release_not_ready` / `release_incomplete` / `release_empty` /
-   * `release_conflict` / `release_merge_failed` / `release_merge_method_unavailable`.
+   * `release_conflict` / `release_migration_conflict` / `release_merge_failed` / `release_merge_method_unavailable`.
    */
   approveRelease(id: string): Promise<Release>;
   /** Owner only: "Check again" — re-reads (or opens) the release pull request and its mergeability. 409 `release_not_ready`. */

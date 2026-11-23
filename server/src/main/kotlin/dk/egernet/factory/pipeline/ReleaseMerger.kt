@@ -361,6 +361,14 @@ class ReleaseMerger(
         setNotice(id, null)
         val headSha = if (info != null && info.state == "open") info.head.sha.takeIf { it.isNotEmpty() } else null
         val checks = headSha?.let { readChecks(withPr, client, it) }
+        // Database migrations that collide with the target's hold the release like a conflict: no announcement, no
+        // automatic merge, and approval refuses (docs/ARCHITECTURE.md §6 "Database migrations").
+        if (headSha != null && owner != null) {
+            migrationConflict(withPr, owner, repo.defaultBranch)?.let {
+                setNotice(id, it)
+                return
+            }
+        }
 
         if (withPr.complete && state != ReleaseMergeState.CONFLICT && io { store.claimReadyAnnouncement(id) }) {
             bestEffort("comment on the release pull request") {
@@ -479,6 +487,31 @@ class ReleaseMerger(
         }
     }
 
+    /**
+     * Why the release branch must not be merged into [target] because of its database migrations, or null. Compares
+     * the two branches with git in [owner]'s clone (the one the release's runs were built in). A comparison that cannot
+     * be made is logged and blocks nothing: CI is the strict gate.
+     */
+    private suspend fun migrationConflict(r: ReleaseRecord, owner: UserRecord, target: String): String? {
+        val branch = r.branch ?: return null
+        return io {
+            try {
+                val cmp = workspaces.withRepoLock(owner.username, r.repo) {
+                    workspaces.git.compareBranches(
+                        workspaces.mainDir(owner.username, r.repo), target, branch, workspaces.home(owner.username),
+                        access.githubToken(owner), MigrationCheck::rootOf,
+                    )
+                }
+                if (cmp == null) log.warn("Release {}: the database migrations of {} could not be compared with {}", r.id, branch, target)
+                cmp?.let { MigrationCheck.problems(it.baseFiles, it.changes) }?.takeIf { it.isNotEmpty() }
+                    ?.let { MigrationCheck.releaseReason(target, branch, it) }
+            } catch (e: Exception) {
+                log.warn("Release {}: checking the database migrations failed: {}", r.id, e.message)
+                null
+            }
+        }
+    }
+
     /** Sets the merge state; on a change to `conflict`, comments once on the pull request. */
     private suspend fun recordMergeState(r: ReleaseRecord, state: String, client: GitHubClient) {
         if (!io { store.setMergeState(r.id, state) } || state != ReleaseMergeState.CONFLICT) return
@@ -574,6 +607,7 @@ class ReleaseMerger(
         val target = now.targetBranch ?: "the default branch"
         val conflictMsg = "`${now.branch}` no longer merges cleanly into `$target`. Nothing was merged."
         if (now.mergeState == ReleaseMergeState.CONFLICT) throw conflict(conflictMsg, "release_conflict")
+        now.targetBranch?.let { migrationConflict(now, owner, it) }?.let { throw conflict("$it Nothing was merged.", "release_migration_conflict") }
         val method = when (now.mergeMethod) {
             ReleaseMergeMethod.REBASE, ReleaseMergeMethod.MERGE -> now.mergeMethod
             ReleaseMergeMethod.UNAVAILABLE -> throw methodUnavailable(
