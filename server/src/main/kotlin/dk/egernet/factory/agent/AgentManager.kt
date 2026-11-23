@@ -18,6 +18,7 @@ import dk.egernet.factory.db.SettingsStore
 import dk.egernet.factory.db.UserRecord
 import dk.egernet.factory.db.iso
 import dk.egernet.factory.forbidden
+import dk.egernet.factory.git.CheckoutState
 import dk.egernet.factory.github.Access
 import dk.egernet.factory.mcp.McpGrant
 import dk.egernet.factory.mcp.McpRegistry
@@ -36,6 +37,7 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -248,6 +250,8 @@ class AgentManager(
         /** Advisor: the `<run_context>` block of this launch, and whether a message carrying it has been written. */
         var context: String? = null
         @Volatile var contextSent = false
+        /** Chat: the "behind" checkout state (reason, HEAD, behind) this process was last told about, null when none. */
+        var checkoutTold: String? = null
         /** Chat inputs (stream-json `message.content`) written to this process and not yet answered by a `result`. */
         val pending = java.util.Collections.synchronizedList(mutableListOf<JsonElement>())
 
@@ -274,6 +278,8 @@ class AgentManager(
     private val advisorTurns = ConcurrentHashMap.newKeySet<UUID>()
     /** Advisor sessions whose run ended (cancel, merge): queued input for them is dropped, no process is started. */
     private val advisorsEnded = ConcurrentHashMap.newKeySet<UUID>()
+    /** The last `checkout` event payload published per chat by this server process (not published twice in a row). */
+    private val checkoutPublished = ConcurrentHashMap<UUID, JsonObject>()
 
     private fun slot(userId: UUID) = slots.computeIfAbsent(userId) { Semaphore(cfg.maxAgentsPerUser) }
 
@@ -323,7 +329,76 @@ class AgentManager(
         val s = sessions.create(repo, "chat", m, SessionStatus.IDLE, owner.id, null)
         systemEvent(s.id, "info", "New chat in ${cfg.githubOrg}/$repo with model $m. Type /factory help for factory commands.")
         publishFeed(s.id)
+        // The header shows the checkout's commit before the first message; a failure only gets logged.
+        scope.launch(Dispatchers.IO) {
+            try {
+                val identity = chatIdentity(owner) ?: return@launch
+                workspaces.ensureMain(identity, repo)
+                syncCheckout(s.id, owner, repo)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                log.warn("Preparing the checkout of chat {} failed: {}", s.id, e.message)
+            }
+        }
         return sessions.get(s.id)!!
+    }
+
+    /** The identity a chat of [owner] runs as (as in [startChat]), or null without a Claude credential. */
+    private fun chatIdentity(owner: UserRecord): AgentIdentity? {
+        val cred = access.claudeCredential(owner) ?: return null
+        return AgentIdentity(owner.username, owner.displayName, owner.githubLogin, access.githubToken(owner), cred)
+    }
+
+    /**
+     * Syncs [owner]'s main clone of [repo] with its default branch ([Workspaces.syncMain]) and publishes the result as a
+     * `checkout` event unless it equals the last one published for [sessionId]. Never throws (docs/ARCHITECTURE.md §5
+     * "Workspaces"): any failure is logged and gives null.
+     */
+    private suspend fun syncCheckout(sessionId: UUID, owner: UserRecord, repo: String): CheckoutState? = try {
+        withContext(Dispatchers.IO) {
+            val branch = access.visibleRepo(owner, repo)?.defaultBranch
+            val identity = chatIdentity(owner)
+            if (branch == null || identity == null) null else workspaces.syncMain(identity, repo, branch)
+        }?.also { publishCheckout(sessionId, it) }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        log.warn("Syncing the checkout of {} for chat {} failed: {}", repo, sessionId, e.message)
+        null
+    }
+
+    private fun publishCheckout(sessionId: UUID, state: CheckoutState) {
+        if (sessionId in closed) return
+        val payload = buildJsonObject {
+            put("branch", state.branch)
+            put("defaultBranch", state.defaultBranch)
+            put("commit", state.head)
+            put("behind", state.behind)
+            put("ahead", state.ahead)
+            put("status", state.status)
+            put("reason", state.reason)
+            put("updatedFrom", state.updatedFrom)
+        }
+        if (checkoutPublished.put(sessionId, payload) != payload) publish(sessionId, "checkout", payload)
+    }
+
+    /**
+     * The `<checkout_status>` note for [l]'s next message after a sync with [state]: always after a fast-forward, and
+     * for a checkout that stays behind only when this process has not been told that state yet.
+     */
+    private fun checkoutNoteFor(l: Live, state: CheckoutState?): String? {
+        if (state == null) return null
+        return when (state.status) {
+            "behind" -> {
+                val told = "${state.reason}|${state.head}|${state.behind}"
+                if (l.checkoutTold == told) null else checkoutNote(state).also { l.checkoutTold = told }
+            }
+            else -> {
+                l.checkoutTold = null
+                checkoutNote(state)
+            }
+        }
     }
 
     /**
@@ -381,8 +456,9 @@ class AgentManager(
                     if (s.id in closed) return@withLock
                     val content = withContext(Dispatchers.IO) { attachments.content(text, attached) }
                     val l = live[s.id] ?: startChat(s.id, user)
+                    val note = checkoutNoteFor(l, syncCheckout(s.id, user, s.repo))
                     try {
-                        deliver(l, content)
+                        deliver(l, if (note == null) content else withNote(content, note))
                     } catch (e: Exception) {
                         // A resume launch that already died is relaunched by finishChat with this input.
                         if (l.resumed && !l.sawInit) return@withLock
@@ -396,6 +472,11 @@ class AgentManager(
             }
         }
     }
+
+    /** [content] (a string, or content blocks with attachments) with [note] in front, for the agent only. */
+    private fun withNote(content: JsonElement, note: String): JsonElement =
+        if (content is JsonArray) JsonArray(listOf(buildJsonObject { put("type", "text"); put("text", note) }) + content)
+        else JsonPrimitive(note + "\n\n" + content.jsonPrimitive.content)
 
     /** One stream-json user message for the CLI's stdin. */
     private fun userLine(content: JsonElement): String = buildJsonObject {
@@ -809,6 +890,7 @@ class AgentManager(
             attachments.removeSession(s.id)
             onChatClosed?.let { hook -> runCatching { hook(s.id) }.onFailure { log.warn("Removing the images of chat {} failed: {}", s.id, it.message) } }
         }
+        checkoutPublished.remove(s.id)
         bus.closeSession(s.id)
         bus.emitFeed(FeedItem.SessionClosed(s.repo, s.id.toString()))
         log.info("Chat {} in {} closed by {}", s.id, s.repo, user.username)

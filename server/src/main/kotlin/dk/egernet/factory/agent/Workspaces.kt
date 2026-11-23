@@ -1,6 +1,7 @@
 package dk.egernet.factory.agent
 
 import dk.egernet.factory.Config
+import dk.egernet.factory.git.CheckoutState
 import dk.egernet.factory.git.GitOps
 import dk.egernet.factory.github.GitHub
 import java.nio.file.Files
@@ -18,6 +19,11 @@ fun requireSafeSegment(s: String, what: String): String {
 /** Layout under FACTORY_DATA_DIR: homes/<user>, workspaces/<user>/<repo>/{main,runs/<runId>}. */
 class Workspaces(private val cfg: Config, val git: GitOps, private val github: GitHub) {
     private val locks = ConcurrentHashMap<String, Any>()
+    /** When each clone (`<user>/<repo>`) was last fetched by [ensureMain] or [syncMain], in epoch milliseconds. */
+    private val lastFetch = ConcurrentHashMap<String, Long>()
+
+    /** [syncMain] fetches only when the clone was not fetched within this interval (tests set 0). */
+    @Volatile var mainFetchMinIntervalMs = 30_000L
 
     fun home(username: String): Path = cfg.dataDir.resolve("homes").resolve(requireSafeSegment(username, "username"))
     fun repoDir(username: String, repo: String): Path =
@@ -31,8 +37,21 @@ class Workspaces(private val cfg: Config, val git: GitOps, private val github: G
         synchronized(locks.computeIfAbsent("${id.username}/$repo") { Any() }) {
             Files.createDirectories(home(id.username))
             git.ensureClone(id, github.cloneUrl(cfg.githubOrg, repo), dir, home(id.username))
+            lastFetch["${id.username}/$repo"] = System.currentTimeMillis()
         }
         return dir
+    }
+
+    /**
+     * [GitOps.syncCheckout] of the owner's main clone of [repo] under the clone's lock: fast-forwards it to
+     * `origin/<defaultBranch>` when safe. Fetches unless the clone was fetched within [mainFetchMinIntervalMs]. Blocking.
+     */
+    fun syncMain(id: AgentIdentity, repo: String, defaultBranch: String): CheckoutState? = withRepoLock(id.username, repo) {
+        val key = "${id.username}/$repo"
+        val now = System.currentTimeMillis()
+        val fetch = now - (lastFetch[key] ?: 0L) >= mainFetchMinIntervalMs
+        if (fetch) lastFetch[key] = now
+        git.syncCheckout(id, mainDir(id.username, repo), defaultBranch, home(id.username), fetch)
     }
 
     fun <T> withRepoLock(username: String, repo: String, block: () -> T): T =

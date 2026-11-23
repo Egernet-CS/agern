@@ -21,6 +21,18 @@ data class FileChange(val status: Char, val path: String)
  */
 data class BranchComparison(val baseFiles: List<String>, val changes: List<FileChange>)
 
+/**
+ * The state of a main checkout relative to `origin/<defaultBranch>` after [GitOps.syncCheckout]
+ * (docs/ARCHITECTURE.md §5 "Workspaces"). [branch] is null for a detached HEAD; [head] is the full HEAD sha after the
+ * sync. [status] is `current`, `updated` (fast-forwarded from [updatedFrom]) or `behind` (not updated because of
+ * [reason]: `other_branch`, `local_changes`, `local_commits` or `update_failed`). [newCommits]: how many commits an
+ * update brought in (the `behind` before it); 0 otherwise.
+ */
+data class CheckoutState(
+    val branch: String?, val defaultBranch: String, val head: String, val behind: Int, val ahead: Int,
+    val status: String, val reason: String?, val updatedFrom: String?, val newCommits: Int = 0,
+)
+
 /** Git operations the server performs itself (the agents run git on their own). */
 interface GitOps {
     /** Clones the repo into [dir] or fetches if it is already there. */
@@ -75,6 +87,13 @@ interface GitOps {
     fun compareBranches(
         mainDir: Path, baseBranch: String, headBranch: String, home: Path, githubToken: String?, dirOf: (String) -> String?,
     ): BranchComparison? = null
+    /**
+     * Brings the main checkout at [mainDir] up to date with `origin/<defaultBranch>` when that is safe: fetches that
+     * branch first when [fetch] is set (a failed fetch is ignored), then fast-forwards only when the checkout is on
+     * [defaultBranch], clean and without local commits. Never modifies the checkout otherwise. Null when there is no
+     * clone or no `origin/<defaultBranch>`; throws [IllegalArgumentException] for an invalid branch name.
+     */
+    fun syncCheckout(id: AgentIdentity?, mainDir: Path, defaultBranch: String, home: Path, fetch: Boolean): CheckoutState? = null
 }
 
 /**
@@ -273,6 +292,48 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
         val baseFiles = git(mainDir, home, null, "ls-tree", "-r", "-z", "--name-only", base, "--", *dirs.toTypedArray())
             .split('\u0000').filter { it.isNotEmpty() && dirOf(it) != null }
         return BranchComparison(baseFiles, changes)
+    }
+
+    override fun syncCheckout(id: AgentIdentity?, mainDir: Path, defaultBranch: String, home: Path, fetch: Boolean): CheckoutState? {
+        require(defaultBranch.isNotBlank() && !defaultBranch.startsWith("-")) { "Invalid branch name" }
+        if (!Files.isDirectory(mainDir.resolve(".git"))) return null
+        val branch = gitStatus(mainDir, home, null, "symbolic-ref", "--quiet", "--short", "HEAD", timeoutSec = 60)
+            .let { (code, out) -> if (code == 0) out.trim().takeIf { it.isNotEmpty() } else null }
+        val head = git(mainDir, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim()
+        // Fake GitHub: there is no remote to follow.
+        if (localOnly) return CheckoutState(branch, defaultBranch, head, 0, 0, "current", null, null)
+
+        val remote = "refs/remotes/origin/$defaultBranch"
+        if (fetch) {
+            runCatching { git(mainDir, home, id, "fetch", "--no-tags", "origin", "+refs/heads/$defaultBranch:$remote", timeoutSec = 30) }
+                .onFailure { log.warn("git fetch of {} failed in {}: {}", defaultBranch, mainDir, it.message) }
+        }
+        if (gitStatus(mainDir, home, null, "rev-parse", "--verify", "--quiet", "$remote^{commit}", timeoutSec = 60).first != 0) return null
+        val counts = git(mainDir, home, null, "rev-list", "--left-right", "--count", "HEAD...$remote", timeoutSec = 60)
+            .trim().split(Regex("\\s+"))
+        val ahead = counts.getOrNull(0)?.toIntOrNull() ?: throw GitException("git rev-list gave no counts")
+        val behind = counts.getOrNull(1)?.toIntOrNull() ?: throw GitException("git rev-list gave no counts")
+        if (behind == 0) return CheckoutState(branch, defaultBranch, head, 0, ahead, "current", null, null)
+
+        val dirty = git(mainDir, home, null, "status", "--porcelain", timeoutSec = 60).isNotBlank()
+        val reason = when {
+            branch != defaultBranch -> "other_branch"
+            dirty -> "local_changes"
+            ahead > 0 -> "local_commits"
+            else -> null
+        }
+        if (reason != null) return CheckoutState(branch, defaultBranch, head, behind, ahead, "behind", reason, null)
+
+        // The only command of the sync that changes the working tree, the index or a local ref; hooks are off.
+        val (code, out) = gitStatus(
+            mainDir, home, null, "-c", "core.hooksPath=/dev/null", "merge", "--ff-only", "--quiet", remote, timeoutSec = 60,
+        )
+        if (code != 0) {
+            log.warn("Fast-forwarding {} in {} failed: {}", defaultBranch, mainDir, out.takeLast(500).trim())
+            return CheckoutState(branch, defaultBranch, head, behind, ahead, "behind", "update_failed", null)
+        }
+        val newHead = git(mainDir, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim()
+        return CheckoutState(branch, defaultBranch, newHead, 0, 0, "updated", null, head, newCommits = behind)
     }
 
     override fun removeWorktree(mainDir: Path, worktree: Path, home: Path, keepUnpushed: Boolean) {
