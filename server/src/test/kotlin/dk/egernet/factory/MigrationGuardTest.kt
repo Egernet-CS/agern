@@ -54,7 +54,7 @@ class MigrationGuardTest {
     }
 
     private val dir = "server/src/main/resources/db/migration"
-    private val base = listOf("$dir/V15__run_conversation.sql", "$dir/V16__other.sql", "README.md")
+    private val base = listOf("$dir/V15__earlier.sql", "$dir/V16__other.sql", "README.md")
 
     /** The comparison for heads matching [head] (all others: nothing changed). */
     private fun compare(head: (String) -> Boolean, vararg changes: FileChange) {
@@ -111,12 +111,12 @@ class MigrationGuardTest {
 
     @Test
     fun `a lower version or a changed base migration is held too`() {
-        world.git.comparison = { _, _ -> BranchComparison(base, listOf(FileChange('A', "$dir/V14__late.sql"), FileChange('M', "$dir/V15__run_conversation.sql"))) }
+        world.git.comparison = { _, _ -> BranchComparison(base, listOf(FileChange('A', "$dir/V14__late.sql"), FileChange('M', "$dir/V15__earlier.sql"))) }
         val held = await(start().id)
         assertEquals(RunStatus.NEEDS_HUMAN, held.status)
         assertTrue(
             held.error!!.startsWith(
-                "Database migration conflict with `main`: `$dir/V15__run_conversation.sql` was changed; `$dir/V14__late.sql` " +
+                "Database migration conflict with `main`: `$dir/V15__earlier.sql` was changed; `$dir/V14__late.sql` " +
                     "(version 14) is not higher than `$dir/V16__other.sql` (version 16). Pull request #",
             ),
             held.error,
@@ -197,10 +197,10 @@ class MigrationGuardTest {
     @Test
     fun `a manual release is approved once its migrations no longer collide`() {
         val n = gh.addIssue("demo-app", "Feature", "body").number
-        compare({ it == "release/m" }, FileChange('D', "$dir/V15__run_conversation.sql"))
+        compare({ it == "release/m" }, FileChange('D', "$dir/V15__earlier.sql"))
         val r0 = release("m", listOf(n))
         val r = awaitRelease(r0.id, "ready with a notice") { it.status == ReleaseStatus.READY && it.notice != null }
-        assertTrue(r.notice!!.startsWith("Database migration conflict with `main`: `$dir/V15__run_conversation.sql` was removed."), r.notice)
+        assertTrue(r.notice!!.startsWith("Database migration conflict with `main`: `$dir/V15__earlier.sql` was removed."), r.notice)
         assertEquals("release_migration_conflict", assertFailsWith<ApiException> { runBlocking { s.releases.approve(alice, r.id) } }.code)
         world.git.comparison = { _, _ -> BranchComparison(base, emptyList()) }
         assertNull(runBlocking { s.releases.check(alice, r.id) }.notice)

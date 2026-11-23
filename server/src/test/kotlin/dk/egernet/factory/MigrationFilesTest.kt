@@ -14,7 +14,7 @@ class MigrationFilesTest {
     @Test
     fun `the bundled migrations have unique versions and all apply to a fresh database`() {
         val files = MigrationFiles.list(Db.MIGRATIONS)
-        assertTrue(files.size >= 15, files.toString())
+        assertTrue(files.size >= 16, files.toString())
         assertTrue(files.all { MigrationCheck.versionOf(it) != null }, "every bundled file is a versioned migration: $files")
         assertEquals(emptyList(), MigrationCheck.duplicates(files), "duplicate versions among $files")
         val db = TestDb.fresh()

@@ -50,7 +50,7 @@ class MigrationCheckTest {
 
     @Test
     fun `an added migration with a version on the base is a duplicate naming both files`() {
-        val base = listOf("$dir/V15__run_conversation.sql", "$dir/V16__other.sql", "README.md")
+        val base = listOf("$dir/V15__earlier.sql", "$dir/V16__other.sql", "README.md")
         assertEquals(
             listOf("`$dir/V16__mine.sql` has the same version (16) as `$dir/V16__other.sql`"),
             MigrationCheck.problems(base, added("$dir/V16__mine.sql")),
