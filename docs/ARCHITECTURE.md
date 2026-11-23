@@ -2030,7 +2030,8 @@ subordinate ranges.
 through the socket, the `PodmanIntegrationTest` (real rootless Podman: sidecar DNS, bind mount ownership,
 host paths invisible, not privileged, cache reuse, exec, timeout and restart, memory limit enforced, labels,
 removal) run as `agern` *inside* `agern.service`, upgrade, prune, disable and purge. Debian 12 and 13 run the
-same script on a VM by hand.
+same script on a VM by hand. In CI the in-service Gradle runs `--offline`, from a Gradle home seeded from the
+runner's cached one, so a Maven Central outage or rate limit cannot fail the job.
 
 **Release artifact.** One self-contained `agern.jar` (server with the built frontend embedded on
 the classpath) — the host needs only Java 17 and PostgreSQL. `FACTORY_WEB_DIR` overrides the

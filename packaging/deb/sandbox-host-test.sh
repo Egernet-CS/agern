@@ -17,7 +17,9 @@
 # on without restarting the sandbox service; status and prune; 'agern sandbox disable'; purge.
 #
 # Environment: AGERN_SANDBOX_TEST_IMAGE / AGERN_PODMAN_IT_IMAGE (default docker.io/library/busybox:1.36.1);
-# AGERN_IT_GRADLE_CACHE = a Gradle home whose downloaded dependencies seed the agern user's.
+# AGERN_IT_GRADLE_CACHE = a Gradle home in which ':server:test --tests dk.egernet.factory.PodmanIntegrationTest'
+# has already run; it seeds the agern user's, and the in-service Gradle then runs with --offline. Set
+# but unusable (no caches/modules-2 or wrapper/dists, or the copy fails) is a FAIL. Unset: online.
 
 # shellcheck disable=SC2015 # 'test && pass || fail': pass always succeeds
 set -euo pipefail
@@ -183,12 +185,27 @@ if [ -n "$IT_SRC" ]; then
     IT=/var/lib/agern/sandbox-it
     rm -rf "$IT"
     as_agern mkdir -p "$IT"
-    # Optional: a Gradle home with the dependencies already downloaded (CI passes the runner's, which
-    # gradle/actions/setup-gradle caches), so the agern user does not fetch them again.
-    if [ -n "${AGERN_IT_GRADLE_CACHE:-}" ] && [ -d "$AGERN_IT_GRADLE_CACHE/caches/modules-2" ]; then
-        as_agern mkdir -p /var/lib/agern/.gradle/caches
-        tar -C "$AGERN_IT_GRADLE_CACHE" -cf - caches/modules-2 wrapper 2>/dev/null | as_agern tar -C /var/lib/agern/.gradle -xf - || true
-        echo "seeded the agern user's Gradle home from $AGERN_IT_GRADLE_CACHE"
+    # Optional: a Gradle home in which ':server:test --tests dk.egernet.factory.PodmanIntegrationTest'
+    # has already run (CI passes the runner's, which gradle/actions/setup-gradle caches). Its
+    # dependency cache and wrapper seed the agern user's, without Gradle's lock files and gc.properties,
+    # and the in-service Gradle then runs with --offline, so it cannot reach Maven Central. A set but
+    # unusable directory is a FAIL (Gradle then runs online, so the rest of the report still comes).
+    GRADLE_OFFLINE=""
+    if [ -n "${AGERN_IT_GRADLE_CACHE:-}" ]; then
+        missing=""
+        for d in caches/modules-2 wrapper/dists; do
+            [ -d "$AGERN_IT_GRADLE_CACHE/$d" ] || missing="$missing $d"
+        done
+        if [ -n "$missing" ]; then
+            fail "seed the agern user's Gradle home: $AGERN_IT_GRADLE_CACHE has no directory$missing"
+        elif as_agern mkdir -p /var/lib/agern/.gradle &&
+            tar -C "$AGERN_IT_GRADLE_CACHE" --exclude='*.lock' --exclude=gc.properties -cf - caches/modules-2 wrapper |
+            as_agern tar -C /var/lib/agern/.gradle -xf -; then
+            GRADLE_OFFLINE="--offline"
+            pass "seeded the agern user's Gradle home from $AGERN_IT_GRADLE_CACHE (Gradle runs offline)"
+        else
+            fail "seed the agern user's Gradle home: copying caches/modules-2 and wrapper from $AGERN_IT_GRADLE_CACHE failed"
+        fi
     fi
     tar -C "$IT_SRC" --exclude=./.git --exclude=./web --exclude=./build --exclude=./server/build --exclude=./.gradle --exclude=./node_modules -cf - . |
         as_agern tar -C "$IT" -xf -
@@ -196,7 +213,7 @@ if [ -n "$IT_SRC" ]; then
     cat >/run/systemd/system/agern.service.d/zz-sandbox-it.conf <<EOF
 [Service]
 ExecStart=
-ExecStart=$IT/gradlew --no-daemon --console=plain -p $IT :server:test --tests dk.egernet.factory.PodmanIntegrationTest
+ExecStart=$IT/gradlew --no-daemon --console=plain${GRADLE_OFFLINE:+ $GRADLE_OFFLINE} -p $IT :server:test --tests dk.egernet.factory.PodmanIntegrationTest
 Restart=no
 Environment=AGERN_PODMAN_IT=1
 Environment=AGERN_PODMAN_IT_DIR=/var/lib/agern

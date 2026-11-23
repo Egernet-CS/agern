@@ -150,15 +150,31 @@ jobs:
         with:
           name: deb
           path: dist
-      # The integration test runs Gradle as the agern user: download its dependencies here first (cached
-      # by setup-gradle) and hand them over, so it does not hit Maven Central again.
+      # The integration test runs Gradle as the agern user inside agern.service, offline: resolve
+      # everything it needs here first (the same task selection; without AGERN_PODMAN_IT its tests skip),
+      # into the runner's ~/.gradle, which setup-gradle caches between runs. The host test seeds the
+      # agern user's Gradle home from it and runs that Gradle with --offline.
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
       - uses: gradle/actions/setup-gradle@v4
-      # Maven Central sometimes answers 429/404 to hosted runners: one retry after a pause.
-      - run: ./gradlew --no-daemon :server:testClasses || { sleep 60; ./gradlew --no-daemon --refresh-dependencies :server:testClasses; }
+      # The only step that may download. Maven Central sometimes answers 429/404 to hosted runners:
+      # up to 4 attempts, 30/60/120 s apart, the last with --refresh-dependencies (past a cached 404).
+      - name: Resolve Gradle dependencies (for the offline run as agern)
+        run: |
+          cmd=(./gradlew --no-daemon :server:test --tests dk.egernet.factory.PodmanIntegrationTest)
+          delays=(30 60 120)
+          for attempt in 1 2 3 4; do
+            extra=()
+            [ "$attempt" -eq 4 ] && extra=(--refresh-dependencies)
+            if "${cmd[@]}" "${extra[@]}"; then exit 0; fi
+            [ "$attempt" -eq 4 ] && break
+            echo "Gradle attempt $attempt failed; retrying in ${delays[$((attempt - 1))]}s"
+            sleep "${delays[$((attempt - 1))]}"
+          done
+          echo "Gradle failed after 4 attempts" >&2
+          exit 1
       # Installs the package, PostgreSQL and Podman with apt; 'agern sandbox enable' and its
       # self-test; doctor; the server under the hardened unit reaping a leftover sandbox through the
       # socket; PodmanIntegrationTest as the agern user inside agern.service; upgrade, prune,
