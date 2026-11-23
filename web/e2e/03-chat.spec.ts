@@ -45,6 +45,9 @@ test('chat: new chat, streamed reply, tool call, interrupt with Esc, /factory st
   await expect(log(page)).toContainText('You said: hello agern');
   await expect(page.locator('.chat-footer')).toContainText('$0.01');
   await expect(prompt(page)).toBeEnabled();
+  // The header shows the commit of the checkout the agent works in (fake mode: real local git, always current).
+  await expect(page.locator('.chat-head-title')).toHaveText(/~\/demo-app · [0-9a-f]{7}/);
+  await expect(page.locator('.chat-head-behind')).toHaveCount(0);
 
   // `tool` makes the fake CLI run a Bash tool: rendered as ⏺ Bash(command) with its result.
   await send(page, 'use a tool please');

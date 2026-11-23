@@ -4,6 +4,7 @@ import type {
   AgentMessage,
   AgentSession,
   Attachment,
+  CheckoutInfo,
   ClaudeUsage,
   FactoryEvent,
   FeedFrame,
@@ -478,10 +479,22 @@ function newSession(
   return s;
 }
 
+/** A made-up 40-character commit sha. */
+const fakeSha = () => Array.from({ length: 40 }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('');
+
+/** The server's `checkout` event after syncing the chat's checkout (docs/ARCHITECTURE.md §8). */
+function emitCheckout(s: AgentSession, ts: string, state: Partial<CheckoutInfo> = {}) {
+  const payload: CheckoutInfo = {
+    branch: 'main', defaultBranch: 'main', commit: fakeSha(), behind: 0, ahead: 0, status: 'current', reason: null, updatedFrom: null, ...state,
+  };
+  emit(s.id, 'checkout', payload, ts);
+}
+
 export function createChat(repo: string, owner: User, createdMs = Date.now()): AgentSession {
   const s = newSession(repo, 'chat', owner, { title: 'Chat' }, createdMs);
   s.status = 'idle';
   emit(s.id, 'system', { level: 'info', text: `Chat started in ${ORG}/${repo} on main.` }, iso(createdMs));
+  emitCheckout(s, iso(createdMs));
   touchSession(s, iso(createdMs));
   return s;
 }
@@ -1960,6 +1973,8 @@ function seed() {
 
   // Chats.
   const chat = createChat('web-shop', alice, Date.now() - 50 * 60_000);
+  // alice edited a file in her checkout, so the server could not fast-forward it.
+  emitCheckout(chat, ago(49), { behind: 3, status: 'behind', reason: 'local_changes' });
   for (const turn of seededChat) {
     const p = new Player('instant', Date.now() - 48 * 60_000, 20);
     play(chat, turn.steps, p, { userText: turn.user, init: true });

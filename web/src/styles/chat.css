@@ -36,6 +36,10 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* The checkout's "n behind" next to the path (docs/ARCHITECTURE.md §10). */
+.chat-head-behind {
+  color: var(--amber-hi);
+}
 .chat-pick select {
   height: 30px;
   padding: 0 28px 0 10px;

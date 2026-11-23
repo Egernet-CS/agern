@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type ReactNode } from 'react';
-import { api, ApiError, STEERABLE_ROLES, type AgentSession, type Attachment, type Run, type StageRole } from '../../api';
+import { api, ApiError, STEERABLE_ROLES, type AgentSession, type Attachment, type CheckoutInfo, type Run, type StageRole } from '../../api';
 import { useMe } from '../../lib/auth';
 import { cost, duration, modelLabel } from '../../lib/format';
 import { useSessionStream } from '../../lib/realtime';
@@ -40,7 +40,8 @@ export type ChatViewProps = {
    * spec-writer or builder through a text-only composer.
    */
   embedded?: boolean;
-  header?: ReactNode;
+  /** A node, or a function of what the transcript knows (the latest `checkout` event) for the chat header. */
+  header?: ReactNode | ((ctx: { checkout: CheckoutInfo | null }) => ReactNode);
   /**
    * The run whose advisor this is (the conversation while a run needs a human). Its owner talks to the agent through a
    * text-only composer while the run is `needs_human` and no follow-up review runs.
@@ -251,7 +252,7 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header,
           <span>Drop files to attach</span>
         </div>
       )}
-      {header}
+      {typeof header === 'function' ? header({ checkout: summary.checkout }) : header}
       {session && !isOwner && (
         <div className="chat-banner" role="note">
           <span className="eye" aria-hidden>◉</span> observing <strong>{session.owner.displayName || session.owner.username}</strong>
