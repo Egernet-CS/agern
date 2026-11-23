@@ -32,6 +32,7 @@ class FactoryService(
     private val sessions: SessionStore,
     private val bus: EventBus,
     private val releases: ReleaseService,
+    private val images: dk.egernet.factory.db.ImageStore,
 ) {
     private val org get() = cfg.githubOrg
 
@@ -81,7 +82,10 @@ class FactoryService(
         val client = access.requireClient(user)
         val active = runs.activeRunsByIssue(repo)
         val planned = withContext(Dispatchers.IO) { releases.releaseByIssue(repo) }
-        return gh { client.listIssues(org, repo, state) }.map { issueDto(repo, it, false, active[it.number], planned[it.number]) }
+        val counts = withContext(Dispatchers.IO) { images.countsByIssue(repo) }
+        return gh { client.listIssues(org, repo, state) }.map {
+            issueDto(repo, it, false, active[it.number], planned[it.number]).copy(imageCount = counts[it.number] ?: 0)
+        }
     }
 
     suspend fun getIssue(user: UserRecord, repo: String, number: Int): IssueDto {
@@ -89,7 +93,8 @@ class FactoryService(
         val client = access.requireClient(user)
         val i = gh { client.getIssue(org, repo, number) } ?: throw notFound("Issue #$number not found")
         val planned = withContext(Dispatchers.IO) { releases.releaseByIssue(repo) }
-        return issueDto(repo, i, true, runs.activeRunFor(repo, number), planned[number])
+        val count = withContext(Dispatchers.IO) { images.countsByIssue(repo)[number] ?: 0 }
+        return issueDto(repo, i, true, runs.activeRunFor(repo, number), planned[number]).copy(imageCount = count)
     }
 
     /** Issue with its comments, as plain text for agents. */

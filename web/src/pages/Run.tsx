@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
-import { api, ApiError, isRunActive, isRunWorking, type AgentSession, type Run, type Screenshot, type StageRole } from '../api';
+import { api, ApiError, isRunActive, isRunWorking, type AgentSession, type GeneratedImage, type Run, type Screenshot, type StageRole } from '../api';
 import { ChatView } from '../components/chat/ChatView';
 import { RunSandboxLine } from '../components/sandbox/SandboxBits';
 import { Markdown } from '../components/chat/Markdown';
@@ -403,6 +403,7 @@ function StageDetail({ run, node, round, sessions, onRound }: { run: Run; node: 
               </>
             )}
             <StageScreenshots runId={run.id} screenshots={stage.screenshots} />
+            <StageImages images={stage.images ?? []} />
           </>
         )}
       </div>
@@ -450,6 +451,49 @@ function StageScreenshots({ runId, screenshots }: { runId: string; screenshots: 
             <p className="muted small">
               {open.mediaType} · {bytes(open.size)} · {open.width}×{open.height} ·{' '}
               <a href={api.screenshotUrl(runId, open.id)} target="_blank" rel="noreferrer">Open full size ↗</a>
+            </p>
+          </div>
+        )}
+      </Dialog>
+    </>
+  );
+}
+
+/**
+ * The images the selected stage's agent generated (spec-writer, builder), with the prompt used, so they can be seen
+ * before the run is approved. Renders nothing when there are none. Purpose and prompt are untrusted text.
+ */
+function StageImages({ images }: { images: GeneratedImage[] }) {
+  const [openId, setOpenId] = useState<string | null>(null);
+  if (images.length === 0) return null;
+  const open = images.find((s) => s.id === openId) ?? null;
+  return (
+    <>
+      <h3 className="sd-h">Generated images <span className="muted">{images.length}</span></h3>
+      <ul className="shots">
+        {images.map((s) => (
+          <li key={s.id}>
+            <figure className="shot">
+              <button type="button" className="shot-thumb" onClick={() => setOpenId(s.id)} aria-label={`Open image: ${s.purpose}`}>
+                <img src={api.imageUrl(s.id)} alt={s.purpose} loading="lazy" width={s.width} height={s.height} />
+              </button>
+              <figcaption>{s.purpose}</figcaption>
+              <details className="shot-prompt">
+                <summary>Prompt</summary>
+                <p>{s.prompt}</p>
+              </details>
+            </figure>
+          </li>
+        ))}
+      </ul>
+      <Dialog open={open !== null} onClose={() => setOpenId(null)} title="Generated image" wide>
+        {open && (
+          <div className="att-lightbox shot-lightbox">
+            <img src={api.imageUrl(open.id)} alt={open.purpose} />
+            <p className="shot-caption">{open.purpose}</p>
+            <p className="muted small">
+              {open.mediaType} · {bytes(open.size)} · {open.width}×{open.height} · {open.model} ·{' '}
+              <a href={api.imageUrl(open.id)} target="_blank" rel="noopener noreferrer">Open full size ↗</a>
             </p>
           </div>
         )}

@@ -185,8 +185,11 @@ class FakeGitOps : GitOps {
         return files[path]
     }
     override fun ensureClone(id: AgentIdentity, cloneUrl: String, dir: Path, home: Path) { Files.createDirectories(dir) }
+    /** Runs on every worktree right after it is created (e.g. to plant files a repository could contain). */
+    @Volatile var afterWorktree: (Path) -> Unit = {}
     override fun createWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, branch: String, baseBranch: String, home: Path): String {
         Files.createDirectories(worktree)
+        afterWorktree(worktree)
         worktrees += "$branch <- $baseBranch"
         return "origin/$baseBranch"
     }
@@ -237,6 +240,8 @@ class TestWorld(
     releaseStarter: ReleaseStarter? = null,
     /** Use the real git CLI in fake-GitHub mode (local clone, no pushes) instead of [FakeGitOps]. */
     realGit: Boolean = false,
+    /** The image providers (null: the production default list). */
+    imageProviders: List<dk.egernet.factory.images.ImageProvider>? = null,
 ) {
     val dataDir: Path = Files.createTempDirectory("agern-test")
     val cfg = tweak(testConfig(dataDir, twoFactor).let { if (sandbox) it.copy(sandbox = it.sandbox.copy(mode = "podman")) else it })
@@ -248,7 +253,7 @@ class TestWorld(
     val sandboxRuntime = FakeSandboxRuntime()
     val services = Services(
         cfg, TestDb.fresh(), github, cliGit ?: git, launcher ?: this.launcher, loginThrottle = loginThrottle, clock = clock,
-        releaseStarter = releaseStarter, sandboxRuntime = if (sandbox) sandboxRuntime else null,
+        releaseStarter = releaseStarter, sandboxRuntime = if (sandbox) sandboxRuntime else null, imageProviders = imageProviders,
     )
 
     /** Puts `.agern/sandbox.yml` on the default branch (GitHub API and git alike); null removes it. */

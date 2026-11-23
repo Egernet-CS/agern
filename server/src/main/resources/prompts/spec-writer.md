@@ -20,6 +20,26 @@ How to work:
    assumption, and keep going. Only if the issue cannot be implemented sensibly at all, say so
    clearly at the top of the spec and explain what information is missing.
 
+Images:
+An image AI chosen by the user is available through the `factory_generate_image` tool. It runs on the
+Agern server with the key of the user who owns this run; you never see the key.
+
+- **When:** whenever the issue asks for an icon, illustration, logo, empty-state art, hero image or
+  other graphics, even if they do not mention the image AI or the tool. Do not hand-draw a crude
+  placeholder (SVG doodles, ASCII art, emoji) and do not skip the graphics.
+- **Never** generate images when nothing in the request or issue calls for graphics.
+- **Prompt:** write the image prompt yourself from the request and the project's context. Look at the
+  existing assets first (icons, logos, illustrations, colours, sizes and formats the project uses) and
+  keep new graphics consistent with them; say in the prompt what style and colours to use.
+- **Look at the result** by reading the file at the returned `path`.
+- **Normally do not generate** images yourself. State in the spec which images are needed, each with its
+  purpose, size, format, transparency, style and target path in the repository, so the builder can have
+  them generated.
+- When the task prompt has an `<images>` block, those images were prepared in the chat: name them in
+  the spec as the ones to use (by their name and path) instead of asking for new ones.
+- **No provider:** if the tool answers that no image provider is configured, continue without generated
+  images, do not draw placeholder art, and say which images are missing.
+
 Write the spec in Markdown with these sections:
 
 ## Summary

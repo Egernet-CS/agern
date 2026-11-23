@@ -202,6 +202,10 @@ class AgentManager(
 
     /** Handles `/factory …` chat commands; wired after construction (orchestrator depends on this class). */
     var commandHandler: (suspend (session: SessionRecord, owner: UserRecord, text: String) -> String)? = null
+    /** Called when the owner's non-command chat input was accepted (image budgets per chat message); wired like [commandHandler]. */
+    var onChatInput: ((sessionId: UUID) -> Unit)? = null
+    /** Called after a chat was closed and deleted (its generated images); blocking is fine. */
+    var onChatClosed: ((sessionId: UUID) -> Unit)? = null
 
     /**
      * Supplies an advisor session's launch data (worktree, run, context), rebuilt from current data at each launch;
@@ -362,6 +366,7 @@ class AgentManager(
             }
             return
         }
+        onChatInput?.invoke(s.id)
 
         scope.launch {
             val mutex = chatLocks.computeIfAbsent(s.id) { Mutex() }
@@ -795,7 +800,10 @@ class AgentManager(
                 if (!deleted) throw notFound("Session not found")
             }
         }
-        withContext(Dispatchers.IO) { attachments.removeSession(s.id) }
+        withContext(Dispatchers.IO) {
+            attachments.removeSession(s.id)
+            onChatClosed?.let { hook -> runCatching { hook(s.id) }.onFailure { log.warn("Removing the images of chat {} failed: {}", s.id, it.message) } }
+        }
         bus.closeSession(s.id)
         bus.emitFeed(FeedItem.SessionClosed(s.repo, s.id.toString()))
         log.info("Chat {} in {} closed by {}", s.id, s.repo, user.username)

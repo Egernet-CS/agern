@@ -34,6 +34,7 @@ data class UserRecord(
     val totpEnabled: Boolean = false, val totpSecretEnc: ByteArray? = null, val totpPendingEnc: ByteArray? = null,
     val totpLastStep: Long? = null, val totpFailures: Int = 0, val totpLockedUntil: Instant? = null,
     val githubTokenKind: String? = null, val githubTokenScopes: List<String>? = null,
+    val imageProvider: String? = null, val imageModel: String? = null, val imageKeyEnc: ByteArray? = null,
 ) {
     fun toDto() = UserDto(
         id = id.toString(), username = username, displayName = displayName, isAdmin = isAdmin,
@@ -43,6 +44,8 @@ data class UserRecord(
         twoFactorLockedUntil = totpLockedUntil?.takeIf { it.isAfter(Instant.now()) }?.iso(),
         githubTokenKind = if (githubTokenEnc != null) githubTokenKind else null,
         githubTokenScopes = if (githubTokenEnc != null) githubTokenScopes else null,
+        imageProvider = if (imageKeyEnc != null) imageProvider else null,
+        imageModel = if (imageKeyEnc != null) imageModel else null,
     )
     fun owner() = OwnerDto(username, displayName)
     override fun toString() = "UserRecord($username)"
@@ -58,6 +61,7 @@ class UserStore(private val db: Db) {
         rs.instantOrNull("totp_locked_until"),
         rs.getString("github_token_kind"),
         rs.getString("github_token_scopes")?.let { s -> s.split(',').filter { it.isNotEmpty() } },
+        rs.getString("image_provider"), rs.getString("image_model"), rs.getBytes("image_key_enc"),
     )
 
     fun byId(id: UUID) = db.queryOne("SELECT * FROM users WHERE id = ?", id, map = ::map)
@@ -87,6 +91,19 @@ class UserStore(private val db: Db) {
         c.prepare("DELETE FROM claude_usage_windows WHERE user_id = ?", arrayOf<Any?>(id)).use { it.executeUpdate() }
         n
     }
+
+    /** Replaces (or with nulls removes) the image provider setting; [keyEnc] is the encrypted API key. */
+    fun setImageProvider(id: UUID, provider: String?, model: String?, keyEnc: ByteArray?) = db.update(
+        "UPDATE users SET image_provider = ?, image_model = ?, image_key_enc = ? WHERE id = ?", provider, model, keyEnc, id,
+    )
+
+    /**
+     * Replaces the stored image credential only if the row still holds [oldEnc] for [provider] (compare-and-set, so a
+     * re-login or removal made meanwhile wins). Returns whether it changed.
+     */
+    fun replaceImageKey(id: UUID, provider: String, oldEnc: ByteArray, newEnc: ByteArray): Boolean = db.update(
+        "UPDATE users SET image_key_enc = ? WHERE id = ? AND image_provider = ? AND image_key_enc = ?", newEnc, id, provider, oldEnc,
+    ) > 0
 
     fun setTotpPending(id: UUID, enc: ByteArray?) = db.update("UPDATE users SET totp_pending_enc = ? WHERE id = ?", enc, id)
 
@@ -320,9 +337,9 @@ data class StageRecord(
     val id: UUID, val runId: UUID, val role: String, val round: Int, val model: String, val status: String, val verdict: String?,
     val summary: String?, val findings: List<FindingDto>, val sessionId: UUID?, val startedAt: Instant?, val endedAt: Instant?,
 ) {
-    fun toDto(screenshots: List<dk.egernet.factory.ScreenshotDto> = emptyList()) = StageDto(
+    fun toDto(screenshots: List<dk.egernet.factory.ScreenshotDto> = emptyList(), images: List<dk.egernet.factory.GeneratedImageDto> = emptyList()) = StageDto(
         id.toString(), role, round, model, status, verdict, summary, findings, sessionId?.toString(), startedAt?.iso(), endedAt?.iso(),
-        screenshots,
+        screenshots, images,
     )
 }
 
@@ -348,6 +365,7 @@ data class RunRecord(
 
 class RunStore(private val db: Db) {
     private val screenshots = ScreenshotStore(db)
+    private val images = ImageStore(db)
     private val findingsSer = ListSerializer(FindingDto.serializer())
     private val select = """SELECT r.*, u.username AS owner_username, u.display_name AS owner_display_name
         FROM runs r JOIN users u ON u.id = r.owner_id"""
@@ -536,12 +554,13 @@ class RunStore(private val db: Db) {
     /** Stage screenshots are read with one query per run, never one per stage. */
     fun toDto(r: RunRecord): RunDto {
         val shots = screenshots.forRun(r.id).groupBy({ it.stageId }, { it.toDto() })
+        val imgs = images.forRun(r.id).groupBy({ it.sessionId }, { it.toDto() })
         return RunDto(
             id = r.id.toString(), repo = r.repo, issueNumber = r.issueNumber, issueTitle = r.issueTitle, issueKind = r.issueKind,
             status = r.status, round = r.round, maxRounds = r.maxRounds, branch = r.branch, prNumber = r.prNumber, prUrl = r.prUrl,
             owner = OwnerDto(r.ownerUsername, r.ownerDisplayName), startedBySessionId = r.startedBySessionId?.toString(),
             error = r.error, createdAt = r.createdAt.iso(), updatedAt = r.updatedAt.iso(), endedAt = r.endedAt?.iso(),
-            stages = stages(r.id).map { it.toDto(shots[it.id].orEmpty()) },
+            stages = stages(r.id).map { it.toDto(shots[it.id].orEmpty(), it.sessionId?.let { s -> imgs[s] }.orEmpty()) },
             sandbox = r.sandboxJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunSandboxDto.serializer(), it) }.getOrNull() },
             releaseId = r.releaseId?.toString(), baseBranch = r.baseBranch,
             conversation = dk.egernet.factory.RunConversationDto(r.advisorSessionId?.toString(), r.reviewState, r.followUpFrom),

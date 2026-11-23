@@ -2,6 +2,7 @@
 // Scenarios via ?mock=default|fresh|noclaude|observer|loggedout|nosandbox|usage-none|usage-high|usage-limit (remembered per tab;
 // nosandbox: FACTORY_SANDBOX=off; usage-*: alice's Claude usage without data, at 86 % or at a reached limit).
 import { ApiError, type Api, type Channel } from '../api/api';
+import * as images from './images';
 
 /** A 16×10 PNG sketching a page with a sidebar, used for every mock screenshot. */
 const SCREENSHOT_PNG =
@@ -51,6 +52,8 @@ import {
   stopSession,
   usageOf,
 } from './engine';
+
+images.seedRunImage();
 
 /** Mock rule: any 6 digits except 000000, or a recovery code like abcd-1234 (login only). */
 function secondFactor(u: User, code: string, allowRecovery: boolean) {
@@ -267,6 +270,11 @@ export const mockApi: Api = {
         githubTokenScopes: kind === 'classic' ? ['read:org', 'repo'] : null,
       });
     }),
+  putImageProvider: (provider, model, apiKey) => ok(() => images.setImageProvider(me(), provider, model, apiKey)),
+  deleteImageProvider: () => ok(() => images.removeImageProvider(me())),
+  startCodexLogin: () => ok(() => images.startCodexLogin()),
+  codexLogin: () => ok(() => images.pollCodexLogin(me())),
+  cancelCodexLogin: () => ok(() => images.cancelCodexLogin()),
   deleteGithubToken: () => ok(() => Object.assign(me(), { hasGithubToken: false, githubLogin: null, githubTokenKind: null, githubTokenScopes: null })),
 
   preferences: () => ok(preferences),
@@ -290,14 +298,14 @@ export const mockApi: Api = {
   issues: (repo, state = 'open') =>
     ok(() => {
       project(repo);
-      return (db.issues[repo] ?? []).filter((i) => state === 'all' || i.state === state).map(({ body: _body, ...i }) => ({ ...i, release: releaseOfIssue(repo, i.number) }) as Issue);
+      return (db.issues[repo] ?? []).filter((i) => state === 'all' || i.state === state).map(({ body: _body, ...i }) => ({ ...i, release: releaseOfIssue(repo, i.number), imageCount: images.imageCount(repo, i.number) }) as Issue);
     }),
   issue: (repo, n) =>
     ok(() => {
       project(repo);
       const i = db.issues[repo]?.find((x) => x.number === n);
       if (!i) throw new MockError(404, 'not_found', 'Issue not found');
-      return { ...i, release: releaseOfIssue(repo, i.number) };
+      return { ...i, release: releaseOfIssue(repo, i.number), imageCount: images.imageCount(repo, i.number) };
     }),
   createIssue: (repo, body) =>
     ok(() => {
@@ -306,7 +314,7 @@ export const mockApi: Api = {
       const number = Math.max(0, ...list.map((i) => i.number)) + 1;
       const label = body.kind === 'bug' ? { name: 'bug', color: 'd73a4a' } : body.kind === 'feature' ? { name: 'enhancement', color: 'a2eeef' } : { name: 'chore', color: 'c5def5' };
       const now = new Date().toISOString();
-      const i: Issue = { number, title: body.title, state: 'open', kind: body.kind, labels: [label], author: me().githubLogin ?? me().username, assignees: [], comments: 0, createdAt: now, updatedAt: now, htmlUrl: `https://github.com/${ORG}/${repo}/issues/${number}`, body: body.body, activeRunId: null, release: null };
+      const i: Issue = { number, title: body.title, state: 'open', kind: body.kind, labels: [label], author: me().githubLogin ?? me().username, assignees: [], comments: 0, createdAt: now, updatedAt: now, htmlUrl: `https://github.com/${ORG}/${repo}/issues/${number}`, body: body.body, activeRunId: null, release: null, imageCount: 0 };
       list.unshift(i);
       announceIssue(repo, i);
       return i;
@@ -372,7 +380,9 @@ export const mockApi: Api = {
     ok(() => {
       project(repo);
       needClaude();
-      return startRun(repo, n, me());
+      const r = startRun(repo, n, me());
+      images.claimImages(r);
+      return r;
     }),
   runs: (filter = {}) =>
     ok(() =>
@@ -438,6 +448,7 @@ export const mockApi: Api = {
       }
       list.forEach((a) => (a!.sent = true));
       chatInput(s, text, me(), list.map((a) => a!.meta));
+      if (!text.trim().startsWith('/factory')) images.chatImages(s, text, me());
     }),
   sendToAgent: (id, text) => ok(() => messageAgent(session(id), text, me())),
   async uploadAttachment(sessionId, file, opts) {
@@ -481,8 +492,18 @@ export const mockApi: Api = {
     }),
   // One small PNG stands in for every screenshot (the mock has no image bytes).
   screenshotUrl: () => SCREENSHOT_PNG,
+  sessionImages: (id) => ok(() => images.sessionImages(session(id).id)),
+  issueImages: (repo, n) =>
+    ok(() => {
+      project(repo);
+      return images.issueImages(repo, n);
+    }),
+  selectImage: (id, issueNumber, name) => ok(() => images.selectImage(id, issueNumber, name, me())),
+  unselectImage: (id) => ok(() => images.unselectImage(id, me())),
+  discardImage: (id) => ok(() => images.discardImage(id, me())),
+  imageUrl: () => images.IMAGE_PNG,
   attachmentUrl: (_sessionId, id) => attachments.get(id)?.url ?? '/art/favicon.svg',
-  config: () => ok(() => ({ attachments: LIMITS })),
+  config: () => ok(() => ({ attachments: LIMITS, images: images.IMAGE_CONFIG })),
   interrupt: (id) =>
     ok(() => {
       const s = session(id);
@@ -500,6 +521,7 @@ export const mockApi: Api = {
       const s = session(id);
       if (s.owner.username !== me().username && !me().isAdmin) throw new MockError(403, 'forbidden', 'Only the owner or an admin can close this chat');
       if (s.kind !== 'chat') throw new MockError(409, 'not_a_chat', 'Only chat sessions can be closed; cancel the run to stop a pipeline agent');
+      images.closeChatImages(id);
       for (const [aid, a] of attachments) {
         if (a.sessionId !== id) continue;
         URL.revokeObjectURL(a.url);

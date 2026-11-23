@@ -110,6 +110,7 @@ class Orchestrator(
     private val screenshots: ScreenshotStore,
     private val sessions: SessionStore,
     private val events: EventStore,
+    private val images: dk.egernet.factory.images.ImageService,
 ) {
     private val log = LoggerFactory.getLogger(Orchestrator::class.java)
     private val jobs = ConcurrentHashMap<UUID, Job>()
@@ -634,15 +635,20 @@ class Orchestrator(
         val definitionRef = if (run.baseBranch == null || target == repoInfo.defaultBranch) baseRef
             else baseRef.removeSuffix(target) + repoInfo.defaultBranch
         val sandbox = sandboxes.prepare(run.id, run.repo, worktree, definitionRef, workspaces.home(owner.username))
+        // Images selected for the issue in a chat go into the worktree (docs/ARCHITECTURE.md §6 "Generated images").
+        val prepared = withContext(Dispatchers.IO) { images.handOver(runs.get(run.id)!!, worktree) }
         publish(run.id)
         val ctx = RunContext(
             run.id, run.repo, issue, issueText(issue, comments), branch, baseRef, target, worktree, releaseName, repoInfo.defaultBranch, sandbox,
+            prepared,
         )
+        val imageNotes = if (prepared.isEmpty()) emptyList()
+            else listOf("info" to "Prepared images: ${prepared.size} (${prepared.joinToString(", ") { it.meta.name ?: it.meta.purpose }})")
 
         // 1. Spec
         setStatus(run.id, RunStatus.SPEC)
         val specRes = stage(run.id, "spec-writer", 0, owner, ctx, specPrompt(ctx),
-            disallowed = READ_ONLY_TOOLS)
+            disallowed = READ_ONLY_TOOLS, extraTools = dk.egernet.factory.images.ImageService.TOOLS, notes = imageNotes)
         val spec = specRes.resultText?.trim().takeUnless { it.isNullOrEmpty() } ?: throw StageFailed("spec-writer produced no spec")
         finishStage(run.id, "spec-writer", 0, null, firstParagraph(spec), emptyList())
         withContext(Dispatchers.IO) {
@@ -667,9 +673,10 @@ class Orchestrator(
             val prompt = if (round == 0) buildPrompt(ctx, spec) else fixPrompt(ctx, round, maxRounds, findingsForBuilder)
             val b = stage(run.id, "builder", round, owner, ctx, prompt,
                 resume = builderClaudeSession, parent = builderSessionId,
-                extraTools = if (sandboxes.enabled) dk.egernet.factory.sandbox.SandboxManager.TOOLS else emptySet(),
-                notes = ctx.sandbox?.takeIf { sandboxes.enabled }?.let { listOf((if (it.state == "approved") "info" else "warn") to "Sandbox: ${it.reason}") }
-                    ?: emptyList())
+                extraTools = (if (sandboxes.enabled) dk.egernet.factory.sandbox.SandboxManager.TOOLS else emptySet()) +
+                    dk.egernet.factory.images.ImageService.TOOLS,
+                notes = (ctx.sandbox?.takeIf { sandboxes.enabled }?.let { listOf((if (it.state == "approved") "info" else "warn") to "Sandbox: ${it.reason}") }
+                    ?: emptyList()) + (if (round == 0) imageNotes else emptyList()))
             builderClaudeSession = b.claudeSessionId ?: builderClaudeSession
             builderSessionId = b.session.id
             val builderSummary = b.resultText?.trim() ?: ""
@@ -780,7 +787,13 @@ class Orchestrator(
         val releaseName: String? = null, val defaultBranch: String = targetBranch,
         /** The run's sandbox decision; null when sandboxes are switched off. */
         val sandbox: dk.egernet.factory.RunSandboxDto? = null,
+        /** Images selected for the issue in a chat, written into the worktree; empty for most runs. */
+        val prepared: List<dk.egernet.factory.images.PreparedImage> = emptyList(),
     ) {
+        /** The `<images>` block for the spec-writer's and builder's task prompts; empty (no change at all) without images. */
+        val imagesBlock: String
+            get() = if (prepared.isEmpty()) "" else dk.egernet.factory.images.ImageService.promptBlock(prepared)
+
         /** For release runs: the sentence that names the release branch as the merge target. */
         val releaseNote: String
             get() = if (releaseName == null) "" else
@@ -955,7 +968,7 @@ class Orchestrator(
     private fun specPrompt(c: RunContext) = """
         |Write the implementation spec for this issue in ${org}/${c.repo}.
         |
-        |${c.issueText}
+        |${c.issueText}${c.imagesBlock}
         |Your working directory is a checkout of the repository at `${c.baseRef}`. Explore it (read-only) before writing.
         |Your final message must be the spec in Markdown and nothing else: it is posted verbatim as a comment on the issue
         |and handed to the builder.
@@ -967,7 +980,7 @@ class Orchestrator(
         |You are in a git worktree on branch `${c.branch}`, created from `${c.baseRef}`. Commit your work to this branch.
         |Do not push, open pull requests or merge: the factory does that after you finish.
         |${sandboxLine(c)}
-        |${c.releaseNote}${c.issueText}
+        |${c.releaseNote}${c.issueText}${c.imagesBlock}
         |<spec>
         |$spec
         |</spec>

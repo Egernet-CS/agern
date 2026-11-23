@@ -92,5 +92,5 @@ tasks.test {
 
 tasks.processTestResources {
     // keep the fake CLI executable when copied into build/resources
-    filesMatching("fake-claude") { permissions { unix("rwxr-xr-x") } }
+    filesMatching(listOf("fake-claude", "fake-codex")) { permissions { unix("rwxr-xr-x") } }
 }
