@@ -154,8 +154,10 @@ class ReleaseMerger(
 
     /**
      * The periodic re-evaluation: every [periodicMillis], each `ready` release that is automatic (it may have become
-     * green: there is no webhook) or whose checks are pending (so the page shows when they finish). A release is only
-     * published when something changed. Runs in [scope], so stopping the services cancels it.
+     * green: there is no webhook) or whose checks are pending (so the page shows when they finish) is re-evaluated, and
+     * every other `ready` release with a pull request is reconciled ([reconcileLocked]: merged or closed on GitHub, its
+     * mergeability; never a merge). A release is only published when something changed. Runs in [scope], so stopping the
+     * services cancels it.
      */
     fun startTicker(): Job = scope.launch {
         while (isActive) {
@@ -174,7 +176,8 @@ class ReleaseMerger(
             try {
                 val (before, after) = locks.of(id).withLock {
                     val b = io { store.get(id) }
-                    evaluateLocked(id, becameReady = false, Trigger.PERIODIC)
+                    if (b != null && fullPeriodic(b)) evaluateLocked(id, becameReady = false, Trigger.PERIODIC)
+                    else reconcileLocked(id)
                     b to io { store.get(id) }
                 }
                 if (before?.copy(updatedAt = Instant.EPOCH) != after?.copy(updatedAt = Instant.EPOCH)) publish(id)
@@ -182,6 +185,55 @@ class ReleaseMerger(
                 log.warn("Release {} could not be re-evaluated: {}", id, e.message)
             }
         }
+    }
+
+    /**
+     * Whether the periodic re-evaluation evaluates [r] in full: automatic (it may be merged once green) or with checks
+     * still pending. Every other ready release with a pull request (a manual one) is only reconciled.
+     */
+    private fun fullPeriodic(r: ReleaseRecord) =
+        r.automatic || r.checksState == ReleaseChecksState.PENDING || r.checksState == ReleaseChecksState.AWAITING
+
+    /**
+     * The periodic look at a manual `ready` release with a pull request: one read of the pull request. Merged on GitHub
+     * (by a person) finishes the release as a check would; closed without merging forgets the pull request with a
+     * notice; open refreshes its mergeability, and a new head commit gets a full re-evaluation (its checks, the merge
+     * method). It never merges, comments only through [recordMergeState] (once per change to a conflict) and a failed
+     * read changes nothing (the next round tries again).
+     */
+    private suspend fun reconcileLocked(id: UUID) {
+        val r = io { store.get(id) } ?: return
+        if (r.status != ReleaseStatus.READY) return
+        val number = r.prNumber ?: return
+        val client = ownerClient(r) ?: return // a check or an approval says so
+        val info = try {
+            io { client.getPull(org, r.repo, number) }
+        } catch (e: GitHubException) {
+            log.info("Release {}: could not read pull request #{} (tried again next round): {}", id, number, e.message)
+            return
+        }
+        when {
+            info != null && info.merged -> finishLocked(id, method = null, sha = info.mergeCommitSha, by = null)
+            info == null || info.state != "open" -> {
+                log.info("Release {}: pull request #{} was closed without merging; forgetting it", id, number)
+                io { store.clearPull(id) }
+                setNotice(
+                    id, "Pull request #$number was closed on GitHub without being merged. Use \"Check again\" to open a new " +
+                        "one, or cancel the release.",
+                )
+            }
+            info.head.sha.isNotEmpty() && info.head.sha != r.checksSha -> evaluateLocked(id, becameReady = false, Trigger.PERIODIC)
+            else -> info.mergeable?.let { recordMergeState(r, if (it) ReleaseMergeState.CLEAN else ReleaseMergeState.CONFLICT, client) }
+        }
+    }
+
+    /**
+     * A GitHub read that failed during an evaluation. The periodic re-evaluation only logs it (the next round tries
+     * again), so a transient error never replaces a useful notice; every other trigger shows [text].
+     */
+    private suspend fun readFailed(id: UUID, trigger: Trigger, text: String) {
+        if (trigger == Trigger.PERIODIC) log.info("Release {}: {} (tried again next round)", id, text)
+        else setNotice(id, text)
     }
 
     /** What started an evaluation: decides whether it may merge an automatic release. */
@@ -198,8 +250,7 @@ class ReleaseMerger(
     /**
      * Merges a `ready`, complete, conflict-free release into the default branch as its [owner] (already checked to be
      * the owner): rebase (or a merge commit where rebase merging is disabled or GitHub cannot rebase the branch), never
-     * squash. Refusals change nothing
-     * on GitHub. Serialised per release: a second approval finds the release `released` (409 `release_not_ready`).
+     * squash. Refusals change nothing on GitHub. Serialised per release: a second approval finds the release `released` (409 `release_not_ready`).
      */
     suspend fun approve(owner: UserRecord, id: UUID): ReleaseRecord {
         try {
@@ -279,7 +330,7 @@ class ReleaseMerger(
         } catch (e: GitHubException) {
             null
         } ?: run {
-            setNotice(id, "Could not read ${r.repo} on GitHub with the owner's token; check again later.")
+            readFailed(id, trigger, "Could not read ${r.repo} on GitHub with the owner's token; check again later.")
             return
         }
         if (r.targetBranch != repo.defaultBranch) io { store.setTarget(id, repo.defaultBranch) }
@@ -291,7 +342,7 @@ class ReleaseMerger(
             val info = try {
                 io { client.getPull(org, r.repo, number) }
             } catch (e: GitHubException) {
-                setNotice(id, "Could not read pull request #$number: ${e.message}")
+                readFailed(id, trigger, "Could not read pull request #$number: ${e.message}")
                 return
             }
             when {
@@ -344,7 +395,7 @@ class ReleaseMerger(
         val info = try {
             readMergeable(client, withPr.repo, prNumber)
         } catch (e: GitHubException) {
-            setNotice(id, "Could not check pull request #$prNumber: ${e.message}")
+            readFailed(id, trigger, "Could not check pull request #$prNumber: ${e.message}")
             return
         }
         if (info?.merged == true) {
@@ -359,7 +410,9 @@ class ReleaseMerger(
         // The method first: whoever sees the merge state also sees how it would be merged.
         val method = methodFor(repo, info?.rebaseable)
         io { store.setMergeMethod(id, method) }
-        recordMergeState(withPr, state, client)
+        // Mergeability GitHub is still computing does not replace a known state in the periodic round: a conflict that
+        // reads unknown once and then conflict again would otherwise be commented on twice.
+        if (state != ReleaseMergeState.UNKNOWN || trigger != Trigger.PERIODIC) recordMergeState(withPr, state, client)
         setNotice(id, null)
         val headSha = if (info != null && info.state == "open") info.head.sha.takeIf { it.isNotEmpty() } else null
         val checks = headSha?.let { readChecks(withPr, client, it) }

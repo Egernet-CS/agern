@@ -367,11 +367,13 @@ class ReleaseStore(private val db: Db) {
     fun readyIds(): List<UUID> = db.query("SELECT id FROM releases WHERE status = 'ready'") { it.uuid("id") }
 
     /**
-     * Ids of the `ready` releases the periodic re-evaluation looks at: every automatic one (it may become green), and
-     * manual ones whose checks are pending (so the release page shows when they finish).
+     * Ids of the `ready` releases the periodic re-evaluation looks at: every automatic one (it may become green), manual
+     * ones whose checks are pending (so the release page shows when they finish), and every other one with a pull
+     * request (reconciled only: it may have been merged or closed on GitHub).
      */
     fun periodicIds(): List<UUID> = db.query(
-        "SELECT id FROM releases WHERE status = 'ready' AND (release_mode = 'automatic' OR checks_state IN ('pending', 'awaiting')) ORDER BY ready_at, id",
+        "SELECT id FROM releases WHERE status = 'ready' AND (release_mode = 'automatic' OR checks_state IN ('pending', 'awaiting') " +
+            "OR pr_number IS NOT NULL) ORDER BY ready_at, id",
     ) { it.uuid("id") }
 
     /** Ids of released releases whose clean-up did not finish (a restart in between). */
