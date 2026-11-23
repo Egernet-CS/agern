@@ -42,6 +42,9 @@ test('approve and release: the owner merges a ready release; others cannot; it i
   await expect(prLink).toHaveAttribute('href', /\/pull\/\d+$/);
   await expect(section).toContainText(`release/${name} → main`);
   await expect(section.getByRole('status')).toHaveText('Ready to release. Merges cleanly into main.');
+  await expect(section).toContainText(
+    'Approval merges it by rebasing: one commit per issue on main. If GitHub cannot rebase it, a merge commit is used where the repository allows one.',
+  );
   const approve = section.getByRole('button', { name: 'Approve and release' });
   await expect(approve).toBeEnabled();
   await expect(section.getByRole('button', { name: 'Check again' })).toBeVisible();
@@ -65,7 +68,7 @@ test('approve and release: the owner merges a ready release; others cannot; it i
   // Alice confirms.
   await approve.click();
   const dialog = page.getByRole('dialog', { name: `Release ${name}?` });
-  await expect(dialog).toContainText('into main by rebasing: 2 issues, one commit each.');
+  await expect(dialog).toContainText('into main by rebasing (or with a merge commit if GitHub cannot rebase it): 2 issues, one commit each.');
   await expect(dialog).toContainText(`the branch release/${name} is deleted`);
   await expect(dialog.getByRole('button', { name: 'Cancel' })).toBeFocused();
   await dialog.getByRole('button', { name: 'Approve and release' }).click();

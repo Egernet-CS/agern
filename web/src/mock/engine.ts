@@ -1514,6 +1514,8 @@ function advanceRelease(r: Release) {
 export const conflictingReleases = new Set<string>();
 /** Repositories that only allow squash merges (no rebase, no merge commit). */
 export const squashOnlyRepos = new Set<string>();
+/** Release branches (`<repo>:<branch>`) GitHub cannot rebase (e.g. main was merged into them): a merge commit is used. */
+export const unrebaseableReleases = new Set<string>();
 /** The checks on each release branch's pull request (`<repo>:<branch>`); none listed: no checks at all. */
 export const releaseChecks = new Map<string, Omit<ReleaseChecks, 'sha'>>();
 let nextReleasePr = 120;
@@ -1529,7 +1531,7 @@ function evaluateRelease(r: Release) {
   }
   if (r.prNumber) {
     r.mergeState = conflictingReleases.has(`${r.repo}:${r.branch}`) ? 'conflict' : 'clean';
-    r.mergeMethod = squashOnlyRepos.has(r.repo) ? 'unavailable' : 'rebase';
+    r.mergeMethod = squashOnlyRepos.has(r.repo) ? 'unavailable' : unrebaseableReleases.has(`${r.repo}:${r.branch}`) ? 'merge' : 'rebase';
     const checks = releaseChecks.get(`${r.repo}:${r.branch}`) ?? { state: 'none', detail: 'No checks' };
     r.checks = { ...checks, sha: `${r.name.length}f3a9c1e7b2d4${r.prNumber}`.slice(0, 40) };
   } else r.mergeState = 'unknown';
@@ -1562,7 +1564,7 @@ export function checkRelease(r: Release, by: User) {
   return r;
 }
 
-/** Owner-only approval: merges the release pull request (rebase), closes the issues, deletes the branch. */
+/** Owner-only approval: merges the release pull request (rebase, or a merge commit if it cannot be rebased), closes the issues, deletes the branch. */
 export function approveRelease(r: Release, by: User) {
   if (r.status === 'planning' || r.status === 'scheduled') throw conflictOf(r);
   guardRelease(r, by, 'owner');
