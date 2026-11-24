@@ -903,13 +903,27 @@ or cancel. Talking never changes the run's status and never approves anything. M
 
 For a change that affects a UI, the **ux** and **ui-design** reviewers run the app and attach captioned screenshots
 of the screens they reviewed to their stage with the MCP tool `factory_attach_screenshot` (§7); the builder and the
-other roles do not get the tool. Their prompts (`prompts/ux.md`, `prompts/ui-design.md`) tell them to start the app
-on a free port (the four reviewers share the worktree), capture each added or altered screen in the states that
-matter (empty/filled, error/loading, light/dark, narrow width), give each a one-line caption, quote the caption in a
-finding the screenshot supports, delete the files after attaching and never commit them — and to say in their
-summary how many they attached, that the change has no UI, or why they could not take any. Missing screenshots are
-never a reason for `CHANGES` and never fail the stage.
+other roles do not get the tool.
 
+- **Prompts** (`prompts/ux.md`, `prompts/ui-design.md`, section "Screenshots"): the reviewer decides from the diff
+  whether the change touches a UI (web components, styles, templates, user-facing text). If it does, it **must** try
+  to run the app — reading the diff is not a review of a UI — and attach screenshots of the changed screens in the
+  states that matter (empty/filled, error/loading, both themes if the product has them, narrow width). Concretely:
+  read the project's preview recipe `.agern/preview.md` first if there is one; start the app from the run's worktree
+  on a free port (the four reviewers share the worktree), never on Agern's own port (`FACTORY_PORT`, named in the
+  review task) and never against a production service; find a headless browser (`chromium`, `chromium-browser`,
+  `google-chrome`, `google-chrome-stable`, or a Playwright install in the project) and wait for rendering
+  (`--virtual-time-budget=8000` with Chromium's `--screenshot`, or a Playwright script) — without it a single-page
+  app comes out blank; for a login-protected app prefer the project's mock or development mode, seed data or a test
+  user from its end-to-end setup; look at each image before attaching it; give each a one-line caption, quote the
+  caption in a finding the screenshot supports, delete the files after attaching and never commit them; stop
+  everything it started. The summary always says how many it attached, that the change has no UI, or — only after a
+  real attempt — the command it ran and the error it got. Missing screenshots are never a reason for `CHANGES` and
+  never fail the stage.
+- **Preview recipe:** a project can describe how to start its UI for review in `.agern/preview.md` (free text:
+  command, port, how to log in, useful pages). Agern's own is in the repository: the web frontend's mock mode
+  (`cd web && npm ci && npm run dev:mock -- --host 127.0.0.1 --port <free port> --strictPort`) runs against simulated
+  data in the browser and needs no server, database or login.
 - **Who:** decided from the MCP grant — the token's session must be the session of a `ux` or `ui-design` stage of the
   token's run, in the token's repository — never from tool arguments.
 - **Per round:** a screenshot belongs to the caller's stage row, so to its role and round. Each fix round creates new
@@ -928,9 +942,36 @@ never a reason for `CHANGES` and never fail the stage.
   reviewers attached <n> screenshot(s) of this change (<build | fix round N>). See them on <run page>:` followed by
   `- **<role>:** <caption>` per screenshot (reviewers in pipeline order, each in attach order). The run page is
   linked only when `FACTORY_PUBLIC_URL` is public (`Config.pageRef`), otherwise named. Images are never uploaded.
-- **Prerequisite:** reviewers run the app on the factory host, so for projects with a web UI a headless browser
-  (e.g. Chromium via Playwright) must be installed there by an administrator. Without it the reviewers report that
-  they could not take screenshots, and the run continues as usual.
+- **Warning "UI change reviewed without screenshots":** after the reviewers of a round (pipeline and follow-up
+  rounds alike) have all returned a verdict, Agern checks the round's diff (`git diff --name-only <baseRef>...HEAD`
+  in the worktree). When it touches UI files and neither the ux nor the ui-design stage of that round attached a
+  screenshot, it records the warning `UI change reviewed without screenshots: the change touches <n> UI file(s)
+  (<first three>, and <k> more), but neither the ux nor the ui-design reviewer attached a screenshot. Their summaries
+  should say what they tried and what failed.` on both stages (`stages.warning`, migration V21), shown on the run page
+  (`Run.warnings`, `Stage.warning`, §10), and comments it on the pull request (best effort):
+  `**Agern: warning — UI change reviewed without screenshots** (<build | fix round N>). …` with the run page reference
+  and up to ten of the files. It is a warning only: the run's status, the approver and the merge are unaffected.
+  Whether a reviewer's summary names a concrete failed attempt is not judged by the server: the warning shows either
+  way, and the summary is where a human reads why. Nothing is checked when the diff cannot be read.
+  - *UI files* (`pipeline/UiChanges.kt`, a deliberately simple path heuristic): extensions `tsx jsx vue svelte astro
+    css scss sass less styl html htm`, template extensions `hbs handlebars mustache ejs erb njk twig liquid j2 jinja
+    jinja2 pug jte ftl cshtml razor heex eex`, `ts js mjs` inside a `components`, `pages`, `views`, `screens`,
+    `layouts` or `templates` directory, and other non-code files under `templates/`. Never tests: paths with a
+    `test`, `tests`, `__tests__`, `e2e`, `spec`, `specs`, `cypress` or `playwright` directory, or a
+    `.test.`/`.spec.`/`.stories.` file name.
+  - *Per project:* `.agern/ui-files` on the run's base branch (read from the base ref, so a run cannot switch off its
+    own warning) replaces the defaults: one glob per line, `#` comments, `!glob` excludes; a glob without `/`
+    matches the file name in any directory, `*`/`?` stay within a path segment, `**` spans segments, a trailing `/`
+    means everything under it. Only exclusions: the defaults minus those. No rule at all (empty or comments only):
+    no file counts as UI, so no warning.
+- **Prerequisite:** reviewers run the app on the factory host, so for projects with a web UI a headless browser must
+  be installed there. The Debian package *recommends* `chromium` (`apt install chromium fonts-noto-core`; the fonts
+  keep text from rendering as boxes), and `agern doctor` warns when none of `chromium`, `chromium-browser`,
+  `google-chrome`, `google-chrome-stable` is on the agents' `PATH` (a project's own Playwright browser is not
+  checked). Verified on Debian with Chromium 156: the agent user takes a screenshot with
+  `chromium --headless --no-sandbox --disable-gpu --window-size=1280,800 --virtual-time-budget=8000 --screenshot=out.png <url>`.
+  Without a browser the reviewers report that they could not take screenshots, the run shows the warning above, and
+  it continues as usual.
 
 ### Releases
 
@@ -1668,7 +1709,8 @@ type Stage = { id: string; role: StageRole;
   findings: { severity: string; file: string | null; detail: string }[];
   sessionId: string | null; startedAt: string | null; endedAt: string | null;
   screenshots: Screenshot[];    // ux / ui-design only (§6 "Screenshots"), attach order; [] for other stages
-  images: GeneratedImage[] };   // images the stage's agent generated (spec-writer, builder), oldest first
+  images: GeneratedImage[];     // images the stage's agent generated (spec-writer, builder), oldest first
+  warning: string | null };     // a warning that never fails the stage, e.g. "UI change reviewed without screenshots: …"
 
 type GeneratedImage = { id: string; repo: string; origin: 'chat' | 'run'; sessionId: string;
   owner: { username: string; displayName: string }; provider: string; model: string;
@@ -1696,7 +1738,8 @@ type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; 
   continuesRunId: string | null;   // the failed run this one continues from its commits (§6 "Retrying a run")
   continuedByRunId: string | null; // the newest run that continues this one
   failureKind: 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | null;
-  failedStep: 'push' | 'pull_request' | 'merge' | null };  // the step after the builder that failed
+  failedStep: 'push' | 'pull_request' | 'merge' | null;  // the step after the builder that failed
+  warnings: { round: number; roles: StageRole[]; text: string }[] };  // the stages' warnings per round, oldest first
 
 type RetryOptions = { runId: string;       // '' for a release issue without a run
   recommended: 'step' | 'continue' | 'start_over'; reason: string;   // one line
@@ -2232,7 +2275,8 @@ package version replaces the `-` that starts a pre-release with `~` so dpkg sort
 first (`1.3.0-rc.1` → `1.3.0~rc.1` < `1.3.0`). Depends: `default-jre-headless (>= 2:1.17) |
 java17-runtime-headless` (checked with `apt-cache` on all three: Debian 12's default is OpenJDK 17,
 Debian 13's and Ubuntu 24.04's 21; `openjdk-17/21-jre-headless` provide `java17-runtime-headless`),
-`git`, `ca-certificates`, `curl`, `passwd`; Recommends `postgresql`; Suggests `gh`. The `claude`
+`git`, `ca-certificates`, `curl`, `passwd`; Recommends `postgresql`, `chromium` (the UI reviewers' headless browser,
+§6 "Screenshots"; Ubuntu has no `chromium` deb, only a snap, so apt skips it there); Suggests `gh`. The `claude`
 CLI is not a dependency (`agern doctor` reports it and how to install it). Layout: `/usr/bin/agern`,
 `/usr/share/agern/{agern.jar,VERSION,env.example}`, `/usr/lib/systemd/system/{agern.service,
 agern-upgrade.service,agern-upgrade.timer}` (`/usr/lib`, not `/lib`: all targets are merged-/usr),
@@ -2391,6 +2435,9 @@ On the run page, a selected stage (the selected round's stage row) that has scre
 section after its findings: a wrapping grid of lazily loaded thumbnails with their captions as `figcaption`. A
 thumbnail is a button ("Open screenshot: <caption>") that opens a dialog with the image scaled to fit, the caption,
 its type, size and dimensions and an "Open full size ↗" link. A stage without screenshots shows nothing extra.
+Each of the run's `warnings` is a notice under the header (`role="note"`, amber like other warnings): the warning's
+title in bold with the round's name, its detail, and a "See the <role> review" button that selects that stage and
+round. A stage with a `warning` shows it above its summary.
 Screenshots attached while the page is open arrive through the feed (`useLiveRun`), without a reload.
 Below them, a stage whose agent generated images (§6 "Generated images") shows "Generated images <n>": thumbnails
 ("Open image: <purpose>") with the purpose and the prompt in a "Prompt" disclosure, a lightbox with type, size,
