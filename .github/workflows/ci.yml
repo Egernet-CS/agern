@@ -33,6 +33,72 @@ jobs:
       - run: npm run lint
       - run: npm run build
 
+  e2e:
+    name: Web (e2e)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The Playwright suite (web/e2e) against the real server in fake mode (fake GitHub, Claude CLI and
+    # sandboxes). web/e2e/server.mjs builds the server (installDist) and the frontend itself and creates
+    # a fresh database per run in this PostgreSQL service, through psql on the runner.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: factory
+          POSTGRES_PASSWORD: factory
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U factory"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      E2E_PG_CONTAINER_CMD: env PGHOST=localhost PGPORT=5432 PGPASSWORD=factory
+      E2E_DB_HOST: localhost
+      E2E_DB_HOST_PORT: "5432"
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - run: npm ci
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+      - name: Playwright version
+        id: playwright
+        run: echo "version=$(node -p "require('playwright/package.json').version")" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-shell-${{ runner.os }}-${{ steps.playwright.outputs.version }}
+      # Headless runs use Chromium's headless shell; the system libraries are installed every time
+      # (apt), the browser itself only on a cache miss.
+      - name: Install Chromium (headless shell)
+        run: npx playwright install --with-deps --only-shell chromium
+      # One worker: the specs share one server and build on each other's state (playwright.config.ts).
+      - name: Run the e2e suite
+        run: npm run e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: |
+            web/playwright-report
+            web/test-results
+          if-no-files-found: ignore
+          retention-days: 7
+
   server:
     name: Server (build and tests)
     runs-on: ubuntu-latest
@@ -187,7 +253,7 @@ jobs:
   publish-main:
     name: Publish the rolling main pre-release
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [web, server, packaging, migrations, deb, deb-smoke, sandbox]
+    needs: [web, e2e, server, packaging, migrations, deb, deb-smoke, sandbox]
     runs-on: ubuntu-latest
     permissions:
       contents: write # move the main-latest tag and update its release assets
