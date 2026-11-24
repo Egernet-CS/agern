@@ -88,7 +88,7 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_SANDBOX_MAX_CONCURRENT` | `2` | Containers that run commands that may exist at the same time, over all runs (1–100): a run's sandbox takes one slot and each platform container it creates one more (sidecars take none). A builder that would exceed it first gives up its run's own idle containers, else gets a "busy" answer |
 | `FACTORY_SANDBOX_MAX_PLATFORMS` | `4` | Platforms a definition may name besides its default image (0–20; `0` forbids them) |
 | `FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES` | `30` | Default and maximum time for one sandbox command (1–1440), also capped by `FACTORY_STAGE_TIMEOUT_MINUTES` |
-| `FACTORY_DEV_FAKE_GITHUB` | `false` | Development only, requires `FACTORY_AUTH=dev`: in-memory fake GitHub (org with `demo-app`, `private-lab` and the workspace `demo-workspace` with its members `demo-ws-app` (base branch `dev`), `demo-ws-tools` and `demo-ws-lab` (only alice can read it); issues #1–#5 of `demo-workspace` carry one, no, several and an inaccessible member's label; the submodule workspace `demo-shop` whose `.gitmodules` declares `services/api` (`demo-shop-api`, SSH URL), `web` (`demo-shop-web`, relative URL, `branch = main`) and `vendor/icons` (another organization, context only), with issues #1–#2 labelled `demo-shop-api` and `demo-shop-web` and #3 without a member label (a run of `demo-shop` itself); tokens `fake-<login>` = classic with `repo`, `read:org`; `fake-<login>~<scope>,…` = only those scopes), local `git init` instead of clones, pushes skipped |
+| `FACTORY_DEV_FAKE_GITHUB` | `false` | Development only, requires `FACTORY_AUTH=dev`: in-memory fake GitHub (org with `demo-app`, `private-lab` and the workspace `demo-workspace` with its members `demo-ws-app` (base branch `dev`), `demo-ws-tools` and `demo-ws-lab` (only alice can read it); issues #1–#5 of `demo-workspace` carry one, no, several and an inaccessible member's label; the submodule workspace `demo-shop` whose `.gitmodules` declares `services/api` (`demo-shop-api`, SSH URL), `web` (`demo-shop-web`, relative URL, `branch = main`), `tools/cli` (`demo-ws-tools`, whose label no issue of `demo-shop` carries, so it is missing until Agern creates it) and `vendor/icons` (another organization, context only), with issues #1–#2 labelled `demo-shop-api` and `demo-shop-web` and #3 without a member label (a run of `demo-shop` itself); tokens `fake-<login>` = classic with `repo`, `read:org`; `fake-<login>~<scope>,…` = only those scopes), local `git init` instead of clones, pushes skipped |
 
 ## 4. Identity and secrets
 
@@ -367,6 +367,24 @@ repository). It follows the commit the workspace pins (chat syncs fast-forward t
 submodule update moves it); it is not synced against its base branch and has no `<checkout_status>` member line. In
 fake-GitHub mode, where the workspace clone is a local repository without submodules, a local repository stands in
 for it, as for a cloned member.
+
+**Member labels.** Issues are routed by label, so Agern makes sure every member's label exists in the workspace
+repository (both kinds of workspace), with the acting user's own token (`MemberLabels`). When `GET
+/api/projects/{repo}` builds the workspace, the repository's labels are listed (`GET /repos/{org}/{repo}/labels`,
+paged) and each member label missing there (compared ignoring case) is created: `POST /repos/{org}/{repo}/labels`
+with name = the label, a stable colour (the first three bytes of the SHA-256 of the lower-case name, each ×¾ so white
+text stays readable) and the description "Runs change the member <directory> (<repository>)" (at most 100
+characters). 422 `already_exists` counts as there; 403/404 (the token may not create labels) and other errors are
+logged and the label stays missing. Existing labels are never renamed or recoloured. This happens at most once per
+user, repository and definition (member labels, directories and repositories) within 5 minutes; the result is
+cached with it, and a failure (even to list the labels) never fails the page (no warning then). The labels still
+missing are `Workspace.missingLabels`; the project page shows them with a "Create missing labels" button, which calls
+`POST /api/projects/{repo}/workspace/labels` (any user who can see the project, as for creating an issue; GitHub
+decides with the caller's token): the same listing and creation, now regardless of the cache, answering
+`{ created, missing }`; 403 `labels_forbidden` "Your GitHub token cannot create labels in <org>/<repo>: <labels> are
+still missing." when GitHub refused and nothing was created; 409 `not_a_workspace` or `workspace_invalid`. The fake
+GitHub lists the labels its issues carry plus those created, and refuses to create labels in a repository while
+`<dataDir>/fake-github/<repo>/.agern-fake/labels-readonly` exists (for the end-to-end test).
 
 Layout under `workspaces/<user>/<workspace repo>/`:
 
@@ -1028,7 +1046,8 @@ token:
 
 Each outcome is a comment on the workspace issue and a `system` event (`info`, or `warn` when nothing was bumped) in
 the run's latest stage transcript. A bump that throws is logged and reported the same way (``**Agern: submodule
-pointer not bumped.** Moving … failed: <message>. Bump it by hand.``); the run stays `merged`. The workspace clone
+pointer not bumped.** Moving … failed: <message>. Bump it by hand.``). The bump runs after the worktree's clean-up and
+before the run is set to `merged`, so the outcome is on the issue when the run settles; it never fails the run. The workspace clone
 itself is not touched: its submodule moves when a chat sync fast-forwards it.
 
 **Releases** are not available for workspace projects defined by `.agern/workspace.yml` in this step: creating one
@@ -1976,7 +1995,8 @@ type Workspace = { path: '.agern/workspace.yml' | '.gitmodules'; valid: boolean;
     label: string;
     accessible: boolean;       // the caller's own token can read it
     submodule: boolean }[];    // a git submodule of the workspace repository; [] when invalid
-  contextOnly: string[] };     // paths of submodules that are not members (fetched, never a target)
+  contextOnly: string[];       // paths of submodules that are not members (fetched, never a target)
+  missingLabels: string[] };   // member labels missing in the workspace repository (§5 "Member labels")
 
 type IssueKind = 'feature' | 'bug' | 'task';      // from labels: bug → bug; enhancement/feature → feature; else task
 type Issue = { number: number; title: string; state: 'open' | 'closed'; kind: IssueKind;
@@ -2263,6 +2283,7 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `POST /api/projects/{repo}/sandbox/approval` | `{ sha256 }` → `SandboxStatus` | admin (403 otherwise; 404 when the admin cannot see the project or there is no file). Approves exactly the content with that hash, replacing the project's earlier approval; 400 malformed hash, 409 `sandbox_definition_changed` when the file now has another hash, 422 `sandbox_definition_invalid` |
 | `DELETE /api/projects/{repo}/sandbox/approval` | → `SandboxStatus` | admin; removes the project's approval (also when there is none). Runs already started keep their decision |
 | `GET /api/projects/{repo}/runs` | → `Run[]` | newest first |
+| `POST /api/projects/{repo}/workspace/labels` | → `{ created: string[]; missing: string[] }` | creates the missing member labels with the caller's token (§5 "Member labels"); 403 `labels_forbidden`, 409 `not_a_workspace` / `workspace_invalid`, 404 when the caller cannot see the project |
 | `POST /api/projects/{repo}/runs` | `{ issueNumber }` → `Run` | needs Claude credential; 409 if the issue has an active run; a workspace project: 409 `workspace_invalid`, `member_label_missing`, `member_label_ambiguous`, 403 `member_not_accessible` (§6 "Workspace runs") |
 | `GET /api/runs?active=true&status=<s>` | → `Run[]` | across visible repos, newest first (max 200). `active=true`: not finished, i.e. `queued`, `spec`, `building`, `reviewing`, `approving` or `needs_human`. `status`: only these statuses, repeatable and/or comma list (`?status=needs_human`); unknown status → 400. Both given: both apply |
 | `GET /api/runs/{id}` | → `Run` | |
@@ -2974,7 +2995,11 @@ plain text with the pill "no access" (title "Your GitHub token cannot read this 
 checkouts."), a submodule member the tag "submodule" (class `member-submodule`, title "A git submodule of the
 workspace repository. After a run's pull request merges, Agern opens a pull request that moves the submodule
 pointer."), the base branch (monospace) and the label as a tag. Below the rows, when there are any, a muted line
-"Context only (submodules of other organizations, never a run's target): `<path>`, …" (class `member-context`). The
+"Context only (submodules of other organizations, never a run's target): `<path>`, …" (class `member-context`). When
+`missingLabels` is not empty, a warning notice (class `member-labels-missing`) "Member labels missing on GitHub" —
+"Issues are routed to a member by its label. Missing: `<label>`, …" with the button "Create missing labels"
+("Creating…" while it runs) sits above the rows; afterwards it shows what is still missing (hidden when nothing is),
+and an error below it (class `member-labels-error`, `role="alert"`). The
 header tag's title names the definition's file ("Several repositories checked out side by side (<path>)"). An invalid
 definition shows instead a `role="alert"` box "`<path>` is invalid. Runs cannot start until it is fixed." with the
 errors as a list.

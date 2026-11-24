@@ -119,17 +119,20 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header,
     el?.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
   };
 
-  // Clear optimistic echo once the server's user event arrives.
-  useEffect(() => {
-    if (!sending) return;
+  // The optimistic echo is hidden as soon as the server's user event is in the stream (decided while rendering, so the
+  // message is never shown twice for a frame), and cleared afterwards.
+  const echoArrived = useMemo(() => {
+    if (!sending) return false;
     const ids = sending.attachments.map((a) => a.id).join();
-    const arrived = stream.events.some((e) => {
+    return stream.events.some((e) => {
       if (e.type !== 'user') return false;
       const p = e.payload as { text?: string; attachments?: unknown };
       return p?.text === sending.text && attachmentsOf(p.attachments).map((a) => a.id).join() === ids;
     });
-    if (arrived) setSending(null);
   }, [stream.events, sending]);
+  useEffect(() => {
+    if (echoArrived) setSending(null);
+  }, [echoArrived]);
 
   const send = useCallback(
     async (text: string) => {
@@ -274,7 +277,7 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header,
             <div className="t-meta">{isChat ? 'Empty session. Say hello — or type /factory help.' : isAdvisor ? 'No messages yet.' : 'Waiting for the agent to start…'}</div>
           )}
           <TranscriptItems items={items} me={me.username} sessionId={sessionId} />
-          {sending && (
+          {sending && !echoArrived && (
             <div className="t-user t-user--pending">
               <span className="t-prompt" aria-hidden>&gt;</span>
               <div className="t-user-body">

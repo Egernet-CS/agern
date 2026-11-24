@@ -1401,8 +1401,7 @@ class Orchestrator(
             bestEffort { client.closeIssue(org, run.repo, run.issueNumber) }
         }
         cleanupWorktree(run.id, merged = true)
-        runs.setFailure(run.id, null, null)
-        runs.setStatus(run.id, RunStatus.MERGED, clearError = true)
+        // Before the run counts as merged, so that its outcome is on the issue when the run settles; never fails the run.
         if (run.targetRepo != null && run.releaseId == null) {
             // Single runs merge on approval (the approver's or the owner's): the pointer bump follows the same way.
             try {
@@ -1413,6 +1412,8 @@ class Orchestrator(
                     "$org/${run.repo} to the merge of ${prRef(run, pr)} failed: ${e.message?.take(300)}. Bump it by hand.")
             }
         }
+        runs.setFailure(run.id, null, null)
+        runs.setStatus(run.id, RunStatus.MERGED, clearError = true)
     }
 
     /**

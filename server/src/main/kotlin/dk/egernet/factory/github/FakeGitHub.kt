@@ -15,7 +15,9 @@ class FakeGitHub(private val org: String) : GitHub {
                     /** Files on the default branch, by path (only what tests put there). */
                     val files: MutableMap<String, String> = mutableMapOf(),
                     /** Binary files on the default branch, by path (only what tests put there); they take precedence. */
-                    val byteFiles: MutableMap<String, ByteArray> = mutableMapOf())
+                    val byteFiles: MutableMap<String, ByteArray> = mutableMapOf(),
+                    /** Labels created through [Client.createLabel], by lower-case name (labels on issues exist too). */
+                    val labels: MutableMap<String, GhLabel> = mutableMapOf())
 
     val repos = mutableMapOf<String, Repo>()
     val actions = CopyOnWriteArrayList<String>()
@@ -79,6 +81,15 @@ class FakeGitHub(private val org: String) : GitHub {
         failNextMerges[repo] = n - 1
         return true
     }
+
+    /** Lets tests make label creation fail with this HTTP status (e.g. 403 for a token without push access). */
+    @Volatile var createLabelFailure: Int? = null
+
+    /**
+     * Development: creating labels in a repository fails with 403 while `<filesDir>/<repo>/.agern-fake/labels-readonly`
+     * exists (an end-to-end test switches it on and off).
+     */
+    private fun labelsReadOnly(repo: String) = dirFile(repo, ".agern-fake/labels-readonly") != null
 
     /** Clone URLs by repository instead of `fake://…` (a test with real remotes: local bare repositories). */
     val cloneUrls = java.util.concurrent.ConcurrentHashMap<String, String>()
@@ -251,6 +262,9 @@ class FakeGitHub(private val org: String) : GitHub {
             |	path = web
             |	url = ../demo-shop-web.git
             |	branch = main
+            |[submodule "cli"]
+            |	path = tools/cli
+            |	url = ../demo-ws-tools.git
             |[submodule "vendor/icons"]
             |	path = vendor/icons
             |	url = https://github.com/another-org/icons.git
@@ -293,7 +307,8 @@ class FakeGitHub(private val org: String) : GitHub {
 
     /**
      * A workspace built from git submodules: `demo-shop` has no `.agern/workspace.yml`, only a `.gitmodules` with the
-     * members `services/api` (`demo-shop-api`, an SSH URL) and `web` (`demo-shop-web`, a relative URL) and a submodule
+     * members `services/api` (`demo-shop-api`, an SSH URL), `web` (`demo-shop-web`, a relative URL) and `tools/cli`
+     * (`demo-ws-tools`, whose label no issue carries yet, so it is missing until Agern creates it) and a submodule
      * of another organization (context only), issues labelled with a member's repository name and one without a
      * member label (a run of `demo-shop` itself).
      */
@@ -303,7 +318,10 @@ class FakeGitHub(private val org: String) : GitHub {
         addRepo("demo-shop-web", "The shop's web app, a submodule of demo-shop")
         setFile("demo-shop", ".gitmodules", demoShopGitmodules(org))
         gitlinks["demo-shop:main"] = java.util.concurrent.ConcurrentHashMap(
-            mapOf("services/api" to "0".repeat(39) + "1", "web" to "0".repeat(39) + "2", "vendor/icons" to "0".repeat(39) + "3"),
+            mapOf(
+                "services/api" to "0".repeat(39) + "1", "web" to "0".repeat(39) + "2", "tools/cli" to "0".repeat(39) + "4",
+                "vendor/icons" to "0".repeat(39) + "3",
+            ),
         )
         addIssue("demo-shop", "Add a health endpoint", "The load balancer needs GET /health.", listOf("enhancement", "demo-shop-api"))
         addIssue("demo-shop", "Show the cart total in the header", "Users cannot see what the cart costs.", listOf("demo-shop-web"))
@@ -551,6 +569,23 @@ class FakeGitHub(private val org: String) : GitHub {
             actions += "update-branch $repo $branch"
             Unit
         }
+
+        override fun listLabels(org: String, repo: String): List<GhLabel> = synchronized(this@FakeGitHub) {
+            val r = repo(org, repo)
+            // As on GitHub, every label an issue carries exists in the repository.
+            (r.labels.values + r.issues.flatMap { it.labels }).distinctBy { it.name.lowercase() }
+        }
+
+        override fun createLabel(org: String, repo: String, name: String, color: String, description: String): Boolean =
+            synchronized(this@FakeGitHub) {
+                val r = repo(org, repo)
+                createLabelFailure?.let { throw GitHubException(it, "Resource not accessible by personal access token") }
+                if (labelsReadOnly(repo)) throw GitHubException(403, "Resource not accessible by personal access token")
+                if (listLabels(org, repo).any { it.name.equals(name, ignoreCase = true) }) return@synchronized false
+                r.labels[name.lowercase()] = GhLabel(name, color)
+                actions += "create-label $repo $name"
+                true
+            }
 
         private fun closePullList(number: Int) =
             pulls.values.forEach { l -> l.replaceAll { if (it.number == number) it.copy(state = "closed") else it } }

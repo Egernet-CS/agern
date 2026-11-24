@@ -27,6 +27,7 @@ import type {
   Settings,
   SoftwareRequest,
   User,
+  MemberLabelsResult,
 } from './types';
 
 /** One open realtime connection. Reconnection is the caller's job (see lib/realtime.ts). */
@@ -159,6 +160,8 @@ export interface Api {
 
   projectRuns(repo: string): Promise<Run[]>;
   startRun(repo: string, issueNumber: number): Promise<Run>;
+  /** Creates the missing member labels of a workspace project with the caller's token (403 `labels_forbidden`). */
+  createMemberLabels(repo: string): Promise<MemberLabelsResult>;
   /** `active`: not finished (incl. needs_human). `status`: only these statuses. Both given: both apply. */
   runs(filter?: { active?: boolean; status?: RunStatus[] }): Promise<Run[]>;
   run(id: string): Promise<Run>;

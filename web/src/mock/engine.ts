@@ -1129,6 +1129,7 @@ export function workspaceOf(repo: string, user: User): Workspace | null {
         }))
       : [],
     contextOnly: [],
+    missingLabels: [],
   };
 }
 

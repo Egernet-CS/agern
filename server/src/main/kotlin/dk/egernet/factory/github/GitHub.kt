@@ -212,6 +212,13 @@ interface GitHubClient {
     fun createGitlinkCommit(org: String, repo: String, parentSha: String, path: String, sha: String, message: String): String
     /** Moves the existing [branch] to [sha], also when that is not a fast-forward. */
     fun forceUpdateBranch(org: String, repo: String, branch: String, sha: String)
+    /** The repository's issue labels (at most a few thousand). */
+    fun listLabels(org: String, repo: String): List<GhLabel>
+    /**
+     * Creates the issue label [name] with [color] (6 hex digits) and [description]. False when a label of that name
+     * already exists (422 `already_exists`); other refusals surface as [GitHubException] (403/404: no permission).
+     */
+    fun createLabel(org: String, repo: String, name: String, color: String, description: String): Boolean
 }
 
 /** The merge methods [GitHubClient.mergePull] accepts: never `squash`. */
@@ -456,6 +463,17 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
                 put("tree", tree)
                 putJsonArray("parents") { add(parentSha) }
             }), "create commit"), "sha") ?: throw GitHubException(502, "GitHub create commit returned no sha")
+        }
+
+        override fun listLabels(org: String, repo: String): List<GhLabel> =
+            paged("/repos/${enc(org)}/${enc(repo)}/labels?per_page=100", GhLabel.serializer(), maxPages = 30)
+
+        override fun createLabel(org: String, repo: String, name: String, color: String, description: String): Boolean {
+            val r = send("POST", "/repos/${enc(org)}/${enc(repo)}/labels",
+                buildJsonObject { put("name", name); put("color", color); put("description", description) })
+            if (r.statusCode() == 422 && r.body().contains("already_exists")) return false
+            ok(r, "create label")
+            return true
         }
 
         override fun forceUpdateBranch(org: String, repo: String, branch: String, sha: String) {

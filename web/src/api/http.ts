@@ -162,6 +162,7 @@ export const httpApi: Api = {
 
   projectRuns: (repo) => get(`/api/projects/${enc(repo)}/runs`),
   startRun: (repo, issueNumber) => post(`/api/projects/${enc(repo)}/runs`, { issueNumber }),
+  createMemberLabels: (repo) => post(`/api/projects/${enc(repo)}/workspace/labels`, {}),
   runs: (filter = {}) => {
     const q = new URLSearchParams();
     if (filter.active) q.set('active', 'true');

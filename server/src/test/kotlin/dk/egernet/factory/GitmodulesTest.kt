@@ -172,6 +172,7 @@ class GitmodulesTest {
             listOf(
                 WorkspaceMember("services/api", "demo-shop-api", null, "demo-shop-api", submodule = true),
                 WorkspaceMember("web", "demo-shop-web", "main", "demo-shop-web", submodule = true),
+                WorkspaceMember("tools/cli", "demo-ws-tools", null, "demo-ws-tools", submodule = true),
             ),
             state.members,
         )
@@ -185,6 +186,6 @@ class GitmodulesTest {
         val yml = assertNotNull(s.workspaceDefs.lookup(alice, "demo-shop"))
         assertEquals(WORKSPACE_FILE, yml.path)
         assertEquals(listOf(WorkspaceMember("web", "demo-shop-web", "main", "web", submodule = true)), yml.members)
-        assertEquals(listOf("services/api", "vendor/icons"), yml.contextOnly.map { it.path })
+        assertEquals(listOf("services/api", "tools/cli", "vendor/icons"), yml.contextOnly.map { it.path })
     }
 }

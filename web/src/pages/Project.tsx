@@ -885,13 +885,49 @@ function NewReleaseDialog({ repo, open, onClose }: { repo: string; open: boolean
 
 /** The project's sandbox state in one row, linking to its sandbox page; live when an admin approves or revokes. */
 /** The members of a workspace project (ARCHITECTURE §5 "Workspace projects"), or why its definition is invalid. */
-function MembersSection({ workspace }: { workspace: Workspace }) {
+function MembersSection({ repo, workspace }: { repo: string; workspace: Workspace }) {
+  const [missing, setMissing] = useState(workspace.missingLabels);
+  const [creating, setCreating] = useState(false);
+  const [labelError, setLabelError] = useState<Error | null>(null);
+  useEffect(() => setMissing(workspace.missingLabels), [workspace.missingLabels]);
+  const createLabels = async () => {
+    setCreating(true);
+    setLabelError(null);
+    try {
+      setMissing((await api.createMemberLabels(repo)).missing);
+    } catch (e) {
+      setLabelError(e instanceof Error ? e : new Error(String(e)));
+    } finally {
+      setCreating(false);
+    }
+  };
   return (
     <>
       <div className="panel-head">
         <h2>Members</h2>
         {workspace.valid && <span className="muted small">{workspace.members.length}</span>}
       </div>
+      {workspace.valid && missing.length > 0 && (
+        <div className="member-labels-missing">
+          <Notice
+            tone="warn"
+            title="Member labels missing on GitHub"
+            action={
+              <button type="button" className="btn btn--sm" disabled={creating} onClick={() => void createLabels()}>
+                {creating ? 'Creating…' : 'Create missing labels'}
+              </button>
+            }
+          >
+            Issues are routed to a member by its label. Missing: {missing.map((l, n) => (
+              <span key={l}>
+                {n > 0 && ', '}
+                <code>{l}</code>
+              </span>
+            ))}
+          </Notice>
+          {labelError && <p className="muted small pad member-labels-error" role="alert">{labelError.message}</p>}
+        </div>
+      )}
       {!workspace.valid ? (
         <div className="ws-invalid" role="alert">
           <p>
@@ -1070,7 +1106,7 @@ function ActivityPanel({
           );
         })}
       </ul>
-      {workspace && <MembersSection workspace={workspace} />}
+      {workspace && <MembersSection repo={repo} workspace={workspace} />}
       <div className="panel-head">
         <h2>Releases</h2>
         {ownReleases && (

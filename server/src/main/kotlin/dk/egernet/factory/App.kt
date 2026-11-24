@@ -149,8 +149,10 @@ class Services(
         cfg, access, releaseStore, bus, releaseBuilder, releaseScheduler, releaseMerger, releaseModePolicy, workspaceDefs,
     )
     val projectIcons = dk.egernet.factory.db.ProjectIconStore(db)
+    val memberLabels = dk.egernet.factory.workspace.MemberLabels(access)
     val factory = FactoryService(
         cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases, images.store, projectIcons, workspaceDefs,
+        memberLabels,
     )
     val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes, screenshots, images)
 

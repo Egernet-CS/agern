@@ -85,7 +85,13 @@ data class ProjectDto(
 data class WorkspaceDto(
     val path: String, val valid: Boolean, val errors: List<String>, val members: List<WorkspaceMemberDto>,
     val contextOnly: List<String> = emptyList(),
+    /** Member labels that do not exist in the workspace repository (creating them failed); empty when all exist. */
+    val missingLabels: List<String> = emptyList(),
 )
+
+/** `POST /api/projects/{repo}/workspace/labels`: the labels created now, and those still missing. */
+@Serializable
+data class MemberLabelsDto(val created: List<String>, val missing: List<String>)
 
 /**
  * [branch]: the effective base branch, or the declared one (possibly null) for a member the caller cannot read.

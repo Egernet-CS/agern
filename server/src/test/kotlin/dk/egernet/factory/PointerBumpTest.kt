@@ -94,7 +94,7 @@ class PointerBumpTest {
         world.git.remoteCommit = { _, _ -> false }
         run()
         assertEquals("0".repeat(39) + "1", pointer("services/api"))
-        val bump = gh.pullMeta.values.single { it.repo == ws }
+        val bump = gh.pullMeta.values.singleOrNull { it.repo == ws } ?: error(comments().toString() + gh.actions)
         assertEquals("open", bump.state)
         assertTrue(comments().any { it.contains("was not merged. Submodule commit missing") }, comments().toString())
     }

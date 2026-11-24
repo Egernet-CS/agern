@@ -1,22 +1,58 @@
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { expect, test, type Page } from 'playwright/test';
 import { BASE, login } from './support';
 
 // A workspace built from git submodules (docs/ARCHITECTURE.md §5 "Workspace projects"): the fake GitHub's demo-shop has
-// no .agern/workspace.yml, only a .gitmodules with the members services/api (demo-shop-api) and web (demo-shop-web),
-// and a submodule of another organization (vendor/icons, context only).
+// no .agern/workspace.yml, only a .gitmodules with the members services/api (demo-shop-api), web (demo-shop-web) and
+// tools/cli (demo-ws-tools, whose label does not exist yet), and a submodule of another organization (vendor/icons).
 test.describe.configure({ mode: 'serial' });
 
 const members = (page: Page) => page.locator('.panel--activity .member-row');
 const issueRow = (page: Page, title: string) => page.locator('.issue-list .issue', { hasText: title });
 const startButton = (page: Page, title: string) => issueRow(page, title).getByRole('button', { name: '▶ Start run' });
 
+/** While it exists, the fake GitHub refuses to create labels in demo-shop (403), as for a token without push access. */
+function labelsReadOnly(on: boolean) {
+  const dir = process.env.E2E_DATA_DIR;
+  if (!dir) throw new Error('E2E_DATA_DIR is not set (the global setup starts the server)');
+  const file = join(dir, 'fake-github', 'demo-shop', '.agern-fake', 'labels-readonly');
+  if (on) {
+    mkdirSync(join(file, '..'), { recursive: true });
+    writeFileSync(file, '');
+  } else rmSync(file, { force: true });
+}
+
+// First in this file: the first page load of demo-shop would create the missing label by itself.
+test('missing member labels are shown and can be created', async ({ page }) => {
+  labelsReadOnly(true);
+  try {
+    await login(page, 'alice');
+    await page.goto(`${BASE()}/p/demo-shop`);
+    const warning = page.locator('.member-labels-missing');
+    await expect(warning).toContainText('Member labels missing on GitHub');
+    await expect(warning).toContainText('demo-ws-tools');
+    const button = warning.getByRole('button', { name: 'Create missing labels' });
+    await button.click();
+    await expect(page.locator('.member-labels-error')).toContainText('cannot create labels');
+    labelsReadOnly(false);
+    await button.click();
+    await expect(warning).toHaveCount(0);
+    await page.reload();
+    await expect(page.getByRole('heading', { name: 'Members' })).toBeVisible();
+    await expect(page.locator('.member-labels-missing')).toHaveCount(0);
+  } finally {
+    labelsReadOnly(false);
+  }
+});
+
 test('the members come from the submodules', async ({ page }) => {
   await login(page, 'alice');
   await page.goto(`${BASE()}/p/demo-shop`);
-  const tag = page.locator('.ph-meta .tag', { hasText: 'workspace · 2 members' });
+  const tag = page.locator('.ph-meta .tag', { hasText: 'workspace · 3 members' });
   await expect(tag).toBeVisible();
   await expect(tag).toHaveAttribute('title', 'Several repositories checked out side by side (.gitmodules)');
-  await expect(members(page)).toHaveCount(2);
+  await expect(members(page)).toHaveCount(3);
   const api = members(page).filter({ hasText: 'demo-shop-api' });
   await expect(api).toContainText('services/api');
   await expect(api.locator('.member-submodule')).toHaveText('submodule');
@@ -60,7 +96,7 @@ test('a run on a labelled issue changes the submodule in its own repository', as
 
   // The workspace issue is closed by Agern.
   await page.goto(`${BASE()}/p/demo-shop`);
-  await expect(members(page)).toHaveCount(2);
+  await expect(members(page)).toHaveCount(3);
   await expect(issueRow(page, 'Add a health endpoint')).toHaveCount(0);
   await expect(issueRow(page, 'Show the cart total in the header')).toHaveCount(1);
 });
