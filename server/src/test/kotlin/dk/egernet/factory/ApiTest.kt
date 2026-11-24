@@ -215,7 +215,7 @@ class ApiTest {
         val root = login("root", "pw-r")
 
         val projects = json(alice.get("/api/projects").bodyAsText()).jsonArray.map { it.jsonObject["name"]!!.jsonPrimitive.content }
-        val workspace = setOf("demo-workspace", "demo-ws-app", "demo-ws-tools")
+        val workspace = setOf("demo-workspace", "demo-ws-app", "demo-ws-tools", "demo-shop", "demo-shop-api", "demo-shop-web")
         assertEquals(setOf("demo-app", "private-lab", "demo-ws-lab") + workspace, projects.toSet())
         assertEquals(setOf("demo-app") + workspace, json(bob.get("/api/projects").bodyAsText()).jsonArray.map { it.jsonObject["name"]!!.jsonPrimitive.content }.toSet())
         // New fields of a project that is not a workspace: no workspace, no members on its issues, no target on its runs.
@@ -301,7 +301,7 @@ class ApiTest {
         val narrowed = json(alice.putJson("/api/me/github-token", """{"token":"fake-alice~public_repo"}""").bodyAsText()).jsonObject
         assertEquals(listOf("public_repo"), narrowed["githubTokenScopes"]!!.jsonArray.map { it.jsonPrimitive.content })
         assertEquals(
-            setOf("demo-app", "demo-workspace", "demo-ws-app", "demo-ws-tools"),
+            setOf("demo-app", "demo-workspace", "demo-ws-app", "demo-ws-tools", "demo-shop", "demo-shop-api", "demo-shop-web"),
             json(alice.get("/api/projects").bodyAsText()).jsonArray.map { it.jsonObject["name"]!!.jsonPrimitive.content }.toSet(),
         )
 

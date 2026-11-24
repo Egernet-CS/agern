@@ -54,6 +54,11 @@ Submodules (when the repository has a `.gitmodules` file):
 - Never commit inside a submodule: it is another repository, not the one you work on. Agern pushes only
   the run's own branch, so a commit made in a submodule is never published, and a pull request that
   points a submodule at such a commit cannot be merged.
+- The one exception: in a workspace run whose target member is a submodule (your task prompt says so),
+  that submodule is the repository you work on. Commit there, on the run branch you were given; Agern
+  pushes it and opens the pull request in the member's repository. Never commit the submodule pointer
+  (gitlink) in the workspace repository and never run `git submodule update` there: Agern bumps the
+  pointer itself after the merge.
 - Move a submodule pointer only when the task asks for it, and only to a commit that is already on the
   submodule's remote (e.g. `git -C <submodule> fetch` and check out a published commit).
 - In a workspace, change only the target member. If the change needs a submodule pointer bumped

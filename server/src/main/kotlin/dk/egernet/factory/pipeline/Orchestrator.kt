@@ -229,7 +229,7 @@ class Orchestrator(
             return dk.egernet.factory.agent.MemberCheckout(prevDir, prevRepo, prevBase)
         }
         val m = workspaceDefs.memberFor(owner, repo, issue) ?: return null
-        return dk.egernet.factory.agent.MemberCheckout(m.directory, m.repository, m.baseBranch!!)
+        return dk.egernet.factory.agent.MemberCheckout(m.directory, m.repository, m.baseBranch!!, m.member.submodule)
     }
 
     private fun launchJob(runId: UUID, block: suspend () -> Unit) {
@@ -712,14 +712,17 @@ class Orchestrator(
         val releaseName = run.baseBranch?.takeIf { run.releaseId != null }?.removePrefix("release/")
         val block = run.targetRepo?.let { tr ->
             // Rebuilt from the current definition: the members recorded as checked out for the run are its context.
-            val resolved = runCatching { workspaceDefs.resolved(owner, run.repo) }.getOrNull().orEmpty()
-                .filter { it.repository != tr }
+            val all = runCatching { workspaceDefs.resolved(owner, run.repo) }.getOrNull().orEmpty()
+            val submoduleTarget = all.any { it.repository == tr && it.directory == run.targetDir && it.member.submodule }
+            val resolved = all.filter { it.repository != tr }
             val others = resolved.filter { it.repository in run.contextRepos && it.baseBranch != null }
-                .map { dk.egernet.factory.agent.MemberCheckout(it.directory, it.repository, it.baseBranch!!) }
+                .map { dk.egernet.factory.agent.MemberCheckout(it.directory, it.repository, it.baseBranch!!, it.member.submodule) }
             val left = resolved.filter { it.repository !in run.contextRepos }.map {
                 dk.egernet.factory.agent.LeftOut(it.directory, it.repository, if (it.accessible) "not checked out for this run" else "your GitHub token cannot read it")
             }
-            workspaceBlock(run.repo, run.issueNumber, dk.egernet.factory.agent.MemberCheckout(run.targetDir ?: "", tr, target), others, left)
+            workspaceBlock(
+                run.repo, run.issueNumber, dk.egernet.factory.agent.MemberCheckout(run.targetDir ?: "", tr, target, submoduleTarget), others, left,
+            )
         }.orEmpty()
         RunContext(
             run.id, run.repo,
@@ -743,9 +746,18 @@ class Orchestrator(
         append("Target member directory: `${t.directory}` (repository $org/${t.repository}, base branch `${t.baseBranch}`). ")
         append("Run every git command for this change there, e.g. `git -C ${t.directory} status`. ")
         append("Only commits in `${t.directory}/` become the pull request.\n")
-        append("Other checkouts are read-only context at their base branch; do not edit, commit or push there:\n")
+        if (t.submodule) {
+            append("`${t.directory}` is a git submodule of $org/$wsRepo, checked out on the run branch from `${t.baseBranch}` (not at the ")
+            append("commit the workspace pins). Change only this submodule. Never commit the submodule pointer (gitlink) in the ")
+            append("workspace repository and do not run `git submodule update` in the root (it would reset `${t.directory}`): Agern ")
+            append("bumps the pointer in $org/$wsRepo after the pull request is merged.\n")
+        }
+        append("Other checkouts are read-only context; do not edit, commit or push there:\n")
         append("- `.` — $org/$wsRepo (workspace root files)\n")
-        others.forEach { append("- `${it.directory}` — $org/${it.repository} @ ${it.baseBranch}\n") }
+        others.forEach {
+            if (it.submodule) append("- `${it.directory}` — $org/${it.repository} @ the commit the workspace pins (submodule)\n")
+            else append("- `${it.directory}` — $org/${it.repository} @ ${it.baseBranch}\n")
+        }
         if (leftOut.isNotEmpty()) append("Not checked out: " + leftOut.joinToString(", ") { "`${it.directory}` (${it.reason})" } + "\n")
         append("The issue is $org/$wsRepo#$issueNumber; the pull request is opened in $org/${t.repository} against `${t.baseBranch}`.\n")
     }
@@ -1158,9 +1170,9 @@ class Orchestrator(
         val declared = state?.takeIf { it.valid }?.members?.firstOrNull { it.directory == tDir && it.repository == tRepo } ?: throw StageFailed(gone)
         val resolved = workspaceDefs.resolve(owner, state)
         if (resolved.firstOrNull { it.member == declared }?.accessible != true) throw StageFailed(workspaceDefs.notAccessible(declared).message)
-        val target = dk.egernet.factory.agent.MemberCheckout(tDir, tRepo, base)
+        val target = dk.egernet.factory.agent.MemberCheckout(tDir, tRepo, base, declared.submodule)
         val others = resolved.filter { it.member != declared && it.accessible && it.baseBranch != null }
-            .map { dk.egernet.factory.agent.MemberCheckout(it.directory, it.repository, it.baseBranch!!) }
+            .map { dk.egernet.factory.agent.MemberCheckout(it.directory, it.repository, it.baseBranch!!, it.member.submodule) }
         val unreadable = resolved.filter { !it.accessible }
             .map { dk.egernet.factory.agent.LeftOut(it.directory, it.repository, "your GitHub token cannot read it") }
         workspaces.ensureMain(id, run.repo)
@@ -1369,6 +1381,109 @@ class Orchestrator(
         cleanupWorktree(run.id, merged = true)
         runs.setFailure(run.id, null, null)
         runs.setStatus(run.id, RunStatus.MERGED, clearError = true)
+        if (run.targetRepo != null && run.releaseId == null) {
+            // Single runs merge on approval (the approver's or the owner's): the pointer bump follows the same way.
+            try {
+                bumpSubmodulePointer(run, client, pr, autoMerge = true)
+            } catch (e: Exception) {
+                log.warn("Run {}: bumping the submodule pointer failed: {}", run.id, e.message)
+                pointerNotice(run, client, "warn", "**Agern: submodule pointer not bumped.** Moving `${run.targetDir}` in " +
+                    "$org/${run.repo} to the merge of ${prRef(run, pr)} failed: ${e.message?.take(300)}. Bump it by hand.")
+            }
+        }
+    }
+
+    /**
+     * After the pull request [pr] of a workspace run whose target is a submodule merged (docs/ARCHITECTURE.md §6
+     * "Workspace runs"): a commit on a branch of the workspace repository moves the gitlink at the target's directory to
+     * the merge commit, opened as a pull request against the default branch and squash-merged when [autoMerge]. The
+     * merge commit must exist in the member repository. A merge that fails (e.g. the default branch moved and the same
+     * gitlink changed) is retried once from the new tip of the default branch; after that the pull request is left
+     * open. The outcome goes to the workspace issue and the run's transcript. Nothing for other runs. Blocking.
+     */
+    private fun bumpSubmodulePointer(run: RunRecord, client: GitHubClient, pr: Int, autoMerge: Boolean) {
+        val owner = users.byId(run.ownerId) ?: return
+        val member = runCatching { workspaceDefs.lookup(owner, run.repo) }.getOrNull()?.takeIf { it.valid }?.members
+            ?.firstOrNull { it.directory == run.targetDir && it.repository == run.targetRepo && it.submodule } ?: return
+        val ws = run.repo
+        val dir = member.directory
+        val sha = client.getPull(org, member.repository, pr)?.mergeCommitSha
+            ?: throw IllegalStateException("GitHub did not report the merge commit of ${prRef(run, pr)}")
+        // The merge guard (#90): never point the workspace at a commit its member repository does not have.
+        if (!client.commitExists(org, member.repository, sha)) {
+            pointerNotice(run, client, "warn", "**Agern: submodule pointer not bumped.** The merge commit `${sha.take(12)}` of " +
+                "${prRef(run, pr)} is not in $org/${member.repository}, so `$dir` in $org/$ws was left where it is.")
+            return
+        }
+        val defaultBranch = client.getRepo(org, ws)?.defaultBranch ?: throw IllegalStateException("$org/$ws is not readable")
+        if (client.gitlinkAt(org, ws, dir, defaultBranch) == sha) {
+            pointerNotice(run, client, "info", "**Agern: submodule pointer** `$dir` in $org/$ws already points at `${sha.take(12)}`.")
+            return
+        }
+        val branch = "factory/bump-${dir.replace('/', '-')}-${run.id.toString().take(8)}"
+        val title = "Bump $dir to ${sha.take(12)} ($org/${member.repository}#$pr)"
+        val body = "Moves the submodule `$dir` to $org/${member.repository}@$sha, the merge of $org/${member.repository}#$pr " +
+            "for $org/$ws#${run.issueNumber}.\n\nOpened by Agern for run `${run.id}`."
+        var pull: dk.egernet.factory.github.GhPull? = null
+        var lastError: String? = null
+        for (attempt in 0..1) {
+            // From the current tip of the default branch each time: a retry rebases the bump onto what moved meanwhile.
+            val tip = client.branchSha(org, ws, defaultBranch) ?: throw IllegalStateException("Branch $defaultBranch of $org/$ws not found")
+            val commit = client.createGitlinkCommit(org, ws, tip, dir, sha, title)
+            if (client.branchSha(org, ws, branch) == null) client.createBranch(org, ws, branch, commit)
+            else client.forceUpdateBranch(org, ws, branch, commit)
+            val p = pull ?: client.findOpenPull(org, ws, branch) ?: client.createPull(org, ws, branch, defaultBranch, title, body)
+            pull = p
+            if (!autoMerge) {
+                pointerNotice(run, client, "info", "**Agern: submodule pointer** `$dir` → `${sha.take(12)}`: pull request ${p.htmlUrl} " +
+                    "is open for a human to merge.")
+                return
+            }
+            // The merge guard of every run (docs/ARCHITECTURE.md §6 "Submodule pointers") for the pointer Agern moved itself.
+            bumpProblem(owner, ws, defaultBranch, branch, "$org/$ws#${p.number}")?.let { problem ->
+                pointerNotice(run, client, "warn", "**Agern: submodule pointer** `$dir` → `${sha.take(12)}`: pull request ${p.htmlUrl} " +
+                    "was not merged. ${problem.text}")
+                return
+            }
+            try {
+                client.squashMerge(org, ws, p.number, title)
+                bestEffort { client.deleteBranch(org, ws, branch) }
+                pointerNotice(run, client, "info", "**Agern: submodule pointer** `$dir` → `${sha.take(12)}`: merged pull request ${p.htmlUrl}.")
+                return
+            } catch (e: Exception) {
+                lastError = e.message
+                log.info("Run {}: merging pointer bump #{} failed (attempt {}): {}", run.id, p.number, attempt + 1, e.message)
+            }
+        }
+        pointerNotice(run, client, "warn", "**Agern: submodule pointer** `$dir` → `${sha.take(12)}`: pull request ${pull?.htmlUrl} " +
+            "could not be merged (${lastError?.take(300)}); it is left open for a human.")
+    }
+
+    /**
+     * [SubmoduleCheck] of the pointer bump on [branch] of workspace [ws] against [target], in the owner's workspace clone;
+     * null when it may be merged. Fails closed like the runs' check. Blocking; never throws.
+     */
+    private fun bumpProblem(owner: UserRecord, ws: String, target: String, branch: String, prRef: String): SubmoduleCheck.Problem? {
+        val unchecked = SubmoduleCheck.Problem(SubmoduleCheck.UNCHECKED, "Its submodule pointer could not be checked.")
+        return try {
+            val home = workspaces.home(owner.username)
+            val token = access.githubToken(owner)
+            val links = workspaces.withRepoLock(owner.username, ws) {
+                workspaces.git.changedGitlinks(workspaces.mainDir(owner.username, ws), target, branch, home, token)
+            } ?: return unchecked
+            SubmoduleCheck.check(links, target, prRef, has = { workspaces.git.remoteHasCommit(it.url!!, it.sha, home, token) })
+        } catch (e: Exception) {
+            log.warn("Checking the pointer bump {} of {} failed: {}", branch, ws, e.message)
+            unchecked
+        }
+    }
+
+    /** The outcome of a pointer bump: a comment on the workspace issue and an event in the run's latest transcript. */
+    private fun pointerNotice(run: RunRecord, client: GitHubClient, level: String, text: String) {
+        bestEffort { client.comment(org, run.repo, run.issueNumber, text) }
+        runs.stages(run.id).lastOrNull { it.sessionId != null }?.sessionId?.let { sid ->
+            bestEffort { agents.systemEvent(sid, level, text.replace("**", "")) }
+        }
     }
 
     /**
@@ -1454,10 +1569,13 @@ class Orchestrator(
 
     /**
      * The `warn` text for submodules in which the builder committed (docs/ARCHITECTURE.md §6 "Submodule pointers"): in the
-     * run's checkout [root] and its target worktree [worktree] (the same directory outside workspaces); null when none.
+     * run's checkout [root] and its target worktree [worktree] (the same directory outside workspaces; never the target
+     * itself when it is a submodule of the root); null when none.
      */
     private fun submoduleCommitsWarning(root: Path, worktree: Path, home: Path): String? {
-        val found = workspaces.git.unpushedSubmodules(root, home).map { it.path to it.commits } +
+        // A submodule target's worktree is a submodule of the root too: its commits are the run's own (pushed by Agern).
+        val target = if (worktree == root) null else root.relativize(worktree).toString()
+        val found = workspaces.git.unpushedSubmodules(root, home).filter { it.path != target }.map { it.path to it.commits } +
             if (worktree == root) emptyList() else workspaces.git.unpushedSubmodules(worktree, home).map { "${root.relativize(worktree)}/${it.path}" to it.commits }
         if (found.isEmpty()) return null
         return "Commits inside submodules: " + found.joinToString(", ") { (path, n) -> "`$path` ($n commit(s))" } +

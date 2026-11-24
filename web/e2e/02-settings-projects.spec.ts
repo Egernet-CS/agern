@@ -24,8 +24,9 @@ test('settings: register the fake GitHub token and a Claude credential; projects
   await gh.getByRole('button', { name: 'Replace' }).click();
   await expect(gh.getByText('This token can only see public repositories and cannot push')).toBeVisible();
   await page.goto(`${BASE()}/`);
-  // demo-app and the public repositories of the seeded workspace (demo-workspace, demo-ws-app, demo-ws-tools).
-  await expect(page.locator('.project-card')).toHaveCount(4);
+  // demo-app and the public repositories of the seeded workspaces (demo-workspace, demo-ws-app, demo-ws-tools;
+  // demo-shop, demo-shop-api, demo-shop-web).
+  await expect(page.locator('.project-card')).toHaveCount(7);
   await expect(page.locator('.token-hint')).toContainText('Only public repositories are listed.');
   await page.locator('.token-hint').getByRole('link', { name: 'check it in Settings' }).click();
   await page.locator('#github').getByLabel('Personal access token').fill('fake-alice');
@@ -34,19 +35,19 @@ test('settings: register the fake GitHub token and a Claude credential; projects
 
   await page.goto(`${BASE()}/`);
   const cards = page.locator('.project-card');
-  await expect(cards).toHaveCount(6);
+  await expect(cards).toHaveCount(9);
   await expect(page.locator('.token-hint')).toHaveCount(0);
   await expect(cards.filter({ hasText: 'demo-app' })).toContainText('public');
   await expect(cards.filter({ hasText: 'private-lab' })).toContainText('private');
-  await expect(page.locator('.hero-stats')).toContainText('projects6');
+  await expect(page.locator('.hero-stats')).toContainText('projects9');
 });
 
 test('a second user without access does not see the private repository', async ({ page }) => {
   await login(page, 'bob');
   await registerCredentials(page, 'bob');
   await page.goto(`${BASE()}/`);
-  // demo-app and the workspace's public repositories; not private-lab or demo-ws-lab.
-  await expect(page.locator('.project-card')).toHaveCount(4);
+  // demo-app and the workspaces' public repositories; not private-lab or demo-ws-lab.
+  await expect(page.locator('.project-card')).toHaveCount(7);
   await expect(page.locator('.project-card', { hasText: 'demo-app' })).toHaveCount(1);
   await expect(page.getByText('private-lab')).toHaveCount(0);
   await expect(page.getByText('demo-ws-lab')).toHaveCount(0);

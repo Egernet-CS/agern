@@ -14,7 +14,6 @@ import dk.egernet.factory.github.GhIssue
 import dk.egernet.factory.github.GhRepo
 import dk.egernet.factory.github.GitHubException
 import dk.egernet.factory.pipeline.Orchestrator
-import dk.egernet.factory.workspace.WORKSPACE_FILE
 import dk.egernet.factory.workspace.WorkspaceState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -95,10 +94,14 @@ class FactoryService(
         val ws = withContext(Dispatchers.IO) {
             workspaces.lookup(user, r.name)?.let { state ->
                 WorkspaceDto(
-                    WORKSPACE_FILE, state.valid, state.errors,
+                    state.path, state.valid, state.errors,
                     workspaces.resolve(user, state).map {
-                        WorkspaceMemberDto(it.directory, it.repository, if (it.accessible) it.baseBranch else it.member.branch, it.member.label, it.accessible)
+                        WorkspaceMemberDto(
+                            it.directory, it.repository, if (it.accessible) it.baseBranch else it.member.branch, it.member.label,
+                            it.accessible, it.member.submodule,
+                        )
                     },
+                    state.contextOnly.map { it.path },
                 )
             }
         }

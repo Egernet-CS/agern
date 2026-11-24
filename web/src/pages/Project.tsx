@@ -115,7 +115,7 @@ export function ProjectPage() {
           <span>{activeRuns} run{activeRuns === 1 ? '' : 's'} in flight</span>
           {p && <span>{p.openIssues} open issues</span>}
           {p?.workspace?.valid && (
-            <span className="tag" title="Several repositories checked out side by side (.agern/workspace.yml)">
+            <span className="tag" title={`Several repositories checked out side by side (${p.workspace.path})`}>
               workspace · {plural(p.workspace.members.length, 'member')}
             </span>
           )}
@@ -410,7 +410,7 @@ const NO_RELEASE = '__none__';
  */
 function workspaceStartBlock(ws: Workspace | null, i: Issue): string | null {
   if (!ws) return null;
-  if (!ws.valid) return 'Fix .agern/workspace.yml first';
+  if (!ws.valid) return `Fix ${ws.path} first`;
   const m = i.workspaceMembers ?? [];
   if (m.length === 0) return 'Add one member label on GitHub first';
   if (m.length > 1) return 'Keep exactly one member label';
@@ -881,7 +881,7 @@ function MembersSection({ workspace }: { workspace: Workspace }) {
       {!workspace.valid ? (
         <div className="ws-invalid" role="alert">
           <p>
-            <code>.agern/workspace.yml</code> is invalid. Runs cannot start until it is fixed.
+            <code>{workspace.path}</code> is invalid. Runs cannot start until it is fixed.
           </p>
           <ul>
             {workspace.errors.map((e, n) => (
@@ -905,6 +905,14 @@ function MembersSection({ workspace }: { workspace: Workspace }) {
                     no access
                   </span>
                 )}
+                {m.submodule && (
+                  <span
+                    className="tag tag--plain member-submodule"
+                    title="A git submodule of the workspace repository. After a run's pull request merges, Agern opens a pull request that moves the submodule pointer."
+                  >
+                    submodule
+                  </span>
+                )}
               </div>
               <div className="rr-bot">
                 {m.branch ? <span className="mono member-branch">{m.branch}</span> : <span className="muted">default branch</span>}
@@ -913,6 +921,17 @@ function MembersSection({ workspace }: { workspace: Workspace }) {
             </li>
           ))}
         </ul>
+      )}
+      {workspace.valid && workspace.contextOnly.length > 0 && (
+        <p className="muted small pad member-context">
+          Context only (submodules of other organizations, never a run's target):{' '}
+          {workspace.contextOnly.map((c, n) => (
+            <span key={c}>
+              {n > 0 && ', '}
+              <code>{c}</code>
+            </span>
+          ))}
+        </p>
       )}
     </>
   );

@@ -59,6 +59,11 @@ data class Config(
     /** How often a streamed MCP answer sends a progress notification or keep-alive while the call runs. */
     val mcpProgressEveryMs: Long = 15_000,
 ) {
+    /** The git host's HTTPS base (`https://github.com/`, or the GitHub Enterprise host of [githubApiUrl]). */
+    val gitHost: String
+        get() = if (githubApiUrl == "https://api.github.com") "https://github.com/"
+            else githubApiUrl.substringBefore("/api/").trimEnd('/') + "/"
+
     /**
      * The MCP tool-call and idle timeouts given to every agent (`MCP_TOOL_TIMEOUT`, `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`):
      * longer than any call can take (no call outlives the stage; the first sandbox call adds creation and setup).

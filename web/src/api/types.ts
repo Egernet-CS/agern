@@ -59,14 +59,19 @@ export type WorkspaceMember = {
   label: string;
   /** Whether the caller's own GitHub token can read the repository. */
   accessible: boolean;
+  /** The member is a git submodule of the workspace repository; Agern bumps its pointer after a run merges. */
+  submodule: boolean;
 };
 
 export type Workspace = {
-  path: '.agern/workspace.yml';
+  /** Where the definition comes from: the workspace file, or the submodules (`.gitmodules`) when there is none. */
+  path: '.agern/workspace.yml' | '.gitmodules';
   valid: boolean;
   errors: string[];
   /** Empty when the definition is invalid. */
   members: WorkspaceMember[];
+  /** Paths of submodules that are not members (another organization): fetched as context, never a run's target. */
+  contextOnly: string[];
 };
 
 /** Largest project icon the server accepts (1 MiB); used for the client pre-check and by the mock. */

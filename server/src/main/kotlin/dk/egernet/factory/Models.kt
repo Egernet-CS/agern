@@ -77,12 +77,25 @@ data class ProjectDto(
     val workspace: WorkspaceDto? = null,
 )
 
+/**
+ * [path]: where the definition comes from, `.agern/workspace.yml` or `.gitmodules` (members derived from the
+ * submodules). [contextOnly]: the paths of submodules that are not members (fetched, never a run's target).
+ */
 @Serializable
-data class WorkspaceDto(val path: String, val valid: Boolean, val errors: List<String>, val members: List<WorkspaceMemberDto>)
+data class WorkspaceDto(
+    val path: String, val valid: Boolean, val errors: List<String>, val members: List<WorkspaceMemberDto>,
+    val contextOnly: List<String> = emptyList(),
+)
 
-/** [branch]: the effective base branch, or the declared one (possibly null) for a member the caller cannot read. */
+/**
+ * [branch]: the effective base branch, or the declared one (possibly null) for a member the caller cannot read.
+ * [submodule]: the member is a git submodule of the workspace repository (Agern bumps its pointer after a merge).
+ */
 @Serializable
-data class WorkspaceMemberDto(val directory: String, val repository: String, val branch: String?, val label: String, val accessible: Boolean)
+data class WorkspaceMemberDto(
+    val directory: String, val repository: String, val branch: String?, val label: String, val accessible: Boolean,
+    val submodule: Boolean = false,
+)
 
 /** A member whose label an issue carries. */
 @Serializable

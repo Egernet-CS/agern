@@ -16,8 +16,12 @@ const val WORKSPACE_FILE = ".agern/workspace.yml"
  * One member of a workspace (docs/ARCHITECTURE.md §5 "Workspace projects"): checked out at [directory] (relative to the
  * workspace root, `/`-separated), the bare repository name [repository] of the configured organization, the declared
  * base [branch] (null: the member repository's default branch) and the issue [label] that routes issues to it.
+ * [submodule]: the member is a git submodule of the workspace repository at [directory] (the submodule checkout is
+ * the member's checkout; Agern does not clone it), else Agern clones it there itself.
  */
-data class WorkspaceMember(val directory: String, val repository: String, val branch: String?, val label: String)
+data class WorkspaceMember(
+    val directory: String, val repository: String, val branch: String?, val label: String, val submodule: Boolean = false,
+)
 
 sealed interface ParsedWorkspace {
     data class Valid(val members: List<WorkspaceMember>) : ParsedWorkspace
@@ -49,6 +53,11 @@ object WorkspaceDefinitions {
     /** Whether [branch] is a valid base branch name. */
     fun validBranch(branch: String): Boolean = branchProblem(branch) == null
 
+    /** Whether [label] is a valid issue label for a member (trimmed, 1–50 characters, no control characters, not reserved). */
+    fun validLabel(label: String): Boolean =
+        label == label.trim() && label.isNotEmpty() && label.length <= MAX_LABEL_CHARS && label.none { it.isISOControl() } &&
+            label.lowercase() !in RESERVED_LABELS
+
     private fun directoryProblem(d: String): String? {
         val segments = d.split('/')
         if (segments.size > MAX_DIRECTORY_SEGMENTS) return "at most $MAX_DIRECTORY_SEGMENTS path segments"
@@ -69,7 +78,15 @@ object WorkspaceDefinitions {
         else -> null
     }
 
-    fun parse(content: String, org: String, workspaceRepo: String): ParsedWorkspace {
+    /**
+     * [submodules]: the workspace repository's submodules (`.gitmodules` on its default branch). A member whose
+     * directory is a submodule's path is that submodule ([WorkspaceMember.submodule]); its repository must be the one
+     * the submodule's URL names, and without a `branch` of its own it takes the submodule's.
+     */
+    fun parse(
+        content: String, org: String, workspaceRepo: String, submodules: List<ResolvedSubmodule> = emptyList(),
+        defaultBranch: String = "main",
+    ): ParsedWorkspace {
         if (content.toByteArray(Charsets.UTF_8).size > MAX_BYTES) {
             return ParsedWorkspace.Invalid(listOf("$WORKSPACE_FILE is larger than ${MAX_BYTES / 1024} KiB"))
         }
@@ -109,7 +126,15 @@ object WorkspaceDefinitions {
                 errors += "$path.label: '${m.label}' is the label of another member (labels must be unique, ignoring case)"
             }
         }
-        return if (errors.isEmpty()) ParsedWorkspace.Valid(members.map { it.second }) else ParsedWorkspace.Invalid(errors)
+        val result = members.map { (i, m) ->
+            val sub = submodules.firstOrNull { it.path == m.directory } ?: return@map m
+            if (sub.repository == null || !sub.repository.equals(m.repository, ignoreCase = true)) {
+                errors += "members[$i].directory: '${m.directory}' is the submodule ${sub.submodule.url} in $GITMODULES_FILE, " +
+                    "not the repository $org/${m.repository}"
+            }
+            m.copy(submodule = true, branch = m.branch ?: Gitmodules.branchOf(sub.submodule, defaultBranch))
+        }
+        return if (errors.isEmpty()) ParsedWorkspace.Valid(result) else ParsedWorkspace.Invalid(errors)
     }
 
     private fun member(node: YamlNode, path: String, org: String, workspaceRepo: String, errors: MutableList<String>): WorkspaceMember? {

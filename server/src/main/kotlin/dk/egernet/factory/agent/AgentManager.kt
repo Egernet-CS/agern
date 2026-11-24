@@ -381,20 +381,22 @@ class AgentManager(
         val defs = workspaceDefs ?: return null
         val state = defs.lookup(owner, repo) ?: return null
         val resolved = defs.resolve(owner, state)
-        val wanted = resolved.filter { it.accessible && it.baseBranch != null }.map { MemberCheckout(it.directory, it.repository, it.baseBranch!!) }
+        val wanted = resolved.filter { it.accessible && it.baseBranch != null }
+            .map { MemberCheckout(it.directory, it.repository, it.baseBranch!!, it.member.submodule) }
         val wc = workspaces.ensureWorkspace(identity, repo, wanted)
         sessions.addContextRepos(sessionId, wc.checkedOut.map { it.repository })
         recordChatClones(sessionId, owner, repo)
         val left = resolved.filter { !it.accessible }.map { LeftOut(it.directory, it.repository, "your GitHub token cannot read it") } + wc.leftOut
         val note = buildString {
             if (!state.valid) {
-                append("The workspace definition `.agern/workspace.yml` is invalid (${state.firstProblem}), so only the workspace ")
+                append("The workspace definition `${state.path}` is invalid (${state.firstProblem}), so only the workspace ")
                 append("repository is checked out and no run can start until it is fixed.\n")
             }
             if (resolved.isNotEmpty()) append("Members (directory, repository, base branch, issue label):\n")
             wc.checkedOut.forEach { m ->
                 val label = state.members.firstOrNull { it.directory == m.directory }?.label ?: m.repository
-                append("- `${m.directory}` — ${cfg.githubOrg}/${m.repository}, base `${m.baseBranch}`, label `$label`\n")
+                val kind = if (m.submodule) " (a git submodule of the workspace repository, at the commit it pins)" else ""
+                append("- `${m.directory}` — ${cfg.githubOrg}/${m.repository}, base `${m.baseBranch}`, label `$label`$kind\n")
             }
             left.forEach { append("- `${it.directory}` — ${cfg.githubOrg}/${it.repository}: not checked out (${it.reason})\n") }
         }
