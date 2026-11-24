@@ -262,7 +262,11 @@ class Workspaces(private val cfg: Config, val git: GitOps, private val github: G
         for (m in clonedMembers(username, repo)) {
             val clone = runCatching { memberPath(main, m.directory) }.getOrNull() ?: continue
             if (!Files.isDirectory(clone)) continue
-            git.removeWorktree(clone, memberPath(root, m.directory), home, keepUnpushed)
+            val wt = memberPath(root, m.directory)
+            // A symbolic link of the workspace repository at a member path was never a worktree of ours: never follow it
+            // (removing the root worktree removes the link itself).
+            if (!noSymlinks(root, wt)) continue
+            git.removeWorktree(clone, wt, home, keepUnpushed)
         }
         git.removeWorktree(main, root, home, keepUnpushed)
     }

@@ -71,15 +71,17 @@ class WorkspaceCheckoutTest {
         .filter { Files.isDirectory(it.resolve(".git")) }
         .flatMap { clone -> git.listWorktrees(clone, home).map { it.path }.filter { it.toRealPath() != clone.toRealPath() } }
 
-    private fun awaitChatCheckout(user: String, dirs: List<String>) {
+    /** Creates a chat of [user] and waits until its checkout has recorded [n] member repositories. */
+    private fun chatCheckout(user: dk.egernet.factory.db.UserRecord, n: Int) {
+        val chat = s.agents.createChat(user, ws, null)
         val deadline = System.currentTimeMillis() + 10_000
-        while (dirs.any { !Files.isDirectory(main(user).resolve(it).resolve(".git")) } && System.currentTimeMillis() < deadline) Thread.sleep(20)
+        while (s.sessions.get(chat.id)!!.contextRepos.size < n && System.currentTimeMillis() < deadline) Thread.sleep(20)
+        assertEquals(n, s.sessions.get(chat.id)!!.contextRepos.size)
     }
 
     @Test
     fun `a chat checks out the members its owner can read`() {
-        s.agents.createChat(alice, ws, null)
-        awaitChatCheckout("alice", listOf("app", "tools/cli", "lab"))
+        chatCheckout(alice, 3)
         assertEquals("dev", branchOf(main().resolve("app")))
         assertEquals("main", branchOf(main().resolve("tools/cli")))
         assertEquals("main", branchOf(main().resolve("lab")))
@@ -90,9 +92,7 @@ class WorkspaceCheckoutTest {
         val members = Files.readString(s.workspaces.repoDir("alice", ws).resolve("members.json"))
         assertTrue(members.contains("\"repository\":\"demo-ws-app\""), members)
 
-        s.agents.createChat(bob, ws, null)
-        awaitChatCheckout("bob", listOf("app", "tools/cli"))
-        Thread.sleep(200)
+        chatCheckout(bob, 2)
         assertFalse(Files.exists(main("bob").resolve("lab")), "bob cannot read demo-ws-lab")
     }
 
@@ -168,6 +168,28 @@ class WorkspaceCheckoutTest {
         // Two commits: the first run's and this one's.
         assertEquals(2, gitIn(app, "rev-list", "--count", "dev..HEAD").trim().toInt())
         runBlocking { s.orchestrator.cancel(alice, next.id) }
+    }
+
+    @Test
+    fun `a symbolic link at a member path is never followed`() {
+        script()
+        chatCheckout(alice, 3)
+        // The workspace repository gains a symbolic link where the member `app` goes (written with plumbing: main/app is
+        // Agern's clone of demo-ws-app on disk).
+        val outside = Files.createTempDirectory("agern-outside")
+        Files.writeString(outside.resolve("keep.txt"), "keep")
+        val blob = ProcessBuilder("git", "hash-object", "-w", "--stdin").directory(main().toFile()).start().let { p ->
+            p.outputStream.use { it.write(outside.toString().toByteArray()) }
+            p.inputStream.bufferedReader().readText().trim().also { p.waitFor() }
+        }
+        gitIn(main(), "update-index", "--add", "--cacheinfo", "120000,$blob,app")
+        gitIn(main(), "commit", "-q", "-m", "Link app elsewhere")
+        val failed = await(start().id)
+        assertEquals(RunStatus.FAILED, failed.status)
+        assertTrue(failed.error!!.contains("occupied"), failed.error)
+        assertEquals("keep", Files.readString(outside.resolve("keep.txt")), "clean-up never follows the link")
+        assertFalse(Files.exists(runDir(failed.id)))
+        outside.toFile().deleteRecursively()
     }
 
     @Test

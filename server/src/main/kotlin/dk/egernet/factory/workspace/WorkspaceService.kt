@@ -59,7 +59,9 @@ class WorkspaceService(private val access: Access, private val ttlMillis: Long =
         val r = access.visibleRepo(user, repo) ?: return null
         val client = access.client(user) ?: return null
         val content = try {
-            client.getFile(org, r.name, WORKSPACE_FILE, r.defaultBranch)
+            // Never more than the size limit (+1 byte, to tell that it is too large) is read.
+            client.getFileBytes(org, r.name, WORKSPACE_FILE, r.defaultBranch, WorkspaceDefinitions.MAX_BYTES + 1L)
+                ?.toString(Charsets.UTF_8)
         } catch (e: Exception) {
             log.warn("Reading {} of {} failed: {}", WORKSPACE_FILE, repo, e.message)
             if (strict) throw ApiException(HttpStatusCode.BadGateway, "github_error", "Could not read $WORKSPACE_FILE: ${e.message}")
