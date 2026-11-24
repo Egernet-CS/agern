@@ -183,7 +183,13 @@ data class StageDto(
     val screenshots: List<ScreenshotDto> = emptyList(),
     /** Images the stage's agent generated, oldest first. Never the bytes. */
     val images: List<GeneratedImageDto> = emptyList(),
+    /** A warning the server recorded on the stage, e.g. "UI change reviewed without screenshots: …"; null: none. */
+    val warning: String? = null,
 )
+
+/** A warning on a run: the stage warnings of one [round], by the [roles] that carry it (docs/ARCHITECTURE.md §6 "Screenshots"). */
+@Serializable
+data class RunWarningDto(val round: Int, val roles: List<String>, val text: String)
 
 /** A screenshot attached to a stage; the image is served by `GET /api/runs/{id}/screenshots/{sid}`. */
 @Serializable
@@ -214,6 +220,8 @@ data class RunDto(
     val failureKind: String? = null,
     /** The mechanical step after the builder that failed ([FailedStep]): `push`, `pull_request` or `merge`. */
     val failedStep: String? = null,
+    /** Warnings that never fail the run, per round, oldest round first (from the stages' [StageDto.warning]). */
+    val warnings: List<RunWarningDto> = emptyList(),
 )
 
 /** Ways to retry a failed run (docs/ARCHITECTURE.md §6 "Retrying a run"). */

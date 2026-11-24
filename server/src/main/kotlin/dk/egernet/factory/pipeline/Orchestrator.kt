@@ -580,6 +580,7 @@ class Orchestrator(
                 list.filterNotNull().toMap()
             }
             withContext(Dispatchers.IO) { bestEffort { screenshotNote(runs.get(runId)!!, client, round) } }
+            withContext(Dispatchers.IO) { bestEffort { uiScreenshotWarning(runs.get(runId)!!, owner, ctx, client, round) } }
             val sha7 = head.take(7)
             val changes = REVIEWER_ROLES.filter { reviews[it]?.verdict == "CHANGES" }
             val verdicts = REVIEWER_ROLES.joinToString(", ") { "$it ${reviews.getValue(it).verdict}" }
@@ -987,6 +988,7 @@ class Orchestrator(
                 list.filterNotNull().toMap()
             }
             withContext(Dispatchers.IO) { bestEffort { screenshotNote(runs.get(run.id)!!, client, round) } }
+            withContext(Dispatchers.IO) { bestEffort { uiScreenshotWarning(runs.get(run.id)!!, owner, ctx, client, round) } }
             val changes = lastReviews.filterValues { it.verdict == "CHANGES" }
             if (changes.isEmpty()) break
             if (round >= maxRounds) {
@@ -1033,6 +1035,31 @@ class Orchestrator(
         val pr = run.prNumber ?: return
         screenshotNoteText(cfg, run.repo, run.id, round, runs.stages(run.id), screenshots.forRun(run.id))
             ?.let { client.comment(org, run.repo, pr, it) }
+    }
+
+    /**
+     * After a review round: when the round's diff touches UI files ([UiChanges]) and neither the ux nor the ui-design
+     * stage of [round] attached a screenshot, records the warning "UI change reviewed without screenshots" on both
+     * stages and comments it on the pull request (docs/ARCHITECTURE.md §6 "Screenshots"). A warning only: the run goes
+     * on as before. Blocking.
+     */
+    private fun uiScreenshotWarning(run: RunRecord, owner: UserRecord, ctx: RunContext, client: GitHubClient, round: Int) {
+        val stages = runs.stages(run.id).filter { it.round == round && it.role in SCREENSHOT_ROLES }
+        if (stages.isEmpty()) return
+        val ids = stages.map { it.id }.toSet()
+        if (screenshots.forRun(run.id).any { it.stageId in ids }) return
+        val home = workspaces.home(owner.username)
+        val changed = workspaces.git.changedFiles(ctx.worktree, ctx.baseRef, home) ?: return
+        val override = runCatching {
+            workspaces.git.readFile(ctx.worktree, ctx.baseRef, UiChanges.UI_FILES, home, UiChanges.MAX_UI_FILES_BYTES)
+        }.getOrElse { e -> log.warn("Reading {} of {} failed, using the default UI rules: {}", UiChanges.UI_FILES, run.repo, e.message); null }
+        val ui = UiChanges.uiFiles(changed, UiChanges.Rules.parse(override))
+        if (ui.isEmpty()) return
+        val text = UiChanges.warningText(ui)
+        stages.forEach { runs.setStageWarning(it.id, text) }
+        publish(run.id)
+        val pr = run.prNumber ?: return
+        bestEffort { client.comment(org, run.repo, pr, uiWarningComment(cfg, run.repo, run.id, round, ui)) }
     }
 
     private fun stepLabel(step: String?) = when (step) {
@@ -1370,7 +1397,7 @@ class Orchestrator(
         |
         |Inspect the change with `git diff ${c.baseRef}...HEAD`, `git log ${c.baseRef}..HEAD` and by reading the code; run tests or
         |the app where that helps your review.
-        |
+        |${if (role in SCREENSHOT_ROLES) uiReviewNote() else ""}
         |${c.releaseNote}${c.issueText}
         |<spec>
         |$spec
@@ -1384,6 +1411,12 @@ class Orchestrator(
         |(severity blocker|major|minor|nit, file or null, detail). Use `CHANGES` only for findings that must be fixed before merge.
     """.trimMargin()
     }
+
+    /** For the ux and ui-design reviewers: where to start, and the port that is never theirs (docs/ARCHITECTURE.md §6 "Screenshots"). */
+    private fun uiReviewNote() =
+        "If the change touches a UI, run the app and attach screenshots as your role instructions say (read `.agern/preview.md` " +
+            "first if the repository has one). Agern itself listens on port ${cfg.port} on this host: never start anything on " +
+            "that port, never stop or call that server, and never use a production service.\n"
 
     private fun approvalPrompt(c: RunContext, spec: String, reviews: Map<String, Verdict>, round: Int, maxRounds: Int, prUrl: String?) = buildString {
         append("Decide whether the pull request for issue #${c.issue.number} in ${org}/${c.repo} may be squash-merged into `${c.targetBranch}`.\n")
@@ -1424,6 +1457,18 @@ class Orchestrator(
          * the run page ([Config.pageRef], so an internal address is never published) and one line per screenshot,
          * reviewers in [REVIEWER_ROLES] order, each in attach order. Captions are single-line already (sanitised on attach).
          */
+        /** The pull request comment for [UiChanges.WARNING_TITLE] in review [round]. */
+        fun uiWarningComment(cfg: Config, repo: String, runId: UUID, round: Int, uiFiles: List<String>): String {
+            val what = if (round == 0) "build" else "fix round $round"
+            val ref = cfg.pageRef("p/$repo/runs/$runId", "the page of run `$runId`")
+            val n = uiFiles.size
+            val list = uiFiles.take(10).joinToString("\n") { "- `$it`" } + if (n > 10) "\n- … and ${n - 10} more" else ""
+            return "**Agern: warning — ${UiChanges.WARNING_TITLE}** ($what). This change touches $n UI " +
+                "${if (n == 1) "file" else "files"}, but neither the ux nor the ui-design reviewer attached a screenshot, so " +
+                "nobody has looked at the result yet. Their summaries on $ref should say what they tried. The run is not " +
+                "failed for this.\n\n$list"
+        }
+
         fun screenshotNoteText(
             cfg: Config, repo: String, runId: UUID, round: Int, stages: List<StageRecord>, shots: List<dk.egernet.factory.db.ScreenshotMeta>,
         ): String? {

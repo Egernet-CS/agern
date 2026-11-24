@@ -250,6 +250,9 @@ class FakeGitOps : GitOps {
     /** What [head] answers; tests move it to simulate a commit. */
     @Volatile var headSha = "0000000000000000000000000000000000000001"
     override fun head(worktree: Path, home: Path) = headSha
+    /** What [changedFiles] answers (null, the default: it cannot be told, so no UI-change check). */
+    @Volatile var changed: List<String>? = null
+    override fun changedFiles(worktree: Path, baseRef: String, home: Path): List<String>? = changed
     override fun baseRef(baseBranch: String) = "origin/$baseBranch"
     /** What [branchCommits] answers (null: the branch is not found). */
     @Volatile var branchCommits: Int? = 1
