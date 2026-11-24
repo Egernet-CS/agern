@@ -5,7 +5,8 @@ import { ChatView } from '../components/chat/ChatView';
 import { IssueImagesDialog } from '../components/images/IssueImagesDialog';
 import { REVIEWERS, roundName } from '../components/pipeline/model';
 import { sandboxSummary } from '../components/sandbox/SandboxBits';
-import { Dialog, Empty, ErrorBox, KindBadge, Loading, Notice, ReleaseStatusPill, RoleBadge, RunStatusPill, SessionStatusPill } from '../components/ui/ui';
+import { ProjectIconControl } from '../components/ui/ProjectIconControl';
+import { Dialog, Empty, ErrorBox, KindBadge, Loading, Notice, ProjectIcon, ReleaseStatusPill, RoleBadge, RunStatusPill, SessionStatusPill } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
 import { dateTime, modelLabel, timeAgo } from '../lib/format';
@@ -36,11 +37,13 @@ export function ProjectPage() {
   const releases = useProjectReleases(repo);
   const { closedSessions, markSessionClosed } = useFeed();
   const [closing, setClosing] = useState<AgentSession | null>(null);
+  const [iconError, setIconError] = useState<string | null>(null);
   // Chats this user closed (set before the request): they never get the "was closed" notice for them.
   const closedByMe = useRef(new Set<string>());
 
   useEffect(() => {
     document.title = `${repo} · Agern`;
+    setIconError(null);
   }, [repo]);
 
   const chats = sessions.filter((s) => s.kind === 'chat');
@@ -91,6 +94,17 @@ export function ProjectPage() {
       <header className="project-head">
         <div className="ph-title">
           <Link to="/" className="crumb">projects /</Link>
+          {me.isAdmin && p ? (
+            <ProjectIconControl
+              repo={repo}
+              iconUrl={p.iconUrl}
+              size={28}
+              onChanged={(np) => project.setData(() => np)}
+              onError={setIconError}
+            />
+          ) : (
+            <ProjectIcon name={repo} iconUrl={p?.iconUrl} size={28} />
+          )}
           <h1>{repo}</h1>
           {p?.private && <span className="tag">private</span>}
         </div>
@@ -101,6 +115,12 @@ export function ProjectPage() {
           {p && <span>{p.openIssues} open issues</span>}
           {p && <a href={p.htmlUrl} target="_blank" rel="noreferrer">GitHub ↗</a>}
         </div>
+        {iconError && (
+          <div className="ph-alert" role="alert">
+            <span>{iconError}</span>
+            <button type="button" className="btn btn--ghost btn--sm" onClick={() => setIconError(null)}>Dismiss</button>
+          </div>
+        )}
       </header>
 
       <div className="project-tabs" role="tablist" aria-label="Project sections">

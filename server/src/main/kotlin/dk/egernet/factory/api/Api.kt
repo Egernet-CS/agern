@@ -9,6 +9,7 @@ import dk.egernet.factory.ErrorDetail
 import dk.egernet.factory.FeedFrame
 import dk.egernet.factory.LoginStepDto
 import dk.egernet.factory.PIPELINE_ROLES
+import dk.egernet.factory.ProjectIcons
 import dk.egernet.factory.RunStatus
 import dk.egernet.factory.Services
 import dk.egernet.factory.SettingsDto
@@ -466,6 +467,36 @@ private fun Route.projectRoutes(s: Services) {
         call.respond(s.sandboxes.approve(u, repo, req.sha256))
     }
     delete("/projects/{repo}/sandbox/approval") { call.respond(s.sandboxes.revoke(call.requireUser(s), repoParam())) }
+    // Project icons (docs/ARCHITECTURE.md §8 "Project icons"): admins set them, everyone who sees the repo sees them.
+    put("/projects/{repo}/icon") {
+        val u = call.requireAdmin(s)
+        val repo = repoParam()
+        call.respond(
+            s.factory.setProjectIcon(u, repo) {
+                val declared = call.request.header(HttpHeaders.ContentLength)?.toLongOrNull()
+                if (declared != null && declared > ProjectIcons.MAX_BYTES) throw ProjectIcons.tooLarge()
+                // Enforced while streaming: never more than the limit is buffered.
+                readLimited(call.receiveChannel(), ProjectIcons.MAX_BYTES) ?: throw ProjectIcons.tooLarge()
+            },
+        )
+    }
+    delete("/projects/{repo}/icon") {
+        val u = call.requireAdmin(s)
+        call.respond(s.factory.deleteProjectIcon(u, repoParam()))
+    }
+    get("/projects/{repo}/icon") {
+        val u = call.requireUser(s)
+        val m = s.factory.visibleProjectIcon(u, repoParam())
+        val bytes = s.factory.projectIconData(m.repo)
+        // Only the four raster types are ever served (an SVG can never be stored, and is not served if it were).
+        if (bytes == null || m.mediaType !in INLINE_IMAGE_TYPES) throw notFound("Icon not found")
+        // Immutable only for the current version's URL; a stale or missing `v` must revalidate.
+        val current = call.request.queryParameters["v"] == ProjectIcons.version(m.sha256)
+        call.respondStoredFile(
+            bytes, m.mediaType, "inline", "${m.repo}-icon.${dk.egernet.factory.agent.Screenshots.extension(m.mediaType)}",
+            cacheControl = if (current) IMMUTABLE else "private, no-cache",
+        )
+    }
 }
 
 private fun Route.runRoutes(s: Services) {
@@ -755,15 +786,20 @@ private suspend fun readLimited(ch: io.ktor.utils.io.ByteReadChannel, max: Long)
     return out.toByteArray()
 }
 
+/** Cache-Control for stored bytes that never change under their URL. */
+private const val IMMUTABLE = "private, max-age=31536000, immutable"
+
 /**
  * Sends stored bytes (attachments, screenshots, generated images) with the headers that keep them inert in our origin:
  * no sniffing, a CSP without script, same-origin only, cached privately (the bytes of an id never change).
  */
-private suspend fun ApplicationCall.respondStoredFile(bytes: ByteArray, mediaType: String, disposition: String, name: String) {
+private suspend fun ApplicationCall.respondStoredFile(
+    bytes: ByteArray, mediaType: String, disposition: String, name: String, cacheControl: String = IMMUTABLE,
+) {
     response.header("X-Content-Type-Options", "nosniff")
     response.header("Content-Security-Policy", "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox")
     response.header("Cross-Origin-Resource-Policy", "same-origin")
-    response.header(HttpHeaders.CacheControl, "private, max-age=31536000, immutable")
+    response.header(HttpHeaders.CacheControl, cacheControl)
     response.header(HttpHeaders.ContentDisposition, contentDisposition(disposition, name))
     respondBytes(bytes, ContentType.parse(mediaType))
 }

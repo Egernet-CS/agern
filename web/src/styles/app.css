@@ -1207,9 +1207,44 @@ a.crumb:hover {
   align-items: center;
   justify-content: space-between;
 }
+.pc-ident {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 1 1 auto;
+  margin-right: 10px;
+}
 .pc-name {
   font: 650 1.05rem/1.2 var(--font-mono);
   letter-spacing: -0.01em;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A project's icon, or its first letter on the user avatar's tile (ARCHITECTURE §10). */
+.project-icon {
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-sm);
+  overflow: hidden;
+  background: linear-gradient(135deg, #3a2a18, #6b4520);
+  color: var(--amber-hi);
+  border: 1px solid rgba(255, 177, 74, 0.35);
+  font: 700 0.85rem/1 var(--font-ui);
+  box-sizing: border-box;
+}
+.project-icon.has-image {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+}
+.project-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
 }
 .pc-desc {
   color: var(--text-2);
@@ -1336,6 +1371,53 @@ html.app-locked #root {
   display: flex;
   align-items: baseline;
   gap: 8px;
+}
+.ph-title > .project-icon,
+.ph-icon-control {
+  align-self: center;
+  flex: none;
+}
+.ph-icon-control {
+  position: relative;
+  display: flex;
+}
+.ph-icon-btn {
+  display: flex;
+  padding: 2px;
+  margin: -2px;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+.ph-icon-btn:hover:not(:disabled) {
+  border-color: var(--line-2);
+  background: var(--surface-3);
+}
+.ph-icon-btn:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+.ph-icon-menu {
+  right: auto;
+  left: 0;
+  z-index: 20;
+}
+.ph-icon-hint {
+  max-width: 220px;
+}
+.ph-alert {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 6px 6px 12px;
+  border-radius: var(--r-sm);
+  border: 1px solid rgba(255, 100, 100, 0.45);
+  background: var(--fail-wash);
+  color: var(--text-2);
+  font-size: 0.88rem;
 }
 .ph-title h1 {
   font: 700 1.4rem/1.2 var(--font-mono);

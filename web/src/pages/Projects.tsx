@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, isRunWorking, isSessionActive } from '../api';
-import { Art, Empty, ErrorBox, Loading, Notice } from '../components/ui/ui';
+import { Art, Empty, ErrorBox, Loading, Notice, ProjectIcon } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
 import { timeAgo } from '../lib/format';
@@ -121,7 +121,10 @@ export function ProjectsPage() {
             <li key={p.name}>
               <Link to={`/p/${p.name}`} className={`project-card ${live?.agents ? 'is-live' : ''}`}>
                 <div className="pc-top">
-                  <span className="pc-name">{p.name}</span>
+                  <span className="pc-ident">
+                    <ProjectIcon name={p.name} iconUrl={p.iconUrl} size={32} />
+                    <span className="pc-name">{p.name}</span>
+                  </span>
                   {p.private ? <span className="tag">private</span> : <span className="tag">public</span>}
                 </div>
                 <p className="pc-desc">{p.description ?? <span className="muted">No description</span>}</p>
