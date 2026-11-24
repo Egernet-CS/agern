@@ -8,6 +8,7 @@ import dk.egernet.factory.db.Db
 import dk.egernet.factory.db.UserRecord
 import dk.egernet.factory.git.GitOps
 import dk.egernet.factory.github.FakeGitHub
+import com.zaxxer.hikari.HikariDataSource
 import io.zonky.test.db.postgres.embedded.EmbeddedPostgres
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
@@ -15,6 +16,7 @@ import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -36,12 +38,61 @@ object TestDb {
     private val pg: EmbeddedPostgres by lazy { EmbeddedPostgres.builder().start() }
     private val counter = AtomicInteger()
 
-    /** A fresh database per call, migrated from [migrations] (the application's own by default). */
+    /**
+     * How many pools from [fresh] may be open at once. Every pool holds 5 connections and the embedded PostgreSQL allows
+     * 100 clients, so a test that never closes its pools would otherwise make some later test fail far away from it.
+     */
+    const val MAX_OPEN_POOLS = 10
+
+    /** The pools handed out by [fresh], with where each was created (closed ones are dropped on the next [fresh]). */
+    private val pools = CopyOnWriteArrayList<Pair<HikariDataSource, Throwable>>()
+
+    /**
+     * A fresh database per call, migrated from [migrations] (the application's own by default). Its pool must be closed
+     * when the test ends: [TestWorld.close], [Services.stopAndReleaseDb] or closing [Db.dataSource] directly.
+     */
     fun fresh(migrations: String = Db.MIGRATIONS): Db {
+        pools.removeIf { it.first.isClosed }
+        check(pools.size < MAX_OPEN_POOLS) {
+            "$MAX_OPEN_POOLS test database pools are still open; close them when the test ends " +
+                "(TestWorld.close() or Services.stopAndReleaseDb()). Created by: " +
+                pools.joinToString(", ") { creationSite(it.second) }
+        }
         val name = "t${System.nanoTime()}_${counter.incrementAndGet()}"
         pg.postgresDatabase.connection.use { c -> c.createStatement().use { it.execute("CREATE DATABASE $name") } }
-        return Db.connect(pg.getJdbcUrl("postgres", name), "postgres", "postgres", poolSize = 5, migrations = migrations)
+        val db = Db.connect(pg.getJdbcUrl("postgres", name), "postgres", "postgres", poolSize = 5, migrations = migrations)
+        pools += (db.dataSource as HikariDataSource) to Throwable("pool created here")
+        return db
     }
+
+    /** The number of pools from [fresh] that are not closed yet. */
+    fun openPools(): Int = pools.count { !it.first.isClosed }
+
+    /** The number of client connections the embedded PostgreSQL has, apart from the one asking. */
+    fun clientConnections(): Int = pg.postgresDatabase.connection.use { c ->
+        c.createStatement().use { st ->
+            st.executeQuery(
+                "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()",
+            ).use { rs -> rs.next(); rs.getInt(1) }
+        }
+    }
+
+    /** The first stack frame of [t] outside this support code and the JDK, Kotlin and JUnit, e.g. `ApiTest.<init>(ApiTest.kt:24)`. */
+    private fun creationSite(t: Throwable): String {
+        val skip = listOf("java.", "jdk.", "sun.", "kotlin.", "kotlinx.", "org.junit.", "org.gradle.", "worker.org.gradle.")
+        val frame = t.stackTrace.firstOrNull { f ->
+            val cls = f.className.substringAfterLast('.').substringBefore('$')
+            cls != "TestDb" && cls != "TestWorld" && skip.none { f.className.startsWith(it) }
+        } ?: return "unknown"
+        return "${frame.className.substringAfterLast('.')}.${frame.methodName}(${frame.fileName}:${frame.lineNumber})"
+    }
+}
+
+/** Stops the services, waits (bounded) until none of their coroutines still uses the database, then closes the pool. */
+fun Services.stopAndReleaseDb() {
+    stop()
+    runBlocking { withTimeoutOrNull(10_000) { scope.coroutineContext[kotlinx.coroutines.Job]!!.join() } }
+    (db.dataSource as java.io.Closeable).close()
 }
 
 /** A scripted agent process. */
@@ -307,12 +358,15 @@ class TestWorld(
         }
     }
 
-    fun close() = services.stop()
+    private val closed = java.util.concurrent.atomic.AtomicBoolean()
 
-    /** [close], then give the pool's connections back to PostgreSQL (the embedded server allows only so many). */
-    fun closeAndReleaseDb() {
-        close()
-        (services.db.dataSource as java.io.Closeable).close()
+    /**
+     * Stops the services and gives the pool's connections back to PostgreSQL (see [Services.stopAndReleaseDb]); the
+     * embedded server allows only so many. Calling it again does nothing. A test that simulates a restart on the same
+     * database calls `services.stop()` instead, which leaves the pool open.
+     */
+    fun close() {
+        if (closed.compareAndSet(false, true)) services.stopAndReleaseDb()
     }
 }
 

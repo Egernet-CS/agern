@@ -53,11 +53,11 @@ class RunConversationTest {
     @AfterTest fun tearDown() {
         followUpReview = "PASS"
         extraServices.forEach { it.stop() }
-        world.close()
+        // The extra services share the world's pool: wait until none of their coroutines uses it before it is closed.
         runBlocking {
-            for (svc in extraServices + s) withTimeoutOrNull(10_000) { svc.scope.coroutineContext[kotlinx.coroutines.Job]!!.join() }
+            for (svc in extraServices) withTimeoutOrNull(10_000) { svc.scope.coroutineContext[kotlinx.coroutines.Job]!!.join() }
         }
-        (s.db.dataSource as java.io.Closeable).close()
+        world.close()
     }
 
     private fun review(verdict: String) = buildJsonObject {

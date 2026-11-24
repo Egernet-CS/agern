@@ -60,13 +60,11 @@ class ReleaseBuildTest {
         // Let hanging fake agents go, then stop everything.
         gates.keys.forEach { gates[it] = true }
         extraServices.forEach { it.stop() }
-        world.close()
-        // Wait until no coroutine of the stopped services still uses the database, then give the pool's connections
-        // back to PostgreSQL: every test has its own database.
+        // The extra services share the world's pool: wait until none of their coroutines uses it before it is closed.
         runBlocking {
-            for (svc in extraServices + s) withTimeoutOrNull(10_000) { svc.scope.coroutineContext[kotlinx.coroutines.Job]!!.join() }
+            for (svc in extraServices) withTimeoutOrNull(10_000) { svc.scope.coroutineContext[kotlinx.coroutines.Job]!!.join() }
         }
-        (s.db.dataSource as java.io.Closeable).close()
+        world.close()
     }
 
     // ------------------------------------------------------------ scripted agents, per issue title

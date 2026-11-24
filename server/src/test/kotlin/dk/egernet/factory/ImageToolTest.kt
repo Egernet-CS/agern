@@ -31,7 +31,7 @@ class ImageToolTest {
     private fun world(tweak: (Config) -> Config = { it }) =
         TestWorld(twoFactor = false, tweak = tweak, imageProviders = listOf(provider, opaque)).also { worlds += it }
 
-    @AfterTest fun tearDown() = worlds.forEach { it.closeAndReleaseDb() }
+    @AfterTest fun tearDown() = worlds.forEach { it.close() }
 
     private fun chatToken(w: TestWorld, user: String, repo: String = "demo-app"): Pair<UUID, String> {
         val u = w.user(user)

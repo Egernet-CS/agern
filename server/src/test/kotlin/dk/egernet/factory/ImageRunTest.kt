@@ -25,7 +25,7 @@ import kotlin.test.assertTrue
 class ImageRunTest {
     private val worlds = CopyOnWriteArrayList<TestWorld>()
     private fun world() = TestWorld(twoFactor = false, imageProviders = listOf(RecordingImageProvider())).also { worlds += it }
-    @AfterTest fun tearDown() = worlds.forEach { it.closeAndReleaseDb() }
+    @AfterTest fun tearDown() = worlds.forEach { it.close() }
 
     /** One image generated in a chat of [user] and selected for [issue] as [name]; returns its id. */
     private fun selected(w: TestWorld, user: String, issue: Int, name: String, purpose: String = "app icon"): UUID {

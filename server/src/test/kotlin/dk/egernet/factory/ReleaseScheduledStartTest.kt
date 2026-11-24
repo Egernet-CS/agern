@@ -4,7 +4,6 @@ import dk.egernet.factory.db.ReleaseRecord
 import dk.egernet.factory.db.UserRecord
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.withTimeoutOrNull
 import java.time.Duration
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -37,8 +36,6 @@ class ReleaseScheduledStartTest {
 
     @AfterTest fun tearDown() {
         world.close()
-        runBlocking { withTimeoutOrNull(10_000) { s.scope.coroutineContext[kotlinx.coroutines.Job]!!.join() } }
-        (s.db.dataSource as java.io.Closeable).close()
     }
 
     private fun issue(title: String) = world.github.addIssue("demo-app", title, "body").number

@@ -49,7 +49,7 @@ class SandboxAdminTest {
     private val world = TestWorld(twoFactor = false, sandbox = true)
     private val s = world.services
 
-    @AfterTest fun tearDown() = world.closeAndReleaseDb()
+    @AfterTest fun tearDown() = world.close()
 
     private val definition = "image: docker.io/library/node:22\nsetup: echo setting up\nservices:\n  db:\n    image: docker.io/library/postgres:17\nresources: { cpus: 1, memory: 1g }\n"
 

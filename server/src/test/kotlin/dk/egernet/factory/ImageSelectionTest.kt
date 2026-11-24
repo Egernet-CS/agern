@@ -36,7 +36,7 @@ import kotlin.test.assertTrue
 /** Selecting chat images for issues, serving them, and cleanup (docs/ARCHITECTURE.md §6 "Generated images"). */
 class ImageSelectionTest {
     private val w = TestWorld(twoFactor = false, imageProviders = listOf(RecordingImageProvider()))
-    @AfterTest fun tearDown() = w.closeAndReleaseDb()
+    @AfterTest fun tearDown() = w.close()
 
     private suspend fun ApplicationTestBuilder.login(user: String, pw: String): HttpClient {
         val c = createClient { install(HttpCookies) }

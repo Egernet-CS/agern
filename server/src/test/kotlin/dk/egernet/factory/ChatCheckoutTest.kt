@@ -67,7 +67,7 @@ class ChatCheckoutTest {
     }
 
     @AfterAll fun tearDown() {
-        s.stop()
+        s.stopAndReleaseDb()
         tmp.toFile().deleteRecursively()
     }
 

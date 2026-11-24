@@ -49,7 +49,7 @@ class ScreenshotTest {
     private val worlds = CopyOnWriteArrayList<TestWorld>()
     private fun world(tweak: (Config) -> Config = { it }) = TestWorld(twoFactor = false, tweak = tweak).also { worlds += it }
 
-    @AfterTest fun tearDown() = worlds.forEach { it.closeAndReleaseDb() }
+    @AfterTest fun tearDown() = worlds.forEach { it.close() }
 
     // ---------------------------------------------------------------- MCP calls the way an agent makes them
 

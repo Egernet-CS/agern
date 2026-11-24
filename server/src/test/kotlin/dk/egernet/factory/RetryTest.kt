@@ -14,7 +14,6 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -49,8 +48,6 @@ class RetryTest {
 
     @AfterTest fun tearDown() {
         world.close()
-        runBlocking { withTimeoutOrNull(10_000) { s.scope.coroutineContext[kotlinx.coroutines.Job]!!.join() } }
-        (s.db.dataSource as java.io.Closeable).close()
     }
 
     /**
