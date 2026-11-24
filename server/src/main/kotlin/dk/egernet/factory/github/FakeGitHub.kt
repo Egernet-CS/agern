@@ -13,7 +13,9 @@ class FakeGitHub(private val org: String) : GitHub {
     data class Repo(val name: String, val description: String?, val private: Boolean, val visibleTo: Set<String>? = null,
                     val issues: MutableList<GhIssue> = mutableListOf(), val comments: MutableMap<Int, MutableList<GhComment>> = mutableMapOf(),
                     /** Files on the default branch, by path (only what tests put there). */
-                    val files: MutableMap<String, String> = mutableMapOf())
+                    val files: MutableMap<String, String> = mutableMapOf(),
+                    /** Binary files on the default branch, by path (only what tests put there); they take precedence. */
+                    val byteFiles: MutableMap<String, ByteArray> = mutableMapOf())
 
     val repos = mutableMapOf<String, Repo>()
     val actions = CopyOnWriteArrayList<String>()
@@ -171,10 +173,23 @@ class FakeGitHub(private val org: String) : GitHub {
     /** The file at [path] on [repo]'s default branch, or null (no visibility check: server-side use only). */
     fun fileOf(repo: String, path: String): String? = synchronized(this) {
         repos[repo]?.files?.get(path)
-    } ?: filesDir?.let { dir ->
+    } ?: dirFile(repo, path)?.let { java.nio.file.Files.readString(it) }
+
+    /** The bytes at [path] on [repo]'s default branch: [setFileBytes], then [setFile] as UTF-8, then [filesDir]. */
+    fun fileBytesOf(repo: String, path: String): ByteArray? = synchronized(this) {
+        repos[repo]?.let { it.byteFiles[path] ?: it.files[path]?.toByteArray(Charsets.UTF_8) }
+    } ?: dirFile(repo, path)?.let { java.nio.file.Files.readAllBytes(it) }
+
+    /** A regular file under [filesDir] for [repo] and [path]; null for paths that could leave the repository's directory. */
+    private fun dirFile(repo: String, path: String): java.nio.file.Path? = filesDir?.let { dir ->
         if (path.split('/').any { it == ".." || it.isEmpty() } || repo.contains('/') || repo.startsWith(".")) return@let null
-        val f = dir.resolve(repo).resolve(path)
-        if (java.nio.file.Files.isRegularFile(f)) java.nio.file.Files.readString(f) else null
+        dir.resolve(repo).resolve(path).takeIf { java.nio.file.Files.isRegularFile(it) }
+    }
+
+    /** Puts (or with null removes) a binary file on [repo]'s default branch. */
+    fun setFileBytes(repo: String, path: String, bytes: ByteArray?) = synchronized(this) {
+        val r = repos.getValue(repo)
+        if (bytes == null) r.byteFiles.remove(path) else r.byteFiles[path] = bytes
     }
 
     /** Puts (or with null removes) a file on [repo]'s default branch. */
@@ -298,6 +313,11 @@ class FakeGitHub(private val org: String) : GitHub {
         override fun getFile(org: String, repo: String, path: String, ref: String): String? {
             synchronized(this@FakeGitHub) { repo(org, repo) }
             return fileOf(repo, path)
+        }
+
+        override fun getFileBytes(org: String, repo: String, path: String, ref: String, maxBytes: Long): ByteArray? {
+            synchronized(this@FakeGitHub) { repo(org, repo) }
+            return fileBytesOf(repo, path)?.let { if (it.size > maxBytes) it.copyOf(maxBytes.toInt()) else it }
         }
 
         override fun squashMerge(org: String, repo: String, number: Int, title: String) = synchronized(this@FakeGitHub) {

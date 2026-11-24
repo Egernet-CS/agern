@@ -55,14 +55,14 @@ test('compose with pasted, picked and dropped files; per-file errors; send; the 
   await expect(chips(page).first().locator('img')).toBeVisible();
 
   // Pick a file with the attach button.
-  await page.locator('input[type=file]').setInputFiles({ name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('hello agent\n') });
+  await page.getByRole('region', { name: 'Chat' }).locator('input[type=file]').setInputFiles({ name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('hello agent\n') });
   // Drop one on the chat pane.
   await dropFile(page, 'dropped.csv', 'text/csv', 'a,b\n1,2\n');
   await expect(chips(page)).toHaveCount(3);
   await expect(chips(page).filter({ hasText: 'dropped.csv' })).toContainText('8 B');
 
   // A file over the limit fails on its own chip and blocks sending until it is removed.
-  await page.locator('input[type=file]').setInputFiles({ name: 'huge.bin', mimeType: 'application/octet-stream', buffer: Buffer.alloc(21 * 1024 * 1024) });
+  await page.getByRole('region', { name: 'Chat' }).locator('input[type=file]').setInputFiles({ name: 'huge.bin', mimeType: 'application/octet-stream', buffer: Buffer.alloc(21 * 1024 * 1024) });
   const huge = chips(page).filter({ hasText: 'huge.bin' });
   await expect(huge).toContainText('Too large');
   await expect(page.locator('.prompt-blocked')).toContainText('Remove the attachments that failed');
@@ -106,7 +106,7 @@ test('compose with pasted, picked and dropped files; per-file errors; send; the 
   await expect(log(page)).not.toContainText('FILE missing');
 
   // A message of attachments only (no text) is fine too.
-  await page.locator('input[type=file]').setInputFiles({ name: 'only.txt', mimeType: 'text/plain', buffer: Buffer.from('just a file') });
+  await page.getByRole('region', { name: 'Chat' }).locator('input[type=file]').setInputFiles({ name: 'only.txt', mimeType: 'text/plain', buffer: Buffer.from('just a file') });
   await expect(chips(page).locator('.att-chip-bar')).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Send (Enter)' })).toBeEnabled();
   await page.getByRole('button', { name: 'Send (Enter)' }).click();
@@ -161,7 +161,7 @@ test('phone width: composer with attachments', async ({ browser }) => {
   await login(page, 'alice');
   await page.goto(`${BASE()}/p/demo-app?session=${sessionId}`);
   await pasteFile(page, 'image.png', 'image/png', pngBytes(64, 48));
-  await page.locator('input[type=file]').setInputFiles([
+  await page.getByRole('region', { name: 'Chat' }).locator('input[type=file]').setInputFiles([
     { name: 'a-rather-long-file-name-for-a-phone.log', mimeType: 'text/plain', buffer: Buffer.from('x') },
     { name: 'huge.bin', mimeType: 'application/octet-stream', buffer: Buffer.alloc(21 * 1024 * 1024) },
   ]);

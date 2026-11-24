@@ -92,7 +92,25 @@ class FactoryService(
      */
     suspend fun setProjectIcon(user: UserRecord, repo: String, readBody: suspend () -> ByteArray): ProjectDto {
         val r = withContext(Dispatchers.IO) { access.requireVisible(user, repo) }
-        val icon = ProjectIcons.validate(readBody())
+        return storeProjectIcon(user, r, ProjectIcons.validate(readBody()))
+    }
+
+    /**
+     * Sets the icon of [repo] from the file at [rawPath] on its default branch, read once with [user]'s own token
+     * (docs/ARCHITECTURE.md §8 "Project icons"). The caller has checked that [user] is an admin. The bytes go through
+     * the same validation as an upload; the icon does not follow later changes of the file.
+     */
+    suspend fun setProjectIconFromRepository(user: UserRecord, repo: String, rawPath: String): ProjectDto {
+        val r = withContext(Dispatchers.IO) { access.requireVisible(user, repo) }
+        val path = ProjectIcons.repositoryPath(rawPath)
+        val client = access.requireClient(user)
+        val bytes = gh { client.getFileBytes(org, r.name, path, r.defaultBranch, ProjectIcons.MAX_BYTES + 1) }
+            ?: throw ApiException(io.ktor.http.HttpStatusCode.NotFound, "icon_file_not_found", "No file `$path` on the default branch")
+        if (bytes.size > ProjectIcons.MAX_BYTES) throw ProjectIcons.tooLarge()
+        return storeProjectIcon(user, r, ProjectIcons.validate(bytes))
+    }
+
+    private suspend fun storeProjectIcon(user: UserRecord, r: GhRepo, icon: ValidIcon): ProjectDto {
         withContext(Dispatchers.IO) { icons.put(r.name, icon.mediaType, icon.bytes, icon.sha256, icon.width, icon.height, user.id) }
         return projectWithIcon(r)
     }

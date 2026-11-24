@@ -17,6 +17,8 @@ import io.ktor.server.testing.ApplicationTestBuilder
 import io.ktor.server.testing.testApplication
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -46,6 +48,9 @@ private fun encoded(w: Int, h: Int, format: String): ByteArray {
     g.dispose()
     return ByteArrayOutputStream().also { assertTrue(ImageIO.write(img, format, it)) }.toByteArray()
 }
+
+private fun svg(body: String, attrs: String = """viewBox="0 0 24 24"""") =
+    """<svg xmlns="http://www.w3.org/2000/svg" $attrs>$body</svg>"""
 
 class ProjectIconTest {
     private val world = TestWorld(twoFactor = false)
@@ -218,17 +223,138 @@ class ProjectIconTest {
         refused(400, "empty_icon", ByteArray(0), message = "The file is empty")
         val big = png(4, 4).copyOf(ProjectIcons.MAX_BYTES.toInt() + 1)
         refused(413, "icon_too_large", big, message = "The icon is larger than 1.0 MB")
+        val notAnImage = "The icon must be a PNG, JPEG, WebP, GIF or SVG image"
+        refused(415, "unsupported_icon_type", "just text".toByteArray(), type = "text/plain", message = notAnImage)
+        refused(415, "unsupported_icon_type", "<html><script>alert(1)</script></html>".toByteArray(), message = notAnImage)
+        refused(415, "unsupported_icon_type", "%PDF-1.4\n".toByteArray(), message = notAnImage)
+        // SVGs that break a rule: 422, whatever type the client claims.
         refused(
-            415, "unsupported_icon_type", """<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>""".toByteArray(),
-            type = "image/svg+xml", message = "The icon must be a PNG, JPEG, WebP or GIF image",
+            422, "invalid_icon", svg("<script>alert(1)</script>").toByteArray(), type = "image/svg+xml",
+            message = "The SVG cannot be used: it contains a <script> element",
         )
-        refused(415, "unsupported_icon_type", "<html><script>alert(1)</script></html>".toByteArray())
-        refused(415, "unsupported_icon_type", "%PDF-1.4\n".toByteArray())
+        refused(
+            422, "invalid_icon", ("<!DOCTYPE svg [<!ENTITY a \"a\">]>" + svg("<text>&a;</text>")).toByteArray(),
+            message = "The SVG cannot be used: it contains a DOCTYPE",
+        )
+        refused(
+            422, "invalid_icon", svg("<use href=\"https://evil.example/x.svg#a\"/>").toByteArray(), type = "application/octet-stream",
+            message = "The SVG cannot be used: it references something outside the document (href)",
+        )
+        refused(422, "invalid_icon", svg("<rect onclick=\"alert(1)\"/>").toByteArray())
+        val bigSvg = svg("<!--" + "x".repeat(ProjectIcons.MAX_BYTES.toInt()) + "-->").toByteArray()
+        refused(413, "icon_too_large", bigSvg, type = "image/svg+xml")
         refused(422, "invalid_icon", png(4, 4).copyOf(12), message = "The image could not be read")
         refused(422, "icon_dimensions_too_large", png(2049, 10), message = "The icon may be at most 2048×2048 pixels")
         refused(422, "icon_dimensions_too_large", png(10, 2049))
 
         // The limits themselves are accepted.
         assertEquals(200, root.putIcon(png(2048, 1)).status.value)
+    }
+
+    @Test
+    fun `SVG upload and serving`() = testApplication {
+        application { agernModule(world.services) }
+        val root = login("root", "pw-r")
+        val bob = login("bob", "pw-b")
+
+        // A raster icon keeps the stored-file CSP with images from our origin.
+        val first = png(16, 16)
+        val pngUrl = json(root.putIcon(first).bodyAsText()).jsonObject.iconUrl()!!
+        val pngCsp = bob.get(pngUrl).headers["Content-Security-Policy"]!!
+        assertEquals("default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox", pngCsp)
+
+        // Detected by content: the client's type does not matter.
+        val icon = ("\uFEFF<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" + svg("<circle cx=\"12\" cy=\"12\" r=\"10\" fill=\"#0a0\"/>")).toByteArray()
+        val up = root.putIcon(icon, type = "application/octet-stream")
+        assertEquals(200, up.status.value, up.bodyAsText())
+        val url = json(up.bodyAsText()).jsonObject.iconUrl()!!
+        assertTrue(urlPattern.matches(url), url)
+        assertNotEquals(pngUrl, url)
+
+        val meta = assertNotNull(world.services.projectIcons.meta("demo-app"))
+        assertEquals("image/svg+xml", meta.mediaType)
+        assertEquals(0, meta.width)
+        assertEquals(0, meta.height)
+        assertEquals(sha256(icon), meta.sha256)
+        assertContentEquals(icon, world.services.projectIcons.data("demo-app"))
+
+        val got = bob.get(url)
+        assertEquals(200, got.status.value)
+        assertContentEquals(icon, got.readRawBytes())
+        assertEquals("image/svg+xml", got.headers["Content-Type"])
+        assertEquals("nosniff", got.headers["X-Content-Type-Options"])
+        assertEquals("same-origin", got.headers["Cross-Origin-Resource-Policy"])
+        val csp = got.headers["Content-Security-Policy"]!!
+        assertEquals("default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox", csp)
+        assertTrue(!csp.contains("'self'") && !csp.contains("script"), csp)
+        val disposition = got.headers["Content-Disposition"]!!
+        assertTrue(disposition.startsWith("inline") && disposition.contains("demo-app-icon.svg"), disposition)
+        assertEquals(immutable, got.headers["Cache-Control"])
+        assertEquals("private, no-cache", bob.get("/api/projects/demo-app/icon").headers["Cache-Control"])
+
+        // Back to a PNG and to an SVG with only width/height.
+        val pngAgain = json(root.putIcon(first).bodyAsText()).jsonObject.iconUrl()!!
+        assertEquals("image/png", bob.get(pngAgain).headers["Content-Type"])
+        assertEquals(16, world.services.projectIcons.meta("demo-app")!!.width)
+        val sized = svg("<rect width=\"8\" height=\"8\"/>", attrs = "width=\"32\" height=\"32\"").toByteArray()
+        val sizedUrl = json(root.putIcon(sized, type = "image/png").bodyAsText()).jsonObject.iconUrl()!!
+        assertContentEquals(sized, bob.get(sizedUrl).readRawBytes())
+        assertEquals("image/svg+xml", bob.get(sizedUrl).headers["Content-Type"])
+    }
+
+    private suspend fun HttpClient.iconFromRepository(path: String, repo: String = "demo-app"): HttpResponse =
+        post("/api/projects/$repo/icon/from-repository") {
+            header("X-Factory-Request", "1"); contentType(ContentType.Application.Json)
+            setBody(buildJsonObject { put("path", path) }.toString())
+        }
+
+    @Test
+    fun `icon from a file in the repository`() = testApplication {
+        application { agernModule(world.services) }
+        val root = login("root", "pw-r")
+        val alice = login("alice", "pw-a")
+        val gh = world.github
+        val logo = png(24, 24)
+        val vector = svg("<circle cx=\"12\" cy=\"12\" r=\"10\"/>")
+        gh.setFileBytes("demo-app", "web/public/logo.png", logo)
+        gh.setFile("demo-app", "art/logo.svg", vector)
+
+        // A PNG, then an SVG (a leading `/` and whitespace are fine).
+        val fromPng = root.iconFromRepository("web/public/logo.png")
+        assertEquals(200, fromPng.status.value, fromPng.bodyAsText())
+        val pngUrl = json(fromPng.bodyAsText()).jsonObject.iconUrl()!!
+        assertContentEquals(logo, alice.get(pngUrl).readRawBytes())
+        val fromSvg = root.iconFromRepository("  /art/logo.svg ")
+        assertEquals(200, fromSvg.status.value, fromSvg.bodyAsText())
+        val svgUrl = json(fromSvg.bodyAsText()).jsonObject.iconUrl()!!
+        assertContentEquals(vector.toByteArray(), alice.get(svgUrl).readRawBytes())
+        assertEquals("image/svg+xml", alice.get(svgUrl).headers["Content-Type"])
+        val meta = world.services.projectIcons.meta("demo-app")!!
+        assertEquals("image/svg+xml", meta.mediaType)
+        assertEquals(world.services.users.byUsername("root")!!.id, meta.updatedBy)
+
+        suspend fun refused(status: Int, code: String, path: String, message: String? = null, client: HttpClient = root, repo: String = "demo-app") {
+            val r = client.iconFromRepository(path, repo)
+            assertEquals(status, r.status.value, r.bodyAsText())
+            assertEquals(code, errorCode(r.bodyAsText()))
+            message?.let { assertEquals(it, json(r.bodyAsText()).jsonObject["error"]!!.jsonObject["message"]!!.jsonPrimitive.content) }
+            assertEquals(svgUrl, root.project().iconUrl(), "a refused request keeps the icon")
+        }
+
+        refused(403, "forbidden", "art/logo.svg", client = alice)
+        refused(404, "not_found", "art/logo.svg", repo = "private-lab")
+        val badPath = "path must be a file path inside the repository"
+        for (p in listOf("", "  ", "/", "../x", "a//b", "a/./b", "a/", "a\\b", "a\u0001b", "x".repeat(1025))) {
+            refused(400, "bad_request", p, message = badPath)
+        }
+        refused(404, "icon_file_not_found", "missing.png", message = "No file `missing.png` on the default branch")
+        gh.setFileBytes("demo-app", "big.png", png(4, 4).copyOf(ProjectIcons.MAX_BYTES.toInt() + 1))
+        refused(413, "icon_too_large", "big.png")
+        gh.setFile("demo-app", "README.md", "# Demo")
+        refused(415, "unsupported_icon_type", "README.md")
+        gh.setFile("demo-app", "evil.svg", svg("<script>alert(1)</script>"))
+        refused(422, "invalid_icon", "evil.svg", message = "The SVG cannot be used: it contains a <script> element")
+        gh.setFileBytes("demo-app", "empty.png", ByteArray(0))
+        refused(400, "empty_icon", "empty.png")
     }
 }

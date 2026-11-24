@@ -48,8 +48,8 @@ export type Project = {
 /** Largest project icon the server accepts (1 MiB); used for the client pre-check and by the mock. */
 export const PROJECT_ICON_MAX_BYTES = 1_048_576;
 
-/** The raster types a project icon may be; the server decides by the bytes, this only filters the file picker. */
-export const PROJECT_ICON_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+/** The types a project icon may be (four raster types and SVG); the server decides by the bytes, this only filters the file picker. */
+export const PROJECT_ICON_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/svg+xml'];
 
 export type IssueKind = 'feature' | 'bug' | 'task';
 

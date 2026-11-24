@@ -128,6 +128,7 @@ export const httpApi: Api = {
   projects: () => get('/api/projects'),
   project: (repo) => get(`/api/projects/${enc(repo)}`),
   setProjectIcon: (repo, file) => upload(`/api/projects/${enc(repo)}/icon`, file, { method: 'PUT' }),
+  setProjectIconFromRepository: (repo, path) => post(`/api/projects/${enc(repo)}/icon/from-repository`, { path }),
   deleteProjectIcon: (repo) => del(`/api/projects/${enc(repo)}/icon`),
   issues: (repo, state = 'open') => get(`/api/projects/${enc(repo)}/issues?state=${state}`),
   issue: (repo, n) => get(`/api/projects/${enc(repo)}/issues/${n}`),

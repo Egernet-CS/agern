@@ -99,6 +99,7 @@ export function ProjectPage() {
               repo={repo}
               iconUrl={p.iconUrl}
               size={28}
+              defaultBranch={p.defaultBranch}
               onChanged={(np) => project.setData(() => np)}
               onError={setIconError}
             />
