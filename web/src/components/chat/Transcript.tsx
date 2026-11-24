@@ -1,12 +1,27 @@
-import { memo, useState } from 'react';
+import { memo, useRef, useState } from 'react';
 import { cost, duration, modelLabel } from '../../lib/format';
+import { useNow } from '../../lib/useNow';
 import { SandboxLogBlock } from '../sandbox/SandboxLog';
 import { MessageAttachments } from './attachments';
 import { GeneratedImages } from './generated';
 import { Markdown } from './Markdown';
-import { toolArgs, toolDisplayName, toolSummary, type Item } from './model';
+import { toolArgs, toolDisplayName, toolSummary, type Item, type ToolProgress } from './model';
 
 const PREVIEW_LINES = 3;
+
+/**
+ * "running… 2m 10s" beside a running tool call. Heartbeats come every few seconds; in between the time counts on
+ * from the latest one (or from the first heartbeat seen when they carry no elapsed time).
+ */
+function RunningFor({ progress }: { progress: ToolProgress }) {
+  const now = useNow(1000);
+  const base = useRef<{ elapsed: number | null; at: number } | null>(null);
+  if (!base.current || (progress.elapsedSeconds !== null && progress.elapsedSeconds !== base.current.elapsed)) {
+    base.current = { elapsed: progress.elapsedSeconds, at: Date.now() };
+  }
+  const ms = (base.current.elapsed ?? 0) * 1000 + Math.max(0, now - base.current.at);
+  return <span className="t-tool-progress"> running… {duration(ms)}</span>;
+}
 
 function ToolCall({ item }: { item: Extract<Item, { k: 'tool' }> }) {
   const [open, setOpen] = useState(false);
@@ -26,6 +41,7 @@ function ToolCall({ item }: { item: Extract<Item, { k: 'tool' }> }) {
         <span className="t-body">
           <span className="t-tool-name">{toolDisplayName(item.name)}</span>
           <span className="t-tool-args">({args})</span>
+          {!r && item.progress && <RunningFor progress={item.progress} />}
           <span className="sr-only">{state === 'pending' ? ' running' : state === 'error' ? ' failed' : ' done'}</span>
         </span>
       </div>

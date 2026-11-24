@@ -4,6 +4,9 @@ import type { Attachment, CheckoutInfo, FactoryEvent, ImagesPayload, SandboxLog,
 
 export type ToolResult = { text: string; isError: boolean; images: number };
 
+/** Live heartbeat of a tool call that is still running: seconds it has run so far (null when the CLI did not say). */
+export type ToolProgress = { elapsedSeconds: number | null };
+
 /** A message the run's owner sent to a running pipeline agent (directly, or forwarded by their chat agent). */
 export type Forwarded = {
   messageId: string;
@@ -17,7 +20,7 @@ export type Item =
   | { k: 'user'; id: string; text: string; username: string; ts: string; attachments: Attachment[]; forwarded?: Forwarded }
   | { k: 'text'; id: string; text: string; streaming?: boolean }
   | { k: 'thinking'; id: string; text: string; streaming?: boolean }
-  | { k: 'tool'; id: string; name: string; input: unknown; inputPartial?: string; result?: ToolResult; streaming?: boolean }
+  | { k: 'tool'; id: string; name: string; input: unknown; inputPartial?: string; result?: ToolResult; streaming?: boolean; progress?: ToolProgress }
   | { k: 'init'; id: string; model: string; cwd: string | null; tools: number; mcp: { name: string; status: string }[] }
   | { k: 'result'; id: string; ok: boolean; subtype: string; costUsd: number | null; turns: number | null; durationMs: number | null; text: string | null }
   | { k: 'system'; id: string; level: 'info' | 'warn' | 'error'; text: string; sandbox?: SandboxLog }
@@ -50,6 +53,14 @@ const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFi
  * tokens). The server sends them live only; ones stored by older versions are skipped in the transcript.
  */
 export const TRANSIENT_SYSTEM_SUBTYPES: ReadonlySet<string> = new Set(['thinking_tokens']);
+
+/**
+ * True for a `tool_progress` heartbeat: the CLI sends one every few seconds while a tool call runs. The server sends
+ * them live only; ones stored by older versions are skipped in the transcript.
+ */
+export function isToolProgress(p: unknown): p is { type: 'tool_progress'; tool_use_id?: unknown; parent_tool_use_id?: unknown; elapsed_time_seconds?: unknown } {
+  return isObj(p) && p.type === 'tool_progress';
+}
 
 /** True for a live `system/thinking_tokens` progress payload. */
 export function isThinkingTokens(p: unknown): p is { type: 'system'; subtype: 'thinking_tokens'; estimated_tokens?: unknown } {
@@ -270,8 +281,8 @@ export function buildTranscript(events: FactoryEvent[], partials: unknown[]): { 
         summary.turns = num(p.num_turns) ?? summary.turns;
         summary.turnOpen = false;
         items.push({ k: 'result', id, ok, subtype: str(p.subtype) ?? 'result', costUsd: num(p.total_cost_usd), turns: num(p.num_turns), durationMs: num(p.duration_ms), text: str(p.result) });
-      } else if (t === 'stream_event') {
-        // Persisted partials should not happen; ignore quietly.
+      } else if (t === 'stream_event' || t === 'tool_progress' || t === 'response_length') {
+        // Live-only progress; stored ones (partials should not be; heartbeats of older versions) are skipped.
       } else if (t === 'system') {
         const sub = str(p.subtype) ?? 'system';
         if (sub !== 'hook_response' && sub !== 'status' && !TRANSIENT_SYSTEM_SUBTYPES.has(sub)) items.push({ k: 'unknown', id, label: `system.${sub}`, json: compactJson(p, 160) });
@@ -289,6 +300,14 @@ export function buildTranscript(events: FactoryEvent[], partials: unknown[]): { 
   for (const raw of partials) {
     if (isThinkingTokens(raw)) {
       summary.thinkingTokens = num(raw.estimated_tokens) ?? summary.thinkingTokens;
+      continue;
+    }
+    if (isToolProgress(raw)) {
+      // Matched by tool_use_id, else its parent (a hook's heartbeat names the tool there), else the latest open call.
+      // A heartbeat of a call that has its result already is stale.
+      const known = tools.get(str(raw.tool_use_id) ?? '') ?? tools.get(str(raw.parent_tool_use_id) ?? '');
+      const tool = known ? (known.result ? undefined : known) : [...tools.values()].reverse().find((x) => !x.result);
+      if (tool) tool.progress = { elapsedSeconds: num(raw.elapsed_time_seconds) ?? tool.progress?.elapsedSeconds ?? null };
       continue;
     }
     const e = isObj(raw) && isObj(raw.event) ? raw.event : null;
