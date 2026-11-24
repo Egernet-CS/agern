@@ -1169,7 +1169,7 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   release becomes ready, after every change to a ready release (an issue's state, an issue moved out, the
   description edited), on "Check again", at the start of every approval and after a restart. As the owner (every
   GitHub call of a release uses the owner's token), it: reads the repository (its default branch becomes
-  `targetBranch`, its merge settings decide `mergeMethod`); reconciles an existing pull request — merged on GitHub
+  `targetBranch`, its merge settings and the pull request's `rebaseable` decide `mergeMethod`); reconciles an existing pull request — merged on GitHub
   (by a person) finishes the release exactly as Agern's own merge would ("After the merge", with `releasedBy` null),
   closed without merging is forgotten and replaced; opens the pull request when the release is complete and has
   none (`findOpenPull(release/<name>)`, else `createPull`); rewrites its title and body when they changed (stored as
@@ -1224,14 +1224,24 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   commit `<title> (#<issue>)`. A *rebase merge* replays exactly those commits onto the default branch: one commit per
   issue, a linear history like the one single runs produce, and no extra commit. A *merge commit* also keeps them
   (they become reachable through the merge) but adds a merge commit and a non-linear history; a *squash* would
-  collapse the release into one commit and is never used (`mergePull` refuses it). So approval uses `rebase`; only if
-  the repository reports `allow_rebase_merge: false` it uses a merge commit titled `Release <name> (#<pr>)` — a
-  documented choice shown before approval (`mergeMethod`, in the confirmation dialog), not a fallback after a
-  failure. If the repository allows neither (`mergeMethod: unavailable`), approval answers 409
+  collapse the release into one commit and is never used (`mergePull` refuses it). So approval uses `rebase`; it uses
+  a merge commit titled `Release <name> (#<pr>)` instead if the repository reports `allow_rebase_merge: false`, or if
+  GitHub reports the pull request as not rebaseable (`rebaseable: false`; e.g. the default branch was merged into the
+  release branch with a merge commit to resolve a conflict) and the repository allows merge commits — a choice shown
+  before approval (`mergeMethod`, on the release page and in the confirmation dialog). GitHub may not have computed
+  `rebaseable` yet (null counts as rebaseable): if the rebase merge is then refused with 405 "This branch can't be
+  rebased", Agern tries **once** more with a merge commit where the repository allows one (its settings are read
+  again). The method actually used is stored (`mergeMethod` of the released release) and named in the closing
+  comments ("rebased onto …" or "… with a merge commit …"). Not rebaseable and merge commits not allowed: no method
+  works, so the release stays `ready` without the ready announcement and without an automatic merge, with the notice
+  "GitHub cannot rebase `release/<name>` onto `<default>` (it contains merge commits, …), and <repo> does not allow
+  merge commits; Agern never squashes a release. Allow merge commits …, or rebuild the release branch without merge
+  commits, then use "Check again"."; approval (and a failed fallback) answers 409 `release_merge_failed` with the same
+  text ending "approve again. Nothing was merged.". If the repository allows neither (`mergeMethod: unavailable`), approval answers 409
   `release_merge_method_unavailable` ("This repository only allows squash merges. Allow rebase merging or merge
   commits in its GitHub settings to release."). A setting GitHub leaves out counts as allowed; if GitHub then
   refuses the chosen method ("… merges are not allowed on this repository"), approval answers the same 409 with
-  GitHub's message and a notice, and **never retries with another method**.
+  GitHub's message and a notice, and **never retries with another method** (only "can't be rebased" above falls back).
 - **Release mode** (#41). Every release has `mode` `manual` (the default) or `automatic`, chosen when it is created
   (`POST …/releases { mode }`, the creation dialog) and changed with `PUT /api/releases/{id}/mode` or `/factory release
   mode <name> manual|automatic` until it is finished (`released`: 409 `release_not_editable`; `cancelled`: 409
@@ -1272,7 +1282,16 @@ release mode (#41). Single runs are unaffected and still merge into the default 
     manual release's page also shows when they finish; likewise `awaiting`), oldest first, each under its mutex; a release is published
     on the feed only when something changed. It runs in the services' scope and stops with them. Each round costs a
     handful of GitHub calls per such release with the owner's token (repository, pull request, combined status, check
-    runs), well within the rate limit for the few releases a project has ready at once.
+    runs), well within the rate limit for the few releases a project has ready at once. Every other `ready` release
+    with a pull request (a manual one) is only **reconciled**, with one read of its pull request: merged on GitHub by a
+    person finishes it exactly as a check would ("After the merge", `releasedBy` null); closed without merging forgets
+    the pull request with the notice "Pull request #n was closed on GitHub without being merged. Use "Check again" to
+    open a new one, or cancel the release." (nothing reopens it by itself); open refreshes `mergeState` (a change to
+    `conflict` gets its one comment), and a new head commit gets a full re-evaluation (its checks and merge method).
+    The periodic round never merges a manual release. A GitHub read that fails during the periodic round (a transient
+    network or GitHub error) is only logged and tried again next round: it does not replace the notice, and
+    mergeability that GitHub is still computing does not replace a known `mergeState` (so a conflict is not commented
+    on again).
   - *Released by.* `released_by` is the owner and `released_automatically` is true; the release page says "Released
     automatically <time> for <owner>", and each closed issue's comment ends "Released automatically by Agern for
     @<owner> (the release was set to automatic)." instead of "Approved by @<owner>.".

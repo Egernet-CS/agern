@@ -351,6 +351,88 @@ class ReleaseAutomaticTest {
     }
 
     @Test
+    fun `an automatic release GitHub cannot rebase is merged with a merge commit`() {
+        gh.notRebaseable += "demo-app:release/anr"
+        val r0 = release("anr", listOf(issue("Auto not rebaseable")), mode = ReleaseMode.AUTOMATIC)
+        start(r0.id)
+        val done = awaitReleased(r0.id)
+        assertTrue(done.releasedAutomatically)
+        assertEquals(ReleaseMergeMethod.MERGE, done.mergeMethod)
+        assertEquals(listOf("merge-merge demo-app #${done.prNumber}"), gh.actions.filter { it.startsWith("merge-") })
+    }
+
+    // ------------------------------------------------------------ manual releases in the periodic re-evaluation
+
+    @Test
+    fun `a manual ready release merged on GitHub is finished by the periodic round, which never merges it`() {
+        val n = issue("Merged outside")
+        val r0 = release("mo", listOf(n))
+        start(r0.id)
+        val r = awaitChecked(r0.id, ReleaseChecksState.NONE)
+        assertEquals(ReleaseMode.MANUAL, r.mode)
+        // Clean and green: the periodic round reconciles it with one read of the pull request and merges nothing.
+        val reads = gh.pullReads.get()
+        val checkReads = gh.checkReads.get()
+        repeat(3) { tick() }
+        assertEquals(reads + 3, gh.pullReads.get(), "one pull request read per round")
+        assertEquals(checkReads, gh.checkReads.get(), "no checks read while the head is unchanged")
+        assertEquals(ReleaseStatus.READY, s.releaseStore.get(r.id)!!.status)
+        assertEquals(0, merges())
+
+        // A transient GitHub error neither replaces the notice nor comments.
+        s.releaseStore.setNotice(r.id, "A useful notice")
+        val before = comments(r.prNumber!!).size
+        gh.getPullFailures = 1
+        tick()
+        assertEquals("A useful notice", s.releaseStore.get(r.id)!!.notice)
+        assertEquals(before, comments(r.prNumber!!).size)
+        assertEquals(ReleaseStatus.READY, s.releaseStore.get(r.id)!!.status)
+
+        // A person merges it on GitHub: the next round finishes it exactly as a check would.
+        gh.mergeOnGitHub(r.prNumber!!)
+        tick()
+        val done = awaitReleased(r.id)
+        assertNull(done.releasedById, "merged outside Agern")
+        assertFalse(done.releasedAutomatically)
+        assertNotNull(done.mergeSha)
+        assertEquals(0, merges(), "Agern merged nothing")
+        assertEquals("closed", issueState(n))
+        eventually("released comment") { comments(n).any { it.contains("It was merged on GitHub.") } }
+        assertTrue("delete-branch demo-app release/mo" in gh.actions)
+    }
+
+    @Test
+    fun `the periodic round notices a manual release's pull request closed or turned conflicting on GitHub`() {
+        val r0 = release("mc", listOf(issue("Closed outside")))
+        start(r0.id)
+        val r = awaitChecked(r0.id, ReleaseChecksState.NONE)
+        // The release branch stops merging cleanly: the round records the conflict and comments once.
+        gh.conflicting += "demo-app:release/mc"
+        repeat(2) { tick() }
+        assertEquals(ReleaseMergeState.CONFLICT, s.releaseStore.get(r.id)!!.mergeState)
+        assertEquals(1, comments(r.prNumber!!).count { it.contains("no longer merges cleanly") })
+        gh.conflicting.clear()
+        tick()
+        assertEquals(ReleaseMergeState.CLEAN, s.releaseStore.get(r.id)!!.mergeState)
+
+        // Closed on GitHub without merging: forgotten, with a notice; nothing reopens or merges it by itself.
+        gh.closePull(r.prNumber!!)
+        tick()
+        val closed = s.releaseStore.get(r.id)!!
+        assertEquals(ReleaseStatus.READY, closed.status)
+        assertNull(closed.prNumber)
+        assertTrue(closed.notice!!.contains("was closed on GitHub without being merged"), closed.notice)
+        val pullsBefore = gh.actions.count { it.startsWith("pr demo-app release/mc") }
+        tick()
+        assertEquals(pullsBefore, gh.actions.count { it.startsWith("pr demo-app release/mc") })
+        assertEquals(0, merges())
+        // "Check again" opens a new one.
+        val again = runBlocking { s.releases.check(alice, r.id) }
+        assertNotNull(again.prNumber)
+        assertTrue(again.prNumber != r.prNumber)
+    }
+
+    @Test
     fun `an owner without a GitHub token blocks an automatic release`() {
         gh.setStatus("demo-app", "release/t", "ci", "pending")
         val r0 = release("t", listOf(issue("Tokenless")), mode = ReleaseMode.AUTOMATIC)

@@ -575,7 +575,9 @@ const shortSha = (sha: string) => sha.slice(0, 7);
 function methodWords(release: Release, target: string, past: boolean): string {
   switch (release.mergeMethod) {
     case 'rebase':
-      return past ? `Rebased onto ${target}, one commit per issue` : `Approval merges it by rebasing: one commit per issue on ${target}.`;
+      return past
+        ? `Rebased onto ${target}, one commit per issue`
+        : `Approval merges it by rebasing: one commit per issue on ${target}. If GitHub cannot rebase it, a merge commit is used where the repository allows one.`;
     case 'merge':
       return past
         ? `Merged into ${target} with a merge commit, one commit per issue`
@@ -825,7 +827,9 @@ function ApproveReleaseDialog({
   const n = release.issues.filter((i) => i.state === 'merged').length;
   const issues = `${n} issue${n === 1 ? '' : 's'}`;
   const how =
-    release.mergeMethod === 'merge' ? `with a merge commit: ${issues}, one commit each, plus the merge commit` : `by rebasing: ${issues}, one commit each`;
+    release.mergeMethod === 'merge'
+      ? `with a merge commit: ${issues}, one commit each, plus the merge commit`
+      : `by rebasing (or with a merge commit if GitHub cannot rebase it): ${issues}, one commit each`;
   // Approval is never blocked by checks (the owner decides), but it says what it would override.
   const checks = release.checks;
   const warning =
