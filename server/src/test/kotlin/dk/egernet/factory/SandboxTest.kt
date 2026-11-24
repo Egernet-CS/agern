@@ -76,6 +76,16 @@ class SandboxTest {
         put("command", command); timeoutSeconds?.let { put("timeoutSeconds", it) }
     })
 
+    private fun execBg(w: TestWorld, p: FakeProcess, command: String, timeoutSeconds: Long? = null) =
+        call(w, token(p), "factory_sandbox_exec", buildJsonObject {
+            put("command", command); put("background", true); timeoutSeconds?.let { put("timeoutSeconds", it) }
+        })
+
+    private fun wait(w: TestWorld, p: FakeProcess, handle: String? = null, waitSeconds: Long? = null) =
+        call(w, token(p), "factory_sandbox_wait", buildJsonObject { handle?.let { put("handle", it) }; waitSeconds?.let { put("waitSeconds", it) } })
+
+    private fun ToolAnswer.str(k: String) = json[k]!!.jsonPrimitive.content
+
     private fun toolNames(w: TestWorld, token: String): List<String> =
         AppJson.parseToJsonElement(runBlocking { w.services.mcp.handle(token, """{"jsonrpc":"2.0","id":1,"method":"tools/list"}""") }.second!!)
             .jsonObject["result"]!!.jsonObject["tools"]!!.jsonArray.map { it.jsonObject["name"]!!.jsonPrimitive.content }
@@ -323,10 +333,14 @@ class SandboxTest {
         w.sandboxFile(definition)
         approve(w)
         val bothRunning = CountDownLatch(2)
+        val handles = java.util.concurrent.ConcurrentHashMap<UUID, String>()
+        val foreign = CopyOnWriteArrayList<ToolAnswer>()
         script(w) { p ->
-            exec(w, p, "echo from ${p.spec.sessionId}")
+            handles[p.spec.sessionId] = exec(w, p, "echo from ${p.spec.sessionId}").str("handle")
             bothRunning.countDown()
             bothRunning.await(10, TimeUnit.SECONDS)
+            // The other run's handle is unknown here: handles are looked up only in the caller's own run.
+            foreign += wait(w, p, handles.entries.single { it.key != p.spec.sessionId }.value, 0)
             "ok"
         }
         val a = start(w, 1)
@@ -337,12 +351,16 @@ class SandboxTest {
             val mine = w.sandboxRuntime.execs.filter { it.second == "echo from $session" }
             assertEquals(listOf("agern-run-$runId"), mine.map { it.first })
         }
+        assertEquals(2, foreign.size)
+        assertTrue(foreign.all { it.isError && it.text.startsWith("Unknown handle 'cmd-") }, foreign.toString())
         // A token without a run (a chat), even if it were granted the tools, has no sandbox; dead tokens are refused.
         val alice = w.user("alice")
         val chat = w.services.agents.createChat(alice, "demo-app", null)
         val chatToken = w.services.mcpRegistry.issue(McpGrant(chat.id, alice.id, "demo-app", null, McpRegistry.CHAT_TOOLS + SandboxManager.TOOLS))
         val answer = call(w, chatToken, "factory_sandbox_exec", buildJsonObject { put("command", "id") })
         assertTrue(answer.isError && answer.text.contains("chats have none"), answer.text)
+        val chatWait = call(w, chatToken, "factory_sandbox_wait")
+        assertTrue(chatWait.isError && chatWait.text.contains("chats have none"), chatWait.text)
         val dead = w.launcher.byRole("builder").first()
         assertEquals(401, runBlocking { w.services.mcp.handle(token(dead), """{"jsonrpc":"2.0","id":1,"method":"tools/list"}""") }.first)
     }
@@ -735,5 +753,204 @@ class SandboxTest {
         assertEquals(RunStatus.FAILED, t.services.runs.get(old.id)!!.status)
         assertEquals(listOf("agern-run-${old.id}" to true), t.sandboxRuntime.removedWithWorktree.toList(), "sandbox reaper before worktree reaper")
         assertTrue(wt in t.git.removedWorktrees && !java.nio.file.Files.exists(wt), t.git.removedWorktrees.toString())
+    }
+
+    // ---------------------------------------------------------------- background commands and factory_sandbox_wait
+
+    private val plain = "image: docker.io/library/debian:12\n"
+
+    @Test
+    fun `a background command returns a handle at once and factory_sandbox_wait returns its result`() {
+        val w = world()
+        w.sandboxFile(plain)
+        approve(w, plain)
+        val rt = w.sandboxRuntime
+        val gate = CountDownLatch(1)
+        rt.onExec = { _, cmd, _ ->
+            if (cmd == "make long") {
+                gate.await(10, TimeUnit.SECONDS)
+                ExecResult(4, "long done\n", false, false, 1234)
+            } else ExecResult(0, "ran: $cmd\n", false, false, 5)
+        }
+        val a = linkedMapOf<String, ToolAnswer>()
+        var noneYet: ToolAnswer? = null
+        script(w) { p ->
+            noneYet = wait(w, p)
+            a["start"] = execBg(w, p, "make long")
+            val handle = a["start"]!!.str("handle")
+            a["info"] = call(w, token(p), "factory_sandbox_info")
+            a["wait0"] = wait(w, p, handle, 0)
+            a["wait1"] = wait(w, p, handle, 1)
+            a["latest0"] = wait(w, p, null, 0)
+            a["fgDuring"] = exec(w, p, "echo hi")
+            a["bgDuring"] = execBg(w, p, "echo hi")
+            gate.countDown()
+            a["done"] = wait(w, p, handle)
+            a["again"] = wait(w, p, handle, 0)
+            a["fg"] = exec(w, p, "echo after")
+            a["latest"] = wait(w, p)
+            a["unknown"] = wait(w, p, "cmd-nope" + "x".repeat(100))
+            a["badWait"] = call(w, token(p), "factory_sandbox_wait", buildJsonObject { put("waitSeconds", -1) })
+            a["badWait2"] = call(w, token(p), "factory_sandbox_wait", buildJsonObject { put("waitSeconds", "soon") })
+            a["badBg"] = call(w, token(p), "factory_sandbox_exec", buildJsonObject { put("command", "x"); put("background", "yes") })
+            "ok"
+        }
+        val run = start(w)
+        assertEquals(RunStatus.MERGED, w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN, timeoutMs = 30_000).status)
+        assertTrue(noneYet!!.isError && noneYet!!.text == "No sandbox command has been started in this run yet.", noneYet!!.text)
+
+        val start = a["start"]!!
+        assertFalse(start.isError, start.text)
+        val handle = start.str("handle")
+        assertTrue(Regex("cmd-[0-9a-f]{8}").matches(handle), handle)
+        assertEquals("true", start.str("running"))
+        assertEquals(30 * 60L, start.str("timeoutSeconds").toLong())
+        assertTrue(start.str("note").contains("factory_sandbox_wait"))
+        assertFalse(start.json.containsKey("platform"), "no platforms in this definition")
+
+        val info = a["info"]!!.json
+        assertEquals(handle, info["command"]!!.jsonObject["handle"]!!.jsonPrimitive.content)
+        assertEquals(61 * 60L, info["limits"]!!.jsonObject["toolCallTimeoutSeconds"]!!.jsonPrimitive.content.toLong())
+
+        for (k in listOf("wait0", "wait1", "latest0")) {
+            val r = a[k]!!
+            assertFalse(r.isError, "$k: ${r.text}")
+            assertEquals(handle, r.str("handle"))
+            assertEquals("true", r.str("running"), k)
+            assertTrue(r.json.containsKey("elapsedMs") && !r.json.containsKey("exitCode"), r.text)
+        }
+        assertTrue(a["wait1"]!!.str("elapsedMs").toLong() >= 1000, a["wait1"]!!.text)
+        for (k in listOf("fgDuring", "bgDuring")) {
+            val r = a[k]!!
+            assertTrue(r.isError && r.text.startsWith("A command is still running in this run's sandbox (handle $handle, started "), "$k: ${r.text}")
+        }
+
+        val done = a["done"]!!
+        assertFalse(done.isError, done.text)
+        assertEquals("false", done.str("running"))
+        assertEquals(4, done.str("exitCode").toInt())
+        assertEquals("long done\n", done.str("output"))
+        assertEquals(1234L, done.str("durationMs").toLong())
+        assertEquals("false", done.str("timedOut"))
+        assertEquals("false", done.str("truncated"))
+        assertEquals(done.text, a["again"]!!.text, "a finished handle answers the same every time")
+
+        // Foreground calls get a handle too, and a wait without a handle resolves to the latest command.
+        val fg = a["fg"]!!
+        assertEquals(0, fg.str("exitCode").toInt())
+        assertFalse(fg.json.containsKey("running"))
+        assertEquals(fg.str("handle"), a["latest"]!!.str("handle"))
+        assertEquals("ran: echo after\n", a["latest"]!!.str("output"))
+
+        val unknown = a["unknown"]!!
+        assertTrue(unknown.isError && unknown.text.startsWith("Unknown handle 'cmd-nope"), unknown.text)
+        assertTrue(unknown.text.contains("x".repeat(56) + "'") && !unknown.text.contains("x".repeat(57)), "at most 64 characters echoed")
+        for (k in listOf("badWait", "badWait2")) assertEquals("waitSeconds must be a whole number of seconds, 0 or more", a[k]!!.text)
+        assertTrue(a["badBg"]!!.isError && a["badBg"]!!.text == "background must be true or false")
+
+        // Only the commands that were started ran; the background one is logged to the transcript when it ended.
+        assertEquals(listOf("make long", "echo after"), rt.execs.map { it.second })
+        val logs = builderEvents(w, run.id).mapNotNull { it.payload.jsonObject["sandbox"]?.jsonObject }
+        assertEquals(listOf("make long", "echo after"), logs.map { it["command"]!!.jsonPrimitive.content })
+        assertTrue(systemTexts(w, run.id).any { it == "Sandbox `make long`: exit 4 in 1.234 s" }, systemTexts(w, run.id).toString())
+        assertEquals(0, w.services.sandboxes.inUse())
+    }
+
+    @Test
+    fun `background commands time out, and admin stop and release end their waits with the specified errors`() {
+        val w = world()
+        w.sandboxFile(plain)
+        approve(w, plain)
+        val root = w.user("root", admin = true)
+        val rt = w.sandboxRuntime
+        val hang = CountDownLatch(1)
+        val hang2 = CountDownLatch(1)
+        rt.onExec = { _, cmd, _ ->
+            when {
+                cmd == "slow" -> ExecResult(-1, "partial", false, true, 5_000)
+                cmd == "hang 1" -> { hang.await(20, TimeUnit.SECONDS); ExecResult(0, "late\n", false, false, 1) }
+                cmd == "hang 2" -> { hang2.await(20, TimeUnit.SECONDS); ExecResult(0, "late\n", false, false, 1) }
+                else -> ExecResult(0, "ran: $cmd\n", false, false, 5)
+            }
+        }
+        val inHang = CountDownLatch(1)
+        val stopped = CountDownLatch(1)
+        val inHang2 = CountDownLatch(1)
+        val a = linkedMapOf<String, ToolAnswer>()
+        var runId: UUID? = null
+        script(w) { p ->
+            val slow = execBg(w, p, "slow", timeoutSeconds = 5)
+            a["slowStart"] = slow
+            a["slow"] = wait(w, p, slow.str("handle"))
+            val h = execBg(w, p, "hang 1").str("handle")
+            inHang.countDown()
+            stopped.await(10, TimeUnit.SECONDS)
+            a["afterStop"] = wait(w, p, h)
+            a["afterStopAgain"] = wait(w, p, h, 0)
+            hang.countDown()
+            // The stopped command's job ends as soon as the runtime's exec returns; then the next one recreates the sandbox.
+            var next: ToolAnswer
+            do { next = execBg(w, p, "hang 2"); if (next.isError) Thread.sleep(20) } while (next.isError && next.text.startsWith("A command"))
+            a["next"] = next
+            inHang2.countDown()
+            a["afterRelease"] = wait(w, p, next.str("handle"))
+            a["released"] = wait(w, p, next.str("handle"), 0)
+            "ok"
+        }
+        val run = start(w)
+        runId = run.id
+        assertTrue(inHang.await(10, TimeUnit.SECONDS))
+        assertEquals(1, w.services.sandboxes.inUse())
+        runBlocking { w.services.sandboxes.stop(root, run.id) }
+        assertEquals(0, w.services.sandboxes.inUse())
+        assertTrue(rt.containers.isEmpty(), rt.calls.toString())
+        stopped.countDown()
+        assertTrue(inHang2.await(10, TimeUnit.SECONDS))
+        waitFor { rt.execs.count { it.second == "hang 2" } == 1 }
+        w.services.sandboxes.releaseNow(run.id)
+        hang2.countDown()
+        assertEquals(0, w.services.sandboxes.inUse())
+        assertTrue(rt.containers.isEmpty() && rt.networks.isEmpty(), rt.calls.toString())
+        assertEquals(RunStatus.MERGED, w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN, timeoutMs = 30_000).status)
+
+        assertEquals(5L, a["slowStart"]!!.str("timeoutSeconds").toLong())
+        val slow = a["slow"]!!
+        assertFalse(slow.isError, slow.text)
+        assertEquals("true", slow.str("timedOut"))
+        assertEquals(-1, slow.str("exitCode").toInt())
+        assertTrue(slow.str("note").startsWith("Stopped after 5 s"), slow.text)
+        assertEquals(1, rt.calls.count { it == "restart agern-run-$runId" }, rt.calls.toString())
+
+        for (k in listOf("afterStop", "afterStopAgain")) {
+            assertTrue(a[k]!!.isError && a[k]!!.text.startsWith("An admin stopped this run's sandbox while the command ran"), "$k: ${a[k]!!.text}")
+        }
+        assertFalse(a["next"]!!.isError, a["next"]!!.text)
+        assertTrue(a["afterRelease"]!!.isError && a["afterRelease"]!!.text == "The run's sandbox was removed while the command ran (the run ended).",
+            a["afterRelease"]!!.text)
+        assertTrue(a["released"]!!.isError && a["released"]!!.text.startsWith("This run has no sandbox"), a["released"]!!.text)
+        assertEquals(0, w.services.sandboxes.inUse())
+    }
+
+    @Test
+    fun `a run keeps the results of its last 20 commands`() {
+        val w = world()
+        w.sandboxFile(plain)
+        approve(w, plain)
+        val handles = mutableListOf<String>()
+        val a = mutableListOf<ToolAnswer>()
+        script(w) { p ->
+            repeat(22) { handles += exec(w, p, "echo $it").str("handle") }
+            a += wait(w, p, handles[0], 0)
+            a += wait(w, p, handles[1], 0)
+            a += wait(w, p, handles[2], 0)
+            a += wait(w, p, handles[21], 0)
+            "ok"
+        }
+        val run = start(w)
+        assertEquals(RunStatus.MERGED, w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
+        assertEquals(22, handles.toSet().size, "handles are unique")
+        assertTrue(a[0].isError && a[1].isError, a.toString())
+        assertEquals("ran: echo 2\n", a[2].str("output"))
+        assertEquals("ran: echo 21\n", a[3].str("output"))
     }
 }

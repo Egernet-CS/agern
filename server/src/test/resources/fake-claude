@@ -61,6 +61,10 @@ Behaviour
         "echo built in the sandbox && ls") like a real agent (tool_use + tool_result events) and report both answers
         in its result ("Sandbox info: ..." / "Sandbox exec: ..."); with "fake:platform=<name>" it then runs the same
         command once more with that platform ("Sandbox exec on <name>: ...")
+    - "fake:sandbox-long" makes the builder run one foreground factory_sandbox_exec ("sleep long"; a test makes it outlast
+        the 10 s read timeout of mcp_call, so the answer has to come as a stream) and report it ("Sandbox exec: ...")
+    - "fake:sandbox-background" makes the builder start "sleep long" with factory_sandbox_exec {background: true}, then
+        call factory_sandbox_wait with the handle, and report both ("Sandbox start: ..." / "Sandbox wait: ...")
     - "fake:screenshots" makes the ux and ui-design reviewers, before answering, write a small PNG into their working
         directory, attach it through the MCP tool factory_attach_screenshot with the caption
         "Fake <role> screenshot (<build | fix round N>)", delete the file and append "Attached 1 screenshot." (or the
@@ -220,15 +224,34 @@ def rate_limit_event(content):
 
 
 def mcp_call(method, params, req_id):
+    """One MCP request. Like the real CLI it accepts a JSON body or an event stream (a slow call): comments and
+    notifications/progress are skipped, the message with our id is the answer. The 10 s socket timeout applies to the
+    first byte and to every pause between two lines, like a client's first-byte and idle budgets."""
     with open(mcp_config) as f:
         cfg = json.load(f)
     server = list(cfg["mcpServers"].values())[0]
+    if method == "tools/call":
+        params = dict(params, _meta={"progressToken": "fake-%d" % req_id})
     body = json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}).encode()
     headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
     headers.update(server.get("headers", {}))
     req = urllib.request.Request(server["url"], data=body, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read().decode())
+        if not resp.headers.get("Content-Type", "").startswith("text/event-stream"):
+            return json.loads(resp.read().decode())
+        data = []
+        while True:
+            line = resp.readline()
+            if not line:
+                raise RuntimeError("event stream ended without an answer")
+            line = line.decode().rstrip("\r\n")
+            if line.startswith("data:"):
+                data.append(line[5:].lstrip())
+            elif line == "" and data:
+                msg = json.loads("\n".join(data))
+                data = []
+                if msg.get("id") == req_id:
+                    return msg
 
 
 def mcp_tool_roundtrip(tool, arguments, req_id):
@@ -608,7 +631,25 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
         tool_roundtrip("git status --short | head -5")
         checkpoint()
         sandbox_report = ""
-        if "fake:sandbox" in prompt and mcp_config:
+        if "fake:sandbox-long" in prompt and mcp_config:
+            try:
+                mcp_call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake-claude", "version": "0"}}, 1)
+                out, _ = mcp_tool_roundtrip("factory_sandbox_exec", {"command": "sleep long"}, 2)
+                sandbox_report = "\nSandbox exec: %s" % out
+            except Exception as e:  # noqa
+                sandbox_report = "\nSandbox MCP calls failed: %s" % e
+            checkpoint()
+        elif "fake:sandbox-background" in prompt and mcp_config:
+            try:
+                mcp_call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake-claude", "version": "0"}}, 1)
+                started, _ = mcp_tool_roundtrip("factory_sandbox_exec", {"command": "sleep long", "background": True}, 2)
+                handle = json.loads(started).get("handle", "")
+                waited, _ = mcp_tool_roundtrip("factory_sandbox_wait", {"handle": handle}, 3)
+                sandbox_report = "\nSandbox start: %s\nSandbox wait: %s" % (started, waited)
+            except Exception as e:  # noqa
+                sandbox_report = "\nSandbox MCP calls failed: %s" % e
+            checkpoint()
+        elif "fake:sandbox" in prompt and mcp_config:
             try:
                 mcp_call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake-claude", "version": "0"}}, 1)
                 info, _ = mcp_tool_roundtrip("factory_sandbox_info", {}, 2)

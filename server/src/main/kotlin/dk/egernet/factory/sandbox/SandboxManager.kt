@@ -1,5 +1,6 @@
 package dk.egernet.factory.sandbox
 
+import dk.egernet.factory.AppJson
 import dk.egernet.factory.Config
 import dk.egernet.factory.OwnerDto
 import dk.egernet.factory.RunSandboxDto
@@ -30,13 +31,18 @@ import dk.egernet.factory.github.Access
 import dk.egernet.factory.github.GitHubException
 import dk.egernet.factory.notFound
 import dk.egernet.factory.unprocessable
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
@@ -44,6 +50,7 @@ import kotlinx.serialization.json.addJsonObject
 import kotlinx.serialization.json.add
 import org.slf4j.LoggerFactory
 import java.nio.file.Path
+import java.security.SecureRandom
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Semaphore
@@ -72,6 +79,11 @@ class SandboxManager(
     private val runs: RunStore,
     private val access: Access,
     private val git: GitOps,
+    /**
+     * Where commands run (the application's scope): independent of the tool call that started them, so a dropped or
+     * timed-out HTTP request never kills or loses a command.
+     */
+    private val scope: CoroutineScope,
     /** Appends a `system` event (payload as given) to an agent session's transcript. */
     private val publishSystem: (UUID, JsonObject) -> Unit,
     /** Announces approval changes on the live feed (`sandbox_approval`). */
@@ -109,9 +121,37 @@ class SandboxManager(
         @Volatile var user: ExecUser? = null
     }
 
+    /**
+     * One command of a run, foreground or background, under its [handle]. [result] is completed with the answer the agent
+     * gets (the output tail, or an error) when the command ends.
+     */
+    private class Command(
+        val handle: String,
+        val key: String,
+        val command: String,
+        val sessionId: UUID,
+        val background: Boolean,
+        val timeoutMs: Long,
+        val startedAt: Long = System.currentTimeMillis(),
+    ) {
+        val result = CompletableDeferred<SandboxAnswer>()
+        val running: Boolean get() = !result.isCompleted
+        val elapsedMs: Long get() = System.currentTimeMillis() - startedAt
+    }
+
     private class RunSandbox(val runId: UUID, val repo: String, val worktree: Path, val plan: Plan, @Volatile var info: RunSandboxDto) {
-        /** Serialises creation and commands: one command at a time per run. Release and stop never take it. */
+        /**
+         * Serialises creation and commands: one command at a time per run. Taken by the tool call (waiting for a
+         * foreground command, `tryLock` for a background one) and released by the command's job when it ends. Release,
+         * stop and waits never take it.
+         */
         val lock = Mutex()
+        /** The command whose job runs now (null between commands). */
+        @Volatile var current: Command? = null
+        /** The most recently started command: what `factory_sandbox_wait` without a handle waits for. */
+        @Volatile var latest: Command? = null
+        /** The running command and the last [KEPT_RESULTS] finished ones, by handle, oldest first. Guarded by itself. */
+        val commands = LinkedHashMap<String, Command>()
         /** The run's network and services exist. */
         @Volatile var infra = false
         /** When the network and services were created (null while there are none). */
@@ -269,6 +309,10 @@ class SandboxManager(
                 putJsonObject("limits") {
                     put("cpus", def.cpus); put("memory", SandboxConfig.formatMemory(def.memoryBytes))
                     put("execTimeoutSeconds", execCapMs / 1000); put("outputTailChars", OUTPUT_TAIL_CHARS)
+                    put("toolCallTimeoutSeconds", cfg.mcpToolTimeoutMs / 1000)
+                }
+                rs.current?.takeIf { it.running }?.let { c ->
+                    putJsonObject("command") { put("handle", c.handle); put("running", true); put("elapsedMs", c.elapsedMs) }
                 }
                 putJsonObject("capacity") { put("inUse", inUse()); put("max", sc.maxConcurrent); put("heldByThisRun", rs.slotsHeld.get()) }
             }
@@ -279,9 +323,12 @@ class SandboxManager(
     /**
      * `factory_sandbox_exec`: runs [command] with `sh -lc` in the run's sandbox — in [platform]'s container when given —
      * creating it first if needed. The full output (up to [ExecLimits.LOG_CHARS]) goes into [sessionId]'s transcript as a
-     * `system` event; the agent gets the tail.
+     * `system` event; the agent gets the tail. The command runs in a job on the manager's scope under a handle: in the
+     * foreground the call waits for it, with [background] it returns the handle at once ([wait] gets the result).
      */
-    suspend fun exec(runId: UUID, sessionId: UUID, command: String, timeoutSeconds: Long?, platform: String? = null): SandboxAnswer {
+    suspend fun exec(
+        runId: UUID, sessionId: UUID, command: String, timeoutSeconds: Long?, platform: String? = null, background: Boolean = false,
+    ): SandboxAnswer {
         if (!enabled) return SandboxAnswer(true, "Sandboxes are switched off on this server. Build and test on the host as usual.")
         val rs = sandboxes[runId] ?: return SandboxAnswer(true, "This run has no sandbox. Build and test on the host as usual.")
         val plan = rs.plan
@@ -297,41 +344,140 @@ class SandboxManager(
         val cap = execCapMs
         if (timeoutSeconds != null && timeoutSeconds <= 0) return SandboxAnswer(true, "timeoutSeconds must be positive")
         val timeoutMs = minOf(timeoutSeconds?.let { it * 1000 } ?: cap, cap)
-        return rs.lock.withLock {
-            if (rs.released) return@withLock SandboxAnswer(true, "The run's sandbox has been removed.")
+        // One command at a time: a background command refuses everything else; a foreground one queues foreground calls.
+        rs.current?.takeIf { it.running && (background || it.background) }?.let { return busy(it) }
+        if (background) {
+            if (!rs.lock.tryLock()) return rs.current?.let { busy(it) } ?: SandboxAnswer(true, "Another sandbox command of this run is " +
+                "being started. Wait for it with factory_sandbox_wait before starting another.")
+        } else {
+            rs.lock.lock()
+        }
+        var handedOver = false
+        try {
+            if (rs.released) return SandboxAnswer(true, "The run's sandbox has been removed.")
             rs.sessionId = sessionId
-            if (!rs.boxes.containsKey(key)) create(rs, plan, key, sessionId)?.let { return@withLock SandboxAnswer(true, it) }
-            val box = rs.boxes[key] ?: return@withLock SandboxAnswer(true, STOPPED_WHILE_RUNNING)
+            if (!rs.boxes.containsKey(key)) create(rs, plan, key, sessionId)?.let { return SandboxAnswer(true, it) }
+            val box = rs.boxes[key] ?: return SandboxAnswer(true, STOPPED_WHILE_RUNNING)
             box.lastUsed = System.nanoTime()
             noteUsed(rs, key)
-            val name = boxName(runId, key)
+            val cmd = Command(newHandle(rs), key, command, sessionId, background, timeoutMs)
+            synchronized(rs.commands) { rs.commands[cmd.handle] = cmd }
+            rs.latest = cmd
+            rs.current = cmd
             val generation = rs.generation.get()
-            val r = try {
-                withContext(Dispatchers.IO) { runtime!!.exec(name, shellCommand(command), WORKDIR, timeoutMs, box.user) }
-            } catch (e: Exception) {
-                if (rs.generation.get() != generation) return@withLock SandboxAnswer(true, STOPPED_WHILE_RUNNING)
-                return@withLock SandboxAnswer(true, "The sandbox command could not be run: ${e.message}")
+            // ATOMIC: the job runs (and frees the lock) even when the scope is cancelled before it starts.
+            scope.launch(start = CoroutineStart.ATOMIC) {
+                try {
+                    val answer = try {
+                        runCommand(rs, def, box, cmd, generation)
+                    } catch (e: Exception) {
+                        SandboxAnswer(true, "The sandbox command could not be run: ${e.message}")
+                    }
+                    forget(rs, cmd)
+                    cmd.result.complete(answer)
+                } finally {
+                    cmd.result.complete(SandboxAnswer(true, "The sandbox command could not be run: the server is shutting down."))
+                    if (rs.current === cmd) rs.current = null
+                    rs.lock.unlock()
+                }
             }
-            box.lastUsed = System.nanoTime()
-            if (rs.released) return@withLock SandboxAnswer(true, "The run's sandbox was removed while the command ran (the run ended).")
-            if (rs.generation.get() != generation) return@withLock SandboxAnswer(true, STOPPED_WHILE_RUNNING)
-            if (r.timedOut) {
-                // Kill whatever the command left running; files (and what setup installed) are kept.
-                runCatching { withContext(Dispatchers.IO) { runtime!!.restartContainer(name) } }
-                    .onFailure { log.warn("Restarting sandbox {} of run {} after a timeout failed: {}", key, runId, it.message) }
-            }
-            logEvent(sessionId, "exec", command, r, timeoutMs, platformLabel(def, key))
-            val tail = r.output.takeLast(OUTPUT_TAIL_CHARS)
-            SandboxAnswer(false, buildJsonObject {
-                put("exitCode", r.exitCode)
-                put("output", tail)
-                put("truncated", r.outputTruncated || tail.length < r.output.length)
-                put("durationMs", r.durationMs)
-                put("timedOut", r.timedOut)
+            handedOver = true
+            if (!background) return cmd.result.await()
+            return SandboxAnswer(false, buildJsonObject {
+                put("handle", cmd.handle)
+                put("running", true)
+                put("timeoutSeconds", timeoutMs / 1000)
                 if (def.platforms.isNotEmpty()) put("platform", key)
-                if (r.timedOut) put("note", "Stopped after ${timeoutMs / 1000} s; every process in the container was killed (files are kept).")
+                put("note", "Started in the background. Call factory_sandbox_wait to get the exit code and output; do not poll with sleep.")
             }.toString())
+        } finally {
+            if (!handedOver) rs.lock.unlock()
         }
+    }
+
+    /** The part of a command after the container exists: runs it, handles a timeout, logs it and builds the answer. */
+    private suspend fun runCommand(rs: RunSandbox, def: SandboxDefinition, box: Box, cmd: Command, generation: Int): SandboxAnswer {
+        val key = cmd.key
+        val name = boxName(rs.runId, key)
+        val r = try {
+            withContext(Dispatchers.IO) { runtime!!.exec(name, shellCommand(cmd.command), WORKDIR, cmd.timeoutMs, box.user) }
+        } catch (e: Exception) {
+            if (rs.generation.get() != generation) return SandboxAnswer(true, STOPPED_WHILE_RUNNING)
+            return SandboxAnswer(true, "The sandbox command could not be run: ${e.message}")
+        }
+        box.lastUsed = System.nanoTime()
+        if (rs.released) return SandboxAnswer(true, REMOVED_WHILE_RUNNING)
+        if (rs.generation.get() != generation) return SandboxAnswer(true, STOPPED_WHILE_RUNNING)
+        if (r.timedOut) {
+            // Kill whatever the command left running; files (and what setup installed) are kept.
+            runCatching { withContext(Dispatchers.IO) { runtime!!.restartContainer(name) } }
+                .onFailure { log.warn("Restarting sandbox {} of run {} after a timeout failed: {}", key, rs.runId, it.message) }
+        }
+        logEvent(cmd.sessionId, "exec", cmd.command, r, cmd.timeoutMs, platformLabel(def, key))
+        val tail = r.output.takeLast(OUTPUT_TAIL_CHARS)
+        return SandboxAnswer(false, buildJsonObject {
+            put("handle", cmd.handle)
+            put("exitCode", r.exitCode)
+            put("output", tail)
+            put("truncated", r.outputTruncated || tail.length < r.output.length)
+            put("durationMs", r.durationMs)
+            put("timedOut", r.timedOut)
+            if (def.platforms.isNotEmpty()) put("platform", key)
+            if (r.timedOut) put("note", "Stopped after ${cmd.timeoutMs / 1000} s; every process in the container was killed (files are kept).")
+        }.toString())
+    }
+
+    private fun busy(c: Command) = SandboxAnswer(true, "A command is still running in this run's sandbox (handle ${c.handle}, started " +
+        "${c.elapsedMs / 1000} s ago). Wait for it with factory_sandbox_wait before starting another.")
+
+    private val random = SecureRandom()
+
+    /** `cmd-` and 8 lower-case hex characters, unique among the run's commands. */
+    private fun newHandle(rs: RunSandbox): String = synchronized(rs.commands) {
+        generateSequence { "cmd-%08x".format(random.nextInt()) }.first { it !in rs.commands }
+    }
+
+    /**
+     * Drops the oldest finished commands so that, with [ending] (about to finish), the run keeps [KEPT_RESULTS] results.
+     * Called before [ending]'s result is completed, so a caller woken by it already sees the trimmed list.
+     */
+    private fun forget(rs: RunSandbox, ending: Command) = synchronized(rs.commands) {
+        val finished = rs.commands.values.filter { it !== ending && !it.running }
+        finished.take((finished.size - (KEPT_RESULTS - 1)).coerceAtLeast(0)).forEach { rs.commands.remove(it.handle) }
+    }
+
+    /**
+     * `factory_sandbox_wait`: waits up to [waitSeconds] (null: until it ends; capped at the command limit) for the command
+     * [handle] of run [runId] — blank: the most recently started one — and returns its result, or that it still runs.
+     * Never takes the run's command lock, so any number of waits can run at once.
+     */
+    suspend fun wait(runId: UUID, handle: String?, waitSeconds: Long?): SandboxAnswer {
+        if (!enabled) return SandboxAnswer(true, "Sandboxes are switched off on this server. Build and test on the host as usual.")
+        val rs = sandboxes[runId] ?: return SandboxAnswer(true, "This run has no sandbox. Build and test on the host as usual.")
+        val plan = rs.plan
+        if (plan !is Plan.Available) return SandboxAnswer(true, "No sandbox for this run: ${rs.info.reason} Build and test on the host as usual.")
+        if (waitSeconds != null && waitSeconds < 0) return SandboxAnswer(true, "waitSeconds must be a whole number of seconds, 0 or more")
+        val wanted = handle?.trim()?.takeIf { it.isNotEmpty() }
+        val cmd = if (wanted == null) rs.latest ?: return SandboxAnswer(true, "No sandbox command has been started in this run yet.")
+        else synchronized(rs.commands) { rs.commands[wanted] } ?: return SandboxAnswer(true, "Unknown handle '${wanted.take(64)}'. Handles " +
+            "come from factory_sandbox_exec; older results are dropped after $KEPT_RESULTS newer commands.")
+        val answer = when {
+            waitSeconds == null -> cmd.result.await()
+            waitSeconds == 0L || !cmd.running -> if (cmd.running) null else cmd.result.await()
+            else -> withTimeoutOrNull(minOf(waitSeconds * 1000, execCapMs)) { cmd.result.await() }
+        } ?: return SandboxAnswer(false, buildJsonObject {
+            put("handle", cmd.handle)
+            put("running", true)
+            put("elapsedMs", cmd.elapsedMs)
+            put("note", "Still running. Call factory_sandbox_wait again.")
+        }.toString())
+        if (answer.isError) return answer
+        val done = AppJson.parseToJsonElement(answer.text).jsonObject
+        return SandboxAnswer(false, buildJsonObject {
+            put("handle", cmd.handle)
+            put("running", false)
+            for ((k, v) in done) if (k != "handle") put(k, v)
+        }.toString())
     }
 
     /** What the transcript calls the container a command ran in: null when the definition has no platforms. */
@@ -551,6 +697,8 @@ class SandboxManager(
     fun releaseNow(runId: UUID) {
         val rs = sandboxes.remove(runId) ?: return
         rs.released = true
+        // The command dies with its container; waits on it learn so now, not when the runtime's exec returns.
+        rs.current?.result?.complete(SandboxAnswer(true, REMOVED_WHILE_RUNNING))
         val had = rs.created
         teardown(rs)
         if (had) announce(rs, "removed")
@@ -583,6 +731,7 @@ class SandboxManager(
             ?: throw notFound("Run $runId has no sandbox right now")
         rs.generation.incrementAndGet()
         withContext(NonCancellable + Dispatchers.IO) { teardown(rs) }
+        rs.current?.result?.complete(SandboxAnswer(true, STOPPED_WHILE_RUNNING))
         log.info("Sandbox of run {} stopped by {}", runId, admin.username)
         announce(rs, "stopped")
         rs.sessionId?.let {
@@ -798,10 +947,13 @@ class SandboxManager(
         /** After setup (as root): files it left in the user's home or the worktree go to the user; `-xdev` skips cache volumes. */
         const val HAND_OVER_SCRIPT = "uid=\$1; shift; find \"\$@\" -xdev ! -user \"\$uid\" -exec chown -h \"\$uid:\$uid\" {} + 2>/dev/null || true"
 
+        private const val REMOVED_WHILE_RUNNING = "The run's sandbox was removed while the command ran (the run ended)."
+        /** Finished commands whose results a run keeps for `factory_sandbox_wait`. */
+        const val KEPT_RESULTS = 20
         private const val STOPPED_WHILE_RUNNING = "An admin stopped this run's sandbox while the command ran, so it was killed. " +
             "The next command creates a new sandbox (the setup script runs again)."
         /** How much of a command's output the agent gets back (the end of it). */
         const val OUTPUT_TAIL_CHARS = 20_000
-        val TOOLS = setOf("factory_sandbox_info", "factory_sandbox_exec")
+        val TOOLS = setOf("factory_sandbox_info", "factory_sandbox_exec", "factory_sandbox_wait")
     }
 }

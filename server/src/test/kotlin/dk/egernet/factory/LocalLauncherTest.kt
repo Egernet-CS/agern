@@ -66,6 +66,7 @@ class LocalLauncherTest {
         val allowed = setOf(
             "PATH", "HOME", "LANG", "TERM", "CLAUDE_CODE_OAUTH_TOKEN", "GIT_TERMINAL_PROMPT", "GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME",
             "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GH_TOKEN",
+            "MCP_TOOL_TIMEOUT", "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT",
             "__CF_USER_TEXT_ENCODING", // added by macOS to every process
         )
         assertTrue(allowed.containsAll(names), "unexpected env vars: ${names - allowed}")

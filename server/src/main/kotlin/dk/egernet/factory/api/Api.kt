@@ -72,7 +72,15 @@ import io.ktor.util.AttributeKey
 import io.ktor.websocket.CloseReason
 import io.ktor.websocket.Frame
 import io.ktor.websocket.close
+import dk.egernet.factory.mcp.McpServer
+import io.ktor.server.response.respondTextWriter
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -275,13 +283,68 @@ fun Application.installApi(s: Services) {
                 return@post
             }
             val bearer = call.request.header(HttpHeaders.Authorization)?.takeIf { it.startsWith("Bearer ", ignoreCase = true) }?.substring(7)?.trim()
-            val (status, body) = s.mcp.handle(bearer, call.receiveText())
-            if (body == null) call.respond(HttpStatusCode.fromValue(status), "")
-            else call.respondText(body, ContentType.Application.Json, HttpStatusCode.fromValue(status))
+            val request = call.receiveText()
+            // The bearer check happens at once inside handle(); only an authorised call can still be running later.
+            val pending = call.async { s.mcp.handle(bearer, request) }
+            val early = withTimeoutOrNull(cfg.mcpStreamAfterMs) { pending.await() }
+            val acceptsStream = call.request.header(HttpHeaders.Accept)?.contains("text/event-stream", ignoreCase = true) == true
+            if (early != null || !acceptsStream) {
+                val (status, body) = early ?: pending.await()
+                if (body == null) call.respond(HttpStatusCode.fromValue(status), "")
+                else call.respondText(body, ContentType.Application.Json, HttpStatusCode.fromValue(status))
+                return@post
+            }
+            streamMcpAnswer(call, pending, McpServer.progressToken(request), cfg.mcpProgressEveryMs)
         }
         get("/mcp") { call.respond(HttpStatusCode.MethodNotAllowed, ErrorBody(ErrorDetail("method_not_allowed", "SSE streams are not supported"))) }
         delete("/mcp") { call.respond(HttpStatusCode.MethodNotAllowed, ErrorBody(ErrorDetail("method_not_allowed", "No MCP sessions to delete"))) }
         staticFrontend(cfg)
+    }
+}
+
+/**
+ * Answers a slow MCP call as an event stream (streamable HTTP transport): headers and a comment at once, so the client's
+ * first-byte budget is met; every [everyMs] a `notifications/progress` for [token] (or a keep-alive comment without one),
+ * which resets the client's idle timeout; finally the JSON-RPC response as one `message` event. A client that went away
+ * only ends the writing: the call itself (and a sandbox command it started) is not affected.
+ */
+private suspend fun streamMcpAnswer(
+    call: ApplicationCall, pending: kotlinx.coroutines.Deferred<Pair<Int, String?>>, token: JsonElement?, everyMs: Long,
+) {
+    call.response.header(HttpHeaders.CacheControl, "no-cache")
+    call.respondTextWriter(ContentType.Text.EventStream, HttpStatusCode.OK) {
+        try {
+            write(": agern\n\n")
+            flush()
+            val started = System.nanoTime()
+            var progress = 0L
+            while (true) {
+                val done = withTimeoutOrNull(everyMs) { pending.await() }
+                if (done != null) {
+                    done.second?.let { write("event: message\ndata: $it\n\n") }
+                    flush()
+                    break
+                }
+                if (token != null) {
+                    progress = maxOf(progress + 1, (System.nanoTime() - started) / 1_000_000_000)
+                    val note = buildJsonObject {
+                        put("jsonrpc", "2.0")
+                        put("method", "notifications/progress")
+                        putJsonObject("params") {
+                            put("progressToken", token)
+                            put("progress", progress)
+                            put("message", "Still running ($progress s)")
+                        }
+                    }
+                    write("event: message\ndata: $note\n\n")
+                } else {
+                    write(": keep-alive\n\n")
+                }
+                flush()
+            }
+        } catch (e: java.io.IOException) {
+            log.debug("MCP client went away during a streamed answer: {}", e.message)
+        }
     }
 }
 

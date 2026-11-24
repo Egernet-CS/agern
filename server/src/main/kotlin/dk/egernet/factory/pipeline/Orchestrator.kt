@@ -1346,8 +1346,8 @@ class Orchestrator(
     private fun sandboxLine(c: RunContext): String {
         val sb = c.sandbox?.takeIf { sandboxes.enabled } ?: return ""
         return if (sb.state == "approved") {
-            "\nSandbox: this run has one (image `${sb.image}`). Build and test inside it with `factory_sandbox_exec` instead of on the host; " +
-                "`factory_sandbox_info` lists its services and limits.\n" +
+            "\nSandbox: this run has one (image `${sb.image}`). Build and test inside it with `factory_sandbox_exec` instead of on the host " +
+                "(long commands: `background: true`, then `factory_sandbox_wait`); `factory_sandbox_info` lists its services and limits.\n" +
                 (if (sb.platforms.isEmpty()) "" else "Platforms: ${sb.platforms.joinToString(", ") { "`$it`" }} (other images; " +
                     "`factory_sandbox_exec` with `platform`). Run the test suite in the default image and on every platform before you finish, " +
                     "and report the result per platform in your summary.\n")

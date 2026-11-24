@@ -103,12 +103,25 @@ and duplicate keys are refused. An invalid file means no sandbox (the run procee
 
 ## How the builder uses it
 
-The builder gets two tools. `factory_sandbox_info` describes the sandbox: image, platforms, the user,
-services (host name, ports, readiness), caches, limits. `factory_sandbox_exec { command, timeoutSeconds?,
-platform? }` runs `sh -lc <command>` in `/workspace` and returns the exit code and the last 20,000
-characters of the output; the full output (up to 1,000,000 characters) of every command and setup
-script appears on the run page. One command runs at a time per run; a command that runs out of time
-(server default 30 minutes) is killed together with everything it started, files are kept.
+The builder gets three tools. `factory_sandbox_info` describes the sandbox: image, platforms, the user,
+services (host name, ports, readiness), caches, limits, and the command running now. `factory_sandbox_exec
+{ command, timeoutSeconds?, platform?, background? }` runs `sh -lc <command>` in `/workspace` and returns
+a handle, the exit code and the last 20,000 characters of the output; the full output (up to 1,000,000
+characters) of every command and setup script appears on the run page. One command runs at a time per
+run; a command that runs out of time (server default 30 minutes) is killed together with everything it
+started, files are kept.
+
+A call takes as long as its command, also many minutes: Agern raises the agent's MCP timeouts to the
+stage and command limits and streams progress while the call runs, so a full build with tests comes back
+in one call. With `background: true` the command starts and the call returns its handle at once, so the
+builder can keep working; `factory_sandbox_wait { handle?, waitSeconds? }` then waits for the command
+(default: the most recently started one) and returns the same result, or `running: true` when
+`waitSeconds` ran out first. While a background command runs, any other `factory_sandbox_exec` of the run
+is refused with its handle. Commands run on the server, independent of the tool call that started them:
+when a call is cut off on the agent's side, or the builder's stage ends without waiting, the command runs
+on until it ends, reaches its time limit or the sandbox is removed, and a later wait (also in a fix round
+of the same run) gets its result. When the run's sandbox is removed (the run ended, or an admin stopped
+it), a running command dies with it and its waits end with an error saying so.
 
 ## Platforms
 
@@ -194,6 +207,8 @@ need their own locking.
 | CPUs, memory | `resources`, capped by the server (default 2 CPUs, 4 GiB per container; no swap) |
 | Processes | 4096 per container |
 | One command | the server's limit (default 30 minutes) and the stage limit; `timeoutSeconds` can only lower it |
+| One tool call | as long as the command: Agern raises the agent's MCP timeouts to the stage/command limit and streams progress while the call runs; `background: true` + `factory_sandbox_wait` returns at once instead |
+| Handles | the running command and the results of the last 20 finished commands per run, until the sandbox is removed |
 | Containers at once | `FACTORY_SANDBOX_MAX_CONCURRENT` over the whole server (default 2), counting the default and each platform container; a builder over it is told to try again later |
 | Platforms | `FACTORY_SANDBOX_MAX_PLATFORMS` (default 4) |
 | Services | 5, each with the same CPU and memory limits as the sandbox |
@@ -218,6 +233,9 @@ A command that uses more memory than the limit is killed by the kernel; the sand
 - **"Service '…' did not become ready":** read the log lines in the message; raise `timeoutSeconds`
   for slow services or fix the check (it runs inside the service's image).
 - **Connection refused from a service without `ready`:** add a readiness check, or retry in the test.
+- **`The operation timed out` on a sandbox call:** the agent's MCP client gave up on the call (an older
+  Agern, or a client that ignores the timeout settings), but the command still ran. Call
+  `factory_sandbox_wait` without a handle to get its result.
 - **"The server's sandboxes are all in use":** other runs hold every slot; the builder retries later.
 - **Permission denied in a cache:** the cache was filled by an earlier version of the file that ran as
   root; ask an admin to remove the project's cache volumes (`agern sandbox prune --caches` removes the

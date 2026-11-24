@@ -201,8 +201,16 @@ launcher can later be replaced by a container- or `sudo -u`-based one.
 
 Launch rules:
 - The environment is built **from scratch** (never inherited): `PATH`, `HOME`, `LANG`, `TERM`,
-  the owner's Claude credential variable, and git auth. `HOME` is
+  the owner's Claude credential variable, the MCP timeouts, and git auth. `HOME` is
   `$FACTORY_DATA_DIR/homes/<username>` so Claude session files are per user.
+- MCP timeouts: `MCP_TOOL_TIMEOUT` (the CLI's wall-clock limit per tool call) and
+  `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (its limit for a call that sends no response or progress; default
+  300,000 for HTTP servers) are both set to `max(stage limit, sandbox command limit) + 60 s`, in
+  milliseconds as decimal strings (default 3,660,000), for chats and every stage, so a long sandbox command
+  is never abandoned by the client while the server still runs it. Names and units were read from the
+  bundled code of Claude Code 2.1.328 (the CLI may clamp the value to its own maximum). The CLI also has a
+  per-request budget until an HTTP response starts (~60 s), which no variable raises: `POST /mcp` therefore
+  starts a slow answer early as an event stream (§7).
 - Git over HTTPS authenticates with the owner's GitHub token through environment-only config
   (`GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` with an `http.extraheader`, or
   `GIT_ASKPASS`). The token is not written into `.git/config` or the remote URL. `GH_TOKEN` is set
@@ -401,12 +409,13 @@ it through a change to the default branch and a new approval. With no file, an i
 one paragraph.
 
 **Who gets the tools.** Only the builder (initial build and fix rounds), and only when
-`FACTORY_SANDBOX` is not `off`: it gets `factory_sandbox_info` and `factory_sandbox_exec` (§7) on top of
+`FACTORY_SANDBOX` is not `off`: it gets `factory_sandbox_info`, `factory_sandbox_exec` and `factory_sandbox_wait` (§7) on top of
 the stage tools. The spec-writer, the four reviewers (the `code` reviewer included) and the approver get
 neither: they are read-only, and a shared sandbox with the worktree mounted read-write would let them
 change it, so in this step they review as before, on the host. (A read-only or overlay-mounted sandbox
 for the `code` reviewer is possible later.) Chats have no sandbox. A tool call acts on the sandbox of the
-run its bearer token belongs to, so an agent can never reach another run's sandbox through the tools.
+run its bearer token belongs to, so an agent can never reach another run's sandbox through the tools
+(command handles included: they are looked up only in that run).
 
 **Lifecycle.** One sandbox per run, created lazily by the builder's first `factory_sandbox_exec` and
 shared by all builder rounds of the run. Creation, in order: a private network `agern-run-<runId>`; one
@@ -534,6 +543,21 @@ builder's transcript (`payload.sandbox`, §8, with the platform), so the run pag
 separate log store. When the definition has platforms, the run records the ones commands ran in
 (`Run.sandbox.platformsUsed`) and the builder's task prompt asks it to run the test suite on every platform
 and report the result per platform.
+
+**Background commands and handles.** Validation and creation happen in the tool call; the command itself runs in a
+job on a coroutine scope owned by `SandboxManager` (the application's), which completes the command's result when the
+runtime's `exec` returns. A dropped, cancelled or timed-out HTTP request therefore never kills or loses a command.
+Every command, foreground or background, gets a handle (`cmd-` + 8 random lower-case hex characters, unique in the run).
+In the foreground the call waits for the result (concurrent foreground calls queue on the run's lock); with
+`background: true` it returns the handle at once and the job releases the run's lock when the command ends. While a
+background command runs, every other `exec` of the run is refused at once with its handle, and a background `exec`
+is refused while any command runs. `factory_sandbox_wait` waits for a handle's result (default: the most recently
+started command) without taking the lock, so any number of waits can run. A run keeps its running command and the
+results (the 20,000-character tail; the full log is in the transcript) of its last 20 finished commands until its
+sandbox is released; an admin stop keeps them. A background command's `system` log event goes to the session that
+started it, when it ends; when the builder's stage ends without waiting, the command runs on until it ends, reaches
+its limit or the sandbox is released, and a fix round of the same run can still wait for it. A release or an admin
+stop ends a running command's waits at once with the same errors a foreground call gets.
 
 **Stopped by an admin.** An admin can remove a run's sandbox while the run is active (`DELETE
 /api/admin/sandboxes/{runId}`, the admin page's "Stop"): its containers — platform containers and services
@@ -1412,16 +1436,28 @@ Agents can have graphics made by an image AI the user chose (issue #11). Claude 
 
 ## 7. Chat agent ↔ factory (MCP)
 
-The server exposes an MCP endpoint (`POST /mcp`, streamable HTTP, JSON responses). Every agent
+The server exposes an MCP endpoint (`POST /mcp`, streamable HTTP, no sessions). Every agent
 process gets its own bearer token in its `--mcp-config`; the token maps to the session and thereby
 to the owner and the repo, and dies with the process.
+
+A request answered within 5 s gets one `application/json` body (notifications: 202; auth and parse errors their own
+status). A slower one from a client whose `Accept` contains `text/event-stream` is answered as an event stream, for
+every tool: 200, `Content-Type: text/event-stream`, `Cache-Control: no-cache`, and the comment `: agern` flushed at
+once (so the client's first-byte budget is met); every 15 s while the call runs a `notifications/progress` event
+(`progressToken` as the request's `params._meta.progressToken`, `progress` the elapsed whole seconds, strictly
+increasing, `message: "Still running (<n> s)"`) or, without a token or for a batch, the comment `: keep-alive`; and
+finally `event: message` with the JSON-RPC response on one line, after which the stream is closed. A slow request
+from a client that does not accept a stream gets one JSON body at the end, as before. A client that disconnects only
+ends the writing (logged at debug level); a sandbox command the call started runs on. The `Origin` check and the
+bearer check happen before anything is streamed. `GET /mcp` and `DELETE /mcp` answer 405 (no server-initiated
+streams, no sessions, no resumption).
 
 Tools: `factory_list_issues`, `factory_get_issue`, `factory_create_issue`, `factory_start_run`,
 `factory_list_runs`, `factory_get_run`, `factory_approve_run`, `factory_cancel_run`,
 `factory_send_to_agent`, `factory_request_software`, `factory_list_releases`, `factory_create_release`,
 `factory_assign_issues`, `factory_unassign_issues`, `factory_approve_release`. Pipeline-stage agents get only `factory_get_issue`
 and `factory_request_software`; with sandboxes switched on (`FACTORY_SANDBOX` not `off`) the builder also
-gets `factory_sandbox_info` and `factory_sandbox_exec`; the `ux` and `ui-design` reviewers also get
+gets `factory_sandbox_info`, `factory_sandbox_exec` and `factory_sandbox_wait`; the `ux` and `ui-design` reviewers also get
 `factory_attach_screenshot`. The chat agent, the spec-writer and the builder also get `factory_generate_image`. The advisor (§6 "Conversation at needs human") gets the same two stage tools, bound to its
 run, and nothing else: no approve, cancel, start, release, sandbox, screenshot or image tool.
 
@@ -1454,12 +1490,24 @@ without a run (a chat) is refused:
   `platformNote`; `services: [{ name, host, image, ports, readiness }]` (ports from the image's `EXPOSE`,
   known once created; `readiness`: `unchecked`, `checked on creation` or `ready`) and, when a service has
   no check, `servicesNote` (it may still be starting); `caches`, `env` (names only), `setup` (boolean),
-  `limits: { cpus, memory, execTimeoutSeconds, outputTailChars }` and `capacity: { inUse, max, heldByThisRun }`.
-- `factory_sandbox_exec { command, timeoutSeconds?, platform? }` → JSON `{ exitCode, output, truncated,
-  durationMs, timedOut }` plus `platform` when the definition has platforms (`exitCode` −1 when timed out;
-  `output` is the tail). `platform` omitted or `default`: the top-level image. No sandbox for the run, an
-  unknown platform, busy, a failed creation, readiness check or setup, an empty command or a non-positive
-  timeout come back as tool errors with the reason.
+  `limits: { cpus, memory, execTimeoutSeconds, outputTailChars, toolCallTimeoutSeconds }`,
+  `capacity: { inUse, max, heldByThisRun }` and, while a command runs, `command: { handle, running: true, elapsedMs }`.
+- `factory_sandbox_exec { command, timeoutSeconds?, platform?, background? }` → JSON `{ handle, exitCode, output,
+  truncated, durationMs, timedOut }` plus `platform` when the definition has platforms (`exitCode` −1 when timed out;
+  `output` is the tail). `platform` omitted or `default`: the top-level image. With `background: true` (after the
+  same validation and, if needed, creation) → `{ handle, running: true, timeoutSeconds, note }` plus `platform` at
+  once. No sandbox for the run, an unknown platform, busy, a failed creation, readiness check or setup, an empty
+  command, a non-positive timeout, `background` that is not a boolean (`background must be true or false`) and a
+  command while a background one runs (`A command is still running in this run's sandbox (handle cmd-…, started
+  <n> s ago). Wait for it with factory_sandbox_wait before starting another.`) come back as tool errors.
+- `factory_sandbox_wait { handle?, waitSeconds? }` → for a finished command `{ handle, running: false, exitCode,
+  output, truncated, durationMs, timedOut }` plus `platform` and `note` as for `exec`, the same on every repeat; for
+  one still running when `waitSeconds` is over `{ handle, running: true, elapsedMs, note }`. `handle` omitted or blank:
+  the most recently started command; `waitSeconds` omitted: until the command ends, `0`: at once, above the command
+  limit: capped. Tool errors: a chat, no sandbox (as `exec`), `No sandbox command has been started in this run yet.`,
+  `Unknown handle '<at most 64 characters>'. Handles come from factory_sandbox_exec; older results are dropped after
+  20 newer commands.`, `waitSeconds must be a whole number of seconds, 0 or more`, and a command that ended abnormally
+  (stopped by an admin, removed with the run, could not be run), with the same message every time.
 
 Release tools (§6 "Releases"), chat agents only; the three mutating ones also refuse run-bound tokens:
 `factory_list_releases {}` (the `/factory releases` text, with release ids), `factory_create_release
@@ -2079,7 +2127,7 @@ subordinate ranges.
 `sandbox`): enable and self-test, doctor, the server under the hardened unit removing a leftover sandbox
 through the socket, the `PodmanIntegrationTest` (real rootless Podman: sidecar DNS, bind mount ownership,
 host paths invisible, not privileged, cache reuse, exec, timeout and restart, memory limit enforced, labels,
-removal) run as `agern` *inside* `agern.service`, upgrade, prune, disable and purge. Debian 12 and 13 run the
+removal, and a command that runs for `AGERN_PODMAN_IT_LONG_SECONDS`, default 300 s, returning its output and exit code) run as `agern` *inside* `agern.service`, upgrade, prune, disable and purge. Debian 12 and 13 run the
 same script on a VM by hand. In CI the in-service Gradle runs `--offline`, from a Gradle home seeded from the
 runner's cached one, so a Maven Central outage or rate limit cannot fail the job.
 
@@ -2470,8 +2518,10 @@ sandbox page. In a builder's transcript every `system` event with `payload.sandb
 (the platform as a chip when `platform` is set, `$ command` or "setup script", exit code or "timed out", duration,
 "truncated"; failures in red): opened, it shows the
 last 200 lines of the output in the terminal style with "Show all N lines", the full script or multi-line command, and
-nothing of the output is rendered while closed. The `factory_sandbox_exec` tool call itself is summarised as "Exit N in
-X s · full log below". The admin page has a "Sandboxes" card: runtime, containers in use of the maximum (with a note that
+nothing of the output is rendered while closed. The `factory_sandbox_exec` and `factory_sandbox_wait` tool calls
+themselves are summarised as "Exit N in X s · full log below" (or "Timed out …"); an answer that is still running is
+"Started in the background" (a background start) or "Still running after N s" (a wait that ran out), and the wait's
+arguments show the handle or "latest command". The admin page has a "Sandboxes" card: runtime, containers in use of the maximum (with a note that
 every container that runs commands takes a slot and services take none), the per-container caps, the platform cap, the
 command time limit and the registries; the running sandboxes (run, project, owner, run status, age, each existing
 container as platform chip + image, services, platforms not created yet, slots held, per-container limits and the memory

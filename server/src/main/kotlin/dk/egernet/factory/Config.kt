@@ -54,7 +54,16 @@ data class Config(
      * all before "no checks" counts as green for an automatic release (CI registers its checks some seconds after a push).
      */
     val releaseChecksSettleSeconds: Long = 120,
+    /** How long `POST /mcp` waits for a call before it answers as an event stream (not configurable; tests shorten it). */
+    val mcpStreamAfterMs: Long = 5_000,
+    /** How often a streamed MCP answer sends a progress notification or keep-alive while the call runs. */
+    val mcpProgressEveryMs: Long = 15_000,
 ) {
+    /**
+     * The MCP tool-call and idle timeouts given to every agent (`MCP_TOOL_TIMEOUT`, `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`):
+     * longer than any call can take (no call outlives the stage; the first sandbox call adds creation and setup).
+     */
+    val mcpToolTimeoutMs: Long get() = maxOf(stageTimeoutMs, sandbox.execTimeoutMs) + 60_000
     /** Agents reach the MCP endpoint over loopback, never through the public URL. */
     val mcpUrl: String get() = "http://127.0.0.1:$port/mcp"
     val publicOrigin: String get() = originOf(publicUrl)

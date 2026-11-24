@@ -355,6 +355,7 @@ export function toolArgs(name: string, input: unknown, partial?: string): string
       break;
   }
   if (name.endsWith('__factory_sandbox_exec')) out = s('command');
+  if (name.endsWith('__factory_sandbox_wait')) out = s('handle')?.trim() || 'latest command';
   if (out == null) {
     const entries = Object.entries(input).filter(([, v]) => v !== undefined);
     out = entries
@@ -374,10 +375,13 @@ export function toolSummary(name: string, r: ToolResult): string | null {
   if (name === 'Glob') return `Found ${lines} file${lines === 1 ? '' : 's'}`;
   if (name === 'Grep') return r.text.trim() ? `Found ${lines} match${lines === 1 ? '' : 'es'}` : 'No matches';
   if (name === 'TodoWrite') return 'Updated todos';
-  if (name.endsWith('__factory_sandbox_exec')) {
+  if (name.endsWith('__factory_sandbox_exec') || name.endsWith('__factory_sandbox_wait')) {
     // The agent gets the tail as JSON; the full log is the sandbox block in the transcript.
     try {
-      const j = JSON.parse(r.text) as { exitCode?: number; durationMs?: number; timedOut?: boolean };
+      const j = JSON.parse(r.text) as { exitCode?: number; durationMs?: number; timedOut?: boolean; running?: boolean; elapsedMs?: number };
+      if (j.running === true && typeof j.exitCode !== 'number') {
+        return typeof j.elapsedMs === 'number' ? `Still running after ${Math.round(j.elapsedMs / 1000)} s` : 'Started in the background';
+      }
       if (typeof j.exitCode === 'number') {
         const secs = typeof j.durationMs === 'number' ? ` in ${(j.durationMs / 1000).toFixed(1)} s` : '';
         return `${j.timedOut ? 'Timed out' : `Exit ${j.exitCode}`}${secs} · full log below`;
