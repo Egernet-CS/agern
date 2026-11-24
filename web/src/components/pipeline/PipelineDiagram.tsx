@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
+import { useEffect, useId, useRef, useState, type KeyboardEvent } from 'react';
 import type { Run } from '../../api/types';
 import { between } from '../../lib/format';
 import { useNow } from '../../lib/useNow';
@@ -129,6 +129,8 @@ function trunc(s: string, n: number) {
 
 function Node({ n, box, selected, onSelect, selectable, now, compact }: { n: NodeView; box: Box; selected: boolean; onSelect: () => void; selectable: boolean; now: number; compact: boolean }) {
   const { x, y, w, h } = box;
+  // Per-instance id so the bar's clip never collides between nodes or between diagrams on one page.
+  const clipId = `pn-clip-${useId()}`;
   const tone = n.tone ?? '';
   const cls = `pn pn--${n.state} ${tone ? `pn--tone-${tone}` : ''} ${selected ? 'is-selected' : ''} ${selectable ? 'is-selectable' : ''} pn--${n.id}`;
   const onKey = (e: KeyboardEvent) => {
@@ -158,7 +160,16 @@ function Node({ n, box, selected, onSelect, selectable, now, compact }: { n: Nod
       <rect className="pn-glow" x={-6} y={-6} width={w + 12} height={h + 12} rx={16} />
       <rect className="pn-box" width={w} height={h} rx={isGate ? h / 2 : 11} />
       {n.state === 'running' && !isGate && !isOutcome && (
-        <rect className="pn-scan" x={1} y={h - 4} width={w - 2} height={3} rx={1.5} clipPath={undefined} />
+        <>
+          {/* Clip the bar to the box's rounded rectangle, inset to the inside of the border. The clip sits on a
+              wrapper so it does not scale with the bar's scaleX animation. */}
+          <clipPath id={clipId}>
+            <rect x={1} y={1} width={w - 2} height={h - 2} rx={10} />
+          </clipPath>
+          <g clipPath={`url(#${clipId})`}>
+            <rect className="pn-scan" x={1} y={h - 4} width={w - 2} height={3} />
+          </g>
+        </>
       )}
       {isGate ? (
         <>
