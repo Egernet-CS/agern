@@ -88,7 +88,7 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_SANDBOX_MAX_CONCURRENT` | `2` | Containers that run commands that may exist at the same time, over all runs (1–100): a run's sandbox takes one slot and each platform container it creates one more (sidecars take none). A builder that would exceed it first gives up its run's own idle containers, else gets a "busy" answer |
 | `FACTORY_SANDBOX_MAX_PLATFORMS` | `4` | Platforms a definition may name besides its default image (0–20; `0` forbids them) |
 | `FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES` | `30` | Default and maximum time for one sandbox command (1–1440), also capped by `FACTORY_STAGE_TIMEOUT_MINUTES` |
-| `FACTORY_DEV_FAKE_GITHUB` | `false` | Development only, requires `FACTORY_AUTH=dev`: in-memory fake GitHub (org with `demo-app` and `private-lab`, tokens `fake-<login>` = classic with `repo`, `read:org`; `fake-<login>~<scope>,…` = only those scopes), local `git init` instead of clones, pushes skipped |
+| `FACTORY_DEV_FAKE_GITHUB` | `false` | Development only, requires `FACTORY_AUTH=dev`: in-memory fake GitHub (org with `demo-app`, `private-lab` and the workspace `demo-workspace` with its members `demo-ws-app` (base branch `dev`), `demo-ws-tools` and `demo-ws-lab` (only alice can read it); issues #1–#5 of `demo-workspace` carry one, no, several and an inaccessible member's label; tokens `fake-<login>` = classic with `repo`, `read:org`; `fake-<login>~<scope>,…` = only those scopes), local `git init` instead of clones, pushes skipped |
 
 ## 4. Identity and secrets
 
@@ -194,6 +194,17 @@ their own GitHub token can read that repository (`GET /repos/{org}/{repo}` → 2
 user+repo). All GitHub calls made for a user use that user's token, so GitHub itself enforces
 access. A user without a GitHub token sees no projects.
 
+A workspace project (§5 "Workspace projects") adds one rule: every run and agent session records the member
+repositories that were checked out for it (`context_repos`: at a run's creation the target and every member the owner
+can read, narrowed at its set-up to what was checked out, and copied to its stage and advisor sessions; for a chat the
+union of every checkout). Such a run or session — and everything recorded with it: transcripts, event streams,
+attachments, screenshots, images — is visible only to a user who can read the workspace repository **and** every
+recorded repository (`Access.canSee(user, repo, alsoRepos)`), at every enforcement point: `FactoryService.visibleRun`,
+`listRuns` and `sendToAgent`, `visibleSession`, `GET /api/projects/{repo}/sessions`, `GET /api/agents`, the session
+WebSocket, the feed's `session` and `run` frames, `ImageService.visible` (through the image's session) and the admin
+sandbox overview's `visible`. Invisible ones answer exactly like unknown ones (404, left out of lists, close code
+1008). Ownership is unchanged: every clone, fetch, push, pull request and merge of a run uses the run owner's token.
+
 ## 5. Agent runtime
 
 An agent is one `claude` child process. `AgentLauncher` is an interface so that the local process
@@ -288,6 +299,78 @@ chat: errors are logged and the message goes out unchanged. After a sync with a 
 fast-forward (old and new short sha, number of new commits, "read files again"), and when behind once per process
 launch and again whenever reason, `HEAD` or the count changes (how far behind, why, how to read `origin/<b>`, and not
 to update the checkout without asking). `prompts/chat.md` explains the block to the agent.
+
+Submodules: whenever a checkout has a `.gitmodules` file at its root, `git submodule update --init --recursive` runs
+with the owner's git authentication — after a fresh clone (`ensureClone`), after a successful fast-forward in
+`syncCheckout`, and in every worktree a run creates (the run's worktree; for a workspace run its root, target and
+context members). A failure never fails the operation: clones and syncs log it, and for a run the spec-writer's and
+builder's transcripts start with a `warn` event ``Submodules of `<directory or repo>` could not be fetched: <last 300
+characters of git's output>``. No protocol restriction is relaxed (never `protocol.file.allow=always`); in fake-GitHub
+mode submodules are skipped.
+
+### Workspace projects
+
+A project is a **workspace** when its repository has `.agern/workspace.yml` at the root of its default branch: a set of
+member repositories of the same organization that belong together (an application plus agents, plugins, tooling),
+checked out side by side; issues live in the workspace repository. Without the file nothing changes.
+
+```yaml
+members:
+  - directory: app            # required; where the member is checked out, relative to the workspace root
+    repository: shop-app      # required; a repository of the configured organization (`<name>` or `<org>/<name>`)
+    branch: dev               # optional base branch; default: the member repository's default branch
+    label: app                # optional issue label; default: the repository name
+```
+
+`WorkspaceDefinitions.parse` validates strictly and lists every problem with its path (e.g. `members[1].branch: …`):
+at most 64 KiB, no anchors/aliases or duplicate keys, no unknown keys, 1–50 members; `directory` 1–4 `/`-separated
+segments of `[A-Za-z0-9._-]{1,100}`, none `.`, `..`, `.git`, `.agern`, `.agern-run` or `.claude` (case-insensitive),
+none equal to or a prefix of another member's; `repository` a bare name or `<org>/<name>` of the configured
+organization, not the workspace repository, unique; `branch` `[A-Za-z0-9._/-]{1,200}`, not starting with `-`, `/` or
+`.`, not ending with `/`, `.` or `.lock`, without `..` or `//`; `label` trimmed, 1–50 characters, no control
+characters, unique ignoring case (defaults included), not `needs-human`, `bug`, `enhancement` or `feature`. The file
+is read through the contents API with the acting user's own token, after the visibility check, and cached 60 s per
+user and repository (`WorkspaceService`). A member's effective base branch is `branch`, or its default branch as
+that user's token sees it. An invalid file leaves the project usable for chats as a single repository, but no run can
+start (409 `workspace_invalid`). Agern never runs a setup script from the repository; it clones the members itself.
+
+Layout under `workspaces/<user>/<workspace repo>/`:
+
+| Path | Content |
+|---|---|
+| `main/` | clone of the workspace repository (as for every project) |
+| `main/<directory>/` | a full clone of each member the user's token can read, on local branch `<base>` when cloned |
+| `members.json` | the member directories Agern has cloned (directory, repository), for clean-up |
+| `runs/<runId>/` | detached worktree of the workspace clone at `origin/<default branch>`: the agents' working directory |
+| `runs/<runId>/<target directory>/` | worktree of the target member's clone on the run branch, from `origin/<base>` |
+| `runs/<runId>/<other directory>/` | detached worktree of each other readable member's clone at `origin/<base>` |
+
+- Members the user cannot read are left out of their checkouts. A member whose directory is occupied (it exists and is
+  not Agern's clone of that repository, or a symbolic link of the workspace repository is in the way), whose clone
+  fails or whose base branch does not exist is left out with a warning; if it is a run's target, the run fails at
+  set-up with that reason.
+- Member directories are written once each as `/<directory>/` to `main/.git/info/exclude`, so the workspace clone
+  (and its worktrees) never report them as changes. Every clone, sync, worktree and clean-up operation of a workspace
+  runs under the workspace clone's lock. No shallow or partial clones: a member is cloned once per user and
+  workspace, runs add worktrees.
+- **Chats:** creating a chat and starting its process clone the readable members (existing clones are left alone).
+  Before every non-command message each member clone is synced against `origin/<base>` with the rules above
+  (fast-forward only on `<base>`, clean, without local commits). The `checkout` event and the header badge describe
+  the workspace repository only; when members were fast-forwarded or are behind, the `<checkout_status>` block (added
+  to the workspace's own when both apply) carries one line per such member, ``Member `<directory>` (<repository>): ``
+  followed by the usual sentence, delivered only when the member lines differ from what the process was last told.
+  The chat's system prompt lists the members (directory, repository, base branch, label) and those left out, with why.
+- **Runs:** every stage and the advisor work in `runs/<runId>/`; the other members and the workspace root are
+  read-only by instruction (detached, never pushed, discarded with the run). Runs read other members at their base
+  branches only, never unmerged work.
+- **Clean-up:** when a run ends, and in both reapers, every member worktree of the run (found through `members.json`,
+  whose entries are re-validated) is removed from its member clone (the usual `keepUnpushed` rule for the local
+  branch) before the root worktree and the directory. A member removed from the definition keeps its clone on disk;
+  it is no longer synced, listed or checked out for new runs.
+- **What agents are told:** `Prompts.system` replaces "Your working directory is a git checkout of it." with "This
+  project is a workspace: your working directory is a checkout of the workspace repository `<org>/<repo>`, and its
+  member repositories are separate git repositories in sub-directories. Issues live in the workspace repository." The
+  task prompts of a workspace run carry the workspace block (§6 "Workspace runs").
 
 **Known limitation (v1).** All agents run under the server's OS user with permissions bypassed.
 The factory must run on a dedicated machine or VM. Per-user OS accounts or containers are the
@@ -790,6 +873,70 @@ Run `status`: `queued`, `spec`, `building`, `reviewing`, `approving`, `merged`, 
 Stage `role`: `spec-writer`, `builder`, `security`, `ux`, `ui-design`, `code`, `approver`.
 Stage `status`: `pending`, `running`, `done`, `failed`, `skipped`.
 Stage `verdict`: `PASS`, `CHANGES`, `APPROVE`, `ESCALATE` or null.
+
+### Workspace runs
+
+A run on an issue of a workspace project (§5 "Workspace projects") changes exactly one member: the **target**.
+
+**Routing.** Issues are listed from the workspace repository; each carries the members whose label it has
+(case-insensitive exact match, `Issue.workspaceMembers`). Starting a single run (`POST /api/projects/{repo}/runs`,
+`factory_start_run`, `/factory run`, retry `start_over`) checks, after the credential, visibility and issue checks and
+before `active_run_exists`:
+
+| Condition | Status, code | Message |
+|---|---|---|
+| definition invalid | 409 `workspace_invalid` | ``The workspace definition .agern/workspace.yml is invalid: <first problem>[ (and N more)]. Fix it on `<default branch>` first.`` |
+| no member label | 409 `member_label_missing` | ``Issue #<n> has no member label. Add exactly one of these labels on GitHub to say which repository it belongs to: `<label>` (<repository>), ….`` |
+| several member labels | 409 `member_label_ambiguous` | ``Issue #<n> carries the labels of several members (<label>, <label>). A run changes one member: keep exactly one of them.`` |
+| target not readable by the caller | 403 `member_not_accessible` | ``Your GitHub token cannot read <org>/<repository> (member `<directory>`), so you cannot run this issue.`` |
+
+A refused start creates no run. The run stores the target's repository (`target_repo`), directory (`target_dir`) and
+effective base branch (`base_branch`) when it is created; later edits of the file do not move it. Retry `continue`
+copies the target of the run it continues (no label lookup; 403 `member_not_accessible` when the owner can no longer
+read it); a step retry uses the stored target. At set-up the stored target must still be a declared member with the
+same repository and directory, else the run fails with ``Member `<directory>` (<repository>) is no longer part of the
+workspace definition``.
+
+**Branch, pull request and merge.** Branch `factory/issue-<n>-<slug>-<run>` is created in the target's worktree,
+pushed and opened as a pull request **in the member repository** against the stored base branch. Its title (and the
+squash-merge commit title) is `<issue title> (<org>/<workspace>#<n>)`; its body starts with
+`Closes <org>/<workspace>#<n>` (the rest as usual; "Earlier runs … left open" lists only earlier runs with the same
+target repository). Issue comments, the `needs-human` label and closing the issue act on the workspace repository;
+after the squash merge Agern closes the workspace issue itself, so closing works whatever the member's base branch.
+Comments on the pull request (screenshots, UI warning, follow-up review) go to the member repository. Issue comments
+that name the pull request use its URL, or `<org>/<repository>#<pr>` ("**Agern: merged** pull request …", merge and
+migration failures), never a bare `#<pr>`. The migration check, retry options' commit count, push, changed files,
+`.agern/ui-files`, the reviewed `HEAD` of the conversation and the follow-up push use the target's worktree, clone and
+base ref; screenshots and images (`.agern-run/`) stay relative to the agents' working directory `runs/<runId>/`.
+
+**Sandbox.** The definition is read from the target's base ref and approved per member repository; the target's
+worktree is mounted at `/workspace` (other members are not visible inside it). The sandbox's `repo` and the overview's
+visibility keep using the run's project.
+
+**Prompts.** Every task prompt (spec, build, continue, fix, review, approval) and the advisor's `<run_context>` carry:
+
+```
+Workspace: <org>/<workspace> — several repositories checked out side by side under your working directory.
+Target member directory: `<directory>` (repository <org>/<repository>, base branch `<base>`). Run every git command for this change there, e.g. `git -C <directory> status`. Only commits in `<directory>/` become the pull request.
+Other checkouts are read-only context at their base branch; do not edit, commit or push there:
+- `.` — <org>/<workspace> (workspace root files)
+- `<directory>` — <org>/<repository> @ <base>
+Not checked out: `<directory>` (<reason>)            ← only when there are any
+The issue is <org>/<workspace>#<n>; the pull request is opened in <org>/<repository> against `<base>`.
+```
+
+and write every git command as `git -C <directory>` (e.g. ``git -C app diff origin/dev...HEAD``); the UI reviewers are
+pointed to `<directory>/.agern/preview.md`. `fake-claude`'s builder commits in `<cwd>/<directory>` when its prompt has
+the "Target member directory" line, and its advisor diffs there.
+
+**Releases** are not available for workspace projects in this step: creating one (`POST /api/projects/{repo}/releases`,
+`factory_create_release`, `/factory release create`), starting one (now or scheduled) and
+`Orchestrator.startReleaseRun` answer 409 `workspace_releases_unsupported` "Releases are not available for workspace
+projects yet."
+
+Not in this step: runs that change several members (one pull request per member, merge order, submodule pointer bumps
+in the parent), runs that change the workspace repository itself, choosing the member in Agern, "context only"
+members, members outside the organization.
 
 ### Database migrations
 
@@ -1573,7 +1720,10 @@ Release tools (§6 "Releases"), chat agents only; the three mutating ones also r
 `factory_list_releases {}` (the `/factory releases` text, with release ids), `factory_create_release
 { name, description? }`, `factory_assign_issues { release, issueNumbers }` (`release`: a name — case-insensitive —
 or id of a release of this project; `issueNumbers`: an array of integers, `"#5"` accepted; assigns or moves) and
-`factory_unassign_issues { issueNumbers }`. `factory_list_issues` appends ` [release <name>]` to assigned issues.
+`factory_unassign_issues { issueNumbers }`. `factory_list_issues` appends ` [release <name>]` to assigned issues,
+and for a workspace project ` [member <directory>]`, ` [no member label]` or ` [several member labels]` to every
+issue (§6 "Workspace runs"); `factory_start_run` and `/factory run` report the routing refusals as their message, and
+`factory_create_release` / `/factory release create` answer `workspace_releases_unsupported` there.
 `factory_approve_release { release }` (a name or id; chat agents only, refused for run-bound tokens) approves a
 `ready` release as the chat's owner, with the same checks and refusals as the HTTP endpoint (§6 "Releasing") as tool
 errors, and answers `Release "<name>" is released: pull request <url> merged into <default>, N issue(s) closed.`;
@@ -1645,14 +1795,23 @@ type LoginStep =
 type Project = { name: string; fullName: string; description: string | null; private: boolean;
   defaultBranch: string; language: string | null; openIssues: number; pushedAt: string | null;
   htmlUrl: string; activeAgents: number; activeRuns: number;
-  iconUrl: string | null };    // `/api/projects/<repo>/icon?v=<version>`; null: no icon (§8 "Project icons")
+  iconUrl: string | null;      // `/api/projects/<repo>/icon?v=<version>`; null: no icon (§8 "Project icons")
+  workspace: Workspace | null }; // §5 "Workspace projects"; filled by GET /api/projects/{repo} only (null in the list)
+
+type Workspace = { path: '.agern/workspace.yml'; valid: boolean;
+  errors: string[];            // every problem, with its path; [] when valid
+  members: { directory: string; repository: string;
+    branch: string | null;     // the effective base branch; the declared one (possibly null) for an inaccessible member
+    label: string;
+    accessible: boolean }[] };  // the caller's own token can read it; [] when invalid
 
 type IssueKind = 'feature' | 'bug' | 'task';      // from labels: bug → bug; enhancement/feature → feature; else task
 type Issue = { number: number; title: string; state: 'open' | 'closed'; kind: IssueKind;
   labels: { name: string; color: string }[]; author: string; assignees: string[]; comments: number;
   createdAt: string; updatedAt: string; htmlUrl: string; body?: string; activeRunId: string | null;
   release: { id: string; name: string } | null;  // the release it is planned in (§6 "Releases"); always present
-  imageCount: number };  // images selected for it in a chat (§6 "Generated images")
+  imageCount: number;    // images selected for it in a chat (§6 "Generated images")
+  workspaceMembers: { directory: string; repository: string }[] };  // members whose label it carries; [] outside a workspace
 
 type ReleaseIssue = { number: number; title: string; kind: IssueKind;   // title/kind as when it was assigned
   state: 'waiting' | 'running' | 'merged' | 'held' | 'skipped';
@@ -1733,7 +1892,9 @@ type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; 
   stages: Stage[];
   sandbox: RunSandbox | null;  // the run's sandbox decision (§5 "Sandboxes"); null until the workspace is ready / older runs
   releaseId: string | null;  // the release this run builds an issue for (null: a single run, or the release was deleted)
-  baseBranch: string | null;  // the branch it starts from and merges into; null = the default branch
+  baseBranch: string | null;  // the branch it starts from and merges into; null = the default branch; a workspace run: the member's base
+  targetRepo: string | null;       // a workspace run: the member repository it changes (§6 "Workspace runs"); null otherwise
+  targetDirectory: string | null;  // … and that member's directory in the workspace
   conversation: RunConversation;  // always present; default { sessionId: null, review: 'none', followUpFrom: null }
   continuesRunId: string | null;   // the failed run this one continues from its commits (§6 "Retrying a run")
   continuedByRunId: string | null; // the newest run that continues this one
@@ -1899,7 +2060,7 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `GET /api/me/preferences` | → `Preferences` | the caller's own model / fix-round choices and the effective values |
 | `PUT /api/me/preferences` | `PreferenceOverrides` → `Preferences` | replaces the caller's choices; 400 for an invalid model or unknown role, 422 `max_fix_rounds_out_of_range` |
 | `GET /api/projects` | → `Project[]` | repos of the org visible to the user |
-| `GET /api/projects/{repo}` | → `Project` | |
+| `GET /api/projects/{repo}` | → `Project` | with `workspace` (read with the caller's token; members' `accessible` per caller) |
 | `PUT /api/projects/{repo}/icon` | raw image bytes (PNG, JPEG, WebP, GIF or SVG) → `Project` | admin (403 before the body is read; 404 when the admin cannot see the project). Sets or replaces the icon; 400 `empty_icon`, 413 `icon_too_large`, 415 `unsupported_icon_type`, 422 `invalid_icon` (also every refused SVG) / `icon_dimensions_too_large`; see "Project icons" below |
 | `POST /api/projects/{repo}/icon/from-repository` | `{path}` → `Project` | admin (403; 404 as above). Sets the icon from a file on the repository's default branch, read once with the admin's own GitHub token; 400 `bad_request` for an invalid path, 404 `icon_file_not_found`, then the upload's 400/413/415/422; see "Project icons" below |
 | `DELETE /api/projects/{repo}/icon` | → `Project` | admin (403; 404 as above); removes the icon (also when there is none), `iconUrl: null` |
@@ -1908,11 +2069,11 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `GET /api/projects/{repo}/issues/{number}` | → `Issue` (with `body`) | |
 | `POST /api/projects/{repo}/issues` | `{ title, body, kind }` → `Issue` | |
 | `GET /api/projects/{repo}/releases` | → `Release[]` | newest first (`createdAt` desc), each with its issues in order |
-| `POST /api/projects/{repo}/releases` | `{ name, description?, mode? }` → 201 `Release` | 400 invalid name, description or mode (`manual` default, `automatic`); 409 `release_name_taken`; 409 `release_mode_not_allowed` (#24 seam). Starts nothing |
+| `POST /api/projects/{repo}/releases` | `{ name, description?, mode? }` → 201 `Release` | 400 invalid name, description or mode (`manual` default, `automatic`); 409 `release_name_taken`; 409 `release_mode_not_allowed` (#24 seam); 409 `workspace_releases_unsupported` for a workspace project. Starts nothing |
 | `GET /api/releases/{id}` | → `Release` | 404 unknown or invisible |
 | `PUT /api/releases/{id}` | `{ name, description }` → `Release` | rename or edit; same validation as create. Started: owner or admin, and a different name → 409 `release_name_locked`; released: 409 `release_not_editable`. Editing a ready release updates its pull request's body |
 | `DELETE /api/releases/{id}` | → 204 | removes the plan and its assignments; the issues are untouched on GitHub. `scheduled` → 409 `release_scheduled`; `building`/`paused`/`ready` → 409 `release_active`; `released` → 409 `release_not_editable`; `cancelled`: owner or admin, the branch stays and its runs keep existing with `releaseId` null |
-| `POST /api/releases/{id}/start` | → `Release` | the caller becomes the owner; creates `release/<name>` and builds (§6 "Releases"). 409 `release_not_planning` (also while scheduled), 422 `claude_credential_required`, 409 `release_empty`, 409 `release_already_building`, 409 `release_branch_exists`, 422 `github_push_denied` |
+| `POST /api/releases/{id}/start` | → `Release` | the caller becomes the owner; creates `release/<name>` and builds (§6 "Releases"). 409 `release_not_planning` (also while scheduled), 422 `claude_credential_required`, 409 `release_empty`, 409 `release_already_building`, 409 `release_branch_exists`, 422 `github_push_denied`, 409 `workspace_releases_unsupported` (also for a scheduled start) |
 | `PUT /api/releases/{id}/schedule` | `{ startAt: string }` → `Release` | set (`planning`, caller becomes owner) or change (`scheduled`, owner or admin, owner unchanged) the scheduled start. In order: 404 invisible; 400 "startAt must be an ISO-8601 time" (an instant with `Z` or offset), "The start time must be in the future", "The start time is too far ahead (at most a year)" (> 366 days); set: 422 `claude_credential_required`, 403 without a GitHub token; change: 403 "Only <owner> or an admin can change this schedule"; other states: 409 `release_not_schedulable`. Stored at millisecond precision |
 | `DELETE /api/releases/{id}/schedule` | → `Release` | cancel: back to `planning`, `owner`/`scheduledAt`/`waitingFor` null, `startFailure` kept. 409 `release_not_scheduled` when not scheduled (also once the start has begun), else 403 unless owner or admin |
 | `POST /api/releases/{id}/pause` | → `Release` | owner or admin; `building` → `paused` (else 409 `release_not_building`); the running issue finishes |
@@ -1929,7 +2090,7 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `POST /api/projects/{repo}/sandbox/approval` | `{ sha256 }` → `SandboxStatus` | admin (403 otherwise; 404 when the admin cannot see the project or there is no file). Approves exactly the content with that hash, replacing the project's earlier approval; 400 malformed hash, 409 `sandbox_definition_changed` when the file now has another hash, 422 `sandbox_definition_invalid` |
 | `DELETE /api/projects/{repo}/sandbox/approval` | → `SandboxStatus` | admin; removes the project's approval (also when there is none). Runs already started keep their decision |
 | `GET /api/projects/{repo}/runs` | → `Run[]` | newest first |
-| `POST /api/projects/{repo}/runs` | `{ issueNumber }` → `Run` | needs Claude credential; 409 if the issue has an active run |
+| `POST /api/projects/{repo}/runs` | `{ issueNumber }` → `Run` | needs Claude credential; 409 if the issue has an active run; a workspace project: 409 `workspace_invalid`, `member_label_missing`, `member_label_ambiguous`, 403 `member_not_accessible` (§6 "Workspace runs") |
 | `GET /api/runs?active=true&status=<s>` | → `Run[]` | across visible repos, newest first (max 200). `active=true`: not finished, i.e. `queued`, `spec`, `building`, `reviewing`, `approving` or `needs_human`. `status`: only these statuses, repeatable and/or comma list (`?status=needs_human`); unknown status → 400. Both given: both apply |
 | `GET /api/runs/{id}` | → `Run` | |
 | `GET /api/runs/{id}/screenshots/{sid}` | → image bytes | anyone who may see the run (404 otherwise, and for a screenshot of another run). Served with the sniffed type, `nosniff`, a sandboxing CSP, `Cross-Origin-Resource-Policy: same-origin`, `Cache-Control: private, max-age=31536000, immutable` and `Content-Disposition: inline` (`screenshot-<role>-<id8>.<ext>`). There is no upload or delete route |
@@ -1995,7 +2156,9 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 - Sandbox approval: stale hash → 409 `sandbox_definition_changed`; invalid definition → 422
   `sandbox_definition_invalid`.
 - "Needs Claude credential" → 422 `claude_credential_required`; too many agents → 409
-  `too_many_agents`; issue already has an active run → 409 `active_run_exists`; missing CSRF header
+  `too_many_agents`; issue already has an active run → 409 `active_run_exists`; workspace projects (§6 "Workspace
+  runs"): 409 `workspace_invalid`, `member_label_missing`, `member_label_ambiguous`, `workspace_releases_unsupported`,
+  403 `member_not_accessible`; missing CSRF header
   → 403 `csrf`; foreign `Origin` → 403 `bad_origin`.
 - A new chat session starts `idle` without a process; the first input launches the CLI
   (`starting` → `running` → `idle` after each turn). A `stopped` chat resumes (`--resume`) on the
@@ -2626,6 +2789,25 @@ and both retries.
 
 On the run page of a release run the merge node is titled "merge to release" and the header shows the base branch
 linking to the release page (plain text when the release was deleted); single runs still say "merge to main".
+
+**Workspace projects** (§5 "Workspace projects", §6 "Workspace runs"). The project header shows the tag
+"workspace · N members" for a valid workspace. The activity pane gets a "Members" section above "Releases", one row per
+member: the directory (monospace), the repository as a link to `/p/<repository>` when the caller can read it, else
+plain text with the pill "no access" (title "Your GitHub token cannot read this repository; it is left out of your
+checkouts."), the base branch (monospace) and the label as a tag. An invalid definition shows instead a
+`role="alert"` box "`.agern/workspace.yml` is invalid. Runs cannot start until it is fixed." with the errors as a list.
+A workspace project has no "Sandbox" section (sandboxes belong to the member projects) and no "+ New" release button;
+without releases the empty text reads "Releases are not available for workspace projects yet." Each issue row shows its
+member's directory as a tag (title "Member <directory> · <repository>", plus "no access" when the caller cannot read
+it), else the muted text "no member label" or "several member labels". "▶ Start run" is disabled unless the
+definition is valid, exactly one member matches and the caller can read it; its title says why ("Add one member label
+on GitHub first", "Keep exactly one member label", "Your GitHub token cannot read <repository>", "Fix
+.agern/workspace.yml first"); server refusals still show in the panel's alert line. The run page of a workspace run
+lists "repository" (a link to `/p/<targetRepo>`), "directory" and "base", shows the pull request as
+`<targetRepo>#<n> ↗`, titles the merge node "merge to <baseBranch>" and links the sandbox line to
+`/p/<targetRepo>/sandbox`. The mock seeds `shop-workspace` with three members (`shop` on `dev`, `libs/design` on the
+default branch, `ios` that `bob` cannot read), issues with one, no and several member labels, and a merged workspace
+run; its `startRun` refuses with the server's codes and messages.
 
 **Sandboxes.** The activity pane has a "Sandbox" row (the state as a pill — no definition, invalid, needs approval,
 changed, approved — and a short line) linking to the project's sandbox page `/p/:repo/sandbox`, a normal scrolling page
