@@ -149,7 +149,7 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
         else {
             pb.environment()["GIT_AUTHOR_NAME"] = "Agern"; pb.environment()["GIT_COMMITTER_NAME"] = "Agern"
             pb.environment()["GIT_AUTHOR_EMAIL"] = "agern@agern.local"; pb.environment()["GIT_COMMITTER_EMAIL"] = "agern@agern.local"
-            if (token != null) pb.environment().putAll(AgentCommand.gitTokenEnvironment(token, gitHost))
+            pb.environment().putAll(AgentCommand.gitAuthEnvironment(token, gitHost))
         }
         Files.createDirectories(home)
         val p = pb.start()

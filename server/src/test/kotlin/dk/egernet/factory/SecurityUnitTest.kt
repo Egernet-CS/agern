@@ -103,6 +103,7 @@ class AgentCommandTest {
         assertEquals(
             setOf("PATH", "HOME", "LANG", "TERM", "CLAUDE_CODE_OAUTH_TOKEN", "GIT_TERMINAL_PROMPT", "GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME",
                 "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GH_TOKEN",
+            "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1", "GIT_CONFIG_KEY_2", "GIT_CONFIG_VALUE_2",
                 "MCP_TOOL_TIMEOUT", "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT"),
             env.keys,
         )
@@ -117,6 +118,21 @@ class AgentCommandTest {
         assertEquals("http.https://github.com/.extraheader", env["GIT_CONFIG_KEY_0"])
         val basic = env["GIT_CONFIG_VALUE_0"]!!.removePrefix("AUTHORIZATION: basic ")
         assertEquals("x-access-token:ghp_secret", String(Base64.getDecoder().decode(basic)))
+        // SSH URLs (as in many .gitmodules) are rewritten to HTTPS: Agern has no SSH key.
+        assertEquals("3", env["GIT_CONFIG_COUNT"])
+        assertEquals("url.https://github.com/.insteadOf", env["GIT_CONFIG_KEY_1"])
+        assertEquals("git@github.com:", env["GIT_CONFIG_VALUE_1"])
+        assertEquals("url.https://github.com/.insteadOf", env["GIT_CONFIG_KEY_2"])
+        assertEquals("ssh://git@github.com/", env["GIT_CONFIG_VALUE_2"])
+        // Without a token the rewrite still applies (public repositories over HTTPS), with no auth header.
+        assertEquals(
+            mapOf(
+                "GIT_CONFIG_COUNT" to "2",
+                "GIT_CONFIG_KEY_0" to "url.https://git.example.com/.insteadOf", "GIT_CONFIG_VALUE_0" to "git@git.example.com:",
+                "GIT_CONFIG_KEY_1" to "url.https://git.example.com/.insteadOf", "GIT_CONFIG_VALUE_1" to "ssh://git@git.example.com/",
+            ),
+            AgentCommand.gitAuthEnvironment(null, "https://git.example.com"),
+        )
         assertTrue(System.getenv().keys.filter { it !in env.keys }.none { env.containsKey(it) })
 
         val apiKeyEnv = AgentCommand.environment(spec.copy(identity = spec.identity.copy(claude = ClaudeCredential("api_key", "sk-ant-api"))), "/bin")

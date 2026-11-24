@@ -103,6 +103,28 @@ class SubmoduleCheckoutTest {
     }
 
     @Test
+    fun `SSH submodule URLs of the git host are fetched over its HTTPS base`() {
+        // The git host is a file:// base here (a stand-in for https://github.com/): `git@localhost:sub.git` and
+        // `ssh://git@localhost/sub.git` must resolve to `<base>sub.git`, never to SSH (there is no SSH key).
+        val base = "file://localhost$tmp/"
+        val hostGit = CliGitOps(System.getenv("PATH") ?: "/usr/bin:/bin", base, localOnly = false)
+        val (parent, _) = parentWithSubmodule()
+        gitIn(parent, "config", "-f", ".gitmodules", "submodule.libs/sub.url", "git@localhost:sub.git")
+        gitIn(parent, "commit", "-q", "-am", "Use an SSH submodule URL")
+        gitIn(parent, "push", "-q", "origin", "main")
+        val main = tmp.resolve("ws/main")
+        hostGit.ensureClone(id, tmp.resolve("parent.git").toString(), main, home)
+        assertEquals("lib.txt\n", Files.readString(main.resolve("libs/sub/lib.txt")))
+
+        gitIn(parent, "config", "-f", ".gitmodules", "submodule.libs/sub.url", "ssh://git@localhost/sub.git")
+        gitIn(parent, "commit", "-q", "-am", "Use an ssh:// submodule URL")
+        gitIn(parent, "push", "-q", "origin", "main")
+        val other = tmp.resolve("ws2/main")
+        hostGit.ensureClone(id, tmp.resolve("parent.git").toString(), other, home)
+        assertEquals("lib.txt\n", Files.readString(other.resolve("libs/sub/lib.txt")))
+    }
+
+    @Test
     fun `a broken submodule URL does not fail the clone`() {
         val (parent, _) = parentWithSubmodule()
         gitIn(parent, "config", "-f", ".gitmodules", "submodule.libs/sub.url", tmp.resolve("missing.git").toString())
