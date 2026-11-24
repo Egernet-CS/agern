@@ -71,6 +71,8 @@ Behaviour
         directory, attach it through the MCP tool factory_attach_screenshot with the caption
         "Fake <role> screenshot (<build | fix round N>)", delete the file and append "Attached 1 screenshot." (or the
         tool's error text) to their summary; other roles ignore it
+    - "fake:ui-change" makes the builder also write and commit web/src/FakeBanner.tsx, so the run's diff touches a UI
+        file (without "fake:screenshots" Agern then warns "UI change reviewed without screenshots")
     - "fake:image" (optionally "fake:image=<n>") in a chat message calls the MCP tool factory_generate_image with the
         purpose "app icon" (and "issueNumber" from a "#<n>" in the message) and appends "Image tool: <answer>" to the reply;
         in a builder's prompt the builder calls it too, copies the first returned path to assets/fake-icon.png, commits
@@ -690,6 +692,11 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
             with open("AGERN_FAKE.md", "a") as f:
                 f.write("fake build at %s\n" % time.strftime("%Y-%m-%dT%H:%M:%S"))
             subprocess.run(["git", "add", "AGERN_FAKE.md"], check=False)
+            if "fake:ui-change" in prompt:
+                os.makedirs(os.path.join("web", "src"), exist_ok=True)
+                with open(os.path.join("web", "src", "FakeBanner.tsx"), "a") as f:
+                    f.write("export const FakeBanner = () => <p>fake build at %s</p>;\n" % time.strftime("%Y-%m-%dT%H:%M:%S"))
+                subprocess.run(["git", "add", os.path.join("web", "src", "FakeBanner.tsx")], check=False)
             if os.path.isfile(os.path.join("assets", "fake-icon.png")):
                 subprocess.run(["git", "add", os.path.join("assets", "fake-icon.png")], check=False)
             subprocess.run(["git", "commit", "-q", "-m", "Fake build commit"], check=False)

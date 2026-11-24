@@ -83,3 +83,46 @@ test('the ux and ui-design reviewers’ screenshots show per round on the run pa
   expect(own.status()).toBe(200);
   expect(own.headers()['content-type']).toBe('image/png');
 });
+
+test('a UI change reviewed without screenshots shows a warning on the run page, but still merges', async ({ page }) => {
+  await login(page, 'alice');
+  await newIssue(page, 'Banner without screenshots', 'The builder touches a component. fake:ui-change');
+  await startRunFor(page, 'Banner without screenshots');
+  // No reloads: the warning arrives with the run over the feed.
+  await expect(pill(page)).toHaveText('merged', { timeout: 45_000 });
+
+  const warning = page.locator('.run-warning');
+  await expect(warning).toHaveCount(1);
+  await expect(warning).toHaveAttribute('role', 'note');
+  await expect(warning).toContainText('UI change reviewed without screenshots');
+  await expect(warning).toContainText('build');
+  await expect(warning).toContainText('web/src/FakeBanner.tsx');
+
+  // It leads to the ux review of that round, which carries the same warning; so does ui-design, and nobody else.
+  await warning.getByRole('button', { name: 'See the ux review' }).click();
+  const detail = page.locator('.stage-detail');
+  await expect(detail.locator('.sd-role')).toHaveText('ux');
+  await expect(detail.locator('.sd-warning')).toContainText('UI change reviewed without screenshots: the change touches 1 UI file (web/src/FakeBanner.tsx)');
+  await node(page, 'ui-design').click();
+  await expect(detail.locator('.sd-role')).toHaveText('ui-design');
+  await expect(detail.locator('.sd-warning')).toContainText('UI change reviewed without screenshots');
+  await node(page, 'code').click();
+  await expect(detail.locator('.sd-role')).toHaveText('code');
+  await expect(detail.locator('.sd-warning')).toHaveCount(0);
+});
+
+test('a UI change with screenshots, and a change without UI files, show no warning', async ({ page }) => {
+  await login(page, 'alice');
+  await newIssue(page, 'Banner with screenshots', 'The builder touches a component. fake:ui-change fake:screenshots');
+  await startRunFor(page, 'Banner with screenshots');
+  await expect(pill(page)).toHaveText('merged', { timeout: 45_000 });
+  await node(page, 'ux').click();
+  await expect(page.locator('.stage-detail .shots figcaption')).toHaveText(['Fake ux screenshot (build)']);
+  await expect(page.locator('.run-warning')).toHaveCount(0);
+  await expect(page.locator('.sd-warning')).toHaveCount(0);
+
+  await newIssue(page, 'Docs only', 'Only AGERN_FAKE.md changes.');
+  await startRunFor(page, 'Docs only');
+  await expect(pill(page)).toHaveText('merged', { timeout: 45_000 });
+  await expect(page.locator('.run-warning')).toHaveCount(0);
+});

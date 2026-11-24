@@ -670,7 +670,15 @@ type Plan = {
   changes: Partial<Record<StageRole, string[]>>; // round-0 reviewers that ask for changes, with findings
   approver: 'APPROVE' | 'ESCALATE';
   liveFrom: (role: StageRole, round: number) => boolean;
+  /** The UI reviewers attach no screenshots, so the server's warning "UI change reviewed without screenshots" shows. */
+  noScreenshots?: boolean;
 };
+
+/** Like the backend's warning (docs/ARCHITECTURE.md §6 "Screenshots") for the mock diff of a UI change. */
+const UI_WARNING =
+  'UI change reviewed without screenshots: the change touches 3 UI files (src/components/Button.tsx, src/styles/tokens.css, ' +
+  'src/components/Badge.tsx), but neither the ux nor the ui-design reviewer attached a screenshot. Their summaries ' +
+  'should say what they tried and what failed.';
 
 const reviewers: StageRole[] = ['security', 'ux', 'ui-design', 'code'];
 const reviewerMs: Record<string, number> = { security: 1.3, ux: 0.8, 'ui-design': 0.6, code: 1.1 };
@@ -781,7 +789,9 @@ function runStage(r: Run, role: StageRole, round: number, plan: Plan, startMs: n
         : [];
     steps = reviewerScript(role, verdict, summary);
     if (live) steps = [{ kind: 'pause', ms: reviewerMs[role] * 1500 }, ...steps];
-    const captions = screenshotCaptions[role]?.(round) ?? [];
+    const captions = plan.noScreenshots ? [] : screenshotCaptions[role]?.(round) ?? [];
+    if (plan.noScreenshots && (role === 'ux' || role === 'ui-design'))
+      summary += " Screenshots could not be taken: `npm run dev -- --port 41234` failed with \"Cannot find module 'vite'\".";
     if (captions.length) summary += ` Attached ${captions.length} screenshot${captions.length > 1 ? 's' : ''}.`;
     captions.forEach((caption, i) => {
       if (!live) attachScreenshot(r, stage, caption, iso(p.endMs));
@@ -835,6 +845,11 @@ function pipeline(r: Run, plan: Plan, owner: User, startMs: number) {
       runStage(r, role, round, plan, t, owner, (t2) => {
         end = Math.max(end, t2);
         if (--pending > 0 || fail()) return;
+        if (plan.noScreenshots) {
+          const ui = r.stages.filter((x) => x.round === round && (x.role === 'ux' || x.role === 'ui-design'));
+          ui.forEach((x) => { x.warning = UI_WARNING; });
+          r.warnings = [...(r.warnings ?? []), { round, roles: ui.map((x) => x.role), text: UI_WARNING }];
+        }
         const changes = r.stages.some((x) => x.round === round && x.verdict === 'CHANGES');
         if (changes && round < r.maxRounds) build(round + 1, end + 400);
         else if (changes) {
@@ -2022,7 +2037,7 @@ function seed() {
   // Historical runs (instant).
   const never = () => false;
   startRun('web-shop', 47, alice, null, { changes: {}, liveFrom: never }, Date.now() - 3 * 86400_000);
-  startRun('design-system', 12, alice, null, { changes: {}, liveFrom: never }, Date.now() - 5 * 86400_000);
+  startRun('design-system', 12, alice, null, { changes: {}, liveFrom: never, noScreenshots: true }, Date.now() - 5 * 86400_000);
   const failed = startRun('web-shop', 44, bob, null, { changes: {}, liveFrom: never }, Date.now() - 86400_000);
   for (const st of failed.stages.slice(2)) {
     if (st.sessionId) db.sessions.delete(st.sessionId);

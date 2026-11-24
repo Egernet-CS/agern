@@ -1782,6 +1782,26 @@ html.app-locked #root {
   margin-bottom: 14px;
   font-size: 0.9rem;
 }
+.run-warning {
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+}
+.run-warning .notice-text {
+  flex: 1 1 320px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.sd-warning {
+  margin: 10px 0 0;
+  padding: 8px 12px;
+  border-radius: var(--r);
+  border: 1px solid rgba(255, 177, 74, 0.45);
+  background: var(--amber-wash);
+  color: var(--text);
+  font-size: 0.86rem;
+  overflow-wrap: anywhere;
+}
 .rounds {
   display: flex;
   flex-direction: column;
@@ -2595,6 +2615,9 @@ html.app-locked #root {
   .notice {
     flex-direction: column;
     align-items: stretch;
+  }
+  .run-warning .notice-text {
+    flex-basis: auto;
   }
   .project-head {
     padding: 12px 16px 10px;
