@@ -103,6 +103,31 @@ test('another user observes the chat live and read-only, and cannot send input',
   await bob.context.close();
 });
 
+test('thinking progress shows as one updating spinner line and never lands in the transcript', async ({ page }) => {
+  const sessionId = readState().aliceChat as string;
+  await login(page, 'alice');
+  await page.goto(`${BASE()}/p/demo-app?session=${sessionId}`);
+  await expect(log(page)).toContainText('You said: hello agern');
+
+  // `fake:think` makes the fake CLI send system/thinking_tokens (100, 200, … 1500) for ~3 s before it answers.
+  await send(page, 'fake:think about it');
+  const spinner = page.locator('.t-spinner');
+  await expect(spinner).toContainText('Thinking…');
+  await expect(spinner).toContainText(/~\d00 tokens/);
+  await expect(spinner).toContainText(/~1,[0-4]00 tokens/); // the same line, updated
+  await expect(spinner).toHaveCount(1);
+  await expect(log(page)).not.toContainText('thinking_tokens');
+
+  // The answer ends the indicator; nothing of the progress was stored, so a reload shows none of it either.
+  await expect(log(page)).toContainText('You said: fake:think about it');
+  await expect(spinner).toHaveCount(0);
+  await expect(log(page)).not.toContainText('thinking_tokens');
+  await page.reload();
+  await expect(log(page)).toContainText('You said: fake:think about it');
+  await expect(log(page)).not.toContainText('thinking_tokens');
+  await expect(log(page)).not.toContainText('Thinking…');
+});
+
 test('closing a chat from its header removes it for the owner; a watcher sees that it was closed', async ({ browser }) => {
   const aliceChat = readState().aliceChat as string;
   const alice = await userContext(browser, 'alice');

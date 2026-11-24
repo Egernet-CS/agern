@@ -1,7 +1,8 @@
-// Unit tests of the tool summaries, for Node's built-in runner (`npm test`; Node 22.18+ runs TypeScript as is).
+// Unit tests of the transcript model, for Node's built-in runner (`npm test`; Node 22.18+ runs TypeScript as is).
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { toolArgs, toolSummary } from './model.ts';
+import type { FactoryEvent } from '../../api/types';
+import { buildTranscript, toolArgs, toolSummary } from './model.ts';
 
 const exec = 'mcp__factory__factory_sandbox_exec';
 const wait = 'mcp__factory__factory_sandbox_wait';
@@ -28,4 +29,20 @@ test('finished commands keep the exit summary, for exec and wait alike', () => {
 test('errors and non-JSON answers are not summarised', () => {
   assert.equal(toolSummary(wait, { text: 'Unknown handle', isError: true, images: 0 }), null);
   assert.equal(toolSummary(wait, { text: 'not json', isError: false, images: 0 }), null);
+});
+
+const thinkingTokens = (n: number) => ({ type: 'system', subtype: 'thinking_tokens', estimated_tokens: n, estimated_tokens_delta: 100, session_id: 'c' });
+const claude = (seq: number, payload: unknown) => ({ seq, sessionId: 's', ts: '2026-01-01T00:00:00Z', type: 'claude', payload }) as FactoryEvent;
+
+test('stored thinking_tokens events of older runs are not shown', () => {
+  const { items, summary } = buildTranscript([claude(1, thinkingTokens(100)), claude(2, thinkingTokens(200)), claude(3, { type: 'system', subtype: 'other_thing' })], []);
+  assert.deepEqual(items.map((i) => (i.k === 'unknown' ? i.label : i.k)), ['system.other_thing']);
+  assert.equal(summary.thinkingTokens, null);
+});
+
+test('the latest live thinking_tokens estimate is in the summary, not in the items', () => {
+  const partials = [{ type: 'stream_event', event: { type: 'message_start', message: { id: 'm1' } } }, thinkingTokens(4050), thinkingTokens(5800)];
+  const { items, summary } = buildTranscript([], partials);
+  assert.equal(items.length, 0);
+  assert.equal(summary.thinkingTokens, 5800);
 });

@@ -36,12 +36,25 @@ export type TranscriptSummary = {
   lastActivity: string | null;
   /** The latest `checkout` event: the state of the chat's checkout (null before the first one). */
   checkout: CheckoutInfo | null;
+  /** Live estimate of the tokens the model has thought so far in the current message (null when not thinking). */
+  thinkingTokens: number | null;
 };
 
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v);
 const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+
+/**
+ * Subtypes of Claude Code `system` events that only report progress (`thinking_tokens`: about every 100 thinking
+ * tokens). The server sends them live only; ones stored by older versions are skipped in the transcript.
+ */
+export const TRANSIENT_SYSTEM_SUBTYPES: ReadonlySet<string> = new Set(['thinking_tokens']);
+
+/** True for a live `system/thinking_tokens` progress payload. */
+export function isThinkingTokens(p: unknown): p is { type: 'system'; subtype: 'thinking_tokens'; estimated_tokens?: unknown } {
+  return isObj(p) && p.type === 'system' && p.subtype === 'thinking_tokens';
+}
 
 function compactJson(v: unknown, max = 220): string {
   let s: string;
@@ -146,7 +159,7 @@ export function buildTranscript(events: FactoryEvent[], partials: unknown[]): { 
   const items: Item[] = [];
   const tools = new Map<string, Extract<Item, { k: 'tool' }>>();
   const blocksPerMessage = new Map<string, number>();
-  const summary: TranscriptSummary = { model: null, costUsd: null, turns: null, status: null, turnOpen: false, turnStartedAt: null, lastActivity: null, checkout: null };
+  const summary: TranscriptSummary = { model: null, costUsd: null, turns: null, status: null, turnOpen: false, turnStartedAt: null, lastActivity: null, checkout: null, thinkingTokens: null };
   const forwarded = new Map<string, Forwarded>();
 
   for (const ev of events) {
@@ -261,7 +274,7 @@ export function buildTranscript(events: FactoryEvent[], partials: unknown[]): { 
         // Persisted partials should not happen; ignore quietly.
       } else if (t === 'system') {
         const sub = str(p.subtype) ?? 'system';
-        if (sub !== 'hook_response' && sub !== 'status') items.push({ k: 'unknown', id, label: `system.${sub}`, json: compactJson(p, 160) });
+        if (sub !== 'hook_response' && sub !== 'status' && !TRANSIENT_SYSTEM_SUBTYPES.has(sub)) items.push({ k: 'unknown', id, label: `system.${sub}`, json: compactJson(p, 160) });
       } else {
         items.push({ k: 'unknown', id, label: t ?? 'claude', json: compactJson(p) });
       }
@@ -274,6 +287,10 @@ export function buildTranscript(events: FactoryEvent[], partials: unknown[]): { 
   let msgId: string | null = null;
   const blocks = new Map<number, { type: string; text: string; name?: string }>();
   for (const raw of partials) {
+    if (isThinkingTokens(raw)) {
+      summary.thinkingTokens = num(raw.estimated_tokens) ?? summary.thinkingTokens;
+      continue;
+    }
     const e = isObj(raw) && isObj(raw.event) ? raw.event : null;
     if (!e) continue;
     const idx = num(e.index) ?? 0;

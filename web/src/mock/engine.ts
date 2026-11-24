@@ -374,11 +374,17 @@ function play(
         emit(sid, 'claude', { type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: kind === 'text' ? { type: 'text', text: '' } : { type: 'thinking', thinking: '' } } }, ts, true),
       );
       const chunks = text.match(/[\s\S]{1,14}/g) ?? [];
-      for (const c of chunks) {
+      chunks.forEach((c, i) => {
         p.after(28, (ts) =>
           emit(sid, 'claude', { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: kind === 'text' ? { type: 'text_delta', text: c } : { type: 'thinking_delta', thinking: c } } }, ts, true),
         );
-      }
+        // Newer CLIs report thinking progress about every 100 tokens (live only, like the partials).
+        if (kind === 'thinking' && i % 2 === 1) {
+          p.after(0, (ts) =>
+            emit(sid, 'claude', { type: 'system', subtype: 'thinking_tokens', estimated_tokens: (i + 1) * 50, estimated_tokens_delta: 100, session_id: claudeSid }, ts, true),
+          );
+        }
+      });
     }
     p.after(p.mode === 'live' ? 60 : 900, (ts) => {
       emit(sid, 'claude', {
