@@ -1,5 +1,6 @@
 import { createContext, createElement, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useAsync } from './async';
+import { isThinkingTokens } from '../components/chat/model';
 import { api, type AgentSession, type Channel, type FactoryEvent, type Issue, type Release, type Run, type SandboxApproval, type SandboxStatus } from '../api';
 
 /** `closed`: the server ended the channel for good (e.g. the chat was closed); it is not reopened. */
@@ -58,7 +59,10 @@ function useReconnecting(
 
 export type SessionStream = {
   events: FactoryEvent[];
-  /** Live-only stream_event payloads for the message currently being generated. */
+  /**
+   * Live-only payloads for the message currently being generated: stream_event partials, plus at most one
+   * `system/thinking_tokens` progress event (the latest).
+   */
   partials: unknown[];
   conn: ConnState;
   lastSeq: number;
@@ -102,7 +106,9 @@ export function useSessionStream(sessionId: string | null): SessionStream {
             onFrame: (ev) => {
               if (ev.seq === -1) {
                 const p = ev.payload as { event?: { type?: string } } | null;
-                if (p?.event?.type === 'message_start') setPartials([p]);
+                // Thinking progress: only the latest estimate matters.
+                if (isThinkingTokens(p)) setPartials((prev) => [...prev.filter((x) => !isThinkingTokens(x)), p]);
+                else if (p?.event?.type === 'message_start') setPartials([p]);
                 else setPartials((prev) => [...prev, p]);
                 return;
               }
@@ -111,6 +117,8 @@ export function useSessionStream(sessionId: string | null): SessionStream {
               const t = (ev.payload as { type?: string } | null)?.type;
               if (ev.type === 'claude' && (t === 'result' || t === 'assistant')) {
                 if (t === 'result') setPartials([]);
+                // The thinking is over once the message arrives.
+                else setPartials((prev) => (prev.some(isThinkingTokens) ? prev.filter((x) => !isThinkingTokens(x)) : prev));
               }
               // A turn's end clears the live partials; `running` may arrive after the first deltas, so it must not.
               if (ev.type === 'status') {

@@ -12,18 +12,25 @@ import { TranscriptItems } from './Transcript';
 const GLYPHS = ['·', '✢', '✳', '✶', '✻', '✽', '✻', '✶', '✳', '✢'];
 const VERBS = ['Forging', 'Welding', 'Riveting', 'Machining', 'Assembling', 'Tempering', 'Soldering', 'Calibrating', 'Milling', 'Gathering acorns', 'Annealing', 'Fettling'];
 
-function Spinner({ since, label, canInterrupt, activity }: { since: string | null; label?: string; canInterrupt: boolean; activity: string | null }) {
+/** A live thinking-token estimate, rounded like "~5,800 tokens". */
+function thinkingLabel(tokens: number): string {
+  const rounded = tokens < 100 ? Math.max(0, Math.round(tokens)) : Math.round(tokens / 100) * 100;
+  return `~${rounded.toLocaleString('en-US')} tokens`;
+}
+
+function Spinner({ since, label, canInterrupt, activity, thinkingTokens }: { since: string | null; label?: string; canInterrupt: boolean; activity: string | null; thinkingTokens?: number | null }) {
   const now = useNow(120);
   const start = since ? Date.parse(since) : now;
   const glyph = GLYPHS[Math.floor(now / 120) % GLYPHS.length];
-  const verb = label ?? VERBS[Math.abs(Math.floor(start / 1000)) % VERBS.length];
+  const thinking = thinkingTokens != null;
+  const verb = thinking ? 'Thinking' : label ?? VERBS[Math.abs(Math.floor(start / 1000)) % VERBS.length];
   return (
     <div className="t-spinner" role="status" aria-live="off">
       <span className="t-spinner-glyph" aria-hidden>{glyph}</span>
       <span className="t-spinner-verb">{verb}…</span>
       <span className="t-spinner-meta">
         ({duration(now - start)}
-        {activity ? ` · ${activity}` : ''}
+        {thinking ? ` · ${thinkingLabel(thinkingTokens)}` : activity ? ` · ${activity}` : ''}
         {canInterrupt ? ' · esc to interrupt' : ''})
       </span>
     </div>
@@ -281,6 +288,7 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header,
               since={summary.turnStartedAt ?? session?.createdAt ?? null}
               canInterrupt={canDrive || canTalk}
               activity={isChat ? null : session?.lastActivity ?? null}
+              thinkingTokens={summary.thinkingTokens}
             />
           )}
         </div>
