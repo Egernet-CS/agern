@@ -2017,7 +2017,10 @@ cmd_doctor() {
         found=$(PATH=$apath command -v "$b" 2>/dev/null || true)
         if [ -n "$found" ]; then browser=$found; break; fi
     done
-    if [ -n "$browser" ]; then
+    if [ -n "$browser" ] && grep -qs '/snap/' "$browser" 2>/dev/null; then
+        # Ubuntu's chromium-browser deb is only a launcher for the chromium snap.
+        meh "$browser is Ubuntu's launcher for the chromium snap — UI reviewers can take screenshots only if 'snap install chromium' works for $AGERN_USER; otherwise install Google Chrome's .deb"
+    elif [ -n "$browser" ]; then
         ok "headless browser for the UI reviewers: $browser"
     else
         meh "no headless browser ($(printf '%s' "$HEADLESS_BROWSERS" | sed 's/ /, /g')) on $apath — UI reviewers cannot take screenshots; install one: apt install chromium fonts-noto-core"

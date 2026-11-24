@@ -160,9 +160,12 @@ printf '%s' "$doc" | grep -q 'FAIL  claude not found.*claude.ai/install.sh' && p
 printf '%s' "$doc" | grep -q 'FAIL  gh not found.*apt install gh' && pass "doctor: gh missing, with install hint" || fail "doctor: gh hint"
 printf '%s' "$doc" | grep -q 'FAIL  FACTORY_GITHUB_ORG is not set' && pass "doctor: org not set" || fail "doctor: org not set"
 printf '%s' "$doc" | grep -q "ok    sandboxes off ('sudo agern sandbox enable' turns them on)" && pass "doctor: sandboxes off, one line" || fail "doctor: sandboxes off"
-# chromium is a Recommends: apt installs it where the distribution has it (Debian), not on Ubuntu (a snap there).
-if dpkg-query -W -f='${Status}' chromium 2>/dev/null | grep -q 'install ok installed'; then
-    printf '%s' "$doc" | grep -q 'ok    headless browser for the UI reviewers: /usr/bin/chromium' && pass "doctor: headless browser (chromium, Recommends) found" || fail "doctor: headless browser not found"
+# chromium is a Recommends: Debian installs the browser, Ubuntu the chromium-browser launcher for the snap.
+browser=$(command -v chromium chromium-browser google-chrome google-chrome-stable 2>/dev/null | head -n 1 || true)
+if [ -n "$browser" ] && grep -qs '/snap/' "$browser"; then
+    printf '%s' "$doc" | grep -q "warn  $browser is Ubuntu's launcher for the chromium snap" && pass "doctor: snap launcher $browser flagged" || fail "doctor: snap launcher not flagged"
+elif [ -n "$browser" ]; then
+    printf '%s' "$doc" | grep -q "ok    headless browser for the UI reviewers: $browser" && pass "doctor: headless browser $browser (Recommends) found" || fail "doctor: headless browser $browser not found"
 else
     printf '%s' "$doc" | grep -q 'warn  no headless browser (chromium, .*apt install chromium fonts-noto-core' && pass "doctor: no headless browser, with install hint" || fail "doctor: headless browser hint"
 fi

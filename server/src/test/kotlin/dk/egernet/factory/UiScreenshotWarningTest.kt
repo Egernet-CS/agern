@@ -286,7 +286,7 @@ class UiScreenshotWarningTest {
     }
 
     @Test
-    fun `agern doctor warns when the agents have no headless browser, and names the one they have`() {
+    fun `agern doctor warns when the agents have no headless browser or only the snap launcher, and names the one they have`() {
         val none = Files.createTempDirectory("agern-path-none")
         executable(none, "git")
         val out = doctor(none)
@@ -300,5 +300,13 @@ class UiScreenshotWarningTest {
         val out2 = doctor(some)
         assertTrue(out2.contains("ok    headless browser for the UI reviewers: $browser"), out2)
         assertFalse(out2.contains("no headless browser"), out2)
+
+        // Ubuntu's chromium-browser deb is only a launcher for the snap: flagged, not ok.
+        val snap = Files.createTempDirectory("agern-path-snap")
+        val launcher = snap.resolve("chromium-browser")
+        Files.writeString(launcher, "#!/bin/sh\nexec /snap/bin/chromium \"\$@\"\n"); launcher.toFile().setExecutable(true)
+        val out3 = doctor(snap)
+        assertTrue(out3.contains("warn  $launcher is Ubuntu's launcher for the chromium snap"), out3)
+        assertFalse(out3.contains("ok    headless browser"), out3)
     }
 }

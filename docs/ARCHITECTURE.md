@@ -968,7 +968,7 @@ other roles do not get the tool.
   be installed there. The Debian package *recommends* `chromium` (`apt install chromium fonts-noto-core`; the fonts
   keep text from rendering as boxes), and `agern doctor` warns when none of `chromium`, `chromium-browser`,
   `google-chrome`, `google-chrome-stable` is on the agents' `PATH` (a project's own Playwright browser is not
-  checked). Verified on Debian with Chromium 156: the agent user takes a screenshot with
+  checked), and also when the one it finds is Ubuntu's launcher for the chromium snap. Verified on Debian with Chromium 156: the agent user takes a screenshot with
   `chromium --headless --no-sandbox --disable-gpu --window-size=1280,800 --virtual-time-budget=8000 --screenshot=out.png <url>`.
   Without a browser the reviewers report that they could not take screenshots, the run shows the warning above, and
   it continues as usual.
@@ -2276,7 +2276,8 @@ first (`1.3.0-rc.1` → `1.3.0~rc.1` < `1.3.0`). Depends: `default-jre-headless 
 java17-runtime-headless` (checked with `apt-cache` on all three: Debian 12's default is OpenJDK 17,
 Debian 13's and Ubuntu 24.04's 21; `openjdk-17/21-jre-headless` provide `java17-runtime-headless`),
 `git`, `ca-certificates`, `curl`, `passwd`; Recommends `postgresql`, `chromium` (the UI reviewers' headless browser,
-§6 "Screenshots"; Ubuntu has no `chromium` deb, only a snap, so apt skips it there); Suggests `gh`. The `claude`
+§6 "Screenshots"; on Ubuntu apt satisfies it with `chromium-browser`, a launcher for the snap, which `agern doctor`
+flags); Suggests `gh`. The `claude`
 CLI is not a dependency (`agern doctor` reports it and how to install it). Layout: `/usr/bin/agern`,
 `/usr/share/agern/{agern.jar,VERSION,env.example}`, `/usr/lib/systemd/system/{agern.service,
 agern-upgrade.service,agern-upgrade.timer}` (`/usr/lib`, not `/lib`: all targets are merged-/usr),

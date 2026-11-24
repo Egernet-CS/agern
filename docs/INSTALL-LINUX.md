@@ -51,9 +51,9 @@ sudo apt install postgresql
 ```
 
 The Agern package *recommends* `postgresql` and `chromium`, so `apt install ./agern_….deb` installs them
-too unless you pass `--no-install-recommends` (e.g. for a database on another host). `chromium` (where the
-distribution packages it as a deb: Debian, not Ubuntu) is the headless browser the UX and UI design reviewers
-screenshot the app under review with (section 5).
+too unless you pass `--no-install-recommends` (e.g. for a database on another host). `chromium` is the
+headless browser the UX and UI design reviewers screenshot the app under review with (section 5). On Ubuntu
+it resolves to `chromium-browser`, only a launcher for the chromium snap; `agern doctor` points that out.
 
 ## 3. Install the package
 
@@ -143,7 +143,7 @@ sudo apt install gh
 
 # A headless browser for the UX and UI design reviewers, who run the app under review and attach
 # screenshots of it to the run (recommended by the package, so usually installed already on Debian;
-# on Ubuntu `chromium` is a snap, use Google Chrome's .deb or a project's own Playwright instead):
+# on Ubuntu it is only a launcher for the chromium snap: use Google Chrome's .deb or a project's Playwright):
 sudo apt install chromium fonts-noto-core
 ```
 
