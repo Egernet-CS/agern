@@ -186,6 +186,12 @@ data class StageAgentResult(
 }
 
 /**
+ * Subtypes of stream-json `system` events that only report progress (newer CLIs send `thinking_tokens` about every 100
+ * thinking tokens). Like `stream_event` partials they are sent live and never stored: a run's log would fill with them.
+ */
+internal val TRANSIENT_SYSTEM_SUBTYPES = setOf("thinking_tokens")
+
+/**
  * Owns all agent processes: chat sessions (long-lived, stream-json input) and one-shot pipeline agents.
  * Persists complete stream-json messages as events, broadcasts partial deltas live, tracks status/cost.
  */
@@ -1082,6 +1088,11 @@ class AgentManager(
         }
     }
 
+    /** Sends [obj] to the session's live subscribers only (seq -1): not stored, not counted in usage. */
+    private fun emitLive(l: Live, obj: JsonObject) {
+        bus.emit(l.sessionId, EventDto(-1, l.sessionId.toString(), Instant.now().iso(), "claude", obj))
+    }
+
     private fun handleLine(l: Live, line: String) {
         val obj = try {
             AppJson.parseToJsonElement(line) as? JsonObject
@@ -1094,7 +1105,11 @@ class AgentManager(
         }
         when (obj["type"]?.jsonPrimitive?.contentOrNull) {
             "stream_event" -> {
-                bus.emit(l.sessionId, EventDto(-1, l.sessionId.toString(), Instant.now().iso(), "claude", obj))
+                emitLive(l, obj)
+                return
+            }
+            "system" -> if (obj["subtype"]?.jsonPrimitive?.contentOrNull in TRANSIENT_SYSTEM_SUBTYPES) {
+                emitLive(l, obj)
                 return
             }
             "control_response", "control_request", "keep_alive" -> return
