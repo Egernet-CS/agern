@@ -1,5 +1,5 @@
 // In-memory simulation of the Agern backend. Only loaded when VITE_MOCK=1.
-import { STEERABLE_ROLES } from '../api/types';
+import { PROJECT_ICON_MAX_BYTES, PROJECT_ICON_TYPES, STEERABLE_ROLES } from '../api/types';
 import type {
   AgentMessage,
   AgentSession,
@@ -885,6 +885,27 @@ export function revokeSandboxApproval(repo: string, by: User): SandboxStatus {
   if (!by.isAdmin) throw new MockError(403, 'forbidden', 'Only an admin can revoke a sandbox approval');
   if (db.sandboxApprovals.delete(repo)) feed({ type: 'sandbox_approval', repo, approval: null });
   return sandboxStatus(repo);
+}
+
+/** Sets the project's icon like the server (ARCHITECTURE §8 "Project icons"); the caller checked admin and visibility. */
+export function setProjectIcon(repo: string, file: File) {
+  if (file.size === 0) throw new MockError(400, 'empty_icon', 'The file is empty');
+  if (file.size > PROJECT_ICON_MAX_BYTES) throw new MockError(413, 'icon_too_large', 'The icon is larger than 1.0 MB');
+  if (!PROJECT_ICON_TYPES.includes(file.type)) {
+    throw new MockError(415, 'unsupported_icon_type', 'The icon must be a PNG, JPEG, WebP or GIF image');
+  }
+  replaceProjectIcon(repo, URL.createObjectURL(file));
+}
+
+export function deleteProjectIcon(repo: string) {
+  replaceProjectIcon(repo, null);
+}
+
+function replaceProjectIcon(repo: string, url: string | null) {
+  const p = db.projects.find((x) => x.name === repo);
+  if (!p) throw new MockError(404, 'not_found', `No repository ${repo} in ${ORG}.`);
+  if (p.iconUrl) URL.revokeObjectURL(p.iconUrl);
+  p.iconUrl = url;
 }
 
 /** Like the backend: the run's sandbox containers are gone; admins hear about it on the feed. */
@@ -1819,6 +1840,7 @@ function seed() {
     htmlUrl: `https://github.com/${ORG}/${name}`,
     activeAgents: 0,
     activeRuns: 0,
+    iconUrl: null,
   });
   db.projects = [
     proj('web-shop', 'Storefront and checkout for egernet.dk', 'Kotlin', 9, 4),

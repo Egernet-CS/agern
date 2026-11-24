@@ -37,6 +37,8 @@ import {
   reviewRun,
   talkToRun,
   revokeSandboxApproval,
+  setProjectIcon,
+  deleteProjectIcon,
   pendingSandboxes,
   sandboxOverview,
   sandboxStatus,
@@ -297,6 +299,20 @@ export const mockApi: Api = {
     }),
   projects: () => ok(() => (visible() ? db.projects.map((p) => project(p.name)) : [])),
   project: (repo) => ok(() => project(repo)),
+  setProjectIcon: (repo, file) =>
+    ok(() => {
+      needAdmin();
+      project(repo);
+      setProjectIcon(repo, file);
+      return project(repo);
+    }),
+  deleteProjectIcon: (repo) =>
+    ok(() => {
+      needAdmin();
+      project(repo);
+      deleteProjectIcon(repo);
+      return project(repo);
+    }),
   issues: (repo, state = 'open') =>
     ok(() => {
       project(repo);

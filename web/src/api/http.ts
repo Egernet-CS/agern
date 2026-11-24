@@ -38,10 +38,14 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 const enc = encodeURIComponent;
 
 /** Raw-body upload with progress (fetch cannot report upload progress). */
-function upload<T>(path: string, file: File, opts?: { onProgress?: (loaded: number, total: number) => void; signal?: AbortSignal }): Promise<T> {
+function upload<T>(
+  path: string,
+  file: File,
+  opts?: { onProgress?: (loaded: number, total: number) => void; signal?: AbortSignal; method?: 'POST' | 'PUT' },
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', path);
+    xhr.open(opts?.method ?? 'POST', path);
     xhr.withCredentials = true;
     xhr.setRequestHeader('X-Factory-Request', '1');
     xhr.setRequestHeader('Accept', 'application/json');
@@ -123,6 +127,8 @@ export const httpApi: Api = {
 
   projects: () => get('/api/projects'),
   project: (repo) => get(`/api/projects/${enc(repo)}`),
+  setProjectIcon: (repo, file) => upload(`/api/projects/${enc(repo)}/icon`, file, { method: 'PUT' }),
+  deleteProjectIcon: (repo) => del(`/api/projects/${enc(repo)}/icon`),
   issues: (repo, state = 'open') => get(`/api/projects/${enc(repo)}/issues?state=${state}`),
   issue: (repo, n) => get(`/api/projects/${enc(repo)}/issues/${n}`),
   createIssue: (repo, body) => post(`/api/projects/${enc(repo)}/issues`, body),

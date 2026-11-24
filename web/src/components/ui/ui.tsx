@@ -244,3 +244,18 @@ export async function copyText(text: string): Promise<boolean> {
   ta.remove();
   return ok;
 }
+
+/**
+ * A project's icon as a rounded square tile, or its first letter on a coloured tile when it has none (or the image
+ * fails to load). Decorative: the project's name is always next to it.
+ */
+export function ProjectIcon({ name, iconUrl, size }: { name: string; iconUrl: string | null | undefined; size: number }) {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [iconUrl]);
+  const letter = (Array.from(name)[0] ?? '?').toUpperCase();
+  return (
+    <span className={`project-icon ${iconUrl && !failed ? 'has-image' : ''}`} style={{ width: size, height: size }} aria-hidden>
+      {iconUrl && !failed ? <img src={iconUrl} alt="" onError={() => setFailed(true)} decoding="async" /> : letter}
+    </span>
+  );
+}

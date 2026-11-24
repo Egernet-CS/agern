@@ -72,6 +72,10 @@ export interface Api {
 
   projects(): Promise<Project[]>;
   project(repo: string): Promise<Project>;
+  /** Sets or replaces the project's icon (raw image bytes). Admin only; answers the updated project. */
+  setProjectIcon(repo: string, file: File): Promise<Project>;
+  /** Removes the project's icon (also when none is set). Admin only; answers the updated project. */
+  deleteProjectIcon(repo: string): Promise<Project>;
   issues(repo: string, state?: 'open' | 'closed' | 'all'): Promise<Issue[]>;
   issue(repo: string, number: number): Promise<Issue>;
   createIssue(repo: string, body: { title: string; body: string; kind: IssueKind }): Promise<Issue>;

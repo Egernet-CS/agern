@@ -35,8 +35,8 @@ throwaway database.
 | Agents | The `claude` CLI in headless mode (`-p`, stream-json in and out) |
 | Realtime | WebSocket for output, REST for input |
 
-All persistent state lives in PostgreSQL, including the bytes of chat attachments and of the screenshots
-reviewers attach to their stage (§6 "Screenshots"). The only things on disk are git workspaces, the
+All persistent state lives in PostgreSQL, including the bytes of chat attachments, of the screenshots
+reviewers attach to their stage (§6 "Screenshots") and of project icons (§8 "Project icons"). The only things on disk are git workspaces, the
 per-user Claude home directories and the agents' copies of chat attachments (a cache of the database,
 §5), all under `FACTORY_DATA_DIR` — plus, with sandboxes on, the service user's Podman storage (images,
 per-run containers, per-project cache volumes; §5 "Sandboxes").
@@ -1536,7 +1536,8 @@ type LoginStep =
 
 type Project = { name: string; fullName: string; description: string | null; private: boolean;
   defaultBranch: string; language: string | null; openIssues: number; pushedAt: string | null;
-  htmlUrl: string; activeAgents: number; activeRuns: number };
+  htmlUrl: string; activeAgents: number; activeRuns: number;
+  iconUrl: string | null };    // `/api/projects/<repo>/icon?v=<version>`; null: no icon (§8 "Project icons")
 
 type IssueKind = 'feature' | 'bug' | 'task';      // from labels: bug → bug; enhancement/feature → feature; else task
 type Issue = { number: number; title: string; state: 'open' | 'closed'; kind: IssueKind;
@@ -1789,6 +1790,9 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `PUT /api/me/preferences` | `PreferenceOverrides` → `Preferences` | replaces the caller's choices; 400 for an invalid model or unknown role, 422 `max_fix_rounds_out_of_range` |
 | `GET /api/projects` | → `Project[]` | repos of the org visible to the user |
 | `GET /api/projects/{repo}` | → `Project` | |
+| `PUT /api/projects/{repo}/icon` | raw image bytes → `Project` | admin (403 before the body is read; 404 when the admin cannot see the project). Sets or replaces the icon; 400 `empty_icon`, 413 `icon_too_large`, 415 `unsupported_icon_type`, 422 `invalid_icon` / `icon_dimensions_too_large`; see "Project icons" below |
+| `DELETE /api/projects/{repo}/icon` | → `Project` | admin (403; 404 as above); removes the icon (also when there is none), `iconUrl: null` |
+| `GET /api/projects/{repo}/icon?v=<version>` | → image bytes | anyone who can see the project; 404 when not visible or no icon is set |
 | `GET /api/projects/{repo}/issues?state=open\|closed\|all` | → `Issue[]` | pull requests excluded |
 | `GET /api/projects/{repo}/issues/{number}` | → `Issue` (with `body`) | |
 | `POST /api/projects/{repo}/issues` | `{ title, body, kind }` → `Issue` | |
@@ -1909,6 +1913,26 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   style-src 'unsafe-inline'; sandbox`, `Cross-Origin-Resource-Policy: same-origin`, private immutable caching.
 - Uploads never sent are deleted after 24 hours (and right away when the composer removes them or the page
   is left).
+
+**Project icons.** One optional icon per repository, set by an admin on the project page and shown on the project
+card and in the project header (§10). Agern stores it, since GitHub has no per-repository icon:
+- Storage: table `project_icons` in PostgreSQL, keyed by the canonical repository name (`repo`, the name GitHub
+  returns, not the path parameter), with the sniffed media type, size, SHA-256, width, height, the bytes, and
+  `updated_by` / `updated_at`. A new upload replaces the row in one statement. Nothing is written to the repository,
+  its workspaces or `FACTORY_DATA_DIR`; icons of renamed or deleted repositories are not cleaned up.
+- Upload checks, in order: admin (403), project visible to the admin (404), declared `Content-Length` and then the
+  streamed body capped at 1 MiB (413 `icon_too_large`), empty (400 `empty_icon`), type by magic bytes only — PNG,
+  JPEG, WebP or GIF, so SVG, HTML, PDF and text are refused (415 `unsupported_icon_type`) — header readable
+  (422 `invalid_icon`), at most 2048×2048 px read from the header without decoding (422 `icon_dimensions_too_large`).
+  The limits are constants (`ProjectIcons.MAX_BYTES`, `MAX_EDGE`). The bytes are stored unchanged (no re-encoding,
+  so animated GIFs and WebP survive); the browser crops and scales with `object-fit: cover`.
+- `Project.iconUrl` is `/api/projects/<url-encoded repo>/icon?v=<version>`, `<version>` being the first 16 hex
+  characters of the bytes' SHA-256, so a replaced icon has a new URL. `GET /api/projects` reads all versions in one
+  query.
+- Serving: only when the stored type is one of the four raster types (404 otherwise), with the same headers as
+  attachments (`nosniff`, the script-less CSP, same-origin CORP, `Content-Disposition: inline`,
+  file name `<repo>-icon.<ext>`). `Cache-Control` is `private, max-age=31536000, immutable` only when `v` equals the
+  current version, else `private, no-cache`.
 
 ### WebSockets (cookie-authenticated)
 
@@ -2221,6 +2245,12 @@ passed shows "reset"), the note that the values are only refreshed while an agen
 today $X · this month $Y (UTC days)"; for an API key only the spend, with the same "not the remaining balance"
 sentence. Both reload on the private `usage` frame, after a feed reconnect, when the credential changes and when the
 UTC day rolls over (`useClaudeUsage`, `web/src/lib/usage.ts`); relative times are re-evaluated every 30 s.
+
+**Project icons** (§8). The project card (32 px) and the project header (28 px, between "projects /" and the name)
+show the icon as a rounded square tile (`ProjectIcon`), or the project's first letter on the user avatar's tile when
+none is set or it fails to load, so cards stay aligned. Admins get the header tile as a "Change project icon" button
+with a menu (upload or replace, remove, a hint on types and size); a file over 1 MB is refused before uploading, and
+errors appear in a dismissible `role="alert"` line in the header. The overview shows a change the next time it loads.
 
 The chat renders the Claude stream the way the terminal does: prompt line, streamed assistant
 text, tool calls as `⏺ Tool(args)` with collapsible results, thinking, cost/turn footer. Sessions

@@ -41,7 +41,15 @@ export type Project = {
   htmlUrl: string;
   activeAgents: number;
   activeRuns: number;
+  /** `/api/projects/<repo>/icon?v=<version>`, or null without an icon (ARCHITECTURE §8 "Project icons"). */
+  iconUrl: string | null;
 };
+
+/** Largest project icon the server accepts (1 MiB); used for the client pre-check and by the mock. */
+export const PROJECT_ICON_MAX_BYTES = 1_048_576;
+
+/** The raster types a project icon may be; the server decides by the bytes, this only filters the file picker. */
+export const PROJECT_ICON_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
 
 export type IssueKind = 'feature' | 'bug' | 'task';
 
