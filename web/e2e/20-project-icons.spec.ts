@@ -70,7 +70,7 @@ test('without an icon the header and the card show the letter tile', async ({ pa
   await login(page, 'alice');
   await page.request.delete(`${BASE()}/api/projects/demo-app/icon`, { headers: mutate });
   await page.goto(`${BASE()}/p/demo-app`);
-  await expect(page.getByRole('heading', { name: 'demo-app', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { level: 1, name: 'demo-app', exact: true })).toBeVisible();
   await expect(headerTile(page)).toHaveText('D');
   await expect(headerTile(page).locator('img')).toHaveCount(0);
   await page.goto(`${BASE()}/`);

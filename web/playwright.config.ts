@@ -7,9 +7,11 @@ export default defineConfig({
   workers: 1,
   fullyParallel: false,
   retries: 0,
+  forbidOnly: !!process.env.CI,
   timeout: 90_000,
   expect: { timeout: 15_000 },
-  reporter: [['list']],
+  // In CI also an HTML report (uploaded with the traces when the job fails).
+  reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : [['list']],
   outputDir: process.env.E2E_OUTPUT_DIR ?? 'test-results',
   globalSetup: './e2e/global-setup.ts',
   use: {

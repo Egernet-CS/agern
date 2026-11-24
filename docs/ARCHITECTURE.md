@@ -2193,6 +2193,19 @@ removal, and a command that runs for `AGERN_PODMAN_IT_LONG_SECONDS`, default 300
 same script on a VM by hand. In CI the in-service Gradle runs `--offline`, from a Gradle home seeded from the
 runner's cached one, so a Maven Central outage or rate limit cannot fail the job.
 
+**CI.** `.github/workflows/ci.yml` runs on every pull request and every push to `main`: the frontend
+(typecheck, lint, build), the server (`./gradlew build`, embedded PostgreSQL), the web end-to-end suite,
+shellcheck of the packaging scripts, the migration check (§6 "Database migrations"), the Debian package
+and its smoke tests, and the sandbox host test (above). The end-to-end job (`Web (e2e)`) runs the
+Playwright suite in `web/e2e` exactly as locally: `web/e2e/server.mjs` builds the server and the frontend
+and starts Agern in fake mode (fake GitHub, Claude CLI and sandboxes) with a fresh database in a
+`postgres:16` service container, reached through `E2E_PG_CONTAINER_CMD` (a `psql` prefix on the runner)
+and `E2E_DB_HOST`/`E2E_DB_HOST_PORT`. A container is fine there: the no-Docker rule is for production.
+One worker and no retries — the specs share one server and build on each other's state, and a flaky
+check would block Agern's automatic release merges, which wait for every check (§6 "Releases"). Gradle,
+npm and Playwright's Chromium headless shell are cached; on failure the HTML report and the traces are
+uploaded as the artifact `playwright-report`. `publish-main` needs every job.
+
 **Release artifact.** One self-contained `agern.jar` (server with the built frontend embedded on
 the classpath) — the host needs only Java 17 and PostgreSQL. `FACTORY_WEB_DIR` overrides the
 embedded frontend when set. It ships in two packagings: the tarball for `install.sh` (Linux and
