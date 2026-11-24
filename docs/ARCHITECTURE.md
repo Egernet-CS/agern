@@ -228,7 +228,7 @@ Launch rules:
 - Git over HTTPS authenticates with the owner's GitHub token through environment-only config
   (`GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` with an `http.extraheader`, or
   `GIT_ASKPASS`). The token is not written into `.git/config` or the remote URL. `GH_TOKEN` is set
-  too so `gh` works.
+  too so `gh` works. The same config rewrites the host's SSH URLs to HTTPS (`url.<base>.insteadOf`, §5 "Submodules").
 - Command line: `claude -p --output-format stream-json --verbose --model <model>
   --permission-mode bypassPermissions --strict-mcp-config --mcp-config <file> …`. The MCP config
   (which contains the per-process bearer token) is written to a `0600` file under the owner's
@@ -309,7 +309,9 @@ with the owner's git authentication — after a fresh clone (`ensureClone`), aft
 context members). A failure never fails the operation: clones and syncs log it, and for a run the spec-writer's and
 builder's transcripts start with a `warn` event ``Submodules of `<directory or repo>` could not be fetched: <last 300
 characters of git's output>``. No protocol restriction is relaxed (never `protocol.file.allow=always`); in fake-GitHub
-mode submodules are skipped.
+mode submodules are skipped. Agern has no SSH key, so wherever it sets up git (agents and server-side git, with or
+without a token) SSH URLs of the git host (`git@github.com:org/repo.git`, `ssh://git@github.com/org/repo.git`) are
+rewritten to its HTTPS base through two `url.<base>.insteadOf` entries in the `GIT_CONFIG_*` environment.
 
 ### Workspace projects
 
