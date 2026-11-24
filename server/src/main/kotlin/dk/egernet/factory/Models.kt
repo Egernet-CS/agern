@@ -71,6 +71,8 @@ data class ProjectDto(
     val name: String, val fullName: String, val description: String?, val private: Boolean,
     val defaultBranch: String, val language: String?, val openIssues: Int, val pushedAt: String?,
     val htmlUrl: String, val activeAgents: Int, val activeRuns: Int,
+    /** `/api/projects/<repo>/icon?v=<version>`, or null without an icon (docs/ARCHITECTURE.md §8 "Project icons"). */
+    val iconUrl: String? = null,
 )
 
 @Serializable data class LabelDto(val name: String, val color: String)

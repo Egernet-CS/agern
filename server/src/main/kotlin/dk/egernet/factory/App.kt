@@ -144,7 +144,8 @@ class Services(
         releaseStarter ?: ReleaseStarter { release, owner -> releases.startScheduled(owner, release.id) },
     )
     val releases: ReleaseService = ReleaseService(cfg, access, releaseStore, bus, releaseBuilder, releaseScheduler, releaseMerger, releaseModePolicy)
-    val factory = FactoryService(cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases, images.store)
+    val projectIcons = dk.egernet.factory.db.ProjectIconStore(db)
+    val factory = FactoryService(cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases, images.store, projectIcons)
     val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes, screenshots, images)
 
     /** The start-up removal of leftover sandboxes (runs in the background; tests wait for it). */

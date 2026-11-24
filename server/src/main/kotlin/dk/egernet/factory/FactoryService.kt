@@ -33,6 +33,7 @@ class FactoryService(
     private val bus: EventBus,
     private val releases: ReleaseService,
     private val images: dk.egernet.factory.db.ImageStore,
+    private val icons: dk.egernet.factory.db.ProjectIconStore,
 ) {
     private val org get() = cfg.githubOrg
 
@@ -56,10 +57,12 @@ class FactoryService(
         body = if (withBody) (i.body ?: "") else null, activeRunId = activeRunId?.toString(), release = release,
     )
 
-    fun projectDto(r: GhRepo, agentCounts: Map<String, Int>, runCounts: Map<String, Int>) = ProjectDto(
+    /** [iconSha256]: the SHA-256 of the project's icon, or null without one. */
+    fun projectDto(r: GhRepo, agentCounts: Map<String, Int>, runCounts: Map<String, Int>, iconSha256: String?) = ProjectDto(
         name = r.name, fullName = r.fullName, description = r.description, private = r.private, defaultBranch = r.defaultBranch,
         language = r.language, openIssues = r.openIssuesCount, pushedAt = r.pushedAt, htmlUrl = r.htmlUrl,
         activeAgents = agentCounts[r.name] ?: 0, activeRuns = runCounts[r.name] ?: 0,
+        iconUrl = iconSha256?.let { ProjectIcons.url(r.name, it) },
     )
 
     suspend fun listProjects(user: UserRecord): List<ProjectDto> {
@@ -68,13 +71,47 @@ class FactoryService(
         access.remember(user, repos)
         val agentsByRepo = agents.liveCountByRepo()
         val runsByRepo = runs.countActiveByRepo()
-        return repos.sortedByDescending { it.pushedAt ?: "" }.map { projectDto(it, agentsByRepo, runsByRepo) }
+        val iconVersions = withContext(Dispatchers.IO) { icons.versions() }
+        return repos.sortedByDescending { it.pushedAt ?: "" }.map { projectDto(it, agentsByRepo, runsByRepo, iconVersions[it.name]) }
     }
 
     suspend fun getProject(user: UserRecord, repo: String): ProjectDto {
         val r = withContext(Dispatchers.IO) { access.requireVisible(user, repo) }
-        return projectDto(r, agents.liveCountByRepo(), runs.countActiveByRepo())
+        return projectWithIcon(r)
     }
+
+    private suspend fun projectWithIcon(r: GhRepo): ProjectDto {
+        val sha = withContext(Dispatchers.IO) { icons.meta(r.name)?.sha256 }
+        return projectDto(r, agents.liveCountByRepo(), runs.countActiveByRepo(), sha)
+    }
+
+    /**
+     * Sets or replaces the icon of [repo] (docs/ARCHITECTURE.md §8 "Project icons"). The caller has checked that
+     * [user] is an admin; keyed by the canonical repository name. [readBody] is only called once the repository is
+     * known to be visible, so a refused request never reads the upload.
+     */
+    suspend fun setProjectIcon(user: UserRecord, repo: String, readBody: suspend () -> ByteArray): ProjectDto {
+        val r = withContext(Dispatchers.IO) { access.requireVisible(user, repo) }
+        val icon = ProjectIcons.validate(readBody())
+        withContext(Dispatchers.IO) { icons.put(r.name, icon.mediaType, icon.bytes, icon.sha256, icon.width, icon.height, user.id) }
+        return projectWithIcon(r)
+    }
+
+    /** Removes the icon of [repo], if any. The caller has checked that [user] is an admin. */
+    suspend fun deleteProjectIcon(user: UserRecord, repo: String): ProjectDto {
+        val r = withContext(Dispatchers.IO) { access.requireVisible(user, repo) }
+        withContext(Dispatchers.IO) { icons.delete(r.name) }
+        return projectWithIcon(r)
+    }
+
+    /** The canonical repository name and its icon's metadata, for serving; 404 when not visible or without an icon. */
+    suspend fun visibleProjectIcon(user: UserRecord, repo: String): dk.egernet.factory.db.ProjectIconMeta {
+        val r = withContext(Dispatchers.IO) { access.requireVisible(user, repo) }
+        return withContext(Dispatchers.IO) { icons.meta(r.name) } ?: throw notFound("Icon not found")
+    }
+
+    /** The bytes of an icon returned by [visibleProjectIcon]. */
+    suspend fun projectIconData(repo: String): ByteArray? = withContext(Dispatchers.IO) { icons.data(repo) }
 
     suspend fun listIssues(user: UserRecord, repo: String, state: String): List<IssueDto> {
         if (state !in setOf("open", "closed", "all")) throw badRequest("state must be open, closed or all")
