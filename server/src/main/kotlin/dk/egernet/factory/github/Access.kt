@@ -63,6 +63,14 @@ class Access(
 
     fun canSee(u: UserRecord, repo: String): Boolean = visibleRepo(u, repo) != null
 
+    /**
+     * A run, session or anything recorded with them (transcripts, images, screenshots) of project [repo] that had the
+     * member repositories [alsoRepos] checked out: visible only to whoever can read [repo] and every one of them
+     * (docs/ARCHITECTURE.md §4 "Visibility").
+     */
+    fun canSee(u: UserRecord, repo: String, alsoRepos: Collection<String>): Boolean =
+        canSee(u, repo) && alsoRepos.all { canSee(u, it) }
+
     fun requireVisible(u: UserRecord, repo: String): GhRepo =
         visibleRepo(u, repo) ?: throw notFound("Project '$repo' not found")
 

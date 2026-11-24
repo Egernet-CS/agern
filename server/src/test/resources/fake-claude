@@ -50,7 +50,9 @@ Behaviour
   at that moment), and one that arrives after the last tool round starts a further turn with its own
   `result`. The process exits when stdin is closed.
     - spec-writer: prints a small spec
-    - builder: appends a line to AGERN_FAKE.md and commits it (if the cwd is a git repository)
+    - builder: appends a line to AGERN_FAKE.md and commits it (if the cwd is a git repository); in a workspace run (a
+      prompt line "Target member directory: `<dir>`") it commits in <cwd>/<dir> instead, and the advisor runs its
+      git diff --stat and "please change" commit there
     - reviewers (--json-schema with PASS/CHANGES): PASS, unless the prompt contains
         "fake:changes" (CHANGES before the first fix round) or "fake:always-changes"
     - approver (--json-schema with APPROVE/ESCALATE): APPROVE, unless "fake:escalate"
@@ -431,23 +433,36 @@ def describe_blocks(blocks):
 advisor_context = {}
 
 
+def target_dir(text):
+    """A workspace run's git worktree: the line 'Target member directory: `<dir>`' names it; else the working directory."""
+    m = re.search(r"^Target member directory: `([^`]+)`", text or "", re.M)
+    if m and ".." not in m.group(1).split("/"):
+        return os.path.join(os.getcwd(), m.group(1))
+    return os.getcwd()
+
+
+def is_git(d):
+    return os.path.isdir(os.path.join(d, ".git")) or os.path.isfile(os.path.join(d, ".git"))
+
+
 def advisor_reply(text, context):
     """The advisor's answer: the owner's words, what the run context says, and the actual diff."""
     lines = ["Advisor: " + text]
     for line in context.splitlines():
         if line.startswith("Needs a human because:") or line.startswith("### "):
             lines.append(line)
-    base = re.search(r"git diff (\S+)\.\.\.HEAD", context)
-    if "please change" in text and (os.path.isdir(".git") or os.path.isfile(".git")):
-        with open("AGERN_FAKE.md", "a") as f:
+    base = re.search(r"git (?:-C \S+ )?diff (\S+)\.\.\.HEAD", context)
+    d = target_dir(context)
+    if "please change" in text and is_git(d):
+        with open(os.path.join(d, "AGERN_FAKE.md"), "a") as f:
             f.write("change requested in the conversation at %s\n" % time.strftime("%Y-%m-%dT%H:%M:%S"))
-        subprocess.run(["git", "add", "AGERN_FAKE.md"], check=False)
-        subprocess.run(["git", "commit", "-q", "-m", "Apply the change the run owner asked for (fake)"], check=False)
+        subprocess.run(["git", "add", "AGERN_FAKE.md"], check=False, cwd=d)
+        subprocess.run(["git", "commit", "-q", "-m", "Apply the change the run owner asked for (fake)"], check=False, cwd=d)
         lines.append("Committed the change; the factory pushes it and has it reviewed again. Only you can approve the run.")
     if base:
         ref = base.group(1).strip("`")
         try:
-            stat = subprocess.run(["git", "diff", "--stat", "%s...HEAD" % ref], capture_output=True, text=True, timeout=30).stdout.strip()
+            stat = subprocess.run(["git", "diff", "--stat", "%s...HEAD" % ref], capture_output=True, text=True, timeout=30, cwd=d).stdout.strip()
         except Exception as e:  # noqa
             stat = "git diff failed: %s" % e
         lines.append("Diff: " + (stat or "(no changes)"))
@@ -709,18 +724,20 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
                 except Exception as e:  # noqa
                     image_report += "\nCopying the image failed: %s" % e
         image_report += prepared_report(prompt)
-        if os.path.isdir(".git") or os.path.isfile(".git"):
-            with open("AGERN_FAKE.md", "a") as f:
+        # A workspace run commits in the target member's worktree (its prompt names it), else in the working directory.
+        d = target_dir(prompt)
+        if is_git(d):
+            with open(os.path.join(d, "AGERN_FAKE.md"), "a") as f:
                 f.write("fake build at %s\n" % time.strftime("%Y-%m-%dT%H:%M:%S"))
-            subprocess.run(["git", "add", "AGERN_FAKE.md"], check=False)
+            subprocess.run(["git", "add", "AGERN_FAKE.md"], check=False, cwd=d)
             if "fake:ui-change" in prompt:
-                os.makedirs(os.path.join("web", "src"), exist_ok=True)
-                with open(os.path.join("web", "src", "FakeBanner.tsx"), "a") as f:
+                os.makedirs(os.path.join(d, "web", "src"), exist_ok=True)
+                with open(os.path.join(d, "web", "src", "FakeBanner.tsx"), "a") as f:
                     f.write("export const FakeBanner = () => <p>fake build at %s</p>;\n" % time.strftime("%Y-%m-%dT%H:%M:%S"))
-                subprocess.run(["git", "add", os.path.join("web", "src", "FakeBanner.tsx")], check=False)
-            if os.path.isfile(os.path.join("assets", "fake-icon.png")):
-                subprocess.run(["git", "add", os.path.join("assets", "fake-icon.png")], check=False)
-            subprocess.run(["git", "commit", "-q", "-m", "Fake build commit"], check=False)
+                subprocess.run(["git", "add", os.path.join("web", "src", "FakeBanner.tsx")], check=False, cwd=d)
+            if os.path.isfile(os.path.join(d, "assets", "fake-icon.png")):
+                subprocess.run(["git", "add", os.path.join("assets", "fake-icon.png")], check=False, cwd=d)
+            subprocess.run(["git", "commit", "-q", "-m", "Fake build commit"], check=False, cwd=d)
         if "fake:stop-builder" in prompt and "Do not redo that work" not in prompt:
             text = "API Error: Can't reach the API server - check your internet or DNS (fake)"
             stream_text(text)

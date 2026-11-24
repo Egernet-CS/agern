@@ -717,7 +717,7 @@ private fun Route.releaseRoutes(s: Services) {
 
 private suspend fun visibleSession(s: Services, u: UserRecord, id: UUID): SessionRecord {
     val rec = s.sessions.get(id) ?: throw notFound("Session not found")
-    if (!withContext(Dispatchers.IO) { s.access.canSee(u, rec.repo) }) throw notFound("Session not found")
+    if (!withContext(Dispatchers.IO) { s.access.canSee(u, rec.repo, rec.contextRepos) }) throw notFound("Session not found")
     return rec
 }
 
@@ -727,7 +727,9 @@ private fun Route.sessionRoutes(s: Services) {
         val u = call.requireUser(s)
         val repo = repoParam()
         withContext(Dispatchers.IO) { s.access.requireVisible(u, repo) }
-        call.respond(s.sessions.list(repo, call.request.queryParameters["kind"], activeOnly = false).map { s.agents.dto(it) })
+        val list = s.sessions.list(repo, call.request.queryParameters["kind"], activeOnly = false)
+        val visible = withContext(Dispatchers.IO) { list.filter { s.access.canSee(u, it.repo, it.contextRepos) } }
+        call.respond(visible.map { s.agents.dto(it) })
     }
     post("/projects/{repo}/sessions") {
         val u = call.requireUser(s)
@@ -740,8 +742,8 @@ private fun Route.sessionRoutes(s: Services) {
         val u = call.requireUser(s)
         val active = call.request.queryParameters["active"] == "true"
         val list = s.sessions.list(null, null, active).let { l -> if (active) l.filter { s.agents.isActive(it) } else l }
-        val visible = withContext(Dispatchers.IO) { list.map { it.repo }.distinct().filter { s.access.canSee(u, it) }.toSet() }
-        call.respond(list.filter { it.repo in visible }.map { s.agents.dto(it) })
+        val visible = withContext(Dispatchers.IO) { list.filter { s.access.canSee(u, it.repo, it.contextRepos) } }
+        call.respond(visible.map { s.agents.dto(it) })
     }
     get("/sessions/{id}") {
         val u = call.requireUser(s)
@@ -989,7 +991,7 @@ private fun Route.wsRoutes(s: Services) {
             val u = call.requireUser(s)
             val id = call.parameters["id"]?.let { runCatching { UUID.fromString(it) }.getOrNull() }
             val rec = id?.let { s.sessions.get(it) }
-            if (rec == null || !withContext(Dispatchers.IO) { s.access.canSee(u, rec.repo) }) {
+            if (rec == null || !withContext(Dispatchers.IO) { s.access.canSee(u, rec.repo, rec.contextRepos) }) {
                 close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "not found"))
                 return@webSocket
             }
@@ -1037,7 +1039,7 @@ private fun Route.wsRoutes(s: Services) {
                     if (u.isAdmin) send(Frame.Text(AppJson.encodeToString(FeedFrame.serializer(), FeedFrame(type = "sandboxes", runId = item.runId, change = item.change))))
                     return@collect
                 }
-                val visible = withContext(Dispatchers.IO) { s.access.canSee(u, item.repo) }
+                val visible = withContext(Dispatchers.IO) { s.access.canSee(u, item.repo, item.alsoRepos) }
                 if (!visible) return@collect
                 val frame = when (item) {
                     is FeedItem.Session -> FeedFrame(type = "session", session = item.session)

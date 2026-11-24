@@ -14,6 +14,8 @@ import dk.egernet.factory.github.GhIssue
 import dk.egernet.factory.github.GhRepo
 import dk.egernet.factory.github.GitHubException
 import dk.egernet.factory.pipeline.Orchestrator
+import dk.egernet.factory.workspace.WORKSPACE_FILE
+import dk.egernet.factory.workspace.WorkspaceState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.util.UUID
@@ -34,6 +36,7 @@ class FactoryService(
     private val releases: ReleaseService,
     private val images: dk.egernet.factory.db.ImageStore,
     private val icons: dk.egernet.factory.db.ProjectIconStore,
+    private val workspaces: dk.egernet.factory.workspace.WorkspaceService,
 ) {
     private val org get() = cfg.githubOrg
 
@@ -50,12 +53,24 @@ class FactoryService(
         }
     }
 
-    fun issueDto(repo: String, i: GhIssue, withBody: Boolean, activeRunId: UUID?, release: IssueReleaseDto? = null) = IssueDto(
+    /** [workspace]: the project's workspace definition, for [IssueDto.workspaceMembers]. */
+    fun issueDto(
+        repo: String, i: GhIssue, withBody: Boolean, activeRunId: UUID?, release: IssueReleaseDto? = null,
+        workspace: WorkspaceState? = null,
+    ) = IssueDto(
         number = i.number, title = i.title, state = i.state, kind = issueKindFromLabels(i.labels.map { it.name }),
         labels = i.labels.map { LabelDto(it.name, it.color) }, author = i.user?.login ?: "", assignees = i.assignees.map { it.login },
         comments = i.comments, createdAt = i.createdAt, updatedAt = i.updatedAt, htmlUrl = i.htmlUrl,
         body = if (withBody) (i.body ?: "") else null, activeRunId = activeRunId?.toString(), release = release,
+        workspaceMembers = workspace?.membersLabelled(i.labels.map { it.name }).orEmpty().map { IssueMemberDto(it.directory, it.repository) },
     )
+
+    /** Whether [repo] is a workspace project for [user] (who can see it). */
+    suspend fun isWorkspace(user: UserRecord, repo: String): Boolean = workspaceOf(user, repo) != null
+
+    /** The workspace definition of [repo] as [user] sees it (null: not a workspace). Blocking-safe. */
+    private suspend fun workspaceOf(user: UserRecord, repo: String): WorkspaceState? =
+        withContext(Dispatchers.IO) { workspaces.lookup(user, repo) }
 
     /** [iconSha256]: the SHA-256 of the project's icon, or null without one. */
     fun projectDto(r: GhRepo, agentCounts: Map<String, Int>, runCounts: Map<String, Int>, iconSha256: String?) = ProjectDto(
@@ -77,7 +92,17 @@ class FactoryService(
 
     suspend fun getProject(user: UserRecord, repo: String): ProjectDto {
         val r = withContext(Dispatchers.IO) { access.requireVisible(user, repo) }
-        return projectWithIcon(r)
+        val ws = withContext(Dispatchers.IO) {
+            workspaces.lookup(user, r.name)?.let { state ->
+                WorkspaceDto(
+                    WORKSPACE_FILE, state.valid, state.errors,
+                    workspaces.resolve(user, state).map {
+                        WorkspaceMemberDto(it.directory, it.repository, if (it.accessible) it.baseBranch else it.member.branch, it.member.label, it.accessible)
+                    },
+                )
+            }
+        }
+        return projectWithIcon(r).copy(workspace = ws)
     }
 
     private suspend fun projectWithIcon(r: GhRepo): ProjectDto {
@@ -138,8 +163,9 @@ class FactoryService(
         val active = runs.activeRunsByIssue(repo)
         val planned = withContext(Dispatchers.IO) { releases.releaseByIssue(repo) }
         val counts = withContext(Dispatchers.IO) { images.countsByIssue(repo) }
+        val ws = workspaceOf(user, repo)
         return gh { client.listIssues(org, repo, state) }.map {
-            issueDto(repo, it, false, active[it.number], planned[it.number]).copy(imageCount = counts[it.number] ?: 0)
+            issueDto(repo, it, false, active[it.number], planned[it.number], ws).copy(imageCount = counts[it.number] ?: 0)
         }
     }
 
@@ -149,7 +175,7 @@ class FactoryService(
         val i = gh { client.getIssue(org, repo, number) } ?: throw notFound("Issue #$number not found")
         val planned = withContext(Dispatchers.IO) { releases.releaseByIssue(repo) }
         val count = withContext(Dispatchers.IO) { images.countsByIssue(repo)[number] ?: 0 }
-        return issueDto(repo, i, true, runs.activeRunFor(repo, number), planned[number]).copy(imageCount = count)
+        return issueDto(repo, i, true, runs.activeRunFor(repo, number), planned[number], workspaceOf(user, repo)).copy(imageCount = count)
     }
 
     /** Issue with its comments, as plain text for agents. */
@@ -180,7 +206,7 @@ class FactoryService(
         withContext(Dispatchers.IO) { access.requireVisible(user, repo) }
         val client = access.requireClient(user)
         val i = gh { client.createIssue(org, repo, title.trim(), body, labels) }
-        val dto = issueDto(repo, i, true, null)
+        val dto = issueDto(repo, i, true, null, workspace = workspaceOf(user, repo))
         // Fresh openIssues on the next project fetch, then announce it to everyone who can see the repo.
         access.forgetRepo(repo)
         bus.emitFeed(FeedItem.Issue(repo, dto.copy(body = null)))
@@ -193,14 +219,14 @@ class FactoryService(
     /** Visibility-checked run lookup. */
     suspend fun visibleRun(user: UserRecord, runId: UUID): RunRecord {
         val r = runs.get(runId) ?: throw notFound("Run not found")
-        if (!withContext(Dispatchers.IO) { access.canSee(user, r.repo) }) throw notFound("Run not found")
+        if (!withContext(Dispatchers.IO) { access.canSee(user, r.repo, r.contextRepos) }) throw notFound("Run not found")
         return r
     }
 
     suspend fun listRuns(user: UserRecord, repo: String?, activeOnly: Boolean, statuses: Set<String>? = null): List<RunDto> {
         val list = runs.list(repo, activeOnly, statuses = statuses)
-        val visible = withContext(Dispatchers.IO) { list.map { it.repo }.distinct().filter { access.canSee(user, it) }.toSet() }
-        return list.filter { it.repo in visible }.map { runs.toDto(it) }
+        val visible = withContext(Dispatchers.IO) { list.filter { access.canSee(user, it.repo, it.contextRepos) } }
+        return visible.map { runs.toDto(it) }
     }
 
     suspend fun approveRun(user: UserRecord, runId: UUID): RunDto {
@@ -250,7 +276,7 @@ class FactoryService(
             sessionId != null -> {
                 val rec = sessions.get(sessionId)?.takeIf { it.repo == (repo ?: it.repo) && it.kind != "chat" }
                     ?: throw notFound("Agent session not found")
-                if (!withContext(Dispatchers.IO) { access.canSee(user, rec.repo) }) throw notFound("Agent session not found")
+                if (!withContext(Dispatchers.IO) { access.canSee(user, rec.repo, rec.contextRepos) }) throw notFound("Agent session not found")
                 rec
             }
             runId != null -> {

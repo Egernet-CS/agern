@@ -192,12 +192,18 @@ class WebSessionStore(private val db: Db) {
 
 // ---------------------------------------------------------------- agent sessions
 
+/** `context_repos` as stored: comma-separated repository names. */
+internal fun splitRepos(s: String?): List<String> = s?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
+internal fun joinRepos(repos: Collection<String>): String = repos.distinct().joinToString(",")
+
 data class SessionRecord(
     val id: UUID, val repo: String, val kind: String, val model: String, val status: String,
     val ownerId: UUID, val ownerUsername: String, val ownerDisplayName: String,
     val title: String?, val runId: UUID?, val parentSessionId: UUID?, val issueNumber: Int?,
     val claudeSessionId: String?, val costUsd: Double?, val numTurns: Int?, val lastActivity: String?,
     val createdAt: Instant, val updatedAt: Instant, val endedAt: Instant?,
+    /** Member repositories of a workspace checked out for this session (docs/ARCHITECTURE.md §4 "Visibility"). */
+    val contextRepos: List<String> = emptyList(),
 ) {
     fun toDto(live: Boolean) = AgentSessionDto(
         id = id.toString(), repo = repo, kind = kind, model = model, status = status,
@@ -218,19 +224,33 @@ class SessionStore(private val db: Db) {
         rs.getString("title"), rs.uuidOrNull("run_id"), rs.uuidOrNull("parent_session_id"), rs.intOrNull("issue_number"),
         rs.getString("claude_session_id"), rs.doubleOrNull("cost_usd"), rs.intOrNull("num_turns"), rs.getString("last_activity"),
         rs.instant("created_at"), rs.instant("updated_at"), rs.instantOrNull("ended_at"),
+        splitRepos(rs.getString("context_repos")),
     )
 
     fun create(
         repo: String, kind: String, model: String, status: String, ownerId: UUID, title: String?,
-        runId: UUID? = null, parentSessionId: UUID? = null, issueNumber: Int? = null,
+        runId: UUID? = null, parentSessionId: UUID? = null, issueNumber: Int? = null, contextRepos: List<String> = emptyList(),
     ): SessionRecord {
         val id = UUID.randomUUID()
         db.update(
-            """INSERT INTO agent_sessions(id, repo, kind, model, status, owner_id, title, run_id, parent_session_id, issue_number)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            id, repo, kind, model, status, ownerId, title, runId, parentSessionId, issueNumber,
+            """INSERT INTO agent_sessions(id, repo, kind, model, status, owner_id, title, run_id, parent_session_id, issue_number, context_repos)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            id, repo, kind, model, status, ownerId, title, runId, parentSessionId, issueNumber, joinRepos(contextRepos),
         )
         return get(id)!!
+    }
+
+    /** Adds [repos] to the session's recorded context repositories (a chat's checkouts, as a union). */
+    fun addContextRepos(id: UUID, repos: Collection<String>) {
+        if (repos.isEmpty()) return
+        db.tx { c ->
+            val current = c.prepare("SELECT context_repos FROM agent_sessions WHERE id = ? FOR UPDATE", arrayOf<Any?>(id))
+                .use { ps -> ps.executeQuery().use { rs -> if (rs.next()) rs.getString(1) else null } } ?: return@tx
+            val merged = (splitRepos(current) + repos).distinct()
+            if (merged.size != splitRepos(current).size) {
+                c.prepare("UPDATE agent_sessions SET context_repos = ? WHERE id = ?", arrayOf<Any?>(joinRepos(merged), id)).use { it.executeUpdate() }
+            }
+        }
     }
 
     fun get(id: UUID) = db.queryOne("$select WHERE s.id = ?", id, map = ::map)
@@ -373,6 +393,11 @@ data class RunRecord(
     val failureKind: String? = null,
     /** [dk.egernet.factory.FailedStep] that failed after the builder finished. */
     val failedStep: String? = null,
+    /** A workspace run: the member repository it changes and its directory (docs/ARCHITECTURE.md §6 "Workspace runs"). */
+    val targetRepo: String? = null,
+    val targetDir: String? = null,
+    /** Member repositories checked out for this run (docs/ARCHITECTURE.md §4 "Visibility"). */
+    val contextRepos: List<String> = emptyList(),
 )
 
 class RunStore(private val db: Db) {
@@ -391,6 +416,7 @@ class RunStore(private val db: Db) {
         rs.uuidOrNull("advisor_session_id"), rs.getString("reviewed_sha"), rs.getString("review_state"), rs.intOrNull("follow_up_from"),
         rs.uuidOrNull("continues_run_id"), rs.getString("spec"), rs.getString("builder_summary"),
         rs.getString("failure_kind"), rs.getString("failed_step"),
+        rs.getString("target_repo"), rs.getString("target_dir"), splitRepos(rs.getString("context_repos")),
     )
 
     private fun mapStage(rs: ResultSet) = StageRecord(
@@ -407,6 +433,7 @@ class RunStore(private val db: Db) {
     fun createIfNoActive(
         repo: String, issueNumber: Int, issueTitle: String, issueKind: String, maxRounds: Int, ownerId: UUID, startedBy: UUID?,
         releaseId: UUID? = null, baseBranch: String? = null, continuesRunId: UUID? = null, spec: String? = null,
+        targetRepo: String? = null, targetDir: String? = null, contextRepos: List<String> = emptyList(),
     ): RunRecord? {
         val id = UUID.randomUUID()
         val inserted = db.tx { c ->
@@ -418,9 +445,12 @@ class RunStore(private val db: Db) {
             if (active > 0) return@tx false
             c.prepare(
                 """INSERT INTO runs(id, repo, issue_number, issue_title, issue_kind, status, max_rounds, owner_id, started_by_session_id,
-                     release_id, base_branch, continues_run_id, spec)
-                   VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)""",
-                arrayOf<Any?>(id, repo, issueNumber, issueTitle, issueKind, maxRounds, ownerId, startedBy, releaseId, baseBranch, continuesRunId, spec),
+                     release_id, base_branch, continues_run_id, spec, target_repo, target_dir, context_repos)
+                   VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                arrayOf<Any?>(
+                    id, repo, issueNumber, issueTitle, issueKind, maxRounds, ownerId, startedBy, releaseId, baseBranch, continuesRunId, spec,
+                    targetRepo, targetDir, joinRepos(contextRepos),
+                ),
             ).use { it.executeUpdate() }
             true
         }
@@ -493,10 +523,10 @@ class RunStore(private val db: Db) {
     )
 
     /** Pull request numbers of earlier runs of the issue that ended without merging (their PRs may still be open). */
-    fun earlierUnmergedPulls(repo: String, issueNumber: Int, exceptRunId: UUID): List<Int> = db.query(
+    fun earlierUnmergedPulls(repo: String, issueNumber: Int, exceptRunId: UUID, targetRepo: String? = null): List<Int> = db.query(
         """SELECT DISTINCT pr_number FROM runs WHERE repo = ? AND issue_number = ? AND id <> ? AND pr_number IS NOT NULL
-           AND status IN ('failed','cancelled') ORDER BY pr_number""",
-        repo, issueNumber, exceptRunId,
+           AND status IN ('failed','cancelled') AND target_repo IS NOT DISTINCT FROM CAST(? AS text) ORDER BY pr_number""",
+        repo, issueNumber, exceptRunId, targetRepo,
     ) { it.getInt("pr_number") }
 
     fun activeRunsByIssue(repo: String): Map<Int, UUID> = db.query(
@@ -539,6 +569,8 @@ class RunStore(private val db: Db) {
     )
 
     fun setRound(id: UUID, round: Int) = db.update("UPDATE runs SET round = ?, updated_at = now() WHERE id = ?", round, id)
+    fun setContextRepos(id: UUID, repos: List<String>) =
+        db.update("UPDATE runs SET context_repos = ?, updated_at = now() WHERE id = ?", joinRepos(repos), id)
     fun setBranch(id: UUID, branch: String) = db.update("UPDATE runs SET branch = ?, updated_at = now() WHERE id = ?", branch, id)
     fun setPr(id: UUID, number: Int, url: String) =
         db.update("UPDATE runs SET pr_number = ?, pr_url = ?, updated_at = now() WHERE id = ?", number, url, id)
@@ -620,6 +652,7 @@ class RunStore(private val db: Db) {
             conversation = dk.egernet.factory.RunConversationDto(r.advisorSessionId?.toString(), r.reviewState, r.followUpFrom),
             continuesRunId = r.continuesRunId?.toString(), continuedByRunId = continuedBy(r.id)?.toString(),
             failureKind = r.failureKind, failedStep = r.failedStep,
+            targetRepo = r.targetRepo, targetDirectory = r.targetDir,
             warnings = stageRows.filter { it.warning != null }.groupBy { it.round }.toSortedMap()
                 .map { (round, list) -> dk.egernet.factory.RunWarningDto(round, list.map { it.role }, list.first().warning!!) },
         )

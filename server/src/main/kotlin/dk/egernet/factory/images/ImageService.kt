@@ -506,7 +506,9 @@ class ImageService(
     /** The image if [user] may see its repository; 404 otherwise (unknown ids alike). */
     suspend fun visible(user: UserRecord, id: UUID): ImageMeta {
         val m = withContext(Dispatchers.IO) { store.get(id) } ?: throw notFound("Image not found")
-        if (!withContext(Dispatchers.IO) { access.canSee(user, m.repo) }) throw notFound("Image not found")
+        // The image's session records the member repositories of a workspace it saw (docs/ARCHITECTURE.md §4).
+        val also = withContext(Dispatchers.IO) { sessions.get(m.sessionId)?.contextRepos.orEmpty() }
+        if (!withContext(Dispatchers.IO) { access.canSee(user, m.repo, also) }) throw notFound("Image not found")
         return m
     }
 

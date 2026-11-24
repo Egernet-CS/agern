@@ -213,7 +213,42 @@ class FakeGitHub(private val org: String) : GitHub {
             addIssue("demo-app", "Crash when the list is empty", "Opening the list view with no items throws a TypeError.", listOf("bug"))
             addIssue("demo-app", "Update dependencies", "Bump all dependencies to their latest minor versions.")
             addIssue("private-lab", "Experiment with caching", "Try an in-memory cache for the slow endpoint.")
+            seedWorkspace()
         }
+
+        /** The workspace definition of the seeded `demo-workspace` (docs/ARCHITECTURE.md §3). */
+        val DEMO_WORKSPACE_FILE = """
+            |# The demo shop and its tools, checked out side by side (docs/ARCHITECTURE.md §5 "Workspace projects").
+            |members:
+            |  - directory: app
+            |    repository: demo-ws-app
+            |    branch: dev
+            |    label: app
+            |  - directory: tools/cli
+            |    repository: demo-ws-tools
+            |  - directory: lab
+            |    repository: demo-ws-lab
+            |    label: lab
+            |""".trimMargin()
+    }
+
+    /**
+     * A workspace project: `demo-workspace` with `.agern/workspace.yml` and three members, `demo-ws-app` (base branch
+     * `dev`), `demo-ws-tools` (default branch) and `demo-ws-lab` (only alice can read it), and issues with one, no and
+     * several member labels.
+     */
+    fun seedWorkspace() {
+        addRepo("demo-workspace", "A workspace: the demo shop app and its tools, side by side")
+        addRepo("demo-ws-app", "The shop app of demo-workspace (base branch dev)")
+        addRepo("demo-ws-tools", "Command-line tools of demo-workspace")
+        addRepo("demo-ws-lab", "Experiments of demo-workspace; only alice can read it", private = true, visibleTo = setOf("alice"))
+        synchronized(this) { branches.getOrPut("demo-ws-app") { mutableSetOf() } += "dev" }
+        setFile("demo-workspace", ".agern/workspace.yml", DEMO_WORKSPACE_FILE)
+        addIssue("demo-workspace", "Show prices with currency", "Prices in the shop app lack the currency sign.", listOf("enhancement", "app"))
+        addIssue("demo-workspace", "Add a --dry-run flag to the CLI", "The import command should be able to run without writing.", listOf("demo-ws-tools"))
+        addIssue("demo-workspace", "Document the release process", "Nobody knows how a release is made.")
+        addIssue("demo-workspace", "Share the price formatter", "The app and the CLI format prices differently.", listOf("app", "demo-ws-tools"))
+        addIssue("demo-workspace", "Try a faster search index", "An experiment for the lab.", listOf("lab"))
     }
 
     private inner class Client(val login: String, val scopes: List<String>) : GitHubClient {

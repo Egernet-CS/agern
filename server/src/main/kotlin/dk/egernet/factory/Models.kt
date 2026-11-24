@@ -73,7 +73,20 @@ data class ProjectDto(
     val htmlUrl: String, val activeAgents: Int, val activeRuns: Int,
     /** `/api/projects/<repo>/icon?v=<version>`, or null without an icon (docs/ARCHITECTURE.md §8 "Project icons"). */
     val iconUrl: String? = null,
+    /** The workspace definition (docs/ARCHITECTURE.md §5 "Workspace projects"); filled by `GET /api/projects/{repo}` only. */
+    val workspace: WorkspaceDto? = null,
 )
+
+@Serializable
+data class WorkspaceDto(val path: String, val valid: Boolean, val errors: List<String>, val members: List<WorkspaceMemberDto>)
+
+/** [branch]: the effective base branch, or the declared one (possibly null) for a member the caller cannot read. */
+@Serializable
+data class WorkspaceMemberDto(val directory: String, val repository: String, val branch: String?, val label: String, val accessible: Boolean)
+
+/** A member whose label an issue carries. */
+@Serializable
+data class IssueMemberDto(val directory: String, val repository: String)
 
 @Serializable data class LabelDto(val name: String, val color: String)
 
@@ -88,6 +101,8 @@ data class IssueDto(
     val release: IssueReleaseDto? = null,
     /** Images selected for this issue in a chat (docs/ARCHITECTURE.md §6 "Generated images"). */
     val imageCount: Int = 0,
+    /** Workspace projects: the members whose label the issue carries; empty otherwise. */
+    val workspaceMembers: List<IssueMemberDto> = emptyList(),
 )
 
 @Serializable data class IssueReleaseDto(val id: String, val name: String)
@@ -222,6 +237,9 @@ data class RunDto(
     val failedStep: String? = null,
     /** Warnings that never fail the run, per round, oldest round first (from the stages' [StageDto.warning]). */
     val warnings: List<RunWarningDto> = emptyList(),
+    /** A workspace run: the member repository and directory it changes; null otherwise. */
+    val targetRepo: String? = null,
+    val targetDirectory: String? = null,
 )
 
 /** Ways to retry a failed run (docs/ARCHITECTURE.md §6 "Retrying a run"). */
