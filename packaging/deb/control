@@ -6,7 +6,7 @@ Section: devel
 Priority: optional
 Installed-Size: @INSTALLED_SIZE@
 Depends: default-jre-headless (>= 2:1.17) | java17-runtime-headless, git, ca-certificates, curl, passwd
-Recommends: postgresql
+Recommends: postgresql, chromium
 Suggests: gh, podman (>= 4.3), uidmap, netavark, aardvark-dns, crun, slirp4netns
 Homepage: https://github.com/Egernet-CS/agern
 Description: Agern - the software factory
@@ -17,6 +17,7 @@ Description: Agern - the software factory
  .
  Needs a PostgreSQL database ('agern setup-db' creates one on a local
  PostgreSQL), the 'claude' CLI and 'gh' for the agern user ('agern doctor'
- says what is missing). Optional build/test sandboxes in rootless Podman are
- off until 'agern sandbox enable' (which says what to install). See
- /usr/share/doc/agern/README.Debian.
+ says what is missing). The UX and UI design reviewers screenshot the apps they
+ review with a headless browser ('chromium', recommended). Optional build/test
+ sandboxes in rootless Podman are off until 'agern sandbox enable' (which says
+ what to install). See /usr/share/doc/agern/README.Debian.

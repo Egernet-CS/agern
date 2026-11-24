@@ -18,6 +18,7 @@ Files
 
 First steps
   sudo apt install postgresql && sudo agern setup-db
+  sudo apt install chromium fonts-noto-core   # recommended: the UI reviewers' headless browser
   sudoedit /etc/agern/agern.env    # FACTORY_GITHUB_ORG, FACTORY_PUBLIC_URL, FACTORY_ADMINS, FACTORY_AUTH
   sudo agern doctor && sudo agern start
 

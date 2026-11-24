@@ -160,6 +160,12 @@ printf '%s' "$doc" | grep -q 'FAIL  claude not found.*claude.ai/install.sh' && p
 printf '%s' "$doc" | grep -q 'FAIL  gh not found.*apt install gh' && pass "doctor: gh missing, with install hint" || fail "doctor: gh hint"
 printf '%s' "$doc" | grep -q 'FAIL  FACTORY_GITHUB_ORG is not set' && pass "doctor: org not set" || fail "doctor: org not set"
 printf '%s' "$doc" | grep -q "ok    sandboxes off ('sudo agern sandbox enable' turns them on)" && pass "doctor: sandboxes off, one line" || fail "doctor: sandboxes off"
+# chromium is a Recommends: apt installs it where the distribution has it (Debian), not on Ubuntu (a snap there).
+if dpkg-query -W -f='${Status}' chromium 2>/dev/null | grep -q 'install ok installed'; then
+    printf '%s' "$doc" | grep -q 'ok    headless browser for the UI reviewers: /usr/bin/chromium' && pass "doctor: headless browser (chromium, Recommends) found" || fail "doctor: headless browser not found"
+else
+    printf '%s' "$doc" | grep -q 'warn  no headless browser (chromium, .*apt install chromium fonts-noto-core' && pass "doctor: no headless browser, with install hint" || fail "doctor: headless browser hint"
+fi
 
 sed -i 's/^AGERN_UPGRADE_CHANNEL=stable$/AGERN_UPGRADE_CHANNEL=main/' /etc/agern/agern.env
 agern auto-upgrade status | grep -q '^channel: *main$' && pass "auto-upgrade status (root) reads the channel" || fail "auto-upgrade status as root"
