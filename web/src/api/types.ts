@@ -252,7 +252,15 @@ export type Stage = {
   screenshots: Screenshot[];
   /** Images the stage's agent generated (only the spec-writer and the builder can), oldest first. */
   images: GeneratedImage[];
+  /**
+   * A warning the server recorded on the stage without failing it, e.g. "UI change reviewed without screenshots: …"
+   * on the ux and ui-design stages of a round (docs/ARCHITECTURE.md §6 "Screenshots"). Null or absent: none.
+   */
+  warning?: string | null;
 };
+
+/** A warning on a run: the stage warnings of one round, by the roles that carry it. Never fails the run. */
+export type RunWarning = { round: number; roles: StageRole[]; text: string };
 
 /** Where a chat image is selected; `locked` while a run that took it is not failed or cancelled. */
 export type ImageSelection = { issueNumber: number; name: string; usedByRunId: string | null; locked: boolean };
@@ -374,6 +382,8 @@ export type Run = {
   failureKind?: FailureKind | null;
   /** The mechanical step after the builder that failed. */
   failedStep?: FailedStep | null;
+  /** Warnings that never fail the run, per round, oldest round first (from the stages' `warning`). */
+  warnings?: RunWarning[];
 };
 
 export type FailureKind = 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other';

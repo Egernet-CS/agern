@@ -85,7 +85,9 @@ tests `FACTORY_2FA=off` is accepted when `dev` is the only provider.
     keep that agent working in short Bash steps until a message from the run owner contains `finish`
     (try the composer under its transcript on the run page). Like the real CLI, the spec-writer and
     builder pick up the owner's messages after their current tool call, or as a further turn when they
-    were finishing.
+    were finishing. `fake:screenshots` makes the ux and ui-design reviewers attach a screenshot;
+    `fake:ui-change` makes the builder also commit `web/src/FakeBanner.tsx`, so without screenshots the
+    run shows the warning "UI change reviewed without screenshots".
 
     The advisor (the agent a run's owner talks to at `needs_human`, e.g. after `fake:escalate`) answers
     `Advisor: <your text>`, followed by the "Needs a human because:" line and the reviewer headings from the run

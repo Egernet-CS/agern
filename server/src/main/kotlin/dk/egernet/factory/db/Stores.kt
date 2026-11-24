@@ -336,10 +336,12 @@ class EventStore(private val db: Db) {
 data class StageRecord(
     val id: UUID, val runId: UUID, val role: String, val round: Int, val model: String, val status: String, val verdict: String?,
     val summary: String?, val findings: List<FindingDto>, val sessionId: UUID?, val startedAt: Instant?, val endedAt: Instant?,
+    /** A warning the server recorded on the stage (docs/ARCHITECTURE.md §6 "Screenshots"); null: none. */
+    val warning: String? = null,
 ) {
     fun toDto(screenshots: List<dk.egernet.factory.ScreenshotDto> = emptyList(), images: List<dk.egernet.factory.GeneratedImageDto> = emptyList()) = StageDto(
         id.toString(), role, round, model, status, verdict, summary, findings, sessionId?.toString(), startedAt?.iso(), endedAt?.iso(),
-        screenshots, images,
+        screenshots, images, warning,
     )
 }
 
@@ -395,7 +397,7 @@ class RunStore(private val db: Db) {
         rs.uuid("id"), rs.uuid("run_id"), rs.getString("role"), rs.getInt("round"), rs.getString("model"), rs.getString("status"),
         rs.getString("verdict"), rs.getString("summary"),
         AppJson.decodeFromString(findingsSer, rs.getString("findings_text")),
-        rs.uuidOrNull("session_id"), rs.instantOrNull("started_at"), rs.instantOrNull("ended_at"),
+        rs.uuidOrNull("session_id"), rs.instantOrNull("started_at"), rs.instantOrNull("ended_at"), rs.getString("warning"),
     )
 
     /**
@@ -593,6 +595,9 @@ class RunStore(private val db: Db) {
         status, verdict, summary, JsonbParam(AppJson.encodeToString(findingsSer, findings)), id,
     )
 
+    /** Records a warning on a stage (docs/ARCHITECTURE.md §6 "Screenshots"); it never changes the stage's status. */
+    fun setStageWarning(id: UUID, warning: String?) = db.update("UPDATE stages SET warning = ? WHERE id = ?", warning, id)
+
     /** Pending → skipped, running → failed. Used when a run ends abnormally. */
     fun closeOpenStages(runId: UUID) {
         db.update("UPDATE stages SET status = 'skipped', ended_at = now() WHERE run_id = ? AND status = 'pending'", runId)
@@ -603,17 +608,20 @@ class RunStore(private val db: Db) {
     fun toDto(r: RunRecord): RunDto {
         val shots = screenshots.forRun(r.id).groupBy({ it.stageId }, { it.toDto() })
         val imgs = images.forRun(r.id).groupBy({ it.sessionId }, { it.toDto() })
+        val stageRows = stages(r.id)
         return RunDto(
             id = r.id.toString(), repo = r.repo, issueNumber = r.issueNumber, issueTitle = r.issueTitle, issueKind = r.issueKind,
             status = r.status, round = r.round, maxRounds = r.maxRounds, branch = r.branch, prNumber = r.prNumber, prUrl = r.prUrl,
             owner = OwnerDto(r.ownerUsername, r.ownerDisplayName), startedBySessionId = r.startedBySessionId?.toString(),
             error = r.error, createdAt = r.createdAt.iso(), updatedAt = r.updatedAt.iso(), endedAt = r.endedAt?.iso(),
-            stages = stages(r.id).map { it.toDto(shots[it.id].orEmpty(), it.sessionId?.let { s -> imgs[s] }.orEmpty()) },
+            stages = stageRows.map { it.toDto(shots[it.id].orEmpty(), it.sessionId?.let { s -> imgs[s] }.orEmpty()) },
             sandbox = r.sandboxJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunSandboxDto.serializer(), it) }.getOrNull() },
             releaseId = r.releaseId?.toString(), baseBranch = r.baseBranch,
             conversation = dk.egernet.factory.RunConversationDto(r.advisorSessionId?.toString(), r.reviewState, r.followUpFrom),
             continuesRunId = r.continuesRunId?.toString(), continuedByRunId = continuedBy(r.id)?.toString(),
             failureKind = r.failureKind, failedStep = r.failedStep,
+            warnings = stageRows.filter { it.warning != null }.groupBy { it.round }.toSortedMap()
+                .map { (round, list) -> dk.egernet.factory.RunWarningDto(round, list.map { it.role }, list.first().warning!!) },
         )
     }
 

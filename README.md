@@ -160,6 +160,8 @@ sudo agern doctor && sudo agern start
 - PostgreSQL 16, installed natively
 - `claude`, `git` and `gh` on the service's `PATH` (agents are `claude` processes started by the
   server; they use `git` and `gh`)
+- Recommended: a headless browser (`chromium`, `chromium-browser`, `google-chrome`) on that `PATH`, so the
+  UX and UI design reviewers can run the app under review and attach screenshots (`agern doctor` checks it)
 - Optional: the OpenAI `codex` CLI, for users who generate images with their ChatGPT login (`FACTORY_CODEX_BIN`)
 - `curl`, `tar` and `openssl` for the installer
 

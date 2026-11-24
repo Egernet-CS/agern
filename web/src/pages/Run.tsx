@@ -182,6 +182,29 @@ export function RunPage() {
         </div>
       )}
       {err && <p className="form-error" role="alert">{err}</p>}
+      {(run.warnings ?? []).map((w) => {
+        // "<title>: <detail>" — the title in bold, the detail as a sentence.
+        const cut = w.text.indexOf(':');
+        const title = cut > 0 ? w.text.slice(0, cut) : w.text;
+        const detail = cut > 0 ? w.text.slice(cut + 1).trim() : '';
+        return (
+          <div key={w.round} className="notice notice--warn run-warning" role="note" aria-label={`Warning, ${roundName(w.round, run)}`}>
+            <div className="notice-text">
+              <strong>⚠ {title} <span className="muted">· {roundName(w.round, run)}</span></strong>
+              {detail && detail[0].toUpperCase() + detail.slice(1)}
+            </div>
+            {w.roles[0] && (
+              <button
+                type="button"
+                className="btn btn--sm btn--ghost notice-action"
+                onClick={() => { params.set('stage', w.roles[0]); params.set('round', String(w.round)); setParams(params, { replace: true }); }}
+              >
+                See the {w.roles[0]} review
+              </button>
+            )}
+          </div>
+        );
+      })}
 
       <PipelineDiagram run={run} nodes={nodes} selected={selected} onSelect={select} />
 
@@ -414,6 +437,7 @@ function StageDetail({ run, node, round, sessions, onRound }: { run: Run; node: 
             {role === 'builder' && stage.round > 0 && (
               <p className="muted small">Continues the builder conversation of {roundName(stage.round - 1, run)} (a new agent session resumed with <code>--resume</code>), given all reviewer findings.</p>
             )}
+            {stage.warning && <p className="sd-warning" role="note">⚠ {stage.warning}</p>}
             {stage.summary && <div className="sd-summary"><Markdown text={stage.summary} /></div>}
             {stage.findings.length > 0 && (
               <>

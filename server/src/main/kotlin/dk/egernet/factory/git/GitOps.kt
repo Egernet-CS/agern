@@ -55,6 +55,12 @@ interface GitOps {
     fun commitsAhead(worktree: Path, baseRef: String, home: Path): Int
     /** The commit the worktree has checked out (`git rev-parse HEAD`). */
     fun head(worktree: Path, home: Path): String
+    /**
+     * The paths HEAD of [worktree] changes relative to its merge base with [baseRef] (`git diff --name-only
+     * <baseRef>...HEAD`, renames as their new path, deletions included). Null when it cannot be told (the default for
+     * implementations that do not support it); throws [GitException] when git fails.
+     */
+    fun changedFiles(worktree: Path, baseRef: String, home: Path): List<String>? = null
     /** The ref a worktree on [baseBranch] is created from: `origin/<baseBranch>`, or the local branch without a remote. */
     fun baseRef(baseBranch: String): String
     fun push(id: AgentIdentity, worktree: Path, branch: String, home: Path)
@@ -206,6 +212,12 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
         git(worktree, home, null, "rev-list", "--count", "$baseRef..HEAD").trim().toIntOrNull() ?: 0
 
     override fun head(worktree: Path, home: Path): String = git(worktree, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim()
+
+    override fun changedFiles(worktree: Path, baseRef: String, home: Path): List<String> {
+        require(!baseRef.startsWith("-")) { "Invalid ref" }
+        return git(worktree, home, null, "diff", "--name-only", "-z", "$baseRef...HEAD", "--", timeoutSec = 120)
+            .split('\u0000').filter { it.isNotEmpty() }
+    }
 
     override fun baseRef(baseBranch: String): String = if (localOnly) baseBranch else "origin/$baseBranch"
 

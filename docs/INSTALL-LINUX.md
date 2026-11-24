@@ -50,8 +50,10 @@ sudo apt update
 sudo apt install postgresql
 ```
 
-The Agern package *recommends* `postgresql`, so `apt install ./agern_….deb` installs it too unless
-you pass `--no-install-recommends` (e.g. for a database on another host).
+The Agern package *recommends* `postgresql` and `chromium`, so `apt install ./agern_….deb` installs them
+too unless you pass `--no-install-recommends` (e.g. for a database on another host). `chromium` is the
+headless browser the UX and UI design reviewers screenshot the app under review with (section 5). On Ubuntu
+it resolves to `chromium-browser`, only a launcher for the chromium snap; `agern doctor` points that out.
 
 ## 3. Install the package
 
@@ -138,6 +140,11 @@ sudo -u agern -H bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
 # GitHub CLI (Debian 12 ships an old 2.23; GitHub's apt repository has current versions:
 # https://github.com/cli/cli/blob/trunk/docs/install_linux.md)
 sudo apt install gh
+
+# A headless browser for the UX and UI design reviewers, who run the app under review and attach
+# screenshots of it to the run (recommended by the package, so usually installed already on Debian;
+# on Ubuntu it is only a launcher for the chromium snap: use Google Chrome's .deb or a project's Playwright):
+sudo apt install chromium fonts-noto-core
 ```
 
 Nobody logs in to `claude` or `gh` as the `agern` user: each person registers their own Claude
@@ -147,7 +154,7 @@ person who started them. `sudo agern doctor` reports what is missing and how to 
 ## 6. Start
 
 ```sh
-sudo agern doctor     # configuration, Java, PostgreSQL login, claude/git/gh, privileges, …
+sudo agern doctor     # configuration, Java, PostgreSQL login, claude/git/gh, headless browser, privileges, …
 sudo agern start      # waits until /api/health answers
 agern status
 ```
