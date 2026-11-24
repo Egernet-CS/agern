@@ -51,7 +51,17 @@ data class LaunchSpec(
     val mcpConfigJson: String,
     /** Host prefix for git's http.extraheader, e.g. `https://github.com/`. */
     val gitHost: String = "https://github.com/",
-)
+    /**
+     * The CLI's MCP tool-call and idle timeouts in milliseconds ([dk.egernet.factory.Config.mcpToolTimeoutMs]), so a
+     * long sandbox command is not abandoned by the client (docs/ARCHITECTURE.md §6 "Agent environment").
+     */
+    val mcpToolTimeoutMs: Long = DEFAULT_MCP_TOOL_TIMEOUT_MS,
+) {
+    companion object {
+        /** What `Config()` with its defaults gives: the 60-minute stage limit plus one minute. */
+        const val DEFAULT_MCP_TOOL_TIMEOUT_MS = 61 * 60_000L
+    }
+}
 
 /** A running agent process. */
 interface AgentProcess {
@@ -101,6 +111,10 @@ object AgentCommand {
             "HOME" to spec.home.toString(),
             "LANG" to "en_US.UTF-8",
             "TERM" to "dumb",
+            // Claude CLI (checked against 2.1.328): both in milliseconds. Without them the client gives up on a slow
+            // tool call (a build in the sandbox) while the server still runs it.
+            "MCP_TOOL_TIMEOUT" to spec.mcpToolTimeoutMs.toString(),
+            "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT" to spec.mcpToolTimeoutMs.toString(),
         )
         when (spec.identity.claude.kind) {
             "api_key" -> env["ANTHROPIC_API_KEY"] = spec.identity.claude.value

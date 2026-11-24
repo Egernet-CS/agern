@@ -94,6 +94,7 @@ class AgentCommandTest {
         identity = AgentIdentity("alice", "Alice", "alice-gh", "ghp_secret", ClaudeCredential("oauth_token", "sk-ant-oat-x")),
         interactive = false, resumeClaudeSessionId = "abc", appendSystemPrompt = "# Role: security", prompt = "review",
         jsonSchema = "{}", disallowedTools = listOf("Edit", "Write", "NotebookEdit"), mcpConfigJson = "{\"token\":\"t\"}",
+        mcpToolTimeoutMs = 3_660_000,
     )
 
     @Test
@@ -101,9 +102,16 @@ class AgentCommandTest {
         val env = AgentCommand.environment(spec, "/usr/bin:/bin")
         assertEquals(
             setOf("PATH", "HOME", "LANG", "TERM", "CLAUDE_CODE_OAUTH_TOKEN", "GIT_TERMINAL_PROMPT", "GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME",
-                "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GH_TOKEN"),
+                "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GH_TOKEN",
+                "MCP_TOOL_TIMEOUT", "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT"),
             env.keys,
         )
+        // The CLI's MCP timeouts, in milliseconds: long enough for any sandbox command.
+        assertEquals("3660000", env["MCP_TOOL_TIMEOUT"])
+        assertEquals("3660000", env["CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT"])
+        val cfg = Config(masterKey = ByteArray(32), githubOrg = "o", stageTimeoutMs = 10 * 60_000L)
+        assertEquals(31 * 60_000L, cfg.mcpToolTimeoutMs, "the sandbox command limit (30 min) is longer than this stage limit")
+        assertEquals(61 * 60_000L, cfg.copy(stageTimeoutMs = 60 * 60_000L).mcpToolTimeoutMs)
         assertEquals("/data/homes/alice", env["HOME"])
         assertEquals("sk-ant-oat-x", env["CLAUDE_CODE_OAUTH_TOKEN"])
         assertEquals("http.https://github.com/.extraheader", env["GIT_CONFIG_KEY_0"])

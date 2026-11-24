@@ -525,6 +525,7 @@ class AgentManager(
                 sessionId = sessionId, kind = s.kind, model = s.model, workDir = workDir, home = workspaces.home(owner.username),
                 identity = identity, interactive = true, resumeClaudeSessionId = s.claudeSessionId,
                 appendSystemPrompt = prompts.system(if (advisor) ADVISOR_KIND else "chat", s.repo, mayInstall), mcpConfigJson = mcpConfig(token),
+                mcpToolTimeoutMs = cfg.mcpToolTimeoutMs,
             )
             val proc = withContext(Dispatchers.IO) { launcher.launch(spec) }
             if (s.claudeSessionId != null) systemEvent(sessionId, "info", "Resuming conversation ${s.claudeSessionId}")
@@ -940,6 +941,7 @@ class AgentManager(
                 identity = identity, interactive = false, steerable = steerable, resumeClaudeSessionId = req.resumeClaudeSessionId,
                 appendSystemPrompt = req.systemPrompt, prompt = req.prompt, jsonSchema = req.jsonSchema,
                 disallowedTools = req.disallowedTools, mcpConfigJson = mcpConfig(token),
+                mcpToolTimeoutMs = cfg.mcpToolTimeoutMs,
             )
             for ((level, text) in req.notes) systemEvent(s.id, level, text)
             publish(s.id, "user", buildJsonObject { put("text", req.prompt); put("username", req.owner.username) })
