@@ -14,6 +14,7 @@ import dk.egernet.factory.RunStatus
 import dk.egernet.factory.Services
 import dk.egernet.factory.SettingsDto
 import dk.egernet.factory.SoftwareRequestDto
+import dk.egernet.factory.SvgIcons
 import dk.egernet.factory.agent.EventBus
 import dk.egernet.factory.agent.FeedItem
 import dk.egernet.factory.agent.INLINE_IMAGE_TYPES
@@ -125,6 +126,7 @@ private suspend fun ApplicationCall.retryReq(): dk.egernet.factory.RetryReq {
 @Serializable data class InputReq(val text: String = "", val attachmentIds: List<String> = emptyList())
 @Serializable data class ResolveReq(val status: String, val note: String? = null)
 @Serializable data class ApproveSandboxReq(val sha256: String)
+@Serializable data class IconFromRepositoryReq(val path: String)
 @Serializable data class HealthDto(val status: String, val version: String, val name: String)
 @Serializable data class ActivityDto(val idle: Boolean, val activeRuns: Int, val busyAgents: Int, val version: String)
 @Serializable data class ProvidersDto(val providers: List<String>, val org: String, val twoFactor: Boolean)
@@ -543,6 +545,13 @@ private fun Route.projectRoutes(s: Services) {
             },
         )
     }
+    // A one-time copy of an image file on the repository's default branch, read with the admin's own token.
+    post("/projects/{repo}/icon/from-repository") {
+        val u = call.requireAdmin(s)
+        val repo = repoParam()
+        val req = call.receive<IconFromRepositoryReq>()
+        call.respond(s.factory.setProjectIconFromRepository(u, repo, req.path))
+    }
     delete("/projects/{repo}/icon") {
         val u = call.requireAdmin(s)
         call.respond(s.factory.deleteProjectIcon(u, repoParam()))
@@ -551,13 +560,14 @@ private fun Route.projectRoutes(s: Services) {
         val u = call.requireUser(s)
         val m = s.factory.visibleProjectIcon(u, repoParam())
         val bytes = s.factory.projectIconData(m.repo)
-        // Only the four raster types are ever served (an SVG can never be stored, and is not served if it were).
-        if (bytes == null || m.mediaType !in INLINE_IMAGE_TYPES) throw notFound("Icon not found")
+        // Only the four raster types and validated SVGs are ever served; an SVG gets a CSP without any network access.
+        if (bytes == null || m.mediaType !in ProjectIcons.STORED_TYPES) throw notFound("Icon not found")
         // Immutable only for the current version's URL; a stale or missing `v` must revalidate.
         val current = call.request.queryParameters["v"] == ProjectIcons.version(m.sha256)
         call.respondStoredFile(
-            bytes, m.mediaType, "inline", "${m.repo}-icon.${dk.egernet.factory.agent.Screenshots.extension(m.mediaType)}",
+            bytes, m.mediaType, "inline", "${m.repo}-icon.${ProjectIcons.extension(m.mediaType)}",
             cacheControl = if (current) IMMUTABLE else "private, no-cache",
+            csp = if (m.mediaType == SvgIcons.MEDIA_TYPE) ProjectIcons.SVG_CSP else STORED_FILE_CSP,
         )
     }
 }
@@ -852,15 +862,19 @@ private suspend fun readLimited(ch: io.ktor.utils.io.ByteReadChannel, max: Long)
 /** Cache-Control for stored bytes that never change under their URL. */
 private const val IMMUTABLE = "private, max-age=31536000, immutable"
 
+/** The CSP of stored files: no script, nothing loaded except images from our origin, sandboxed. */
+private const val STORED_FILE_CSP = "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox"
+
 /**
  * Sends stored bytes (attachments, screenshots, generated images) with the headers that keep them inert in our origin:
  * no sniffing, a CSP without script, same-origin only, cached privately (the bytes of an id never change).
  */
 private suspend fun ApplicationCall.respondStoredFile(
     bytes: ByteArray, mediaType: String, disposition: String, name: String, cacheControl: String = IMMUTABLE,
+    csp: String = STORED_FILE_CSP,
 ) {
     response.header("X-Content-Type-Options", "nosniff")
-    response.header("Content-Security-Policy", "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox")
+    response.header("Content-Security-Policy", csp)
     response.header("Cross-Origin-Resource-Policy", "same-origin")
     response.header(HttpHeaders.CacheControl, cacheControl)
     response.header(HttpHeaders.ContentDisposition, contentDisposition(disposition, name))
