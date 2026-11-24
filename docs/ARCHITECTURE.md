@@ -1857,9 +1857,10 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `PUT /api/me/preferences` | `PreferenceOverrides` → `Preferences` | replaces the caller's choices; 400 for an invalid model or unknown role, 422 `max_fix_rounds_out_of_range` |
 | `GET /api/projects` | → `Project[]` | repos of the org visible to the user |
 | `GET /api/projects/{repo}` | → `Project` | |
-| `PUT /api/projects/{repo}/icon` | raw image bytes → `Project` | admin (403 before the body is read; 404 when the admin cannot see the project). Sets or replaces the icon; 400 `empty_icon`, 413 `icon_too_large`, 415 `unsupported_icon_type`, 422 `invalid_icon` / `icon_dimensions_too_large`; see "Project icons" below |
+| `PUT /api/projects/{repo}/icon` | raw image bytes (PNG, JPEG, WebP, GIF or SVG) → `Project` | admin (403 before the body is read; 404 when the admin cannot see the project). Sets or replaces the icon; 400 `empty_icon`, 413 `icon_too_large`, 415 `unsupported_icon_type`, 422 `invalid_icon` (also every refused SVG) / `icon_dimensions_too_large`; see "Project icons" below |
+| `POST /api/projects/{repo}/icon/from-repository` | `{path}` → `Project` | admin (403; 404 as above). Sets the icon from a file on the repository's default branch, read once with the admin's own GitHub token; 400 `bad_request` for an invalid path, 404 `icon_file_not_found`, then the upload's 400/413/415/422; see "Project icons" below |
 | `DELETE /api/projects/{repo}/icon` | → `Project` | admin (403; 404 as above); removes the icon (also when there is none), `iconUrl: null` |
-| `GET /api/projects/{repo}/icon?v=<version>` | → image bytes | anyone who can see the project; 404 when not visible or no icon is set |
+| `GET /api/projects/{repo}/icon?v=<version>` | → image bytes (`image/png`, `image/jpeg`, `image/webp`, `image/gif` or `image/svg+xml`) | anyone who can see the project; 404 when not visible or no icon is set |
 | `GET /api/projects/{repo}/issues?state=open\|closed\|all` | → `Issue[]` | pull requests excluded |
 | `GET /api/projects/{repo}/issues/{number}` | → `Issue` (with `body`) | |
 | `POST /api/projects/{repo}/issues` | `{ title, body, kind }` → `Issue` | |
@@ -1988,18 +1989,60 @@ card and in the project header (§10). Agern stores it, since GitHub has no per-
   `updated_by` / `updated_at`. A new upload replaces the row in one statement. Nothing is written to the repository,
   its workspaces or `FACTORY_DATA_DIR`; icons of renamed or deleted repositories are not cleaned up.
 - Upload checks, in order: admin (403), project visible to the admin (404), declared `Content-Length` and then the
-  streamed body capped at 1 MiB (413 `icon_too_large`), empty (400 `empty_icon`), type by magic bytes only — PNG,
-  JPEG, WebP or GIF, so SVG, HTML, PDF and text are refused (415 `unsupported_icon_type`) — header readable
-  (422 `invalid_icon`), at most 2048×2048 px read from the header without decoding (422 `icon_dimensions_too_large`).
-  The limits are constants (`ProjectIcons.MAX_BYTES`, `MAX_EDGE`). The bytes are stored unchanged (no re-encoding,
-  so animated GIFs and WebP survive); the browser crops and scales with `object-fit: cover`.
+  streamed body capped at 1 MiB (413 `icon_too_large`), empty (400 `empty_icon`), then the type by content only, never
+  by file name or the client's `Content-Type`: the magic bytes of PNG, JPEG, WebP or GIF, otherwise an SVG check
+  (`SvgIcons.inspect`). Anything that is neither — HTML, PDF, text, UTF-16 — is refused with 415
+  `unsupported_icon_type`. For raster images: header readable (422 `invalid_icon`), at most 2048×2048 px read from the
+  header without decoding (422 `icon_dimensions_too_large`). The limits are constants (`ProjectIcons.MAX_BYTES`,
+  `MAX_EDGE`). The bytes are stored unchanged (no re-encoding, so animated GIFs and WebP survive); the browser crops
+  and scales with `object-fit: cover`.
+- SVG: a file is "not an SVG" (415) when it is not strictly valid UTF-8 (a BOM is fine), contains a NUL byte, fails to
+  parse before its first element, or its root element's local name is not `svg`. Every document with an `svg` root that
+  breaks a rule is refused with 422 `invalid_icon` and the message `The SVG cannot be used: <reason>` (the first
+  violation in document order). The rules, checked in one streaming pass of the JDK's StAX parser with DTD support,
+  external entities and entity replacement switched off and a resolver that always fails:
+  - well-formed to the end; no `<!DOCTYPE>`, no processing instruction (the XML declaration is not one), no entity
+    reference other than the predefined ones and character references; the declared encoding, if any, is UTF-8;
+  - the root is `<svg xmlns="http://www.w3.org/2000/svg">` with a `viewBox` of four numbers and positive width and
+    height, or a positive `width` and `height` in pixels (optional `px`);
+  - an element allowlist (structure, shapes, text, gradients, patterns, clipping, masks, markers, `image`, `filter`
+    and the filter primitives except `feImage`; not `script`, `foreignObject`, `a`, SMIL animation, `iframe`, media
+    and the like); elements of the inert editor-metadata namespaces (Inkscape, sodipodi, RDF, Creative Commons,
+    Dublin Core) are allowed, every other namespace is refused;
+  - an attribute allowlist (presentation, geometry, text, paint-server and filter attributes, `data-*`, `aria-*`,
+    `xml:lang`, `xml:space`, editor-metadata attributes); no `on*` attribute anywhere; no `xml:base`, no other
+    `xlink:*` than `xlink:href`; presentation attributes may not contain a backslash (a CSS escape could spell `url`);
+  - `href` / `xlink:href` only on `use`, `image`, the gradients, `pattern`, `filter` and `textPath`, and only as an
+    in-document fragment (`#id`), except on `image`, where only a Base64 `data:` URL of a PNG, JPEG, WebP or GIF is
+    allowed (the payload is decoded and sniffed);
+  - every `url(…)` in an attribute or in CSS is `url(#id)` (optionally quoted);
+  - CSS in `<style>` (only `type="text/css"`, `media`, `id`) and in `style` attributes has no backslash, `@import`,
+    `@font-face`, `javascript:`, `expression(` or `image-set(`.
+
+  All checks run on parser-decoded values (character references resolved, CDATA unwrapped, the text of a `<style>`
+  concatenated across comments). Nothing is sanitised or rewritten: an accepted SVG is stored unchanged with
+  `media_type` `image/svg+xml` and `width` / `height` 0 (vector, no pixel size); `MAX_EDGE` does not apply. Attachments,
+  screenshots and generated images still do not accept SVG.
+- From the repository: `POST /api/projects/{repo}/icon/from-repository` with `{path}` copies one file from the
+  repository's default branch, read with the acting admin's own GitHub token (`GitHubClient.getFileBytes`, the contents
+  API's raw media type, at most `MAX_BYTES + 1` bytes read). Checks, in order: admin (403), project visible (404), path
+  (trimmed, one leading `/` removed; 400 when empty, over 1024 characters, or with a backslash, a control character or
+  an empty, `.` or `..` segment), file present (404 `icon_file_not_found`), size (413), then the same validation as an
+  upload (the file extension is not consulted, so a directory or a Git LFS pointer ends as 415). The icon is stored
+  like an upload and does not follow later changes of the file. The path is only ever a contents-API path; no URL
+  given by a user is fetched. The fake GitHub serves such files from `setFileBytes` / `setFile` and from
+  `<dataDir>/fake-github/<repo>/<path>`.
 - `Project.iconUrl` is `/api/projects/<url-encoded repo>/icon?v=<version>`, `<version>` being the first 16 hex
   characters of the bytes' SHA-256, so a replaced icon has a new URL. `GET /api/projects` reads all versions in one
   query.
-- Serving: only when the stored type is one of the four raster types (404 otherwise), with the same headers as
-  attachments (`nosniff`, the script-less CSP, same-origin CORP, `Content-Disposition: inline`,
-  file name `<repo>-icon.<ext>`). `Cache-Control` is `private, max-age=31536000, immutable` only when `v` equals the
-  current version, else `private, no-cache`.
+- Serving: only when the stored type is one of the four raster types or `image/svg+xml` (404 otherwise), with the same
+  headers as attachments (`nosniff`, the script-less CSP, same-origin CORP, `Content-Disposition: inline`, file name
+  `<repo>-icon.<ext>`, `svg` for SVG). An SVG gets `Content-Type: image/svg+xml` and the stricter CSP
+  `default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox`: opened directly in a tab it can run no
+  script and load nothing from any origin, while embedded raster `data:` images still render. `Cache-Control` is
+  `private, max-age=31536000, immutable` only when `v` equals the current version, else `private, no-cache`. The web
+  shows icons only through `<img>` (never inline SVG, `<object>`, `<embed>` or `<iframe>`), where browsers run no
+  script and load nothing external anyway.
 
 ### WebSockets (cookie-authenticated)
 
@@ -2329,8 +2372,13 @@ UTC day rolls over (`useClaudeUsage`, `web/src/lib/usage.ts`); relative times ar
 **Project icons** (§8). The project card (32 px) and the project header (28 px, between "projects /" and the name)
 show the icon as a rounded square tile (`ProjectIcon`), or the project's first letter on the user avatar's tile when
 none is set or it fails to load, so cards stay aligned. Admins get the header tile as a "Change project icon" button
-with a menu (upload or replace, remove, a hint on types and size); a file over 1 MB is refused before uploading, and
-errors appear in a dismissible `role="alert"` line in the header. The overview shows a change the next time it loads.
+with a menu: upload or replace (the file picker accepts the raster types and `.svg`), "Use a file from the
+repository…", remove, and the hint "PNG, JPEG, WebP, GIF or SVG, up to 1 MB. Shown as a square."; a file over 1 MB is
+refused before uploading, and upload errors appear in a dismissible `role="alert"` line in the header. "Use a file from
+the repository…" opens the dialog "Icon from the repository" with a path field (hint: read once from the default
+branch, the allowed types and size) and "Cancel" / "Use as icon"; the server's error is shown inside the dialog, which
+stays open with the path, and on success or cancel focus returns to the icon button. The mock API accepts SVG uploads
+without checking their content and offers a few seeded repository images (e.g. `logo.svg` in `web-shop`). The overview shows a change the next time it loads.
 
 The chat renders the Claude stream the way the terminal does: prompt line, streamed assistant
 text, tool calls as `⏺ Tool(args)` with collapsible results, thinking, cost/turn footer. Sessions

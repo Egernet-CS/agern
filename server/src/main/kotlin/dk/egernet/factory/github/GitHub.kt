@@ -178,6 +178,8 @@ interface GitHubClient {
     fun squashMerge(org: String, repo: String, number: Int, title: String)
     /** A file's raw content on [ref] (a branch name), or null when it does not exist there. */
     fun getFile(org: String, repo: String, path: String, ref: String): String?
+    /** A file's raw bytes on [ref], at most [maxBytes] of them (the rest is not read); null when the file does not exist. */
+    fun getFileBytes(org: String, repo: String, path: String, ref: String, maxBytes: Long): ByteArray?
     /** The commit a branch points at; null when the branch does not exist. */
     fun branchSha(org: String, repo: String, branch: String): String?
     /** Creates [branch] at [sha]. An existing branch surfaces as [GitHubException] 422. */
@@ -221,7 +223,7 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
     private inner class Client(private val token: String) : GitHubClient {
         private fun enc(s: String) = URLEncoder.encode(s, Charsets.UTF_8).replace("+", "%20")
 
-        private fun send(method: String, path: String, body: JsonObject? = null, accept: String = "application/vnd.github+json"): HttpResponse<String> {
+        private fun request(method: String, path: String, body: JsonObject? = null, accept: String = "application/vnd.github+json"): HttpRequest {
             val b = HttpRequest.newBuilder(URI.create(if (path.startsWith("http")) path else apiUrl.trimEnd('/') + path))
                 .timeout(Duration.ofSeconds(30))
                 .header("Authorization", "Bearer $token")
@@ -231,13 +233,20 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
             val pub = if (body != null) HttpRequest.BodyPublishers.ofString(body.toString()) else HttpRequest.BodyPublishers.noBody()
             if (body != null) b.header("Content-Type", "application/json")
             b.method(method, pub)
-            return http.send(b.build(), HttpResponse.BodyHandlers.ofString())
+            return b.build()
         }
+
+        private fun send(method: String, path: String, body: JsonObject? = null, accept: String = "application/vnd.github+json"): HttpResponse<String> =
+            http.send(request(method, path, body, accept), HttpResponse.BodyHandlers.ofString())
 
         private fun ok(r: HttpResponse<String>, what: String): String {
             if (r.statusCode() in 200..299) return r.body()
-            val msg = runCatching { AppJson.parseToJsonElement(r.body()).let { (it as JsonObject)["message"].toString().trim('"') } }.getOrNull()
-            throw GitHubException(r.statusCode(), "GitHub $what failed: ${r.statusCode()} ${msg ?: ""}".trim())
+            throw failure(r.statusCode(), r.body(), what)
+        }
+
+        private fun failure(status: Int, body: String, what: String): GitHubException {
+            val msg = runCatching { AppJson.parseToJsonElement(body).let { (it as JsonObject)["message"].toString().trim('"') } }.getOrNull()
+            return GitHubException(status, "GitHub $what failed: $status ${msg ?: ""}".trim())
         }
 
         private fun nextLink(r: HttpResponse<String>): String? =
@@ -326,6 +335,20 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
             val r = send("GET", "/repos/${enc(org)}/${enc(repo)}/contents/$p?ref=${enc(ref)}", accept = "application/vnd.github.raw+json")
             if (r.statusCode() == 404) return null
             return ok(r, "GET contents")
+        }
+
+        override fun getFileBytes(org: String, repo: String, path: String, ref: String, maxBytes: Long): ByteArray? {
+            val p = path.split('/').joinToString("/") { enc(it) }
+            val req = request("GET", "/repos/${enc(org)}/${enc(repo)}/contents/$p?ref=${enc(ref)}", accept = "application/vnd.github.raw+json")
+            val r = http.send(req, HttpResponse.BodyHandlers.ofInputStream())
+            // Closing the stream early drops the rest of the body: never more than the limit is read.
+            return r.body().use { body ->
+                when (r.statusCode()) {
+                    404 -> null
+                    in 200..299 -> body.readNBytes(maxBytes.coerceIn(0, Int.MAX_VALUE.toLong() - 8).toInt())
+                    else -> throw failure(r.statusCode(), String(body.readNBytes(64 * 1024), Charsets.UTF_8), "GET contents")
+                }
+            }
         }
 
         override fun squashMerge(org: String, repo: String, number: Int, title: String) {
