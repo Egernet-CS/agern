@@ -15,6 +15,8 @@ Behaviour
     - text containing "env"   -> replies with the names of its environment variables
     - text containing "install" -> files a software request through the MCP tool factory_request_software
     - text containing "long"  -> replies with 80 numbered lines (a transcript taller than the screen)
+    - text containing "fake:think" -> before the reply, "thinks" for ~3 s: 15 system/thinking_tokens progress events
+                                 (estimated_tokens 100, 200, ... 1500), one every 0.2 s, like newer CLIs
     - "forward <runId> <role>: <message>" -> passes <message> to that run's agent through the MCP tool
                                  factory_send_to_agent and reports the tool's answer
     - "file issue: <title>" -> creates a bug issue with that title through the MCP tool
@@ -174,6 +176,14 @@ def stream_text(text, chunk_delay=0.0, chunks=None, interrupted=lambda: False):
                                            "usage": {"input_tokens": 10, "output_tokens": len(text) // 4}},
           "parent_tool_use_id": None, "session_id": session_id, "uuid": str(uuid.uuid4())})
     return True, sent
+
+
+def think(events=15, delay=0.2):
+    """Progress of a model that thinks: system/thinking_tokens about every 100 tokens (newer CLIs, no content)."""
+    for i in range(1, events + 1):
+        emit({"type": "system", "subtype": "thinking_tokens", "estimated_tokens": 100 * i, "estimated_tokens_delta": 100,
+              "session_id": session_id, "uuid": str(uuid.uuid4())})
+        time.sleep(delay)
 
 
 def tool_roundtrip(command):
@@ -521,6 +531,8 @@ def chat_mode():
             result(reply)
             continue
         rate_limit_event(content)
+        if "fake:think" in content:
+            think()
         if "tool" in content:
             tool_roundtrip("echo hello from fake-claude && pwd")
         reply = "You said: " + content
