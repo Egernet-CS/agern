@@ -128,7 +128,11 @@ settings, projects, chat (streaming, tools, interrupt, observing), pipeline runs
 escalation and approval) and the admin page. `npm run e2e:server` starts the same server by itself
 for manual use. Playwright needs its Chromium (`npx playwright install chromium`) or
 `CHROMIUM_PATH=<chromium binary>`; `E2E_SCREENSHOTS=<dir>` also captures desktop and phone
-screenshots of the main screens.
+screenshots of the main screens. Without the dev container, point the suite at any PostgreSQL with
+a `factory`/`factory` superuser: `E2E_PG_CONTAINER_CMD` is the command prefix that runs `psql`
+(e.g. `env PGHOST=localhost PGPORT=5432 PGPASSWORD=factory`) and `E2E_DB_HOST`/`E2E_DB_HOST_PORT`
+where the server reaches it. CI runs the suite on every pull request and push (job `Web (e2e)` in
+`.github/workflows/ci.yml`, against a PostgreSQL service).
 
 ## Production install
 
