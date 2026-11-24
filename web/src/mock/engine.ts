@@ -887,14 +887,56 @@ export function revokeSandboxApproval(repo: string, by: User): SandboxStatus {
   return sandboxStatus(repo);
 }
 
-/** Sets the project's icon like the server (ARCHITECTURE §8 "Project icons"); the caller checked admin and visibility. */
+/**
+ * Sets the project's icon like the server (ARCHITECTURE §8 "Project icons"); the caller checked admin and visibility.
+ * An SVG is recognised by its type or `.svg` name; unlike the server, the mock does not validate the SVG's content.
+ */
 export function setProjectIcon(repo: string, file: File) {
   if (file.size === 0) throw new MockError(400, 'empty_icon', 'The file is empty');
   if (file.size > PROJECT_ICON_MAX_BYTES) throw new MockError(413, 'icon_too_large', 'The icon is larger than 1.0 MB');
-  if (!PROJECT_ICON_TYPES.includes(file.type)) {
-    throw new MockError(415, 'unsupported_icon_type', 'The icon must be a PNG, JPEG, WebP or GIF image');
+  const svg = file.type === 'image/svg+xml' || file.name.toLowerCase().endsWith('.svg');
+  if (!svg && !PROJECT_ICON_TYPES.includes(file.type)) {
+    throw new MockError(415, 'unsupported_icon_type', 'The icon must be a PNG, JPEG, WebP, GIF or SVG image');
   }
-  replaceProjectIcon(repo, URL.createObjectURL(file));
+  // Typed explicitly so `<img>` renders an SVG whose file came without a type.
+  replaceProjectIcon(repo, URL.createObjectURL(svg ? new Blob([file], { type: 'image/svg+xml' }) : file));
+}
+
+const MOCK_SVG_LOGO =
+  'data:image/svg+xml,' +
+  encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#1f6feb"/>' +
+      '<path d="M16 44 32 16l16 28z" fill="#fff"/></svg>',
+  );
+/** An 8×8 green PNG. */
+const MOCK_PNG_LOGO =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEUlEQVR4nGPQn5eNFTEMLQkAa4pOAbGDLyUAAAAASUVORK5CYII=';
+
+/** Image files on the default branch of some mock repositories, by path. */
+const REPOSITORY_IMAGES: Record<string, Record<string, string>> = {
+  'web-shop': { 'logo.svg': MOCK_SVG_LOGO, 'web/public/logo.svg': MOCK_SVG_LOGO, 'art/icon.png': MOCK_PNG_LOGO },
+  'billing-service': { 'docs/logo.png': MOCK_PNG_LOGO },
+};
+
+/** Like the server: a path inside the repository, trimmed and without one leading `/`. */
+function repositoryPath(raw: string): string {
+  const path = raw.trim().replace(/^\//, '');
+  const bad =
+    !path ||
+    path.length > 1024 ||
+    // eslint-disable-next-line no-control-regex
+    /[\\\u0000-\u001f\u007f-\u009f]/.test(path) ||
+    path.split('/').some((s) => s === '' || s === '.' || s === '..');
+  if (bad) throw new MockError(400, 'bad_request', 'path must be a file path inside the repository');
+  return path;
+}
+
+/** Sets the icon from a seeded repository file (a one-time copy); the caller checked admin and visibility. */
+export function setProjectIconFromRepository(repo: string, rawPath: string) {
+  const path = repositoryPath(rawPath);
+  const url = REPOSITORY_IMAGES[repo]?.[path];
+  if (!url) throw new MockError(404, 'icon_file_not_found', `No file \`${path}\` on the default branch`);
+  replaceProjectIcon(repo, url);
 }
 
 export function deleteProjectIcon(repo: string) {
@@ -904,7 +946,7 @@ export function deleteProjectIcon(repo: string) {
 function replaceProjectIcon(repo: string, url: string | null) {
   const p = db.projects.find((x) => x.name === repo);
   if (!p) throw new MockError(404, 'not_found', `No repository ${repo} in ${ORG}.`);
-  if (p.iconUrl) URL.revokeObjectURL(p.iconUrl);
+  if (p.iconUrl?.startsWith('blob:')) URL.revokeObjectURL(p.iconUrl);
   p.iconUrl = url;
 }
 

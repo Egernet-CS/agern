@@ -38,6 +38,7 @@ import {
   talkToRun,
   revokeSandboxApproval,
   setProjectIcon,
+  setProjectIconFromRepository,
   deleteProjectIcon,
   pendingSandboxes,
   sandboxOverview,
@@ -304,6 +305,13 @@ export const mockApi: Api = {
       needAdmin();
       project(repo);
       setProjectIcon(repo, file);
+      return project(repo);
+    }),
+  setProjectIconFromRepository: (repo, path) =>
+    ok(() => {
+      needAdmin();
+      project(repo);
+      setProjectIconFromRepository(repo, path);
       return project(repo);
     }),
   deleteProjectIcon: (repo) =>
