@@ -43,6 +43,7 @@ export function ProjectPage() {
 
   useEffect(() => {
     document.title = `${repo} · Agern`;
+    setIconError(null);
   }, [repo]);
 
   const chats = sessions.filter((s) => s.kind === 'chat');
