@@ -36,6 +36,8 @@ import kotlin.test.fail
  *                                           private /tmp of the calling unit.
  *   AGERN_PODMAN_IT_IMAGE                   a small image with busybox tools (default docker.io/library/busybox:1.36.1)
  *   AGERN_PODMAN_IT_PLATFORM_IMAGE          another small image for the platform container (default docker.io/library/alpine:3.20)
+ *   AGERN_PODMAN_IT_LONG_SECONDS            how long the long command sleeps (default 300: a build-sized command of
+ *                                           five minutes, longer than any MCP client's default timeouts)
  *
  * Containers are built with the same [SandboxManager] spec functions the server uses, so the command lines are exactly
  * those of a run (docs/ARCHITECTURE.md §5 "Sandboxes").
@@ -226,6 +228,18 @@ class PodmanIntegrationTest {
      * another image, exactly as [SandboxManager] creates them: commands run as uid 1000, which is the service user on
      * the host, so the worktree stays the service user's; what setup (root) writes is handed over afterwards.
      */
+    @Test
+    fun `a command that runs for minutes returns its output and exit code`() {
+        val seconds = env["AGERN_PODMAN_IT_LONG_SECONDS"]?.toLongOrNull()?.takeIf { it > 0 } ?: 300
+        val wt = Files.createDirectories(base.resolve("long"))
+        create(runA, wt)
+        val r = sh(SandboxManager.containerName(runA), "echo start; sleep $seconds; echo done; exit 7", timeoutMs = (seconds + 120) * 1000)
+        assertFalse(r.timedOut, r.output)
+        assertEquals(7, r.exitCode, r.output)
+        assertTrue(r.output.contains("start") && r.output.contains("done"), r.output)
+        assertTrue(r.durationMs >= seconds * 1000, "ran ${r.durationMs} ms")
+    }
+
     @Test
     fun `a platform container and a non-root user on real rootless podman`() {
         val worktree = Files.createDirectories(base.resolve("runs/c"))

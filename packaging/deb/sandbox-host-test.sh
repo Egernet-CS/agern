@@ -20,6 +20,8 @@
 # AGERN_IT_GRADLE_CACHE = a Gradle home in which ':server:test --tests dk.egernet.factory.PodmanIntegrationTest'
 # has already run; it seeds the agern user's, and the in-service Gradle then runs with --offline. Set
 # but unusable (no caches/modules-2 or wrapper/dists, or the copy fails) is a FAIL. Unset: online.
+# The integration test includes a command that sleeps AGERN_PODMAN_IT_LONG_SECONDS (default 300, the value the in-service
+# run uses) and checks that its output and exit code come back; the 1800 s wait for the test covers it.
 
 # shellcheck disable=SC2015 # 'test && pass || fail': pass always succeeds
 set -euo pipefail
