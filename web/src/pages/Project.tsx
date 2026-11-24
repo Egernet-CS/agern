@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, ApiError, isReleaseFinished, isReleaseOpen, isRunWorking, isSessionActive, type AgentSession, type Issue, type IssueKind, type Release, type ReleaseMode, type Run } from '../api';
+import { api, ApiError, isReleaseFinished, isReleaseOpen, isRunWorking, isSessionActive, type AgentSession, type CheckoutInfo, type Issue, type IssueKind, type Release, type ReleaseMode, type Run } from '../api';
 import { ChatView } from '../components/chat/ChatView';
 import { IssueImagesDialog } from '../components/images/IssueImagesDialog';
 import { REVIEWERS, roundName } from '../components/pipeline/model';
@@ -147,6 +147,50 @@ export function ProjectPage() {
 
 // ---------------------------------------------------------------- chat
 
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+/** Why a checkout that is behind was not updated (the server's `<checkout_status>` texts, without backticks). */
+function checkoutWhy(c: CheckoutInfo): string {
+  switch (c.reason) {
+    case 'other_branch':
+      return c.branch == null ? `a detached HEAD is checked out, not ${c.defaultBranch}` : `branch ${c.branch} is checked out, not ${c.defaultBranch}`;
+    case 'local_changes':
+      return 'it has uncommitted changes';
+    case 'local_commits':
+      return `it has ${plural(c.ahead, 'local commit')} that are not on origin/${c.defaultBranch}`;
+    default:
+      return 'git could not fast-forward it';
+  }
+}
+
+/** The chat's checkout next to the path in the chat header: commit, branch when not the default, and how far behind. */
+function CheckoutBadge({ checkout: c }: { checkout: CheckoutInfo }) {
+  const sha = c.commit.slice(0, 7);
+  const behind = c.status === 'behind' && c.behind > 0;
+  const where = c.branch === c.defaultBranch ? '' : c.branch == null ? 'detached ' : `${c.branch} `;
+  const sentence = behind
+    ? `Checkout at ${sha}, ${plural(c.behind, 'commit')} behind origin/${c.defaultBranch}. Not updated automatically: ${checkoutWhy(c)}.`
+    : c.branch == null
+      ? `Checkout at ${sha} on a detached HEAD, up to date with origin/${c.defaultBranch}.`
+      : `Checkout at ${sha} on \`${c.branch}\`, up to date with origin/${c.defaultBranch}.`;
+  return (
+    <span className="chat-head-checkout" title={sentence}>
+      <span aria-hidden>
+        {' · '}
+        {where}
+        {sha}
+        {behind && (
+          <>
+            {' · '}
+            <span className="chat-head-behind">{c.behind} behind</span>
+          </>
+        )}
+      </span>
+      <span className="sr-only">{sentence}</span>
+    </span>
+  );
+}
+
 function ChatPanel({
   repo,
   current,
@@ -190,7 +234,7 @@ function ChatPanel({
     </span>
   );
 
-  const header = (
+  const header = (checkout: CheckoutInfo | null) => (
     <div className="chat-head">
       <label className="chat-pick">
         <span className="sr-only">Chat session</span>
@@ -208,7 +252,10 @@ function ChatPanel({
           ))}
         </select>
       </label>
-      <span className="chat-head-title mono">~/{repo}</span>
+      <span className="chat-head-title mono">
+        ~/{repo}
+        {checkout && <CheckoutBadge checkout={checkout} />}
+      </span>
       {current && !closedNotice && closable(current, me) && (
         <button type="button" className="btn btn--ghost btn--sm btn--danger" onClick={() => onCloseChat(current)} title="Stop the agent and delete this chat">
           Close chat
@@ -223,7 +270,7 @@ function ChatPanel({
   if (closedNotice) {
     return (
       <div className="chat chat--empty">
-        {header}
+        {header(null)}
         <div className="chat-start chat-closed" role="status">
           <h3>This chat was closed</h3>
           <p className="muted">Its owner or an admin closed it. The transcript has been deleted.</p>
@@ -238,7 +285,7 @@ function ChatPanel({
   if (!current) {
     return (
       <div className="chat chat--empty">
-        {header}
+        {header(null)}
         <div className="chat-start">
           <pre className="ascii" aria-hidden>{`   ╭──────────────╮
    │  > _         │
@@ -255,7 +302,7 @@ function ChatPanel({
       </div>
     );
   }
-  return <ChatView key={current.id} sessionId={current.id} session={current} header={header} disabledReason={canStart ? undefined : noClaude} />;
+  return <ChatView key={current.id} sessionId={current.id} session={current} header={({ checkout }) => header(checkout)} disabledReason={canStart ? undefined : noClaude} />;
 }
 
 /** Value of the picker's placeholder while the "was closed" notice shows (never a session id). */

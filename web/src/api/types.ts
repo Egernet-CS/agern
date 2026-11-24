@@ -521,7 +521,22 @@ export type SandboxLog = {
   platform?: string | null;
 };
 
-export type EventType = 'user' | 'claude' | 'system' | 'status' | 'images';
+export type EventType = 'user' | 'claude' | 'system' | 'status' | 'images' | 'checkout';
+
+/**
+ * Payload of a `checkout` event: the state of the owner's main checkout after the server synced it with
+ * `origin/<defaultBranch>` (docs/ARCHITECTURE.md §8). `branch` null = detached HEAD.
+ */
+export type CheckoutInfo = {
+  branch: string | null;
+  defaultBranch: string;
+  commit: string;
+  behind: number;
+  ahead: number;
+  status: 'current' | 'updated' | 'behind';
+  reason: 'other_branch' | 'local_changes' | 'local_commits' | 'update_failed' | null;
+  updatedFrom: string | null;
+};
 
 export type FactoryEvent = {
   seq: number;

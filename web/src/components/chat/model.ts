@@ -1,6 +1,6 @@
 // Turns raw session events (incl. Claude Code stream-json) into renderable transcript items.
 // Everything here is defensive: unknown shapes become compact "unknown" items, never throws.
-import type { Attachment, FactoryEvent, ImagesPayload, SandboxLog, SessionStatus } from '../../api/types';
+import type { Attachment, CheckoutInfo, FactoryEvent, ImagesPayload, SandboxLog, SessionStatus } from '../../api/types';
 
 export type ToolResult = { text: string; isError: boolean; images: number };
 
@@ -34,6 +34,8 @@ export type TranscriptSummary = {
   turnOpen: boolean;
   turnStartedAt: string | null;
   lastActivity: string | null;
+  /** The latest `checkout` event: the state of the chat's checkout (null before the first one). */
+  checkout: CheckoutInfo | null;
 };
 
 type Obj = Record<string, unknown>;
@@ -115,11 +117,36 @@ export function normalizeToolContent(c: unknown): { text: string; images: number
   return { text: compactJson(c, 4000), images: 0 };
 }
 
+const CHECKOUT_STATUSES = ['current', 'updated', 'behind'] as const;
+const CHECKOUT_REASONS = ['other_branch', 'local_changes', 'local_commits', 'update_failed'] as const;
+
+/** The payload of a `checkout` event, defensively (undefined unless well-formed). */
+export function checkoutOf(v: unknown): CheckoutInfo | undefined {
+  if (!isObj(v)) return undefined;
+  const defaultBranch = str(v.defaultBranch);
+  const commit = str(v.commit);
+  const behind = num(v.behind);
+  const ahead = num(v.ahead);
+  const status = CHECKOUT_STATUSES.find((s) => s === v.status);
+  if (!defaultBranch || !commit || !/^[0-9a-f]{7,64}$/.test(commit) || behind == null || ahead == null || !status) return undefined;
+  if (v.branch != null && typeof v.branch !== 'string') return undefined;
+  return {
+    branch: str(v.branch),
+    defaultBranch,
+    commit,
+    behind: Math.max(0, Math.floor(behind)),
+    ahead: Math.max(0, Math.floor(ahead)),
+    status,
+    reason: CHECKOUT_REASONS.find((r) => r === v.reason) ?? null,
+    updatedFrom: str(v.updatedFrom),
+  };
+}
+
 export function buildTranscript(events: FactoryEvent[], partials: unknown[]): { items: Item[]; summary: TranscriptSummary } {
   const items: Item[] = [];
   const tools = new Map<string, Extract<Item, { k: 'tool' }>>();
   const blocksPerMessage = new Map<string, number>();
-  const summary: TranscriptSummary = { model: null, costUsd: null, turns: null, status: null, turnOpen: false, turnStartedAt: null, lastActivity: null };
+  const summary: TranscriptSummary = { model: null, costUsd: null, turns: null, status: null, turnOpen: false, turnStartedAt: null, lastActivity: null, checkout: null };
   const forwarded = new Map<string, Forwarded>();
 
   for (const ev of events) {
@@ -167,6 +194,13 @@ export function buildTranscript(events: FactoryEvent[], partials: unknown[]): { 
         const images = imagesOf(p);
         if (images) items.push({ k: 'images', id, images });
         else items.push({ k: 'unknown', id, label: 'images', json: compactJson(p) });
+        continue;
+      }
+      if (ev.type === 'checkout') {
+        // Shown in the chat header, not in the transcript; the latest one wins.
+        const checkout = checkoutOf(p);
+        if (checkout) summary.checkout = checkout;
+        else items.push({ k: 'unknown', id, label: 'checkout', json: compactJson(p) });
         continue;
       }
       if (ev.type !== 'claude' || !isObj(p)) {
