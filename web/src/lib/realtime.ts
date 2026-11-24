@@ -1,6 +1,6 @@
 import { createContext, createElement, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useAsync } from './async';
-import { isThinkingTokens } from '../components/chat/model';
+import { isThinkingTokens, isToolProgress } from '../components/chat/model';
 import { api, type AgentSession, type Channel, type FactoryEvent, type Issue, type Release, type Run, type SandboxApproval, type SandboxStatus } from '../api';
 
 /** `closed`: the server ended the channel for good (e.g. the chat was closed); it is not reopened. */
@@ -57,11 +57,23 @@ function useReconnecting(
   return state;
 }
 
+/** The tool_use_ids answered by the tool_result blocks of a stream-json `user` message. */
+function toolResultIds(payload: unknown): Set<string> {
+  const content = (payload as { message?: { content?: unknown } } | null)?.message?.content;
+  const ids = new Set<string>();
+  if (Array.isArray(content)) {
+    for (const b of content as { type?: unknown; tool_use_id?: unknown }[]) {
+      if (b && b.type === 'tool_result' && typeof b.tool_use_id === 'string') ids.add(b.tool_use_id);
+    }
+  }
+  return ids;
+}
+
 export type SessionStream = {
   events: FactoryEvent[];
   /**
    * Live-only payloads for the message currently being generated: stream_event partials, plus at most one
-   * `system/thinking_tokens` progress event (the latest).
+   * `system/thinking_tokens` progress event (the latest) and the latest `tool_progress` heartbeat per running tool call.
    */
   partials: unknown[];
   conn: ConnState;
@@ -108,6 +120,8 @@ export function useSessionStream(sessionId: string | null): SessionStream {
                 const p = ev.payload as { event?: { type?: string } } | null;
                 // Thinking progress: only the latest estimate matters.
                 if (isThinkingTokens(p)) setPartials((prev) => [...prev.filter((x) => !isThinkingTokens(x)), p]);
+                // Tool heartbeats: only the latest per tool call matters.
+                else if (isToolProgress(p)) setPartials((prev) => [...prev.filter((x) => !(isToolProgress(x) && x.tool_use_id === p.tool_use_id)), p]);
                 else if (p?.event?.type === 'message_start') setPartials([p]);
                 else setPartials((prev) => [...prev, p]);
                 return;
@@ -119,6 +133,11 @@ export function useSessionStream(sessionId: string | null): SessionStream {
                 if (t === 'result') setPartials([]);
                 // The thinking is over once the message arrives.
                 else setPartials((prev) => (prev.some(isThinkingTokens) ? prev.filter((x) => !isThinkingTokens(x)) : prev));
+              }
+              // A tool result ends its call's heartbeats (and those that named no call).
+              if (ev.type === 'claude' && t === 'user') {
+                const done = toolResultIds(ev.payload);
+                if (done.size) setPartials((prev) => (prev.some(isToolProgress) ? prev.filter((x) => !(isToolProgress(x) && (x.tool_use_id == null || done.has(String(x.tool_use_id))))) : prev));
               }
               // A turn's end clears the live partials; `running` may arrive after the first deltas, so it must not.
               if (ev.type === 'status') {

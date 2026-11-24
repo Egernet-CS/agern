@@ -192,6 +192,14 @@ data class StageAgentResult(
 internal val TRANSIENT_SYSTEM_SUBTYPES = setOf("thinking_tokens")
 
 /**
+ * Top-level stream-json event types that only report progress and are, like `stream_event` partials, sent live and
+ * never stored: `tool_progress` is a heartbeat the CLI sends every few seconds while a tool call runs
+ * (`tool_use_id`, `tool_name`, `elapsed_time_seconds`, ...); `response_length` drives the CLI's streamed-characters
+ * counter.
+ */
+internal val TRANSIENT_EVENT_TYPES = setOf("stream_event", "tool_progress", "response_length")
+
+/**
  * Owns all agent processes: chat sessions (long-lived, stream-json input) and one-shot pipeline agents.
  * Persists complete stream-json messages as events, broadcasts partial deltas live, tracks status/cost.
  */
@@ -1104,7 +1112,7 @@ class AgentManager(
             return
         }
         when (obj["type"]?.jsonPrimitive?.contentOrNull) {
-            "stream_event" -> {
+            in TRANSIENT_EVENT_TYPES -> {
                 emitLive(l, obj)
                 return
             }

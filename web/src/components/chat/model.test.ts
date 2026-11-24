@@ -46,3 +46,40 @@ test('the latest live thinking_tokens estimate is in the summary, not in the ite
   assert.equal(items.length, 0);
   assert.equal(summary.thinkingTokens, 5800);
 });
+
+const toolUse = (seq: number, id: string, name = wait) =>
+  claude(seq, { type: 'assistant', message: { id: `m${seq}`, content: [{ type: 'tool_use', id, name, input: { handle: 'h' } }] } });
+const toolResult = (seq: number, id: string) =>
+  claude(seq, { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, content: '{}' }] } });
+const toolProgress = (fields: Record<string, unknown>) => ({ type: 'tool_progress', tool_name: wait, heartbeat: true, uuid: 'u', session_id: 'c', ...fields });
+const toolItems = (items: ReturnType<typeof buildTranscript>['items']) => items.filter((i) => i.k === 'tool');
+
+test('stored tool_progress heartbeats of older runs are not shown', () => {
+  const { items } = buildTranscript([toolUse(1, 't1'), claude(2, toolProgress({ tool_use_id: 't1', elapsed_time_seconds: 5 })), toolResult(3, 't1')], []);
+  assert.deepEqual(items.map((i) => i.k), ['tool']);
+  assert.equal(toolItems(items)[0].progress, undefined);
+});
+
+test('a live heartbeat shows on the running tool call it names', () => {
+  const events = [toolUse(1, 't1'), toolUse(2, 't2')];
+  const { items } = buildTranscript(events, [toolProgress({ tool_use_id: 't1', elapsed_time_seconds: 130 })]);
+  assert.deepEqual(toolItems(items).map((t) => t.progress), [{ elapsedSeconds: 130 }, undefined]);
+});
+
+test('a heartbeat without a known tool_use_id goes to the latest open tool call', () => {
+  const events = [toolUse(1, 't1'), toolResult(2, 't1'), toolUse(3, 't2'), toolUse(4, 't3'), toolResult(5, 't3')];
+  const { items } = buildTranscript(events, [toolProgress({ elapsed_time_seconds: 7 })]);
+  assert.deepEqual(toolItems(items).map((t) => t.progress), [undefined, { elapsedSeconds: 7 }, undefined]);
+  // A hook's heartbeat names the tool call as its parent.
+  const hook = buildTranscript([toolUse(1, 't1'), toolUse(2, 't2')], [toolProgress({ tool_use_id: 'hook-PreToolUse-t1-heartbeat-0', parent_tool_use_id: 't1', elapsed_time_seconds: 3 })]);
+  assert.deepEqual(toolItems(hook.items).map((t) => t.progress), [{ elapsedSeconds: 3 }, undefined]);
+  // Missing elapsed time: still shown as running.
+  const bare = buildTranscript([toolUse(1, 't1')], [{ type: 'tool_progress' }]);
+  assert.deepEqual(toolItems(bare.items)[0].progress, { elapsedSeconds: null });
+});
+
+test('the heartbeat disappears once the tool result arrives', () => {
+  const { items } = buildTranscript([toolUse(1, 't1'), toolResult(2, 't1')], [toolProgress({ tool_use_id: 't1', elapsed_time_seconds: 60 })]);
+  assert.equal(toolItems(items)[0].progress, undefined);
+  assert.equal(items.length, 1);
+});

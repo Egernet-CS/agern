@@ -137,6 +137,11 @@
   color: var(--text-2);
   word-break: break-word;
 }
+.t-tool-progress {
+  color: var(--text-3);
+  font-size: 12px;
+  white-space: nowrap;
+}
 .t-result {
   display: grid;
   grid-template-columns: 18px 18px minmax(0, 1fr);

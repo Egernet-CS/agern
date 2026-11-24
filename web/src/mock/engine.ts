@@ -417,9 +417,26 @@ function play(
         s.lastActivity = shortArgs(step.name, step.input);
         touchSession(s, ts);
       });
+      // While it runs the CLI sends a tool_progress heartbeat every few seconds (live only); here about every second.
+      const heartbeat = (ranMs: number) =>
+        p.after(0, (ts) =>
+          emit(sid, 'claude', { type: 'tool_progress', tool_use_id: toolId, tool_name: step.name, parent_tool_use_id: null, elapsed_time_seconds: Math.floor(ranMs / 1000), heartbeat: true, uuid: uid(), session_id: claudeSid }, ts, true),
+        );
+      const total = step.ms ?? 900;
       const logs = step.logs ?? [];
-      logs.forEach((l) => system(l, Math.round((step.ms ?? 900) / (logs.length + 1))));
-      p.after(logs.length ? Math.round((step.ms ?? 900) / (logs.length + 1)) : step.ms ?? 900, (ts) =>
+      const slice = logs.length ? Math.round(total / (logs.length + 1)) : 1000;
+      let ran = 0;
+      logs.forEach((l) => {
+        system(l, slice);
+        ran += slice;
+        if (ran >= 1000) heartbeat(ran);
+      });
+      while (!logs.length && total - ran > slice) {
+        p.after(slice, () => {});
+        ran += slice;
+        heartbeat(ran);
+      }
+      p.after(logs.length ? slice : total - ran, (ts) =>
         emit(sid, 'claude', {
           type: 'user',
           session_id: claudeSid,
