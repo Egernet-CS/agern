@@ -24,9 +24,26 @@ test('the members come from the submodules', async ({ page }) => {
   await expect(members(page).filter({ hasText: 'demo-shop-web' })).toContainText('main');
   await expect(page.locator('.member-context')).toContainText('vendor/icons');
 
-  // The label is the member repository's name.
+  // The label is the member repository's name; an issue without one is the workspace repository's own.
   await expect(issueRow(page, 'Add a health endpoint').locator('.issue-member')).toHaveText('services/api');
   await expect(startButton(page, 'Add a health endpoint')).toBeEnabled();
+  await expect(issueRow(page, 'Update the architecture notes').locator('.issue-member')).toHaveText('workspace repository');
+  await expect(startButton(page, 'Update the architecture notes')).toBeEnabled();
+  // Releases (of the workspace repository's own issues) and its sandbox are available.
+  await expect(page.getByRole('button', { name: 'New release' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Sandbox' })).toBeVisible();
+});
+
+test('an issue without a member label is a run of the workspace repository itself', async ({ page }) => {
+  await login(page, 'alice');
+  await page.goto(`${BASE()}/p/demo-shop`);
+  await startButton(page, 'Update the architecture notes').click();
+  await expect(page).toHaveURL(/\/p\/demo-shop\/runs\//);
+  const meta = page.locator('.rh-meta');
+  await expect(meta).toContainText(/branchfactory\/issue-3-update-the-architecture-notes-[0-9a-f]{8}/);
+  await expect(meta).not.toContainText('directory');
+  await expect(page.locator('.pipeline g[aria-label^="merge to main: done, verdict MERGED"]')).toBeVisible({ timeout: 45_000 });
+  await expect(meta.locator('a[href*="/demo-shop/pull/"]')).toHaveCount(1);
 });
 
 test('a run on a labelled issue changes the submodule in its own repository', async ({ page }) => {

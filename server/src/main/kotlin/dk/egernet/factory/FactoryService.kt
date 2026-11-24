@@ -67,6 +67,9 @@ class FactoryService(
     /** Whether [repo] is a workspace project for [user] (who can see it). */
     suspend fun isWorkspace(user: UserRecord, repo: String): Boolean = workspaceOf(user, repo) != null
 
+    /** Whether [repo] is a workspace whose members come from `.gitmodules` alone (unlabelled issues are its own runs). */
+    suspend fun isSubmoduleWorkspace(user: UserRecord, repo: String): Boolean = workspaceOf(user, repo)?.fromSubmodules == true
+
     /** The workspace definition of [repo] as [user] sees it (null: not a workspace). Blocking-safe. */
     private suspend fun workspaceOf(user: UserRecord, repo: String): WorkspaceState? =
         withContext(Dispatchers.IO) { workspaces.lookup(user, repo) }

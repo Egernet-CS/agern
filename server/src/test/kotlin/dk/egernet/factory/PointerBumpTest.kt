@@ -54,18 +54,6 @@ class PointerBumpTest {
     }
 
     @Test
-    fun `issues are routed by the label of a submodule member`() {
-        val n = gh.addIssue(ws, "Untargeted", "Which repository?").number
-        val e = kotlin.test.assertFailsWith<ApiException> { runBlocking { s.orchestrator.start(alice, ws, n, null) } }
-        assertEquals("member_label_missing", e.code)
-        assertEquals(
-            "Issue #$n has no member label. Add exactly one of these labels on GitHub to say which repository it belongs to: " +
-                "`demo-shop-api` (demo-shop-api), `demo-shop-web` (demo-shop-web).",
-            e.message,
-        )
-    }
-
-    @Test
     fun `the pointer moves to the merge commit in a merged pull request of the workspace`() {
         val done = run()
         assertEquals("demo-shop-api", done.targetRepo)

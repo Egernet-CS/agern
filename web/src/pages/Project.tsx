@@ -412,16 +412,30 @@ function workspaceStartBlock(ws: Workspace | null, i: Issue): string | null {
   if (!ws) return null;
   if (!ws.valid) return `Fix ${ws.path} first`;
   const m = i.workspaceMembers ?? [];
-  if (m.length === 0) return 'Add one member label on GitHub first';
+  // A workspace from .gitmodules alone: an issue without a member label changes the workspace repository itself.
+  if (m.length === 0) return fromSubmodules(ws) ? null : 'Add one member label on GitHub first';
   if (m.length > 1) return 'Keep exactly one member label';
   const member = ws.members.find((x) => x.directory === m[0].directory);
   if (member && !member.accessible) return `Your GitHub token cannot read ${member.repository}`;
   return null;
 }
 
+/**
+ * A workspace whose members come from `.gitmodules` alone (ARCHITECTURE §6 "Workspace runs"): its own issues (no member
+ * label) are runs of the workspace repository, and it has releases and a sandbox of its own.
+ */
+const fromSubmodules = (ws: Workspace | null) => ws?.path === '.gitmodules';
+
 /** The member an issue of a workspace project belongs to, as shown in its row. */
 function IssueMember({ ws, issue }: { ws: Workspace; issue: Issue }) {
   const m = issue.workspaceMembers ?? [];
+  if (m.length === 0 && fromSubmodules(ws)) {
+    return (
+      <span className="tag tag--plain issue-member issue-member--parent" title="No member label: a run changes the workspace repository itself">
+        workspace repository
+      </span>
+    );
+  }
   if (m.length === 0) return <span className="tag tag--plain issue-member issue-member--none">no member label</span>;
   if (m.length > 1) return <span className="tag tag--plain issue-member issue-member--none">several member labels</span>;
   const member = ws.members.find((x) => x.directory === m[0].directory);
@@ -1012,6 +1026,8 @@ function ActivityPanel({
 }) {
   useNow(5000);
   const me = useMe();
+  // Releases and the sandbox belong to the project unless it is a workspace.yml workspace (§6 "Workspace runs").
+  const ownReleases = !workspace || fromSubmodules(workspace);
   const active = sessions.filter(isSessionActive);
   const runList = runs.slice(0, 12);
   const chats = sessions.filter((s) => s.kind === 'chat');
@@ -1057,7 +1073,7 @@ function ActivityPanel({
       {workspace && <MembersSection workspace={workspace} />}
       <div className="panel-head">
         <h2>Releases</h2>
-        {!workspace && (
+        {ownReleases && (
           <button type="button" className="btn btn--sm" aria-label="New release" onClick={() => setCreatingRelease(true)}>
             + New
           </button>
@@ -1066,7 +1082,7 @@ function ActivityPanel({
       {releases.error && <ErrorBox error={releases.error} retry={releases.reload} />}
       {releases.loading && <Loading />}
       {!releases.loading && !releases.error && releases.releases.length === 0 && (
-        <p className="muted pad">{workspace ? 'Releases are not available for workspace projects yet.' : 'No releases yet. Create one to plan issues ahead.'}</p>
+        <p className="muted pad">{ownReleases ? 'No releases yet. Create one to plan issues ahead.' : 'Releases are not available for workspace projects yet.'}</p>
       )}
       <ul className="run-list release-list">
         {releases.releases.filter((r) => !isReleaseFinished(r)).map((r) => (
@@ -1097,9 +1113,9 @@ function ActivityPanel({
         ))}
       </ul>
       <ReleaseHistory repo={repo} releases={historyOf(releases.releases)} />
-      {!workspace && <NewReleaseDialog repo={repo} open={creatingRelease} onClose={() => setCreatingRelease(false)} />}
-      {/* A workspace's sandboxes belong to its member projects. */}
-      {!workspace && <SandboxSection repo={repo} />}
+      {ownReleases && <NewReleaseDialog repo={repo} open={creatingRelease} onClose={() => setCreatingRelease(false)} />}
+      {/* A workspace's sandboxes belong to its member projects (a submodule workspace's own runs use its own). */}
+      {ownReleases && <SandboxSection repo={repo} />}
       <div className="panel-head">
         <h2>Runs</h2>
       </div>

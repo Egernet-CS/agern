@@ -216,7 +216,12 @@ class Orchestrator(
         owner: UserRecord, repo: String, issue: GhIssue, releaseId: UUID?, continuesFrom: RunRecord?,
     ): dk.egernet.factory.agent.MemberCheckout? {
         if (releaseId != null) {
-            if (workspaceDefs.lookup(owner, repo, strict = true) != null) throw dk.egernet.factory.workspace.WorkspaceService.releasesUnsupported()
+            val state = workspaceDefs.lookup(owner, repo, strict = true) ?: return null
+            // A workspace from .gitmodules alone: a release builds the workspace repository itself, never a member.
+            if (!state.fromSubmodules) throw dk.egernet.factory.workspace.WorkspaceService.releasesUnsupported()
+            state.membersLabelled(issue.labels.map { it.name }).firstOrNull()?.let {
+                throw dk.egernet.factory.workspace.WorkspaceService.memberInRelease(issue.number, it)
+            }
             return null
         }
         val prevRepo = continuesFrom?.targetRepo
@@ -723,7 +728,7 @@ class Orchestrator(
             workspaceBlock(
                 run.repo, run.issueNumber, dk.egernet.factory.agent.MemberCheckout(run.targetDir ?: "", tr, target, submoduleTarget), others, left,
             )
-        }.orEmpty()
+        } ?: parentBlock(owner, run.repo)
         RunContext(
             run.id, run.repo,
             issue ?: GhIssue(run.issueNumber, run.issueTitle, "open", createdAt = "", updatedAt = "", htmlUrl = ""),
@@ -760,6 +765,23 @@ class Orchestrator(
         }
         if (leftOut.isNotEmpty()) append("Not checked out: " + leftOut.joinToString(", ") { "`${it.directory}` (${it.reason})" } + "\n")
         append("The issue is $org/$wsRepo#$issueNumber; the pull request is opened in $org/${t.repository} against `${t.baseBranch}`.\n")
+    }
+
+    /**
+     * The block of a run that changes the workspace repository itself in a workspace whose members come from
+     * `.gitmodules` alone (docs/ARCHITECTURE.md §6 "Workspace runs"); empty for every other run. Blocking; never throws.
+     */
+    private fun parentBlock(owner: UserRecord, repo: String): String {
+        val state = runCatching { workspaceDefs.lookup(owner, repo) }.getOrNull()?.takeIf { it.valid && it.fromSubmodules } ?: return ""
+        return buildString {
+            append("Workspace: $org/$repo — its member repositories are git submodules under your working directory.\n")
+            append("Target: the workspace repository itself; submodules are read-only context. Do not commit inside a submodule ")
+            append("and do not move a submodule pointer (gitlink): a change to a member needs an issue with that member's label.\n")
+            append("Submodules (at the commit the workspace pins):\n")
+            state.members.forEach { append("- `${it.directory}` — $org/${it.repository} (label `${it.label}`)\n") }
+            state.contextOnly.forEach { append("- `${it.path}` (not a member)\n") }
+            append("The issue and the pull request are in $org/$repo.\n")
+        }
     }
 
     /** Human name of a stage round: build, fix round N or follow-up N. */
@@ -926,7 +948,7 @@ class Orchestrator(
                     }
                 }
                 val subs = workspaces.git.updateSubmodules(id, root, home)?.let { listOf(run.repo to it) }.orEmpty()
-                WorkspaceSetUp(root, base, "", subs)
+                WorkspaceSetUp(root, base, parentBlock(owner, run.repo), subs)
             }
         }
         val worktree = setUp.worktree

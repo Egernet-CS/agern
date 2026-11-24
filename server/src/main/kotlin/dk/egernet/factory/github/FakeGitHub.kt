@@ -294,7 +294,8 @@ class FakeGitHub(private val org: String) : GitHub {
     /**
      * A workspace built from git submodules: `demo-shop` has no `.agern/workspace.yml`, only a `.gitmodules` with the
      * members `services/api` (`demo-shop-api`, an SSH URL) and `web` (`demo-shop-web`, a relative URL) and a submodule
-     * of another organization (context only), and issues labelled with a member's repository name.
+     * of another organization (context only), issues labelled with a member's repository name and one without a
+     * member label (a run of `demo-shop` itself).
      */
     fun seedSubmoduleWorkspace() {
         addRepo("demo-shop", "A workspace built from git submodules: the shop's API and web app")
@@ -306,6 +307,7 @@ class FakeGitHub(private val org: String) : GitHub {
         )
         addIssue("demo-shop", "Add a health endpoint", "The load balancer needs GET /health.", listOf("enhancement", "demo-shop-api"))
         addIssue("demo-shop", "Show the cart total in the header", "Users cannot see what the cart costs.", listOf("demo-shop-web"))
+        addIssue("demo-shop", "Update the architecture notes", "docs/architecture.md still describes the old checkout.")
     }
 
     private inner class Client(val login: String, val scopes: List<String>) : GitHubClient {

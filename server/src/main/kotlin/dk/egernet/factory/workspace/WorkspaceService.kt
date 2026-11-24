@@ -26,6 +26,12 @@ data class WorkspaceState(
         return members.filter { it.label.lowercase() in set }
     }
 
+    /**
+     * The members come from `.gitmodules` alone (no `.agern/workspace.yml`): an issue without a member label is a run
+     * of the workspace repository itself, and releases (of such runs) are available.
+     */
+    val fromSubmodules: Boolean get() = path == GITMODULES_FILE
+
     /** "<first problem>[ (and N more)]". */
     val firstProblem: String
         get() = errors.firstOrNull().orEmpty() + if (errors.size > 1) " (and ${errors.size - 1} more)" else ""
@@ -108,14 +114,16 @@ class WorkspaceService(private val access: Access, private val ttlMillis: Long =
 
     /**
      * The member issue [issue] of workspace [repo] is routed to for [user] (docs/ARCHITECTURE.md §6 "Workspace runs"),
-     * or null when [repo] is not a workspace. Throws 409 `workspace_invalid`, `member_label_missing`,
-     * `member_label_ambiguous` or 403 `member_not_accessible`.
+     * or null when [repo] is not a workspace, or when its members come from `.gitmodules` alone and the issue carries
+     * no member label (the run changes the workspace repository itself). Throws 409 `workspace_invalid`,
+     * `member_label_missing` (`.agern/workspace.yml` only), `member_label_ambiguous` or 403 `member_not_accessible`.
      */
     fun memberFor(user: UserRecord, repo: String, issue: GhIssue): ResolvedMember? {
         val state = lookup(user, repo, strict = true) ?: return null
         if (!state.valid) throw invalid(state, access.visibleRepo(user, repo)?.defaultBranch ?: "the default branch")
         val matching = state.membersLabelled(issue.labels.map { it.name })
         when {
+            matching.isEmpty() && state.fromSubmodules -> return null
             matching.isEmpty() -> throw conflict(
                 "Issue #${issue.number} has no member label. Add exactly one of these labels on GitHub to say which repository " +
                     "it belongs to: " + state.members.joinToString(", ") { "`${it.label}` (${it.repository})" } + ".",
@@ -141,6 +149,13 @@ class WorkspaceService(private val access: Access, private val ttlMillis: Long =
         fun invalid(state: WorkspaceState, defaultBranch: String) = conflict(
             "The workspace definition ${state.path} is invalid: ${state.firstProblem}. Fix it on `$defaultBranch` first.",
             "workspace_invalid",
+        )
+
+        /** An issue of a submodule workspace with a member label cannot be built by a release (it builds the workspace repository). */
+        fun memberInRelease(number: Int, m: WorkspaceMember) = conflict(
+            "Issue #$number carries the label of member `${m.directory}` (${m.repository}). A release builds the workspace " +
+                "repository itself: remove the label, or run the issue on its own.",
+            "member_in_release",
         )
 
         fun releasesUnsupported() = conflict("Releases are not available for workspace projects yet.", "workspace_releases_unsupported")

@@ -230,11 +230,13 @@ class ReleaseService(
     }
 
     /** Checks [user]'s credentials and the project's building slot, then builds [r] as [user]. */
-    /** Releases are not available for workspace projects yet (docs/ARCHITECTURE.md §6 "Workspace runs"): 409. */
+    /**
+     * Releases are not available for workspace projects defined by `.agern/workspace.yml` (docs/ARCHITECTURE.md §6
+     * "Workspace runs"): 409. A workspace from `.gitmodules` alone has releases of the workspace repository itself.
+     */
     private suspend fun refuseWorkspace(user: UserRecord, repo: String) {
-        if (workspaceDefs != null && io { workspaceDefs.lookup(user, repo, strict = true) } != null) {
-            throw dk.egernet.factory.workspace.WorkspaceService.releasesUnsupported()
-        }
+        val state = workspaceDefs?.let { d -> io { d.lookup(user, repo, strict = true) } } ?: return
+        if (!state.fromSubmodules) throw dk.egernet.factory.workspace.WorkspaceService.releasesUnsupported()
     }
 
     private suspend fun startAs(user: UserRecord, r: ReleaseRecord): ReleaseRecord {
@@ -375,9 +377,14 @@ class ReleaseService(
         if (target.status == ReleaseStatus.RELEASED) throw releasedNotEditable(target.name)
         if (target.status in ReleaseStatus.ACTIVE || target.status == ReleaseStatus.READY) requireOwner(user, target)
         val client = access.requireClient(user)
+        // A workspace from .gitmodules: its releases build the workspace repository, so member issues stay out.
+        val ws = workspaceDefs?.let { d -> io { d.lookup(user, repo) } }?.takeIf { it.fromSubmodules }
         val issues = nums.map { n ->
             val i = gh { client.getIssue(cfg.githubOrg, repo, n) } ?: throw notFound("Issue #$n not found")
             if (i.state != "open") throw conflict("Issue #$n is closed; only open issues can be planned in a release", "issue_closed")
+            ws?.membersLabelled(i.labels.map { it.name })?.firstOrNull()?.let {
+                throw dk.egernet.factory.workspace.WorkspaceService.memberInRelease(n, it)
+            }
             IssueToAssign(n, i.title, issueKindFromLabels(i.labels.map { it.name }))
         }
         val names = io { store.list(repo) }.associate { it.id to it.name }

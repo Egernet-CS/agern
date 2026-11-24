@@ -168,6 +168,38 @@ class SubmoduleWorkspaceTest {
     }
 
     @Test
+    fun `an unlabelled issue is a run of the workspace repository with the submodules as context`() {
+        val n = world.github.addIssue(ws, "Update the plan", "The plan is out of date.").number
+        world.launcher.stage = { p ->
+            p.init()
+            when (p.spec.kind) {
+                "spec-writer" -> p.result("## Spec\nDo it.")
+                "builder" -> {
+                    val root = p.spec.workDir
+                    seen["api"] = gitIn(root.resolve("services/api"), "rev-parse", "HEAD").trim()
+                    Files.writeString(root.resolve("PLAN.md"), "plan\n")
+                    gitIn(root, "add", "PLAN.md")
+                    gitIn(root, "commit", "-q", "-m", "Update the plan")
+                    p.result("Built it.")
+                }
+                "approver" -> p.result(null, buildJsonObject { put("verdict", "APPROVE"); put("summary", "ok") })
+                else -> p.result(null, buildJsonObject { put("verdict", "PASS"); put("summary", "ok"); put("findings", buildJsonArray { }) })
+            }
+            p.exit(0)
+        }
+        val run = runBlocking { s.orchestrator.start(alice, ws, n, null) }
+        val done = await(run.id)
+        assertEquals(RunStatus.MERGED, done.status, done.error)
+        assertEquals(null, done.targetRepo)
+        // The submodules were fetched at the commit the workspace pins; the branch went to the workspace repository.
+        assertEquals(pinned, seen["api"])
+        val pushed = gitIn(remotes.resolve("$ws.git"), "rev-parse", "refs/heads/${done.branch}").trim()
+        assertEquals("Update the plan", gitIn(remotes.resolve("$ws.git"), "log", "-1", "--format=%s", pushed).trim())
+        assertTrue(world.github.actions.any { it.startsWith("pr $ws ${done.branch} -> main") }, world.github.actions.toString())
+        assertFalse(Files.exists(runDir(run.id)))
+    }
+
+    @Test
     fun `the run's layout while it waits for a human, and clean-up`() {
         script(approver = "ESCALATE")
         val run = start()

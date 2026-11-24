@@ -88,7 +88,7 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_SANDBOX_MAX_CONCURRENT` | `2` | Containers that run commands that may exist at the same time, over all runs (1–100): a run's sandbox takes one slot and each platform container it creates one more (sidecars take none). A builder that would exceed it first gives up its run's own idle containers, else gets a "busy" answer |
 | `FACTORY_SANDBOX_MAX_PLATFORMS` | `4` | Platforms a definition may name besides its default image (0–20; `0` forbids them) |
 | `FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES` | `30` | Default and maximum time for one sandbox command (1–1440), also capped by `FACTORY_STAGE_TIMEOUT_MINUTES` |
-| `FACTORY_DEV_FAKE_GITHUB` | `false` | Development only, requires `FACTORY_AUTH=dev`: in-memory fake GitHub (org with `demo-app`, `private-lab` and the workspace `demo-workspace` with its members `demo-ws-app` (base branch `dev`), `demo-ws-tools` and `demo-ws-lab` (only alice can read it); issues #1–#5 of `demo-workspace` carry one, no, several and an inaccessible member's label; the submodule workspace `demo-shop` whose `.gitmodules` declares `services/api` (`demo-shop-api`, SSH URL), `web` (`demo-shop-web`, relative URL, `branch = main`) and `vendor/icons` (another organization, context only), with issues #1–#2 labelled `demo-shop-api` and `demo-shop-web`; tokens `fake-<login>` = classic with `repo`, `read:org`; `fake-<login>~<scope>,…` = only those scopes), local `git init` instead of clones, pushes skipped |
+| `FACTORY_DEV_FAKE_GITHUB` | `false` | Development only, requires `FACTORY_AUTH=dev`: in-memory fake GitHub (org with `demo-app`, `private-lab` and the workspace `demo-workspace` with its members `demo-ws-app` (base branch `dev`), `demo-ws-tools` and `demo-ws-lab` (only alice can read it); issues #1–#5 of `demo-workspace` carry one, no, several and an inaccessible member's label; the submodule workspace `demo-shop` whose `.gitmodules` declares `services/api` (`demo-shop-api`, SSH URL), `web` (`demo-shop-web`, relative URL, `branch = main`) and `vendor/icons` (another organization, context only), with issues #1–#2 labelled `demo-shop-api` and `demo-shop-web` and #3 without a member label (a run of `demo-shop` itself); tokens `fake-<login>` = classic with `repo`, `read:org`; `fake-<login>~<scope>,…` = only those scopes), local `git init` instead of clones, pushes skipped |
 
 ## 4. Identity and secrets
 
@@ -923,6 +923,27 @@ Stage `verdict`: `PASS`, `CHANGES`, `APPROVE`, `ESCALATE` or null.
 
 A run on an issue of a workspace project (§5 "Workspace projects") changes exactly one member: the **target**.
 
+**Runs of the workspace repository itself (submodule workspaces).** In a workspace whose members come from
+`.gitmodules` alone (no `.agern/workspace.yml`, `WorkspaceState.fromSubmodules`), an issue with **no** member label is a
+run of the workspace repository, exactly as for a project that is one repository (as before submodule workspaces):
+the run's worktree is a worktree of `main/` on the run branch, every submodule is fetched there at the commit the
+workspace pins, and branch, pull request and merge are in the workspace repository; no `target_repo`, no pointer
+bump. The merge guard and the builder's submodule rules of §6 "Submodule pointers" apply unchanged (never commit inside
+a submodule, never move a pointer to an unpublished commit). Its task prompts carry instead of the workspace block:
+
+```
+Workspace: <org>/<workspace> — its member repositories are git submodules under your working directory.
+Target: the workspace repository itself; submodules are read-only context. Do not commit inside a submodule and do not move a submodule pointer (gitlink): a change to a member needs an issue with that member's label.
+Submodules (at the commit the workspace pins):
+- `<directory>` — <org>/<repository> (label `<label>`)
+- `<path>` (not a member)            ← context-only submodules
+The issue and the pull request are in <org>/<workspace>.
+```
+
+Several member labels are still refused (409 `member_label_ambiguous`); one member label makes a member run as below.
+For a workspace defined by `.agern/workspace.yml` nothing changes: an issue without a member label is refused with 409
+`member_label_missing`. Chats are unchanged. `factory_list_issues` marks such issues `[workspace repository]`.
+
 **Routing.** Issues are listed from the workspace repository; each carries the members whose label it has
 (case-insensitive exact match, `Issue.workspaceMembers`). Starting a single run (`POST /api/projects/{repo}/runs`,
 `factory_start_run`, `/factory run`, retry `start_over`) checks, after the credential, visibility and issue checks and
@@ -931,7 +952,7 @@ before `active_run_exists`:
 | Condition | Status, code | Message |
 |---|---|---|
 | definition invalid | 409 `workspace_invalid` | ``The workspace definition .agern/workspace.yml is invalid: <first problem>[ (and N more)]. Fix it on `<default branch>` first.`` |
-| no member label | 409 `member_label_missing` | ``Issue #<n> has no member label. Add exactly one of these labels on GitHub to say which repository it belongs to: `<label>` (<repository>), ….`` |
+| no member label (`.agern/workspace.yml` only) | 409 `member_label_missing` | ``Issue #<n> has no member label. Add exactly one of these labels on GitHub to say which repository it belongs to: `<label>` (<repository>), ….`` |
 | several member labels | 409 `member_label_ambiguous` | ``Issue #<n> carries the labels of several members (<label>, <label>). A run changes one member: keep exactly one of them.`` |
 | target not readable by the caller | 403 `member_not_accessible` | ``Your GitHub token cannot read <org>/<repository> (member `<directory>`), so you cannot run this issue.`` |
 
@@ -1010,14 +1031,23 @@ the run's latest stage transcript. A bump that throws is logged and reported the
 pointer not bumped.** Moving … failed: <message>. Bump it by hand.``); the run stays `merged`. The workspace clone
 itself is not touched: its submodule moves when a chat sync fast-forwards it.
 
-**Releases** are not available for workspace projects in this step: creating one (`POST /api/projects/{repo}/releases`,
-`factory_create_release`, `/factory release create`), starting one (now or scheduled) and
-`Orchestrator.startReleaseRun` answer 409 `workspace_releases_unsupported` "Releases are not available for workspace
-projects yet."
+**Releases** are not available for workspace projects defined by `.agern/workspace.yml` in this step: creating one
+(`POST /api/projects/{repo}/releases`, `factory_create_release`, `/factory release create`), starting one (now or
+scheduled) and `Orchestrator.startReleaseRun` answer 409 `workspace_releases_unsupported` "Releases are not available
+for workspace projects yet."
 
-Not in this step: runs that change several members (one pull request per member, merge order), runs that change the
-workspace repository itself (in a repository whose submodules make it a workspace, every run needs a member label),
-choosing the member in Agern, members outside the organization (such submodules are context only).
+A **submodule workspace** (members from `.gitmodules` alone) has releases of the workspace repository itself, as for
+a project that is one repository: a release builds only issues without a member label (runs of the workspace
+repository; member runs, their pull requests in other repositories and pointer bumps do not fit a release branch).
+Planning an issue that carries a member label (`assign`, `factory_assign_issues`) answers 409 `member_in_release`
+``Issue #<n> carries the label of member `<directory>` (<repository>). A release builds the workspace repository
+itself: remove the label, or run the issue on its own.``; a label added after planning holds the issue when its run
+would start (`Orchestrator.startReleaseRun` refuses with the same text, the release builder holds it with "Could not
+start a run: …").
+
+Not in this step: runs that change several members (one pull request per member, merge order), runs of the workspace
+repository itself in a workspace defined by `.agern/workspace.yml`, choosing the member in Agern, members outside the
+organization (such submodules are context only).
 
 ### Database migrations
 
@@ -2948,11 +2978,15 @@ pointer."), the base branch (monospace) and the label as a tag. Below the rows, 
 header tag's title names the definition's file ("Several repositories checked out side by side (<path>)"). An invalid
 definition shows instead a `role="alert"` box "`<path>` is invalid. Runs cannot start until it is fixed." with the
 errors as a list.
-A workspace project has no "Sandbox" section (sandboxes belong to the member projects) and no "+ New" release button;
-without releases the empty text reads "Releases are not available for workspace projects yet." Each issue row shows its
-member's directory as a tag (title "Member <directory> · <repository>", plus "no access" when the caller cannot read
-it), else the muted text "no member label" or "several member labels". "▶ Start run" is disabled unless the
-definition is valid, exactly one member matches and the caller can read it; its title says why ("Add one member label
+A workspace project defined by `.agern/workspace.yml` has no "Sandbox" section (sandboxes belong to the member
+projects) and no "+ New" release button; without releases the empty text reads "Releases are not available for
+workspace projects yet." A submodule workspace (`path` `.gitmodules`) keeps both, for the runs of the workspace
+repository itself. Each issue row shows its member's directory as a tag (title "Member <directory> · <repository>",
+plus "no access" when the caller cannot read it), else the muted text "no member label" or "several member labels"; in
+a submodule workspace an issue without a member label shows the tag "workspace repository" (class
+`issue-member--parent`, title "No member label: a run changes the workspace repository itself"). "▶ Start run" is
+disabled unless the definition is valid, exactly one member matches (or, in a submodule workspace, none) and the
+caller can read it; its title says why ("Add one member label
 on GitHub first", "Keep exactly one member label", "Your GitHub token cannot read <repository>", "Fix
 <path> first"); server refusals still show in the panel's alert line. The run page of a workspace run
 lists "repository" (a link to `/p/<targetRepo>`), "directory" and "base", shows the pull request as
