@@ -34,6 +34,7 @@ import type {
   User,
   UsageWindow,
   Verdict,
+  Workspace,
 } from '../api/types';
 import { approverScript, builderScript, chatReplies, reviewerScript, sandboxBuilderScript, seededChat, specScript, type Step } from './scripts';
 
@@ -131,6 +132,8 @@ export const db = {
   lockedUntil: new Map<string, number>([['dora', Date.parse(dora.twoFactorLockedUntil!)]]),
   projects: [] as Project[],
   issues: {} as Record<string, Issue[]>,
+  /** `.agern/workspace.yml` of workspace projects; `visibleTo`: who can read a member (default everybody). */
+  workspaces: {} as Record<string, { valid: boolean; errors: string[]; members: MockMember[] }>,
   sessions: new Map<string, AgentSession>(),
   events: new Map<string, FactoryEvent[]>(),
   sessionSubs: new Map<string, Set<(e: FactoryEvent) => void>>(),
@@ -849,7 +852,7 @@ function pipeline(r: Run, plan: Plan, owner: User, startMs: number) {
       if (fail()) return;
       if (!r.prNumber) {
         r.prNumber = 80 + (r.issueNumber % 17);
-        r.prUrl = `https://github.com/${ORG}/${r.repo}/pull/${r.prNumber}`;
+        r.prUrl = `https://github.com/${ORG}/${r.targetRepo ?? r.repo}/pull/${r.prNumber}`;
       }
       review(round, t2);
     });
@@ -1106,6 +1109,69 @@ function makeRun(repo: string, issue: Issue, owner: User, createdMs: number, sta
   return r;
 }
 
+/** A declared workspace member (ARCHITECTURE §5 "Workspace projects"). */
+type MockMember = { directory: string; repository: string; branch: string | null; label: string; visibleTo?: string[] };
+
+const canRead = (m: MockMember, user: User) => !m.visibleTo || m.visibleTo.includes(user.username);
+
+/** Like `GET /api/projects/{repo}`'s `workspace`: null for a project that is one repository. */
+export function workspaceOf(repo: string, user: User): Workspace | null {
+  const w = db.workspaces[repo];
+  if (!w) return null;
+  return {
+    path: '.agern/workspace.yml',
+    valid: w.valid,
+    errors: w.errors,
+    members: w.valid
+      ? w.members.map((m) => ({ directory: m.directory, repository: m.repository, branch: canRead(m, user) ? m.branch ?? 'main' : m.branch, label: m.label, accessible: canRead(m, user) }))
+      : [],
+  };
+}
+
+/** The members whose label [issue] carries (case-insensitive), as in `Issue.workspaceMembers`. */
+export function issueMembers(repo: string, issue: Issue): { directory: string; repository: string }[] {
+  const w = db.workspaces[repo];
+  if (!w?.valid) return [];
+  const labels = new Set(issue.labels.map((l) => l.name.toLowerCase()));
+  return w.members.filter((m) => labels.has(m.label.toLowerCase())).map((m) => ({ directory: m.directory, repository: m.repository }));
+}
+
+/** The member a run of [issue] changes, with the server's refusals (ARCHITECTURE §6 "Workspace runs"); null outside a workspace. */
+function workspaceTarget(repo: string, issue: Issue, user: User): { repository: string; directory: string; branch: string } | null {
+  const w = db.workspaces[repo];
+  if (!w) return null;
+  if (!w.valid) {
+    const more = w.errors.length > 1 ? ` (and ${w.errors.length - 1} more)` : '';
+    throw new MockError(409, 'workspace_invalid', `The workspace definition .agern/workspace.yml is invalid: ${w.errors[0]}${more}. Fix it on \`main\` first.`);
+  }
+  const labels = new Set(issue.labels.map((l) => l.name.toLowerCase()));
+  const matching = w.members.filter((m) => labels.has(m.label.toLowerCase()));
+  if (matching.length === 0) {
+    throw new MockError(
+      409,
+      'member_label_missing',
+      `Issue #${issue.number} has no member label. Add exactly one of these labels on GitHub to say which repository it belongs to: ${w.members.map((m) => `\`${m.label}\` (${m.repository})`).join(', ')}.`,
+    );
+  }
+  if (matching.length > 1) {
+    throw new MockError(
+      409,
+      'member_label_ambiguous',
+      `Issue #${issue.number} carries the labels of several members (${matching.map((m) => m.label).join(', ')}). A run changes one member: keep exactly one of them.`,
+    );
+  }
+  const m = matching[0];
+  if (!canRead(m, user)) {
+    throw new MockError(403, 'member_not_accessible', `Your GitHub token cannot read ${ORG}/${m.repository} (member \`${m.directory}\`), so you cannot run this issue.`);
+  }
+  return { repository: m.repository, directory: m.directory, branch: m.branch ?? 'main' };
+}
+
+/** Releases are not available for workspace projects (409 like the server). */
+export function refuseWorkspaceReleases(repo: string) {
+  if (db.workspaces[repo]) throw new MockError(409, 'workspace_releases_unsupported', 'Releases are not available for workspace projects yet.');
+}
+
 export class MockError extends Error {
   constructor(public status: number, public code: string, message: string, public lockedUntil: string | null = null) {
     super(message);
@@ -1115,8 +1181,10 @@ export class MockError extends Error {
 export function startRun(repo: string, issueNumber: number, owner: User, startedBy: string | null = null, plan?: Partial<Plan>, createdMs = Date.now(), release: Release | null = null): Run {
   const issue = db.issues[repo]?.find((i) => i.number === issueNumber);
   if (!issue) throw new MockError(404, 'not_found', `Issue #${issueNumber} not found in ${repo}.`);
+  const target = release ? null : workspaceTarget(repo, issue, owner);
   if (issue.activeRunId) throw new MockError(409, 'active_run_exists', `Issue #${issueNumber} already has an active run`);
   const r = makeRun(repo, issue, owner, createdMs, startedBy, release);
+  if (target) Object.assign(r, { targetRepo: target.repository, targetDirectory: target.directory, baseBranch: target.branch, sandbox: runSandboxFor(target.repository) });
   touchRun(r, iso(createdMs));
   const full: Plan = {
     changes: { code: ['Merge logic duplicates quantity handling from `CheckoutService`; extract a **shared helper**.'], security: ['Cart routes accept any cart id; ownership is not checked (**IDOR**).', 'Log line prints the full cart including email.'] },
@@ -1931,7 +1999,18 @@ function seed() {
     proj('design-system', 'Shared tokens and React components', 'TypeScript', 3, 60 * 5, false),
     proj('data-pipeline', 'Nightly ETL into the warehouse', 'Python', 2, 60 * 24 * 6),
     proj('infra', 'Terraform for the hosting environment', 'HCL', 0, 60 * 24 * 19),
+    proj('shop-workspace', 'The shop, its design system and the iOS app, side by side', 'Markdown', 4, 60 * 2),
   ];
+  // A workspace project: three members, one of them (ios-companion) not readable by bob.
+  db.workspaces['shop-workspace'] = {
+    valid: true,
+    errors: [],
+    members: [
+      { directory: 'shop', repository: 'web-shop', branch: 'dev', label: 'shop' },
+      { directory: 'libs/design', repository: 'design-system', branch: null, label: 'design' },
+      { directory: 'ios', repository: 'ios-companion', branch: 'feature/scanner', label: 'ios', visibleTo: ['alice', 'carl', 'dora'] },
+    ],
+  };
   // Sandbox definitions: web-shop's is approved, billing-service's changed since its approval, design-system's is invalid.
   const webShopSandbox = 'image: docker.io/library/eclipse-temurin:21-jdk\nuser: builder\nsetup: |\n  apt-get update && apt-get install -y nodejs npm\nservices:\n  postgres:\n    image: docker.io/library/postgres:17\n    env: { POSTGRES_PASSWORD: dev }\n    ready: { command: "pg_isready -h 127.0.0.1", timeoutSeconds: 60 }\ncaches: [ /home/builder/.gradle, /home/builder/.npm ]\nresources: { cpus: 2, memory: 4g }\nplatforms:\n  jdk17:\n    image: docker.io/library/eclipse-temurin:17-jdk\n';
   db.sandboxFiles.set('web-shop', {
@@ -2029,6 +2108,14 @@ function seed() {
     issue('ios-companion', 8, 'feature', 'Scan shelf labels with the camera', 'bob', 4),
     issue('ios-companion', 9, 'bug', 'Pick list does not refresh after sync', 'alice', 2),
   ];
+  const lbl = (name: string) => ({ name, color: 'bfd4f2' });
+  db.issues['shop-workspace'] = [
+    issue('shop-workspace', 1, 'feature', 'Show prices with the currency sign', 'alice', 1, { labels: [LABEL.feature, lbl('shop')] }),
+    issue('shop-workspace', 2, 'task', 'Document how a release is made', 'bob', 2),
+    issue('shop-workspace', 3, 'feature', 'Share the price formatter between shop and design system', 'carl', 3, { labels: [LABEL.feature, lbl('shop'), lbl('design')] }),
+    issue('shop-workspace', 4, 'bug', 'Scanner crashes on damaged labels', 'alice', 4, { labels: [LABEL.bug, lbl('ios')] }),
+    issue('shop-workspace', 5, 'feature', 'Bigger buttons on the product page', 'alice', 9, { labels: [LABEL.feature, lbl('design')] }),
+  ];
   db.issues['design-system'] = [
     issue('design-system', 12, 'feature', 'Dark theme tokens', 'alice', 20, { state: 'closed' }),
     issue('design-system', 14, 'task', 'Publish to the internal registry', 'bob', 3),
@@ -2055,6 +2142,7 @@ function seed() {
   const never = () => false;
   startRun('web-shop', 47, alice, null, { changes: {}, liveFrom: never }, Date.now() - 3 * 86400_000);
   startRun('design-system', 12, alice, null, { changes: {}, liveFrom: never, noScreenshots: true }, Date.now() - 5 * 86400_000);
+  startRun('shop-workspace', 5, alice, null, { changes: {}, liveFrom: never }, Date.now() - 2 * 86400_000);
   const failed = startRun('web-shop', 44, bob, null, { changes: {}, liveFrom: never }, Date.now() - 86400_000);
   for (const st of failed.stages.slice(2)) {
     if (st.sessionId) db.sessions.delete(st.sessionId);

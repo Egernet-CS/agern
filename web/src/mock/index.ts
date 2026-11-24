@@ -53,8 +53,11 @@ import {
   messageAgent,
   MockError,
   ORG,
+  issueMembers,
+  refuseWorkspaceReleases,
   startRun,
   stopSession,
+  workspaceOf,
   usageOf,
 } from './engine';
 
@@ -129,7 +132,7 @@ function project(repo: string) {
   if (!p) throw new MockError(404, 'not_found', `No repository ${repo} in ${ORG}.`);
   const sessions = [...db.sessions.values()].filter((s) => s.repo === repo && isSessionActive(s));
   const runs = [...db.runs.values()].filter((r) => r.repo === repo && isRunActive(r));
-  return { ...p, activeAgents: sessions.length, activeRuns: runs.length, openIssues: (db.issues[repo] ?? []).filter((i) => i.state === 'open').length };
+  return { ...p, activeAgents: sessions.length, activeRuns: runs.length, openIssues: (db.issues[repo] ?? []).filter((i) => i.state === 'open').length, workspace: null };
 }
 /** A release the caller can see (404 before any 403, like the server). */
 function withRelease<T>(id: string, fn: (r: Release) => T): T {
@@ -299,7 +302,7 @@ export const mockApi: Api = {
       return preferences();
     }),
   projects: () => ok(() => (visible() ? db.projects.map((p) => project(p.name)) : [])),
-  project: (repo) => ok(() => project(repo)),
+  project: (repo) => ok(() => ({ ...project(repo), workspace: workspaceOf(repo, me()) })),
   setProjectIcon: (repo, file) =>
     ok(() => {
       needAdmin();
@@ -324,14 +327,16 @@ export const mockApi: Api = {
   issues: (repo, state = 'open') =>
     ok(() => {
       project(repo);
-      return (db.issues[repo] ?? []).filter((i) => state === 'all' || i.state === state).map(({ body: _body, ...i }) => ({ ...i, release: releaseOfIssue(repo, i.number), imageCount: images.imageCount(repo, i.number) }) as Issue);
+      return (db.issues[repo] ?? [])
+        .filter((i) => state === 'all' || i.state === state)
+        .map(({ body: _body, ...i }) => ({ ...i, release: releaseOfIssue(repo, i.number), imageCount: images.imageCount(repo, i.number), workspaceMembers: issueMembers(repo, i as Issue) }) as Issue);
     }),
   issue: (repo, n) =>
     ok(() => {
       project(repo);
       const i = db.issues[repo]?.find((x) => x.number === n);
       if (!i) throw new MockError(404, 'not_found', 'Issue not found');
-      return { ...i, release: releaseOfIssue(repo, i.number), imageCount: images.imageCount(repo, i.number) };
+      return { ...i, release: releaseOfIssue(repo, i.number), imageCount: images.imageCount(repo, i.number), workspaceMembers: issueMembers(repo, i) };
     }),
   createIssue: (repo, body) =>
     ok(() => {
@@ -360,7 +365,7 @@ export const mockApi: Api = {
       project(r.repo);
       return r;
     }),
-  createRelease: (repo, body) => ok(() => (project(repo), createRelease(repo, body, me()))),
+  createRelease: (repo, body) => ok(() => (project(repo), refuseWorkspaceReleases(repo), createRelease(repo, body, me()))),
   updateRelease: (id, body) =>
     ok(() => {
       const r = getRelease(id);
@@ -392,7 +397,7 @@ export const mockApi: Api = {
       project(r.repo);
       return reorderRelease(r, numbers, me());
     }),
-  startRelease: (id) => ok(() => withRelease(id, (r) => startRelease(r, me()))),
+  startRelease: (id) => ok(() => withRelease(id, (r) => (refuseWorkspaceReleases(r.repo), startRelease(r, me())))),
   pauseRelease: (id) => ok(() => withRelease(id, (r) => pauseRelease(r, me()))),
   resumeRelease: (id) => ok(() => withRelease(id, (r) => resumeRelease(r, me()))),
   cancelRelease: (id) => ok(() => withRelease(id, (r) => cancelRelease(r, me()))),

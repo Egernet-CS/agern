@@ -43,6 +43,30 @@ export type Project = {
   activeRuns: number;
   /** `/api/projects/<repo>/icon?v=<version>`, or null without an icon (ARCHITECTURE §8 "Project icons"). */
   iconUrl: string | null;
+  /**
+   * The workspace definition (ARCHITECTURE §5 "Workspace projects"); null for a project that is one repository.
+   * Filled by `GET /api/projects/{repo}` only (always null in the project list).
+   */
+  workspace?: Workspace | null;
+};
+
+/** A member repository of a workspace, as the caller sees it. */
+export type WorkspaceMember = {
+  directory: string;
+  repository: string;
+  /** The effective base branch; for an inaccessible member the declared one (possibly null). */
+  branch: string | null;
+  label: string;
+  /** Whether the caller's own GitHub token can read the repository. */
+  accessible: boolean;
+};
+
+export type Workspace = {
+  path: '.agern/workspace.yml';
+  valid: boolean;
+  errors: string[];
+  /** Empty when the definition is invalid. */
+  members: WorkspaceMember[];
 };
 
 /** Largest project icon the server accepts (1 MiB); used for the client pre-check and by the mock. */
@@ -71,6 +95,8 @@ export type Issue = {
   release: { id: string; name: string } | null;
   /** Images selected for this issue in a chat. */
   imageCount: number;
+  /** Workspace projects: the members whose label the issue carries; empty otherwise. */
+  workspaceMembers?: { directory: string; repository: string }[];
 };
 
 /**
@@ -384,6 +410,9 @@ export type Run = {
   failedStep?: FailedStep | null;
   /** Warnings that never fail the run, per round, oldest round first (from the stages' `warning`). */
   warnings?: RunWarning[];
+  /** A workspace run: the member repository and directory it changes (its `baseBranch` is the member's); null otherwise. */
+  targetRepo?: string | null;
+  targetDirectory?: string | null;
 };
 
 export type FailureKind = 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other';
