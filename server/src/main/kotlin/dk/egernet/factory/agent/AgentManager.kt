@@ -375,12 +375,16 @@ class AgentManager(
      * chat [sessionId] (as a union) and returns them; null otherwise. Blocking.
      */
     private fun ensureChatWorkspace(sessionId: UUID, owner: UserRecord, identity: AgentIdentity, repo: String): ChatWorkspace? {
+        // First, whatever the definition says (or whether it can be read at all): every member clone already in the
+        // chat's working directory is readable by the agent.
+        recordChatClones(sessionId, owner, repo)
         val defs = workspaceDefs ?: return null
         val state = defs.lookup(owner, repo) ?: return null
         val resolved = defs.resolve(owner, state)
         val wanted = resolved.filter { it.accessible && it.baseBranch != null }.map { MemberCheckout(it.directory, it.repository, it.baseBranch!!) }
         val wc = workspaces.ensureWorkspace(identity, repo, wanted)
         sessions.addContextRepos(sessionId, wc.checkedOut.map { it.repository })
+        recordChatClones(sessionId, owner, repo)
         val left = resolved.filter { !it.accessible }.map { LeftOut(it.directory, it.repository, "your GitHub token cannot read it") } + wc.leftOut
         val note = buildString {
             if (!state.valid) {
@@ -417,6 +421,14 @@ class AgentManager(
     } catch (e: Exception) {
         log.warn("Syncing the workspace members of chat {} failed: {}", l.sessionId, e.message)
         null
+    }
+
+    /**
+     * Records every member clone in [owner]'s checkout of [repo] on chat [sessionId] (`context_repos`, as a union): the
+     * chat's agent can read them whether or not the current definition still lists them (docs/ARCHITECTURE.md §4).
+     */
+    private fun recordChatClones(sessionId: UUID, owner: UserRecord, repo: String) {
+        sessions.addContextRepos(sessionId, workspaces.clonesOnDisk(owner.username, repo))
     }
 
     /** The identity a chat of [owner] runs as (as in [startChat]), or null without a Claude credential. */
@@ -599,6 +611,8 @@ class AgentManager(
             val workDir = launch?.workDir ?: withContext(Dispatchers.IO) { workspaces.ensureMain(identity, s.repo) }
             // A chat in a workspace gets the members its owner can read beside the workspace clone.
             val chatWs = if (advisor) null else withContext(Dispatchers.IO) {
+                // Never fails quietly: a chat whose member clones cannot be recorded does not start.
+                recordChatClones(sessionId, owner, s.repo)
                 runCatching { ensureChatWorkspace(sessionId, owner, identity, s.repo) }
                     .onFailure { log.warn("Preparing the workspace of chat {} failed: {}", sessionId, it.message) }.getOrNull()
             }

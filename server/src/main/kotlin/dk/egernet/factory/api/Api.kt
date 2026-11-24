@@ -916,7 +916,7 @@ private fun Route.imageRoutes(s: Services) {
         val repo = repoParam()
         val n = call.parameters["number"]?.toIntOrNull() ?: throw notFound("Issue not found")
         withContext(Dispatchers.IO) { s.access.requireVisible(u, repo) }
-        call.respond(s.images.forIssue(repo, n))
+        call.respond(s.images.forIssue(u, repo, n))
     }
 }
 

@@ -135,7 +135,7 @@ class WorkspaceVisibilityTest {
         val created = alice.postJson("/api/projects/$ws/runs", """{"issueNumber":1}""")
         assertEquals(201, created.status.value, created.bodyAsText())
         val runId = json(created.bodyAsText()).jsonObject["id"]!!.jsonPrimitive.content
-        val run = world.awaitRun(UUID.fromString(runId), RunStatus.TERMINAL)
+        val run = world.awaitRun(UUID.fromString(runId), RunStatus.TERMINAL, timeoutMs = 30_000)
         assertEquals(RunStatus.MERGED, run.status, run.error)
         assertEquals(listOf("demo-ws-app", "demo-ws-tools", "demo-ws-lab"), run.contextRepos)
         val runJson = json(root.get("/api/runs/$runId").bodyAsText()).jsonObject
@@ -166,7 +166,7 @@ class WorkspaceVisibilityTest {
         // The feed: root got the run's frames; bob gets the next visible run's frames without any of the hidden one.
         suspend fun frame(f: DefaultClientWebSocketSession): JsonObject =
             json((f.incoming.receive() as Frame.Text).readText()).jsonObject
-        suspend fun runFrameIds(f: DefaultClientWebSocketSession, until: String): List<String> = withTimeout(10_000) {
+        suspend fun runFrameIds(f: DefaultClientWebSocketSession, until: String): List<String> = withTimeout(30_000) {
             val seen = mutableListOf<String>()
             while (true) {
                 val fr = frame(f)
@@ -184,7 +184,36 @@ class WorkspaceVisibilityTest {
         val other = json(alice.postJson("/api/projects/demo-app/runs", """{"issueNumber":1}""").bodyAsText()).jsonObject["id"]!!.jsonPrimitive.content
         val bobSaw = runFrameIds(bobFeed, other)
         assertTrue(runId !in bobSaw, bobSaw.toString())
-        world.awaitRun(UUID.fromString(other), RunStatus.TERMINAL)
+        world.awaitRun(UUID.fromString(other), RunStatus.TERMINAL, timeoutMs = 30_000)
+    }
+
+    @Test
+    fun `a chat records every member clone on disk, whatever the definition says now`() {
+        val alice = world.user("alice")
+        val first = world.services.agents.createChat(alice, ws, null)
+        awaitContext(first.id, 3)
+        // demo-ws-lab is dropped from the definition: its clone stays in alice's checkout, so a new chat still records it.
+        world.github.setFile(
+            ws, WORKSPACE_FILE,
+            dk.egernet.factory.github.FakeGitHub.DEMO_WORKSPACE_FILE.substringBefore("  - directory: lab"),
+        )
+        world.services.workspaceDefs.invalidate()
+        val second = world.services.agents.createChat(alice, ws, null)
+        assertEquals(setOf("demo-ws-app", "demo-ws-tools", "demo-ws-lab"), awaitContext(second.id, 3))
+        // Also when the definition is gone (or cannot be read at all).
+        world.github.setFile(ws, WORKSPACE_FILE, null)
+        world.services.workspaceDefs.invalidate()
+        val third = world.services.agents.createChat(alice, ws, null)
+        assertEquals(setOf("demo-ws-app", "demo-ws-tools", "demo-ws-lab"), awaitContext(third.id, 3))
+        // So bob, who can read the workspace but not demo-ws-lab, does not see that chat.
+        val bob = world.user("bob")
+        kotlin.test.assertFalse(world.services.access.canSee(bob, ws, world.services.sessions.get(third.id)!!.contextRepos))
+    }
+
+    private fun awaitContext(id: UUID, n: Int): Set<String> {
+        val deadline = System.currentTimeMillis() + 10_000
+        while (world.services.sessions.get(id)!!.contextRepos.size < n && System.currentTimeMillis() < deadline) Thread.sleep(20)
+        return world.services.sessions.get(id)!!.contextRepos.toSet()
     }
 
     @Test

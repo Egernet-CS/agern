@@ -131,6 +131,24 @@ class Workspaces(private val cfg: Config, val git: GitOps, private val github: G
         Files.writeString(membersFile(username, repo), AppJson.encodeToString(membersSer, list))
     }
 
+    private fun forgetMember(username: String, repo: String, m: ClonedMember) {
+        val current = clonedMembers(username, repo)
+        if (m !in current) return
+        Files.writeString(membersFile(username, repo), AppJson.encodeToString(membersSer, current - m))
+    }
+
+    /**
+     * The repositories of every member clone in [username]'s workspace clone of [repo] (from `members.json`, whose
+     * directory exists), whatever the current definition says: what an agent working in `main/` can read. A chat
+     * records them all on its session (docs/ARCHITECTURE.md §4 "Visibility"). Blocking; under the clone's lock.
+     */
+    fun clonesOnDisk(username: String, repo: String): List<String> = withRepoLock(username, repo) {
+        val main = mainDir(username, repo)
+        clonedMembers(username, repo)
+            .filter { m -> runCatching { memberPath(main, m.directory) }.getOrNull()?.let { Files.exists(it, java.nio.file.LinkOption.NOFOLLOW_LINKS) } == true }
+            .map { it.repository }.distinct()
+    }
+
     /** Adds `/<directory>/` to the workspace clone's `info/exclude` (once), so git never reports a member as a local change. */
     private fun exclude(main: Path, directory: String) {
         val gitDir = main.resolve(".git")
@@ -176,11 +194,16 @@ class Workspaces(private val cfg: Config, val git: GitOps, private val github: G
                         left += LeftOut(m.directory, m.repository, "the directory is occupied: it exists in the workspace and is not Agern's clone of ${m.repository}")
                     else -> try {
                         exclude(main, m.directory)
+                        // Recorded before the clone starts, so that a clone interrupted by a crash is still known to
+                        // the clean-up and to the chats' visibility record; a failed clone is undone below.
                         recordMember(id.username, repo, ClonedMember(m.directory, m.repository))
                         git.ensureClone(id, github.cloneUrl(cfg.githubOrg, m.repository), dir, home, m.baseBranch)
                         ok += m
                     } catch (e: Exception) {
                         log.warn("Cloning member {} ({}) of {} failed: {}", m.directory, m.repository, repo, e.message)
+                        // Nothing half-cloned stays behind as "Agern's clone" (the directory did not exist before).
+                        if (noSymlinks(main, dir)) dir.toFile().deleteRecursively()
+                        forgetMember(id.username, repo, ClonedMember(m.directory, m.repository))
                         left += LeftOut(m.directory, m.repository, "it could not be cloned: ${e.message?.take(300)}")
                     }
                 }

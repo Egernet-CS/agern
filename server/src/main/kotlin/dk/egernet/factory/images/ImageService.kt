@@ -565,7 +565,16 @@ class ImageService(
     }
 
     suspend fun forSession(sessionId: UUID): List<GeneratedImageDto> = withContext(Dispatchers.IO) { store.forSession(sessionId).map { it.toDto() } }
-    suspend fun forIssue(repo: String, issue: Int): List<GeneratedImageDto> = withContext(Dispatchers.IO) { store.forIssue(repo, issue).map { it.toDto() } }
+    /**
+     * The images selected for [issue] of [repo] that [user] may see: like [visible], an image made in a session that had
+     * workspace members checked out is listed only to whoever can read every one of them (docs/ARCHITECTURE.md §4).
+     */
+    suspend fun forIssue(user: UserRecord, repo: String, issue: Int): List<GeneratedImageDto> = withContext(Dispatchers.IO) {
+        val also = mutableMapOf<UUID, List<String>>()
+        store.forIssue(repo, issue)
+            .filter { m -> access.canSee(user, m.repo, also.getOrPut(m.sessionId) { sessions.get(m.sessionId)?.contextRepos.orEmpty() }) }
+            .map { it.toDto() }
+    }
 
     // ------------------------------------------------------------ runs and cleanup
 

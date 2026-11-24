@@ -197,12 +197,15 @@ access. A user without a GitHub token sees no projects.
 A workspace project (§5 "Workspace projects") adds one rule: every run and agent session records the member
 repositories that were checked out for it (`context_repos`: at a run's creation the target and every member the owner
 can read, narrowed at its set-up to what was checked out, and copied to its stage and advisor sessions; for a chat the
-union of every checkout). Such a run or session — and everything recorded with it: transcripts, event streams,
+union of every member clone in its working directory — every repository in `members.json` whose clone exists, recorded
+when the chat is created, before its process starts and at every sync, whatever the current definition says or whether
+it can be read at all). Such a run or session — and everything recorded with it: transcripts, event streams,
 attachments, screenshots, images — is visible only to a user who can read the workspace repository **and** every
 recorded repository (`Access.canSee(user, repo, alsoRepos)`), at every enforcement point: `FactoryService.visibleRun`,
 `listRuns` and `sendToAgent`, `visibleSession`, `GET /api/projects/{repo}/sessions`, `GET /api/agents`, the session
 WebSocket, the feed's `session` and `run` frames, `ImageService.visible` (through the image's session) and the admin
-sandbox overview's `visible`. Invisible ones answer exactly like unknown ones (404, left out of lists, close code
+sandbox overview's `visible`, and the list of an issue's selected images (`GET
+/api/projects/{repo}/issues/{number}/images` leaves out images from sessions the caller may not see). Invisible ones answer exactly like unknown ones (404, left out of lists, close code
 1008). Ownership is unchanged: every clone, fetch, push, pull request and merge of a run uses the run owner's token.
 
 ## 5. Agent runtime
@@ -347,7 +350,8 @@ Layout under `workspaces/<user>/<workspace repo>/`:
 
 - Members the user cannot read are left out of their checkouts. A member whose directory is occupied (it exists and is
   not Agern's clone of that repository, or a symbolic link of the workspace repository is in the way), whose clone
-  fails or whose base branch does not exist is left out with a warning; if it is a run's target, the run fails at
+  fails or whose base branch does not exist is left out with a warning (a failed clone's directory and `members.json`
+  entry are removed again); if it is a run's target, the run fails at
   set-up with that reason.
 - Member directories are written once each as `/<directory>/` to `main/.git/info/exclude`, so the workspace clone
   (and its worktrees) never report them as changes. Every clone, sync, worktree and clean-up operation of a workspace
