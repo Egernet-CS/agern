@@ -128,6 +128,32 @@ test('thinking progress shows as one updating spinner line and never lands in th
   await expect(log(page)).not.toContainText('Thinking…');
 });
 
+test('tool heartbeats show as quiet progress on the running tool call and never land in the transcript', async ({ page }) => {
+  const sessionId = readState().aliceChat as string;
+  await login(page, 'alice');
+  await page.goto(`${BASE()}/p/demo-app?session=${sessionId}`);
+  await expect(log(page)).toContainText('You said: hello agern');
+
+  // `fake:heartbeat` makes the fake CLI run `sleep 4` as a Bash tool, sending tool_progress every 0.5 s meanwhile.
+  await send(page, 'fake:heartbeat please');
+  const tool = log(page).locator('.t-tool').filter({ hasText: 'sleep 4' });
+  await expect(tool.locator('.t-tool-progress')).toHaveText(/running… [0-4]s/);
+  await expect(tool.locator('.t-tool-progress')).toHaveText(/running… [2-9]s/); // counts on
+  await expect(log(page).locator('.t-tool-progress')).toHaveCount(1);
+  await expect(log(page)).not.toContainText('tool_progress');
+
+  // The result ends it; nothing of the heartbeats was stored, so a reload shows none of it either.
+  await expect(tool.locator('.t-result')).toContainText('waited');
+  await expect(tool.locator('.t-tool-progress')).toHaveCount(0);
+  await expect(log(page)).toContainText('You said: fake:heartbeat please');
+  await expect(log(page)).not.toContainText('tool_progress');
+  await page.reload();
+  await expect(log(page)).toContainText('You said: fake:heartbeat please');
+  await expect(log(page).locator('.t-tool').filter({ hasText: 'sleep 4' })).toHaveCount(1);
+  await expect(log(page)).not.toContainText('tool_progress');
+  await expect(log(page).locator('.t-tool-progress')).toHaveCount(0);
+});
+
 test('closing a chat from its header removes it for the owner; a watcher sees that it was closed', async ({ browser }) => {
   const aliceChat = readState().aliceChat as string;
   const alice = await userContext(browser, 'alice');
