@@ -4,7 +4,7 @@ import { api, ApiError, isRunActive, isRunWorking, type AgentSession, type Gener
 import { ChatView } from '../components/chat/ChatView';
 import { RunSandboxLine } from '../components/sandbox/SandboxBits';
 import { Markdown } from '../components/chat/Markdown';
-import { buildNodes, humanSelectable, isFollowUp, latestStage, REVIEWERS, ROLE_BLURB, roundName, rounds, stagesFor, type NodeId } from '../components/pipeline/model';
+import { approverEscalation, buildNodes, humanSelectable, isFollowUp, latestStage, REVIEWERS, ROLE_BLURB, roundName, rounds, stagesFor, type NodeId } from '../components/pipeline/model';
 import { Prompt } from '../components/chat/Prompt';
 import { PipelineDiagram } from '../components/pipeline/PipelineDiagram';
 import { RetryDialog } from '../components/ui/RetryDialog';
@@ -36,6 +36,7 @@ export function RunPage() {
   const sessionMap = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions]);
   const [busy, setBusy] = useState<'approve' | 'cancel' | null>(null);
   const [confirmCancel, setConfirmCancel] = useState(false);
+  const [confirmApprove, setConfirmApprove] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const navigate = useNavigate();
   const [err, setErr] = useState<string | null>(null);
@@ -82,6 +83,8 @@ export function RunPage() {
     setParams(params, { replace: true });
   };
   const isOwner = run.owner.username === me.username;
+  // The approver escalated: merging overrides it, so the owner confirms with its reason in front of them.
+  const escalation = approverEscalation(run);
   const advisor = run.conversation.sessionId ? sessionMap.get(run.conversation.sessionId) : undefined;
   const advisorWorking = advisor?.status === 'starting' || advisor?.status === 'running';
   const approveHint =
@@ -104,6 +107,7 @@ export function RunPage() {
     } finally {
       setBusy(null);
       setConfirmCancel(false);
+      setConfirmApprove(false);
     }
   };
 
@@ -155,9 +159,10 @@ export function RunPage() {
             <>
               <button
                 className="btn btn--approve"
-                onClick={() => void act('approve')}
+                onClick={() => (escalation !== null ? setConfirmApprove(true) : void act('approve'))}
                 disabled={busy !== null || approveHint !== null}
                 aria-describedby={approveHint ? 'approve-hint' : undefined}
+                aria-haspopup={escalation !== null ? 'dialog' : undefined}
               >
                 {busy === 'approve' ? 'Approving…' : '✓ Approve & merge'}
               </button>
@@ -238,6 +243,21 @@ export function RunPage() {
           else navigate(`/p/${repo}/runs/${next.id}`);
         }}
       />
+
+      <Dialog open={confirmApprove && escalation !== null} onClose={() => setConfirmApprove(false)} title="Merge against the approver's advice?">
+        <p>The approver did not approve this change and asked for a human:</p>
+        <div className="notice notice--warn escalation-reason" role="note" aria-label="The approver's reason">
+          <div className="notice-text"><Markdown text={escalation ?? ''} /></div>
+        </div>
+        <p>
+          Merging squash-merges {run.prNumber ? <>pull request #{run.prNumber}</> : 'the pull request'} into{' '}
+          <code>{run.baseBranch ?? 'the default branch'}</code> now. Merge only if you have checked the approver’s concern.
+        </p>
+        <div className="dialog-actions">
+          <button className="btn btn--ghost" onClick={() => setConfirmApprove(false)} data-autofocus>Don’t merge</button>
+          <button className="btn btn--approve" onClick={() => void act('approve')} disabled={busy !== null}>{busy === 'approve' ? 'Merging…' : 'Merge anyway'}</button>
+        </div>
+      </Dialog>
 
       <Dialog open={confirmCancel} onClose={() => setConfirmCancel(false)} title="Cancel this run?">
         <p>Running agents are stopped. The branch {run.branch && <code>{run.branch}</code>} and any pull request stay on GitHub.</p>

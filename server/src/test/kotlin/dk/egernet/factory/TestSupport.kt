@@ -293,6 +293,16 @@ class FakeGitOps : GitOps {
         val c = comparison(baseBranch, headBranch) ?: return null
         return dk.egernet.factory.git.BranchComparison(c.baseFiles.filter { dirOf(it) != null }, c.changes.filter { dirOf(it.path) != null })
     }
+    /** What [changedGitlinks] answers for (base branch, head branch); a thrown exception is thrown by it. Default: none. */
+    @Volatile var gitlinks: (base: String, head: String) -> List<dk.egernet.factory.git.GitlinkChange>? = { _, _ -> emptyList() }
+    override fun changedGitlinks(mainDir: Path, baseBranch: String, headBranch: String, home: Path, githubToken: String?) =
+        gitlinks(baseBranch, headBranch)
+    /** What [remoteHasCommit] answers for (url, sha); a thrown exception is thrown by it. Default: every commit exists. */
+    @Volatile var remoteCommit: (url: String, sha: String) -> Boolean = { _, _ -> true }
+    override fun remoteHasCommit(url: String, sha: String, home: Path, githubToken: String?) = remoteCommit(url, sha)
+    /** What [unpushedSubmodules] answers for every checkout. */
+    @Volatile var unpushed: List<dk.egernet.factory.git.UnpushedSubmodule> = emptyList()
+    override fun unpushedSubmodules(dir: Path, home: Path) = unpushed
     override fun removeWorktree(mainDir: Path, worktree: Path, home: Path, keepUnpushed: Boolean) {
         if (!deleteWorktrees) return
         worktree.toFile().deleteRecursively()

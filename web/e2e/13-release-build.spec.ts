@@ -121,6 +121,7 @@ test('a failing issue is held and the build goes on; approving its run merges it
   await item(page, titles[0]).getByRole('link', { name: 'run' }).click();
   await expect(page).toHaveURL(/\/p\/demo-app\/runs\//);
   await page.getByRole('button', { name: '✓ Approve & merge' }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Merge anyway' }).click();
   await expect(pill(page)).toHaveText('merged');
 
   await openRelease(page, id, name);

@@ -63,6 +63,17 @@ export function latestStage(run: Run, role: StageRole): Stage | null {
   return best;
 }
 
+/**
+ * Why the approver escalated, when the run needs a human because of it (its latest approver verdict is ESCALATE): the
+ * owner's merge then asks for an explicit confirmation. Null otherwise.
+ */
+export function approverEscalation(run: Run): string | null {
+  if (run.status !== 'needs_human') return null;
+  const approver = latestStage(run, 'approver');
+  if (approver?.verdict !== 'ESCALATE') return null;
+  return approver.summary?.trim() || 'The approver gave no reason.';
+}
+
 export function stagesFor(run: Run, role: StageRole): Stage[] {
   return run.stages.filter((s) => s.role === role).sort((a, b) => a.round - b.round);
 }

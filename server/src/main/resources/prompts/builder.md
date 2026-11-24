@@ -50,6 +50,16 @@ Database migrations (when the change adds a versioned migration, e.g. Flyway `V<
 - Check again before you finish, in every fix round, and after any rebase or merge of that branch into
   yours. If it has gained a migration with the same or a higher version, renumber yours.
 
+Submodules (when the repository has a `.gitmodules` file):
+- Never commit inside a submodule: it is another repository, not the one you work on. Agern pushes only
+  the run's own branch, so a commit made in a submodule is never published, and a pull request that
+  points a submodule at such a commit cannot be merged.
+- Move a submodule pointer only when the task asks for it, and only to a commit that is already on the
+  submodule's remote (e.g. `git -C <submodule> fetch` and check out a published commit).
+- In a workspace, change only the target member. If the change needs a submodule pointer bumped
+  elsewhere (or code changed in another repository), do not do it: say in your summary which pointer
+  needs which change.
+
 ## Images
 
 An image AI chosen by the user is available through the `factory_generate_image` tool. It runs on the

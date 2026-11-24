@@ -573,6 +573,38 @@ class ReleaseMerger(
         }
     }
 
+    /**
+     * Why release pull request #[pr] must not be merged because of its submodule pointers, or null. Compares the release
+     * branch with its target in [owner]'s clone; fails closed (a check that cannot be made refuses the merge).
+     */
+    private suspend fun submoduleProblem(r: ReleaseRecord, owner: UserRecord, pr: Int): SubmoduleCheck.Problem? = io {
+        val unchecked = SubmoduleCheck.Problem(
+            SubmoduleCheck.UNCHECKED,
+            "Submodule pointers not checked: the submodule pointers of pull request #$pr could not be compared with its " +
+                "target. Nothing was merged. Check again, then approve.",
+        )
+        try {
+            val branch = r.branch
+            val target = r.targetBranch
+            if (branch == null || target == null) unchecked
+            else {
+                val home = workspaces.home(owner.username)
+                val token = access.githubToken(owner)
+                val links = workspaces.withRepoLock(owner.username, r.repo) {
+                    workspaces.git.changedGitlinks(workspaces.mainDir(owner.username, r.repo), target, branch, home, token)
+                }
+                if (links == null) unchecked
+                else SubmoduleCheck.check(
+                    links, target, "#$pr", has = { workspaces.git.remoteHasCommit(it.url!!, it.sha, home, token) },
+                    onError = { c, e -> log.warn("Release {}: checking submodule {} at {} failed: {}", r.id, c.path, c.sha, e.message) },
+                )
+            }
+        } catch (e: Exception) {
+            log.warn("Release {}: checking the submodule pointers failed, not merging: {}", r.id, e.message)
+            unchecked
+        }
+    }
+
     /** Sets the merge state; on a change to `conflict`, comments once on the pull request. */
     private suspend fun recordMergeState(r: ReleaseRecord, state: String, client: GitHubClient) {
         if (!io { store.setMergeState(r.id, state) } || state != ReleaseMergeState.CONFLICT) return
@@ -710,11 +742,17 @@ class ReleaseMerger(
      * the head moved from [headSha], then [finishLocked] with the method actually used. A rebase GitHub refuses because
      * the branch cannot be rebased (405 "can't be rebased", e.g. its rebaseability was not computed yet when it was
      * read) is tried once more with a merge commit where the repository allows one. A refusal throws the
-     * [ApiException] an approval answers.
+     * [ApiException] an approval answers. First, every submodule pointer the release moves must name a commit its
+     * submodule's remote has (409 `release_submodule_commit_missing`, or `release_submodule_check_failed` when that
+     * cannot be checked; docs/ARCHITECTURE.md §6 "Submodule pointers").
      */
     private suspend fun mergeLocked(
         owner: UserRecord, now: ReleaseRecord, pr: Int, method: String, headSha: String?, client: GitHubClient, automatic: Boolean,
     ) {
+        submoduleProblem(now, owner, pr)?.let { p ->
+            setNotice(now.id, p.text)
+            throw conflict(p.text, "release_${p.code}")
+        }
         suspend fun merge(m: String) = io {
             client.mergePull(org, now.repo, pr, m, if (m == ReleaseMergeMethod.MERGE) "Release ${now.name} (#$pr)" else null, headSha)
         }

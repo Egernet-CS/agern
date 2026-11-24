@@ -41,6 +41,13 @@ data class RunCheckout(
     val submoduleErrors: List<Pair<String, String>>,
 )
 
+/**
+ * Commits of a run's submodule that existed nowhere else, saved when the run's checkout was removed
+ * ([Workspaces.removeRunCheckout]): the submodule at [path] (relative to the run's checkout root) had [commits] such
+ * commits up to [head]; they are in the git bundle [file].
+ */
+data class SubmoduleBundle(val path: String, val head: String, val commits: Int, val file: Path)
+
 /** One entry of `members.json`: a member directory Agern has cloned into the workspace clone. */
 @Serializable
 data class ClonedMember(val directory: String, val repository: String)
@@ -64,6 +71,8 @@ class Workspaces(private val cfg: Config, val git: GitOps, private val github: G
         cfg.dataDir.resolve("workspaces").resolve(requireSafeSegment(username, "username")).resolve(requireSafeSegment(repo, "repository"))
     fun mainDir(username: String, repo: String): Path = repoDir(username, repo).resolve("main")
     fun runDir(username: String, repo: String, runId: UUID): Path = repoDir(username, repo).resolve("runs").resolve(runId.toString())
+    /** Where unpushed submodule commits of run [runId] are saved when its checkout is removed ([removeRunCheckout]). */
+    fun bundleDir(username: String, repo: String, runId: UUID): Path = repoDir(username, repo).resolve("bundles").resolve(runId.toString())
 
     /** The owner's clone used by chat (and as the base of run worktrees). Blocking. */
     fun ensureMain(id: AgentIdentity, repo: String): Path {
@@ -276,12 +285,17 @@ class Workspaces(private val cfg: Config, val git: GitOps, private val github: G
     /**
      * Removes run [runId]'s checkout from [username]'s clone of [repo]: every member worktree (found through
      * `members.json`) from its member clone, then the root worktree and the directory ([GitOps.removeWorktree] rules,
-     * [keepUnpushed] for the local branches). Blocking; under the clone's lock.
+     * [keepUnpushed] for the local branches). A submodule's git data lives in its worktree's administrative directory and
+     * goes with it, so first the commits of every submodule found on none of its remote-tracking branches are saved as a
+     * git bundle in [bundleDir] (docs/ARCHITECTURE.md §6 "Submodule pointers"); returns those bundles. Blocking; under
+     * the clone's lock.
      */
-    fun removeRunCheckout(username: String, repo: String, runId: UUID, keepUnpushed: Boolean) = withRepoLock(username, repo) {
+    fun removeRunCheckout(username: String, repo: String, runId: UUID, keepUnpushed: Boolean): List<SubmoduleBundle> = withRepoLock(username, repo) {
         val main = mainDir(username, repo)
         val root = runDir(username, repo, runId)
         val home = home(username)
+        val out = bundleDir(username, repo, runId)
+        val bundles = mutableListOf<SubmoduleBundle>()
         for (m in clonedMembers(username, repo)) {
             val clone = runCatching { memberPath(main, m.directory) }.getOrNull() ?: continue
             if (!Files.isDirectory(clone)) continue
@@ -289,9 +303,25 @@ class Workspaces(private val cfg: Config, val git: GitOps, private val github: G
             // A symbolic link of the workspace repository at a member path was never a worktree of ours: never follow it
             // (removing the root worktree removes the link itself).
             if (!noSymlinks(root, wt)) continue
+            bundles += bundleUnpushed(wt, "${m.directory}/", out, home)
             git.removeWorktree(clone, wt, home, keepUnpushed)
         }
+        bundles += bundleUnpushed(root, "", out, home)
         git.removeWorktree(main, root, home, keepUnpushed)
+        bundles.forEach { log.warn("Run {}: {} unpushed commit(s) of submodule {} saved in {}", runId, it.commits, it.path, it.file) }
+        bundles
+    }
+
+    /** [GitOps.bundleSubmodule] of each of [checkout]'s [GitOps.unpushedSubmodules] into [out]; paths get [prefix]. Never throws. */
+    private fun bundleUnpushed(checkout: Path, prefix: String, out: Path, home: Path): List<SubmoduleBundle> {
+        if (!Files.isDirectory(checkout)) return emptyList()
+        return git.unpushedSubmodules(checkout, home).mapNotNull { s ->
+            val path = prefix + s.path
+            val file = out.resolve(path.replace(Regex("[^A-Za-z0-9._-]"), "_") + ".bundle")
+            runCatching { git.bundleSubmodule(checkout, s.path, file, home) }
+                .onFailure { log.warn("Bundling the unpushed commits of submodule {} in {} failed: {}", s.path, checkout, it.message) }
+                .getOrNull()?.let { SubmoduleBundle(path, s.head, s.commits, file) }
+        }
     }
 
     fun <T> withRepoLock(username: String, repo: String, block: () -> T): T =

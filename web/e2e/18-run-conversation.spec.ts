@@ -88,7 +88,9 @@ test('a requested change is reviewed again before the run can be approved', asyn
   await expect(page.locator('.rh-meta')).toContainText('follow-up 1');
   await expect(pill(page)).toHaveText('needs human');
   await expect(approve(page)).toBeEnabled();
+  // A passing follow-up review does not undo the approver's escalation: the merge is still confirmed.
   await approve(page).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Merge anyway' }).click();
   await expect(pill(page)).toHaveText('merged', { timeout: 30_000 });
   await expect(panel(page)).toContainText('This run is merged; the conversation is closed.');
 });
