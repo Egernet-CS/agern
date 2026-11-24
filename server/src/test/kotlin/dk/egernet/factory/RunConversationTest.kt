@@ -358,7 +358,10 @@ class RunConversationTest {
         val sid = s.runs.get(runId)!!.advisorSessionId!!
         committingAdvisor("2222222333333344444445555555666666677777")
         talk(alice, runId, "please change again")
-        eventually("second follow-up") { s.runs.get(runId)!!.reviewedSha == "2222222333333344444445555555666666677777" }
+        // The reviewed commit is recorded before the error; review state `none` comes last, when everything is recorded.
+        eventually("second follow-up") {
+            s.runs.get(runId)!!.let { it.reviewedSha == "2222222333333344444445555555666666677777" && it.reviewState == ReviewState.NONE }
+        }
         assertEquals(
             "The approver escalated: Unsure about the migration\n\n**Follow-up review 2** (commit `2222222`): all four reviewers pass.",
             s.runs.get(runId)!!.error,
