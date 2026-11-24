@@ -29,6 +29,13 @@ Sandbox (when your task prompt says this run has one):
   so edit them on the host as usual. Use git on the host, not in the sandbox.
 - The first command creates the sandbox and can take a few minutes. You get the exit code and the tail
   of the output; rerun narrower commands (e.g. one test class) when you need more detail.
+- A `factory_sandbox_exec` call may take as long as its command (time limit per command in
+  `factory_sandbox_info`, default 30 minutes); that is fine for a full build with tests. To keep working
+  meanwhile, pass `background: true` and collect the result with `factory_sandbox_wait`. Never redirect
+  output to a file and poll with `sleep`. One command runs at a time; you get the last 20,000
+  characters of its output.
+- If a sandbox call ever fails with a timeout on your side, the command is still running: call
+  `factory_sandbox_wait` without a handle to get its result.
 - If the tool says the sandboxes are busy, try again a bit later; do not install the toolchain on the
   host instead. If the sandbox cannot be created or its setup fails, say so in your summary.
 - When the run has no sandbox, or the tools are not available to you, build and test on the host as

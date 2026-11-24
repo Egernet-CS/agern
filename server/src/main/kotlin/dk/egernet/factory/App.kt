@@ -95,7 +95,7 @@ class Services(
     val usage = dk.egernet.factory.db.ClaudeUsageStore(db, clock)
     val agents = AgentManager(cfg, sessions, events, access, launcher, bus, mcpRegistry, settings, prompts, workspaces, scope, attachments, preferences, usage)
     val sandboxes = SandboxManager(
-        cfg, sandboxRuntime, SandboxApprovalStore(db), runs, access, git,
+        cfg, sandboxRuntime, SandboxApprovalStore(db), runs, access, git, scope,
         publishSystem = { sessionId, payload -> agents.publish(sessionId, "system", payload) },
         emitFeed = { bus.emitFeed(it) },
         emitRun = { id -> runs.get(id)?.let { bus.emitFeed(dk.egernet.factory.agent.FeedItem.Run(runs.toDto(it))) } },

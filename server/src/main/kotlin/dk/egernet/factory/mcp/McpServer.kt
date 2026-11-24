@@ -15,7 +15,10 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.addJsonObject
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.doubleOrNull
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -26,8 +29,10 @@ import org.slf4j.LoggerFactory
 import java.util.UUID
 
 /**
- * Minimal MCP server (streamable HTTP transport, JSON responses only): initialize, notifications/initialized,
- * ping, tools/list, tools/call. Every call acts as the owner of the agent process the bearer token belongs to.
+ * Minimal MCP server (streamable HTTP transport, no sessions): initialize, notifications/initialized, ping, tools/list,
+ * tools/call. Every call acts as the owner of the agent process the bearer token belongs to. [handle] answers one request
+ * body with one JSON body; `POST /mcp` (api/Api.kt) turns a slow answer into an event stream with progress notifications
+ * ([progressToken]) so the client does not give up on it.
  */
 class McpServer(
     private val registry: McpRegistry,
@@ -120,12 +125,23 @@ class McpServer(
             schema()),
         Tool("factory_sandbox_exec", "Run a shell command in this run's sandbox, e.g. a build or the tests. It runs as `sh -lc <command>` " +
             "in /workspace, which is your working directory (the same files, so edits on the host are visible at once). The " +
-            "sandbox is created on first use (this can take a few minutes). Returns { exitCode, output (the tail), truncated, " +
-            "durationMs, timedOut }. Use git on the host, not here.",
+            "sandbox is created on first use (this can take a few minutes). Returns { handle, exitCode, output (the tail), truncated, " +
+            "durationMs, timedOut }. Use git on the host, not here. The call takes as long as the command, up to the time limit in " +
+            "factory_sandbox_info; that is fine for builds and test suites. To keep working meanwhile, pass `background: true`: the " +
+            "command starts and you get a handle at once; get the result with factory_sandbox_wait. One command runs at a time. " +
+            "Never redirect output to a file and poll with `sleep`. If a call ever fails with a timeout on your side, the command " +
+            "is still running: call factory_sandbox_wait without a handle.",
             schema(Triple("command", "string", "Shell command, e.g. './gradlew test' or 'npm ci && npm test'"),
                 Triple("timeoutSeconds", "integer", "Optional time limit in seconds (default and maximum: the server's limit)"),
                 Triple("platform", "string", "Optional: a platform from factory_sandbox_info (another image, e.g. 'jdk17'); default: the main image"),
+                Triple("background", "boolean", "Optional: true starts the command and returns its handle at once; wait for it with factory_sandbox_wait"),
                 required = listOf("command"))),
+        Tool("factory_sandbox_wait", "Wait for a sandbox command (by handle; default: the most recently started one, also a " +
+            "foreground one whose call was cut off) to end and return { running, exitCode, output (the tail), truncated, durationMs, " +
+            "timedOut }. Without waitSeconds it waits until the command ends; waitSeconds limits the wait, and `running: true` " +
+            "means it is still running: call it again.",
+            schema(Triple("handle", "string", "Optional: the handle factory_sandbox_exec returned, e.g. 'cmd-1a2b3c4d'; default: the latest command"),
+                Triple("waitSeconds", "integer", "Optional: wait at most this long (0: answer at once); default: until the command ends"))),
         Tool("factory_attach_screenshot", "Attach a screenshot of the running app to your review stage, so the people following " +
             "the run see what was built (on the run page; the pull request gets a note listing the captions). Only for the ux " +
             "and ui-design reviewers. The file must be a PNG, JPEG, GIF or WebP image inside your working directory; it is " +
@@ -294,8 +310,20 @@ class McpServer(
                         (el as? JsonPrimitive)?.let { p -> p.contentOrNull?.toLongOrNull() } ?: return toolError("timeoutSeconds must be a whole number")
                     }
                     val platform = args["platform"]?.let { el -> (el as? JsonPrimitive)?.takeIf { it.isString }?.content ?: return toolError("platform must be a string") }
-                    sandboxes.exec(runId, grant.sessionId, str("command") ?: return toolError("command is required"), timeout, platform)
+                    val background = args["background"]?.let { el ->
+                        (el as? JsonPrimitive)?.takeIf { !it.isString }?.booleanOrNull ?: return toolError("background must be true or false")
+                    } ?: false
+                    sandboxes.exec(runId, grant.sessionId, str("command") ?: return toolError("command is required"), timeout, platform, background)
                         .let { if (it.isError) return toolError(it.text) else it.text }
+                }
+                "factory_sandbox_wait" -> {
+                    val runId = grant.runId ?: return toolError("Sandboxes belong to pipeline runs; chats have none")
+                    val handle = args["handle"]?.let { el -> (el as? JsonPrimitive)?.takeIf { it.isString }?.content ?: return toolError("handle must be a string") }
+                    val waitSeconds = args["waitSeconds"]?.let { el ->
+                        (el as? JsonPrimitive)?.contentOrNull?.toLongOrNull()?.takeIf { it >= 0 }
+                            ?: return toolError("waitSeconds must be a whole number of seconds, 0 or more")
+                    }
+                    sandboxes.wait(runId, handle, waitSeconds).let { if (it.isError) return toolError(it.text) else it.text }
                 }
                 "factory_attach_screenshot" ->
                     screenshots.attach(grant.sessionId, grant.runId, repo, owner, str("path"), str("caption"))
@@ -309,6 +337,20 @@ class McpServer(
             buildJsonObject { putJsonArray("content") { addJsonObject { put("type", "text"); put("text", text) } } }
         } catch (e: ApiException) {
             toolError(e.message)
+        }
+    }
+
+    companion object {
+        /**
+         * The `params._meta.progressToken` of a request body that is a single JSON-RPC object, when it is a string or a
+         * number; null for anything else (a batch, no token, another type, an unparsable body).
+         */
+        fun progressToken(body: String): JsonElement? {
+            val req = runCatching { AppJson.parseToJsonElement(body) }.getOrNull() as? JsonObject ?: return null
+            val meta = (req["params"] as? JsonObject)?.get("_meta") as? JsonObject ?: return null
+            val token = meta["progressToken"] as? JsonPrimitive ?: return null
+            if (token is JsonNull) return null
+            return token.takeIf { it.isString || it.longOrNull != null || it.doubleOrNull != null }
         }
     }
 
