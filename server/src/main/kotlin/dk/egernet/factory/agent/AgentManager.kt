@@ -1004,7 +1004,7 @@ class AgentManager(
                 l?.let { it.stopReason = "stopped"; it.proc.kill() }
                 closeSteering(l)
                 systemEvent(s.id, "warn", "Agent stopped because the run was cancelled")
-                setStatus(s.id, SessionStatus.STOPPED, ended = true)
+                endStage(s.id, SessionStatus.STOPPED)
             }
             throw e
         } catch (e: Exception) {
@@ -1012,7 +1012,8 @@ class AgentManager(
             l?.proc?.kill()
             return finishStage(s, l, "Could not run agent: ${e.message}")
         } finally {
-            live.remove(s.id)
+            // Normally endStage has already removed the session; if publishing its status threw, correct the feed here.
+            if (live.remove(s.id) != null) runCatching { publishFeed(s.id) }
             token?.let { mcp.revoke(it) }
             slot.release()
         }
@@ -1048,9 +1049,18 @@ class AgentManager(
         closeSteering(l)
         if (error != null) systemEvent(s.id, "error", error)
         val status = if (l?.stopReason == "stopped") SessionStatus.STOPPED else if (error == null) SessionStatus.DONE else SessionStatus.FAILED
-        setStatus(s.id, status, ended = true)
+        endStage(s.id, status)
         val rec = sessions.get(s.id)!!
         return StageAgentResult(rec, l?.claudeSessionId ?: rec.claudeSessionId, l?.lastResult, error == null, error, usageLimit, credentialRejected, timedOut)
+    }
+
+    /**
+     * Sets a stage agent's terminal status. The session leaves [live] first: [dto] reads `live`, so the feed item that
+     * carries the terminal status must already say `live: false`, or clients keep counting the agent as active.
+     */
+    private fun endStage(sessionId: UUID, status: String) {
+        live.remove(sessionId)
+        setStatus(sessionId, status, ended = true)
     }
 
     private fun describeTimeout(): String = describeDuration(cfg.stageTimeoutMs)
