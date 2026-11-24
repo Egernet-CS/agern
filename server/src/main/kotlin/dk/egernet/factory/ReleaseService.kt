@@ -36,6 +36,7 @@ class ReleaseService(
     private val scheduler: ReleaseScheduler,
     private val merger: ReleaseMerger,
     private val modePolicy: ReleaseModePolicy = ReleaseModePolicy.ALLOW_ALL,
+    private val workspaceDefs: dk.egernet.factory.workspace.WorkspaceService? = null,
 ) {
     companion object {
         /** Safe as the git branch `release/<name>` and in URLs. */
@@ -127,6 +128,7 @@ class ReleaseService(
 
     suspend fun create(user: UserRecord, repo: String, name: String, description: String, mode: String? = null): ReleaseRecord {
         requireVisible(user, repo)
+        refuseWorkspace(user, repo)
         val n = validName(name)
         val d = validDescription(description)
         val m = validMode(mode)
@@ -228,7 +230,15 @@ class ReleaseService(
     }
 
     /** Checks [user]'s credentials and the project's building slot, then builds [r] as [user]. */
+    /** Releases are not available for workspace projects yet (docs/ARCHITECTURE.md §6 "Workspace runs"): 409. */
+    private suspend fun refuseWorkspace(user: UserRecord, repo: String) {
+        if (workspaceDefs != null && io { workspaceDefs.lookup(user, repo, strict = true) } != null) {
+            throw dk.egernet.factory.workspace.WorkspaceService.releasesUnsupported()
+        }
+    }
+
     private suspend fun startAs(user: UserRecord, r: ReleaseRecord): ReleaseRecord {
+        refuseWorkspace(user, r.repo)
         if (user.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
         val client = access.requireClient(user)
         if (r.issues.isEmpty()) throw conflict("Add an issue to the release first", "release_empty")

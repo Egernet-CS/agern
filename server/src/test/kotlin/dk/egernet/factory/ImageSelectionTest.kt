@@ -150,6 +150,24 @@ class ImageSelectionTest {
     }
 
     @Test
+    fun `an issue's images from a workspace chat are listed only to whoever can read its members`() = testApplication {
+        application { agernModule(w.services) }
+        val (chat, ids) = chatImages("alice", 1, repo = "demo-workspace")
+        // The chat checked out demo-ws-lab, which only alice can read.
+        val deadline = System.currentTimeMillis() + 10_000
+        while ("demo-ws-lab" !in w.services.sessions.get(chat)!!.contextRepos && System.currentTimeMillis() < deadline) Thread.sleep(20)
+        w.user("bob")
+        val alice = login("alice", "pw-a")
+        val bob = login("bob", "pw-b")
+        assertEquals(200, alice.select(ids[0], 1, "icon").status.value)
+        assertEquals(1, json(alice.get("/api/projects/demo-workspace/issues/1/images").bodyAsText()).jsonArray.size)
+        val forBob = bob.get("/api/projects/demo-workspace/issues/1/images")
+        assertEquals(200, forBob.status.value)
+        assertEquals(0, json(forBob.bodyAsText()).jsonArray.size, "the prompt may hold member content")
+        assertEquals(404, bob.get("/api/images/${ids[0]}").status.value)
+    }
+
+    @Test
     fun `images are served with the attachment headers to whoever may see the repository`() = testApplication {
         application { agernModule(w.services) }
         val (chat, ids) = chatImages("alice", 1)

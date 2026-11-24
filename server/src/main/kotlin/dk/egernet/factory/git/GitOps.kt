@@ -35,8 +35,24 @@ data class CheckoutState(
 
 /** Git operations the server performs itself (the agents run git on their own). */
 interface GitOps {
-    /** Clones the repo into [dir] or fetches if it is already there. */
-    fun ensureClone(id: AgentIdentity, cloneUrl: String, dir: Path, home: Path)
+    /**
+     * Clones the repo into [dir] or fetches if it is already there. A fresh clone checks out [branch] (null: the remote's
+     * default branch) and fetches its submodules ([updateSubmodules]; a failure is only logged).
+     */
+    fun ensureClone(id: AgentIdentity, cloneUrl: String, dir: Path, home: Path, branch: String? = null)
+    /**
+     * Adds a detached worktree at [worktree] of the clone [mainDir] at the up-to-date [baseBranch] (a workspace run's
+     * root and context members). Returns the base ref used. Throws [GitException] when the branch does not exist.
+     */
+    fun addDetachedWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, baseBranch: String, home: Path): String {
+        Files.createDirectories(worktree)
+        return baseRef(baseBranch)
+    }
+    /**
+     * `git submodule update --init --recursive` in the checkout [dir] when it has a `.gitmodules` file, with [id]'s git
+     * authentication. Null when there is nothing to do or it worked, else git's output. Never throws.
+     */
+    fun updateSubmodules(id: AgentIdentity?, dir: Path, home: Path): String? = null
     /**
      * Creates a worktree on a new branch from the up-to-date [baseBranch] (the default branch, or `release/<name>`
      * for a release run). Returns the base ref used. With [startFrom] the branch starts at the tip of that branch
@@ -145,21 +161,51 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
         return p.exitValue() to out
     }
 
-    override fun ensureClone(id: AgentIdentity, cloneUrl: String, dir: Path, home: Path) {
+    override fun ensureClone(id: AgentIdentity, cloneUrl: String, dir: Path, home: Path, branch: String?) {
         if (Files.isDirectory(dir.resolve(".git"))) {
             if (!localOnly) runCatching { git(dir, home, id, "fetch", "--prune", "origin") }
                 .onFailure { log.warn("git fetch failed in {}: {}", dir, it.message) }
             return
         }
+        require(branch == null || (branch.isNotBlank() && !branch.startsWith("-"))) { "Invalid branch name" }
         Files.createDirectories(dir.parent)
         if (localOnly) {
             Files.createDirectories(dir)
-            git(dir, home, id, "init", "-q", "-b", "main")
+            git(dir, home, id, "init", "-q", "-b", branch ?: "main")
             Files.writeString(dir.resolve("README.md"), "# ${dir.parent.fileName}\n\nLocal fake repository (FACTORY_DEV_FAKE_GITHUB).\n")
             git(dir, home, id, "add", "README.md")
             git(dir, home, id, "commit", "-q", "-m", "Initial commit")
         } else {
-            git(dir.parent, home, id, "clone", "-q", cloneUrl, dir.fileName.toString())
+            val args = listOf("clone", "-q") + (if (branch != null) listOf("--branch", branch) else emptyList()) +
+                listOf("--", cloneUrl, dir.fileName.toString())
+            git(dir.parent, home, id, *args.toTypedArray())
+            updateSubmodules(id, dir, home)?.let { log.warn("Submodules of {} could not be fetched: {}", dir, it) }
+        }
+    }
+
+    override fun addDetachedWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, baseBranch: String, home: Path): String {
+        require(baseBranch.isNotBlank() && !baseBranch.startsWith("-")) { "Invalid branch name" }
+        if (localOnly) {
+            if (runCatching { git(mainDir, home, id, "rev-parse", "--verify", "--quiet", "refs/heads/$baseBranch") }.isFailure) {
+                git(mainDir, home, id, "branch", baseBranch, "HEAD")
+            }
+        } else {
+            git(mainDir, home, id, "fetch", "origin", "+refs/heads/$baseBranch:refs/remotes/origin/$baseBranch")
+        }
+        val base = baseRef(baseBranch)
+        Files.createDirectories(worktree.parent)
+        git(mainDir, home, id, "worktree", "add", "--detach", worktree.toString(), base)
+        return base
+    }
+
+    override fun updateSubmodules(id: AgentIdentity?, dir: Path, home: Path): String? {
+        // Fake GitHub: local repositories have no remotes to fetch submodules from.
+        if (localOnly || !Files.isRegularFile(dir.resolve(".gitmodules"))) return null
+        return try {
+            val (code, out) = gitStatus(dir, home, id, "submodule", "update", "--init", "--recursive")
+            if (code == 0) null else out.trim().ifEmpty { "git submodule update failed with exit code $code" }
+        } catch (e: Exception) {
+            e.message ?: e.javaClass.simpleName
         }
     }
 
@@ -345,14 +391,26 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
             return CheckoutState(branch, defaultBranch, head, behind, ahead, "behind", "update_failed", null)
         }
         val newHead = git(mainDir, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim()
+        updateSubmodules(id, mainDir, home)?.let { log.warn("Submodules of {} could not be updated: {}", mainDir, it) }
         return CheckoutState(branch, defaultBranch, newHead, 0, 0, "updated", null, head, newCommits = behind)
+    }
+
+    /** [worktree]'s path from its last `runs/<uuid>` segments on; its last two segments when there are none. */
+    private fun runSuffix(worktree: Path): Path {
+        val names = (0 until worktree.nameCount).map { worktree.getName(it).toString() }
+        val i = names.indices.lastOrNull { k ->
+            names[k] == "runs" && k + 1 < names.size && runCatching { java.util.UUID.fromString(names[k + 1]) }.isSuccess
+        } ?: (names.size - 2).coerceAtLeast(0)
+        return Path.of(names[i], *names.drop(i + 1).toTypedArray())
     }
 
     override fun removeWorktree(mainDir: Path, worktree: Path, home: Path, keepUnpushed: Boolean) {
         try {
-            // Match by the last two segments (`runs/<runId>`): git may report the path with symlinks resolved.
+            // Match by the path from the `runs` segment on (`runs/<runId>`, or `runs/<runId>/<member directory>` in a
+            // workspace member's clone): git may report the path with symlinks resolved.
+            val suffix = runSuffix(worktree)
             val entry = runCatching { listWorktrees(mainDir, home) }.getOrDefault(emptyList())
-                .firstOrNull { it.path.fileName == worktree.fileName && it.path.parent?.fileName == worktree.parent?.fileName }
+                .firstOrNull { it.path.endsWith(suffix) }
             if (entry != null) {
                 runCatching { git(mainDir, home, null, "worktree", "remove", "--force", "--force", entry.path.toString()) }
                     .onFailure { log.warn("Could not remove worktree {}: {}", worktree, it.message) }

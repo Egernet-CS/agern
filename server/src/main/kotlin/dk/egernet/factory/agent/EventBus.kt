@@ -14,10 +14,13 @@ import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
-/** A change visible on the feed. [repo] is used for the per-user visibility filter. */
-sealed class FeedItem(val repo: String) {
-    class Session(val session: AgentSessionDto) : FeedItem(session.repo)
-    class Run(val run: RunDto) : FeedItem(run.repo)
+/**
+ * A change visible on the feed. [repo] is used for the per-user visibility filter, together with [alsoRepos]: the
+ * member repositories a workspace run or session had checked out (docs/ARCHITECTURE.md §4 "Visibility").
+ */
+sealed class FeedItem(val repo: String, val alsoRepos: List<String> = emptyList()) {
+    class Session(val session: AgentSessionDto, alsoRepos: List<String> = emptyList()) : FeedItem(session.repo, alsoRepos)
+    class Run(val run: RunDto, alsoRepos: List<String> = emptyList()) : FeedItem(run.repo, alsoRepos)
 
     /** An issue created through Agern, in list shape (no body). */
     class Issue(repo: String, val issue: IssueDto) : FeedItem(repo)

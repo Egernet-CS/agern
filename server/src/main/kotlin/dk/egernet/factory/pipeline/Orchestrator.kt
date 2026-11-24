@@ -121,6 +121,7 @@ class Orchestrator(
     private val sessions: SessionStore,
     private val events: EventStore,
     private val images: dk.egernet.factory.images.ImageService,
+    private val workspaceDefs: dk.egernet.factory.workspace.WorkspaceService,
 ) {
     private val log = LoggerFactory.getLogger(Orchestrator::class.java)
     private val jobs = ConcurrentHashMap<UUID, Job>()
@@ -152,7 +153,7 @@ class Orchestrator(
 
     fun publish(runId: UUID) {
         runs.touch(runId)
-        runs.get(runId)?.let { bus.emitFeed(FeedItem.Run(runs.toDto(it))) }
+        runs.get(runId)?.let { bus.emitFeed(FeedItem.Run(runs.toDto(it), it.contextRepos)) }
     }
 
     // ------------------------------------------------------------ commands (ownership enforced here)
@@ -181,16 +182,54 @@ class Orchestrator(
         access.requireVisible(owner, repo)
         val client = access.requireClient(owner)
         val issue = withContext(Dispatchers.IO) { client.getIssue(org, repo, issueNumber) } ?: throw notFound("Issue #$issueNumber not found")
+        // A workspace project: the member the run changes (docs/ARCHITECTURE.md §6 "Workspace runs"), fixed for the run.
+        val member = withContext(Dispatchers.IO) { workspaceTarget(owner, repo, issue, releaseId, continuesFrom) }
         // The starting user's own choices (else the admin defaults), fixed for this run: max rounds now, models per stage.
         val eff = preferences.effective(owner.id)
         val run = runs.createIfNoActive(
             repo, issueNumber, issue.title, issueKindFromLabels(issue.labels.map { it.name }), eff.maxFixRounds, owner.id, startedBySession,
-            releaseId, baseBranch, continuesFrom?.id, continuesFrom?.spec,
+            releaseId, member?.first?.baseBranch ?: baseBranch, continuesFrom?.id, continuesFrom?.spec, member?.first?.repository,
+            member?.first?.directory, member?.second.orEmpty(),
         ) ?: throw conflict("Issue #$issueNumber already has an active run", "active_run_exists")
         for (role in listOf("spec-writer", "builder") + REVIEWER_ROLES + "approver") runs.createStage(run.id, role, 0, eff.model(role))
         publish(run.id)
         launchJob(run.id) { execute(run.id) }
         return runs.get(run.id)!!
+    }
+
+    /**
+     * The member a new run of [issue] in [repo] changes, or null for a project that is not a workspace. A release run
+     * is refused in a workspace; a continuation keeps the member of the run it continues; otherwise the issue's member
+     * label decides ([dk.egernet.factory.workspace.WorkspaceService.memberFor]). With it: the repositories the run
+     * will check out (the target and every member the owner can read), recorded at once so that nobody who cannot read
+     * one of them sees the run before its set-up narrows them to what was checked out. Blocking.
+     */
+    private fun workspaceTarget(
+        owner: UserRecord, repo: String, issue: GhIssue, releaseId: UUID?, continuesFrom: RunRecord?,
+    ): Pair<dk.egernet.factory.agent.MemberCheckout, List<String>>? {
+        val target = workspaceMember(owner, repo, issue, releaseId, continuesFrom) ?: return null
+        val readable = workspaceDefs.resolved(owner, repo).orEmpty().filter { it.accessible }.map { it.repository }
+        return target to (listOf(target.repository) + readable).distinct()
+    }
+
+    private fun workspaceMember(
+        owner: UserRecord, repo: String, issue: GhIssue, releaseId: UUID?, continuesFrom: RunRecord?,
+    ): dk.egernet.factory.agent.MemberCheckout? {
+        if (releaseId != null) {
+            if (workspaceDefs.lookup(owner, repo, strict = true) != null) throw dk.egernet.factory.workspace.WorkspaceService.releasesUnsupported()
+            return null
+        }
+        val prevRepo = continuesFrom?.targetRepo
+        val prevDir = continuesFrom?.targetDir
+        val prevBase = continuesFrom?.baseBranch
+        if (prevRepo != null && prevDir != null && prevBase != null) {
+            if (!access.canSee(owner, prevRepo)) {
+                throw workspaceDefs.notAccessible(dk.egernet.factory.workspace.WorkspaceMember(prevDir, prevRepo, prevBase, prevRepo))
+            }
+            return dk.egernet.factory.agent.MemberCheckout(prevDir, prevRepo, prevBase)
+        }
+        val m = workspaceDefs.memberFor(owner, repo, issue) ?: return null
+        return dk.egernet.factory.agent.MemberCheckout(m.directory, m.repository, m.baseBranch!!)
     }
 
     private fun launchJob(runId: UUID, block: suspend () -> Unit) {
@@ -211,7 +250,7 @@ class Orchestrator(
             val client = access.client(owner)
             val base = run.baseBranch ?: client?.let { c -> runCatching { c.getRepo(org, run.repo)?.defaultBranch }.getOrNull() } ?: "main"
             val id = runCatching { identity(owner) }.getOrNull()
-            workspaces.git.branchCommits(id, workspaces.mainDir(owner.username, run.repo), run.branch, base, workspaces.home(owner.username))
+            workspaces.git.branchCommits(id, gitDirOf(run, owner.username), run.branch, base, workspaces.home(owner.username))
         }.getOrNull()
         val hasCommits = (commits ?: 0) > 0
         val stepAvailable = when {
@@ -432,7 +471,27 @@ class Orchestrator(
         }
     }
 
-    private fun worktreeOf(run: RunRecord): Path = workspaces.runDir(run.ownerUsername, run.repo, run.id)
+    /** The git worktree of the run's change: the run directory, or the target member's worktree in it for a workspace run. */
+    private fun worktreeOf(run: RunRecord): Path {
+        val root = workspaces.runDir(run.ownerUsername, run.repo, run.id)
+        return run.targetDir?.let { workspaces.memberPath(root, it) } ?: root
+    }
+
+    /** The clone the run's branch lives in: the owner's clone of the project, or of the target member for a workspace run. */
+    private fun gitDirOf(run: RunRecord, username: String): Path {
+        val main = workspaces.mainDir(username, run.repo)
+        return run.targetDir?.let { workspaces.memberPath(main, it) } ?: main
+    }
+
+    /** The repository of the run's branch and pull request: the target member for a workspace run. */
+    private fun prRepo(run: RunRecord): String = run.targetRepo ?: run.repo
+
+    /** How issue comments name pull request [pr]: `#<pr>`, or `<org>/<member>#<pr>` for a workspace run. */
+    private fun prRef(run: RunRecord, pr: Int): String = if (run.targetRepo != null) "$org/${run.targetRepo}#$pr" else "#$pr"
+
+    /** The pull request (and squash commit) title: `<title> (#<n>)`, or `<title> (<org>/<workspace>#<n>)`. */
+    private fun prTitle(run: RunRecord, title: String): String =
+        if (run.targetRepo != null) "$title ($org/${run.repo}#${run.issueNumber})" else "$title (#${run.issueNumber})"
 
     /** The worktree's HEAD, or null when it cannot be read (e.g. the worktree is gone). Blocking-safe. */
     private suspend fun headOf(run: RunRecord): String? = withContext(Dispatchers.IO) {
@@ -477,6 +536,7 @@ class Orchestrator(
         val model = preferences.effective(owner.id).model("builder")
         val s = sessions.create(
             run.repo, ADVISOR_KIND, model, SessionStatus.IDLE, owner.id, "advisor · #${run.issueNumber}", run.id, null, run.issueNumber,
+            contextRepos = run.contextRepos,
         )
         val bound = runs.bindAdvisor(run.id, s.id, head) ?: s.id
         agents.publishFeed(bound)
@@ -595,7 +655,7 @@ class Orchestrator(
             val pr = runs.get(runId)?.prNumber
             if (pr != null) withContext(Dispatchers.IO) {
                 bestEffort {
-                    client.comment(org, start.repo, pr,
+                    client.comment(org, prRepo(start), pr,
                         "**Agern:** changes requested by the run owner in a conversation were pushed ($sha7) and reviewed again: $verdicts.")
                 }
             }
@@ -633,7 +693,7 @@ class Orchestrator(
         if (!withContext(Dispatchers.IO) { java.nio.file.Files.isDirectory(ctx.worktree) }) {
             throw conflict("The run's worktree is gone, so the agent cannot work on it", "run_worktree_missing")
         }
-        return AdvisorLaunch(ctx.worktree, run.id, advisorContext(runs.get(run.id)!!, ctx))
+        return AdvisorLaunch(ctx.root, run.id, advisorContext(runs.get(run.id)!!, ctx))
     }
 
     /**
@@ -650,12 +710,44 @@ class Orchestrator(
         val defaultBranch = repoInfo?.defaultBranch ?: "main"
         val target = run.baseBranch ?: defaultBranch
         val releaseName = run.baseBranch?.takeIf { run.releaseId != null }?.removePrefix("release/")
+        val block = run.targetRepo?.let { tr ->
+            // Rebuilt from the current definition: the members recorded as checked out for the run are its context.
+            val resolved = runCatching { workspaceDefs.resolved(owner, run.repo) }.getOrNull().orEmpty()
+                .filter { it.repository != tr }
+            val others = resolved.filter { it.repository in run.contextRepos && it.baseBranch != null }
+                .map { dk.egernet.factory.agent.MemberCheckout(it.directory, it.repository, it.baseBranch!!) }
+            val left = resolved.filter { it.repository !in run.contextRepos }.map {
+                dk.egernet.factory.agent.LeftOut(it.directory, it.repository, if (it.accessible) "not checked out for this run" else "your GitHub token cannot read it")
+            }
+            workspaceBlock(run.repo, run.issueNumber, dk.egernet.factory.agent.MemberCheckout(run.targetDir ?: "", tr, target), others, left)
+        }.orEmpty()
         RunContext(
             run.id, run.repo,
             issue ?: GhIssue(run.issueNumber, run.issueTitle, "open", createdAt = "", updatedAt = "", htmlUrl = ""),
             text, run.branch ?: "", workspaces.git.baseRef(target), target, worktreeOf(run), releaseName, defaultBranch,
             run.sandboxJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunSandboxDto.serializer(), it) }.getOrNull() },
+            root = workspaces.runDir(run.ownerUsername, run.repo, run.id), gitRepo = prRepo(run), memberDir = run.targetDir,
+            workspaceBlock = block, contextRepos = run.contextRepos,
         )
+    }
+
+    /**
+     * The block every task prompt of a workspace run carries (docs/ARCHITECTURE.md §6 "Workspace runs"): the layout,
+     * the target member, the read-only context and where the issue and the pull request are.
+     */
+    private fun workspaceBlock(
+        wsRepo: String, issueNumber: Int, t: dk.egernet.factory.agent.MemberCheckout,
+        others: List<dk.egernet.factory.agent.MemberCheckout>, leftOut: List<dk.egernet.factory.agent.LeftOut>,
+    ): String = buildString {
+        append("Workspace: $org/$wsRepo — several repositories checked out side by side under your working directory.\n")
+        append("Target member directory: `${t.directory}` (repository $org/${t.repository}, base branch `${t.baseBranch}`). ")
+        append("Run every git command for this change there, e.g. `git -C ${t.directory} status`. ")
+        append("Only commits in `${t.directory}/` become the pull request.\n")
+        append("Other checkouts are read-only context at their base branch; do not edit, commit or push there:\n")
+        append("- `.` — $org/$wsRepo (workspace root files)\n")
+        others.forEach { append("- `${it.directory}` — $org/${it.repository} @ ${it.baseBranch}\n") }
+        if (leftOut.isNotEmpty()) append("Not checked out: " + leftOut.joinToString(", ") { "`${it.directory}` (${it.reason})" } + "\n")
+        append("The issue is $org/$wsRepo#$issueNumber; the pull request is opened in $org/${t.repository} against `${t.baseBranch}`.\n")
     }
 
     /** Human name of a stage round: build, fix round N or follow-up N. */
@@ -676,7 +768,8 @@ class Orchestrator(
         append("Needs a human because: ${run.error?.trim().orEmpty().ifEmpty { "(no reason recorded)" }}\n")
         append("Branch `${c.branch}`, created from `${c.baseRef}`; pull request ${run.prUrl ?: "(none)"}; it merges into `${c.targetBranch}`.\n")
         append(c.releaseNote)
-        append("Inspect the change with `git diff ${c.baseRef}...HEAD` and `git log ${c.baseRef}..HEAD`, and by reading the code.\n")
+        append(c.workspaceBlock)
+        append("Inspect the change with `${c.git} diff ${c.baseRef}...HEAD` and `${c.git} log ${c.baseRef}..HEAD`, and by reading the code.\n")
         append("This run has no sandbox at this point: build and run checks on the host.\n\n")
         append(c.issueText)
         append("\n<spec>\n").append(specText(run.id)?.trim().orEmpty().ifEmpty { "(none)" }).append("\n</spec>\n")
@@ -803,38 +896,50 @@ class Orchestrator(
         val branch = if (resuming) run.branch ?: throw StageFailed("The run has no branch to retry") else runBranch(run.issueNumber, issue.title, releaseName, run.id)
         // A step retry re-creates the worktree on its own branch; a continuation starts at the tip of the earlier run's branch.
         val startFrom = if (resuming) branch else previous?.branch
-        val worktree = workspaces.runDir(owner.username, run.repo, run.id)
-        val baseRef = withContext(Dispatchers.IO) {
-            val main = workspaces.ensureMain(id, run.repo)
-            workspaces.withRepoLock(owner.username, run.repo) {
-                // Leftovers of runs that have ended (e.g. after a crash) never block a new run; live runs keep theirs.
-                workspaces.reapRunWorktrees(owner.username, run.repo) { it != run.id && keepWorktree(it) }
-                try {
-                    workspaces.git.createWorktree(id, main, worktree, branch, target, workspaces.home(owner.username), startFrom)
-                } catch (e: dk.egernet.factory.git.GitException) {
-                    if (startFrom == null) throw e
-                    throw StageFailed("Could not start from branch $startFrom: ${e.message}")
+        // The agents' working directory; for a workspace run the change is in the target member's worktree inside it.
+        val root = workspaces.runDir(owner.username, run.repo, run.id)
+        val home = workspaces.home(owner.username)
+        val setUp = withContext(Dispatchers.IO) {
+            if (run.targetRepo != null) setUpWorkspace(run, owner, id, repoInfo.defaultBranch, target, branch, startFrom)
+            else {
+                val main = workspaces.ensureMain(id, run.repo)
+                val base = workspaces.withRepoLock(owner.username, run.repo) {
+                    // Leftovers of runs that have ended (e.g. after a crash) never block a new run; live runs keep theirs.
+                    workspaces.reapRunWorktrees(owner.username, run.repo) { it != run.id && keepWorktree(it) }
+                    try {
+                        workspaces.git.createWorktree(id, main, root, branch, target, home, startFrom)
+                    } catch (e: dk.egernet.factory.git.GitException) {
+                        if (startFrom == null) throw e
+                        throw StageFailed("Could not start from branch $startFrom: ${e.message}")
+                    }
                 }
+                val subs = workspaces.git.updateSubmodules(id, root, home)?.let { listOf(run.repo to it) }.orEmpty()
+                WorkspaceSetUp(root, base, "", subs)
             }
         }
+        val worktree = setUp.worktree
+        val baseRef = setUp.baseRef
         if (!resuming) runs.setBranch(run.id, branch)
         // The sandbox decision is made once, from the base commit (a run cannot approve its own change to the file). A
         // release run reads it from the default branch, as fetched with the clone, not from the release branch it starts
         // from: earlier runs of the release merge into that branch without a human, and approvals are of the default
         // branch's file (docs/ARCHITECTURE.md §5 "The run's decision"). baseRef is `origin/<target>` (or `<target>` for
-        // the fake GitHub's local clones), so the same form names the default branch.
-        val definitionRef = if (run.baseBranch == null || target == repoInfo.defaultBranch) baseRef
+        // the fake GitHub's local clones), so the same form names the default branch. A workspace run's sandbox is the
+        // target member's: its file at the member's base ref, approved for the member repository.
+        val definitionRef = if (run.targetRepo != null || run.baseBranch == null || target == repoInfo.defaultBranch) baseRef
             else baseRef.removeSuffix(target) + repoInfo.defaultBranch
-        val sandbox = sandboxes.prepare(run.id, run.repo, worktree, definitionRef, workspaces.home(owner.username))
-        // Images selected for the issue in a chat go into the worktree (docs/ARCHITECTURE.md §6 "Generated images").
-        val prepared = withContext(Dispatchers.IO) { images.handOver(runs.get(run.id)!!, worktree) }
+        val sandbox = sandboxes.prepare(run.id, run.repo, worktree, definitionRef, home, definitionRepo = prRepo(run))
+        // Images selected for the issue in a chat go into the agents' working directory (docs/ARCHITECTURE.md §6 "Generated images").
+        val prepared = withContext(Dispatchers.IO) { images.handOver(runs.get(run.id)!!, root) }
         publish(run.id)
         val ctx = RunContext(
             run.id, run.repo, issue, issueText(issue, comments), branch, baseRef, target, worktree, releaseName, repoInfo.defaultBranch, sandbox,
-            prepared,
+            prepared, root = root, gitRepo = prRepo(run), memberDir = run.targetDir, workspaceBlock = setUp.block,
+            contextRepos = runs.get(run.id)!!.contextRepos,
         )
-        val imageNotes = if (prepared.isEmpty()) emptyList()
-            else listOf("info" to "Prepared images: ${prepared.size} (${prepared.joinToString(", ") { it.meta.name ?: it.meta.purpose }})")
+        val imageNotes = (if (prepared.isEmpty()) emptyList()
+            else listOf("info" to "Prepared images: ${prepared.size} (${prepared.joinToString(", ") { it.meta.name ?: it.meta.purpose }})")) +
+            setUp.submoduleErrors.map { (where, out) -> "warn" to "Submodules of `$where` could not be fetched: ${out.trim().takeLast(300)}" }
         val inherited = if (previous == null) 0 else withContext(Dispatchers.IO) {
             workspaces.git.commitsAhead(worktree, baseRef, workspaces.home(owner.username))
         }
@@ -940,8 +1045,12 @@ class Orchestrator(
                 run = runs.get(run.id)!!
                 if (run.prNumber == null) {
                     // A release run's pull request must not close the issue: that happens when the release is merged.
-                    val lead = if (releaseName != null) "Issue #${issue.number} · release `$releaseName`" else "Closes #${issue.number}"
-                    val earlier = runs.earlierUnmergedPulls(run.repo, run.issueNumber, run.id)
+                    val lead = when {
+                        releaseName != null -> "Issue #${issue.number} · release `$releaseName`"
+                        run.targetRepo != null -> "Closes $org/${run.repo}#${issue.number}"
+                        else -> "Closes #${issue.number}"
+                    }
+                    val earlier = runs.earlierUnmergedPulls(run.repo, run.issueNumber, run.id, run.targetRepo)
                         .takeIf { it.isNotEmpty() }
                         ?.let { prs -> "Earlier runs of this issue left " + prs.joinToString(", ") { "#$it" } + " open; close them if this one supersedes them.\n\n" }
                         .orEmpty()
@@ -952,8 +1061,8 @@ class Orchestrator(
                             ". Its commits are part of this pull request.\n\n"
                     }.orEmpty()
                     val pr = try {
-                        client.findOpenPull(org, run.repo, branch) ?: client.createPull(
-                            org, run.repo, branch, target, "${issue.title} (#${issue.number})",
+                        client.findOpenPull(org, prRepo(run), branch) ?: client.createPull(
+                            org, prRepo(run), branch, target, prTitle(run, issue.title),
                             "$lead\n\nBuilt by Agern run `${run.id}` for @${owner.githubLogin ?: owner.username}.\n\n" + continues + earlier +
                                 "<details><summary>Spec</summary>\n\n$spec\n\n</details>",
                         )
@@ -1026,6 +1135,52 @@ class Orchestrator(
         }
     }
 
+    /** The result of a run's checkout: the change's [worktree], its [baseRef], the workspace [block] and submodule errors. */
+    private data class WorkspaceSetUp(val worktree: Path, val baseRef: String, val block: String, val submoduleErrors: List<Pair<String, String>>)
+
+    /**
+     * Sets up a workspace run's checkout (docs/ARCHITECTURE.md §5 "Workspace projects"): the stored target must still be
+     * a declared member the owner can read; the owner's readable members are cloned and checked out beside it, and the
+     * repositories checked out are recorded on the run. Blocking; throws [StageFailed].
+     */
+    private fun setUpWorkspace(
+        run: RunRecord, owner: UserRecord, id: AgentIdentity, defaultBranch: String, base: String, branch: String, startFrom: String?,
+    ): WorkspaceSetUp {
+        val tRepo = run.targetRepo!!
+        val tDir = run.targetDir ?: throw StageFailed("The run has no member directory")
+        val gone = "Member `$tDir` ($tRepo) is no longer part of the workspace definition"
+        val state = try {
+            workspaceDefs.lookup(owner, run.repo, strict = true)
+        } catch (e: Exception) {
+            throw StageFailed("Reading the workspace definition failed: ${e.message}")
+        }
+        val declared = state?.takeIf { it.valid }?.members?.firstOrNull { it.directory == tDir && it.repository == tRepo } ?: throw StageFailed(gone)
+        val resolved = workspaceDefs.resolve(owner, state)
+        if (resolved.firstOrNull { it.member == declared }?.accessible != true) throw StageFailed(workspaceDefs.notAccessible(declared).message)
+        val target = dk.egernet.factory.agent.MemberCheckout(tDir, tRepo, base)
+        val others = resolved.filter { it.member != declared && it.accessible && it.baseBranch != null }
+            .map { dk.egernet.factory.agent.MemberCheckout(it.directory, it.repository, it.baseBranch!!) }
+        val unreadable = resolved.filter { !it.accessible }
+            .map { dk.egernet.factory.agent.LeftOut(it.directory, it.repository, "your GitHub token cannot read it") }
+        workspaces.ensureMain(id, run.repo)
+        val wc = workspaces.ensureWorkspace(id, run.repo, listOf(target) + others)
+        wc.leftOut.firstOrNull { it.directory == tDir }?.let { throw StageFailed("Member `$tDir` ($tRepo) could not be checked out: ${it.reason}") }
+        val co = workspaces.withRepoLock(owner.username, run.repo) {
+            workspaces.reapRunWorktrees(owner.username, run.repo) { it != run.id && keepWorktree(it) }
+            try {
+                workspaces.prepareRunCheckout(
+                    id, run.repo, run.id, defaultBranch, target, branch, startFrom, others.filter { o -> wc.checkedOut.any { it.directory == o.directory } },
+                )
+            } catch (e: Exception) {
+                if (startFrom != null) throw StageFailed("Could not start from branch $startFrom in member `$tDir`: ${e.message}")
+                throw StageFailed("Member `$tDir` ($tRepo) could not be checked out: ${e.message}")
+            }
+        }
+        runs.setContextRepos(run.id, co.members.map { it.repository })
+        val left = unreadable + wc.leftOut + co.leftOut
+        return WorkspaceSetUp(co.worktree, co.baseRef, workspaceBlock(run.repo, run.issueNumber, target, co.members.drop(1), left), co.submoduleErrors)
+    }
+
     /**
      * After a review round: one comment on the pull request listing the screenshots the reviewers of [round] attached,
      * pointing at the run page (docs/ARCHITECTURE.md §6 "Screenshots"). Nothing for a round without screenshots; the
@@ -1034,7 +1189,7 @@ class Orchestrator(
     private fun screenshotNote(run: RunRecord, client: GitHubClient, round: Int) {
         val pr = run.prNumber ?: return
         screenshotNoteText(cfg, run.repo, run.id, round, runs.stages(run.id), screenshots.forRun(run.id))
-            ?.let { client.comment(org, run.repo, pr, it) }
+            ?.let { client.comment(org, prRepo(run), pr, it) }
     }
 
     /**
@@ -1059,7 +1214,7 @@ class Orchestrator(
         stages.forEach { runs.setStageWarning(it.id, text) }
         publish(run.id)
         val pr = run.prNumber ?: return
-        bestEffort { client.comment(org, run.repo, pr, uiWarningComment(cfg, run.repo, run.id, round, ui)) }
+        bestEffort { client.comment(org, prRepo(run), pr, uiWarningComment(cfg, run.repo, run.id, round, ui)) }
     }
 
     private fun stepLabel(step: String?) = when (step) {
@@ -1073,9 +1228,22 @@ class Orchestrator(
         val releaseName: String? = null, val defaultBranch: String = targetBranch,
         /** The run's sandbox decision; null when sandboxes are switched off. */
         val sandbox: dk.egernet.factory.RunSandboxDto? = null,
-        /** Images selected for the issue in a chat, written into the worktree; empty for most runs. */
+        /** Images selected for the issue in a chat, written into the working directory; empty for most runs. */
         val prepared: List<dk.egernet.factory.images.PreparedImage> = emptyList(),
+        /** The agents' working directory: [worktree], or the workspace root around it for a workspace run. */
+        val root: Path = worktree,
+        /** The repository of the branch and pull request: [repo], or the target member's. */
+        val gitRepo: String = repo,
+        /** The target member's directory under [root] for a workspace run, else null. */
+        val memberDir: String? = null,
+        /** The workspace block of the task prompts (empty for a single-repository run). */
+        val workspaceBlock: String = "",
+        /** The member repositories checked out for the run (recorded on its sessions). */
+        val contextRepos: List<String> = emptyList(),
     ) {
+        /** `git`, or `git -C <member directory>` for a workspace run. */
+        val git: String get() = if (memberDir == null) "git" else "git -C $memberDir"
+
         /** The `<images>` block for the spec-writer's and builder's task prompts; empty (no change at all) without images. */
         val imagesBlock: String
             get() = if (prepared.isEmpty()) "" else dk.egernet.factory.images.ImageService.promptBlock(prepared)
@@ -1100,8 +1268,9 @@ class Orchestrator(
             StageAgentRequest(
                 // The model recorded on the stage when it was created, so Stage.model is what actually ran.
                 owner = owner, repo = ctx.repo, role = role, model = st.model, runId = runId,
-                issueNumber = ctx.issue.number, parentSessionId = parent, workDir = ctx.worktree,
-                systemPrompt = prompts.system(role, ctx.repo, s.agentsMayInstallSoftware), prompt = prompt,
+                issueNumber = ctx.issue.number, parentSessionId = parent, workDir = ctx.root,
+                systemPrompt = prompts.system(role, ctx.repo, s.agentsMayInstallSoftware, workspace = if (ctx.memberDir != null) "" else null),
+                prompt = prompt, contextRepos = ctx.contextRepos,
                 jsonSchema = schema, disallowedTools = disallowed, resumeClaudeSessionId = resume,
                 title = "$role · #${ctx.issue.number}" + if (round > 0) " · round $round" else "",
                 extraTools = extraTools, notes = notes,
@@ -1170,11 +1339,11 @@ class Orchestrator(
             return
         }
         try {
-            client.squashMerge(org, run.repo, pr, "${run.issueTitle} (#${run.issueNumber})")
+            client.squashMerge(org, prRepo(run), pr, prTitle(run, run.issueTitle))
         } catch (e: Exception) {
             // A retry of the run can retry the merge (docs/ARCHITECTURE.md §6 "Retrying a run"); so can the owner's approval.
             runs.setFailure(run.id, null, FailedStep.MERGE)
-            needsHuman(run, owner, "Merging pull request #$pr failed: ${e.message}")
+            needsHuman(run, owner, "Merging pull request ${prRef(run, pr)} failed: ${e.message}")
             return
         }
         bestEffort { client.removeLabel(org, run.repo, run.issueNumber, "needs-human") }
@@ -1187,7 +1356,7 @@ class Orchestrator(
                         "The issue stays open until the release is merged into `$defaultBranch`.")
             }
         } else {
-            bestEffort { client.comment(org, run.repo, run.issueNumber, "**Agern: merged** pull request #$pr$approval.") }
+            bestEffort { client.comment(org, run.repo, run.issueNumber, "**Agern: merged** pull request ${prRef(run, pr)}$approval.") }
             bestEffort { client.closeIssue(org, run.repo, run.issueNumber) }
         }
         cleanupWorktree(run.id, merged = true)
@@ -1206,13 +1375,13 @@ class Orchestrator(
         if (branch == null || target == null) null else {
             val cmp = workspaces.withRepoLock(owner.username, run.repo) {
                 workspaces.git.compareBranches(
-                    workspaces.mainDir(owner.username, run.repo), target, branch, workspaces.home(owner.username),
+                    gitDirOf(run, owner.username), target, branch, workspaces.home(owner.username),
                     access.githubToken(owner), MigrationCheck::rootOf,
                 )
             }
             if (cmp == null) log.warn("Run {}: the database migrations of {} could not be compared with {}", run.id, branch, target)
             cmp?.let { MigrationCheck.problems(it.baseFiles, it.changes) }?.takeIf { it.isNotEmpty() }
-                ?.let { MigrationCheck.runReason(target, pr, it) }
+                ?.let { MigrationCheck.runReason(target, pr, it, prRef(run, pr)) }
         }
     } catch (e: Exception) {
         log.warn("Run {}: checking the database migrations failed, merging without the check: {}", run.id, e.message)
@@ -1228,14 +1397,8 @@ class Orchestrator(
         sandboxes.releaseNow(runId)
         val run = runs.get(runId) ?: return
         val owner = users.byId(run.ownerId) ?: return
-        bestEffort {
-            workspaces.withRepoLock(owner.username, run.repo) {
-                workspaces.git.removeWorktree(
-                    workspaces.mainDir(owner.username, run.repo), workspaces.runDir(owner.username, run.repo, run.id),
-                    workspaces.home(owner.username), keepUnpushed = !merged,
-                )
-            }
-        }
+        // Member worktrees of a workspace run first, then the run's own worktree.
+        bestEffort { workspaces.removeRunCheckout(owner.username, run.repo, run.id, keepUnpushed = !merged) }
     }
 
     private inline fun bestEffort(block: () -> Unit) {
@@ -1294,8 +1457,8 @@ class Orchestrator(
     private fun specPrompt(c: RunContext) = """
         |Write the implementation spec for this issue in ${org}/${c.repo}.
         |
-        |${c.issueText}${c.imagesBlock}
-        |Your working directory is a checkout of the repository at `${c.baseRef}`. Explore it (read-only) before writing.
+        |${c.workspaceBlock}${c.issueText}${c.imagesBlock}
+        |${if (c.memberDir == null) "Your working directory is a checkout of the repository at `${c.baseRef}`." else "The target member `${c.memberDir}` is checked out at `${c.baseRef}`."} Explore it (read-only) before writing.
         |Your final message must be the spec in Markdown and nothing else: it is posted verbatim as a comment on the issue
         |and handed to the builder.
     """.trimMargin()
@@ -1303,7 +1466,7 @@ class Orchestrator(
     private fun buildPrompt(c: RunContext, spec: String) = """
         |Implement issue #${c.issue.number} in ${org}/${c.repo} according to the spec below.
         |
-        |You are in a git worktree on branch `${c.branch}`, created from `${c.baseRef}`. Commit your work to this branch.
+        |${c.workspaceBlock}${worktreeSentence(c)} on branch `${c.branch}`, created from `${c.baseRef}`. Commit your work to this branch.
         |Do not push, open pull requests or merge: the factory does that after you finish.
         |${migrationLine(c)}
         |${sandboxLine(c)}
@@ -1315,17 +1478,22 @@ class Orchestrator(
         |When you are done, end with a short summary of what you changed, how you verified it, and anything left open.
     """.trimMargin()
 
+    /** Where the builder's worktree is: the working directory, or the target member's directory of a workspace run. */
+    private fun worktreeSentence(c: RunContext) =
+        if (c.memberDir == null) "You are in a git worktree" else "The target member `${c.memberDir}` is a git worktree"
+
     /** Round 0 of a run that continues [previous] from its commits (docs/ARCHITECTURE.md §6 "Retrying a run"). */
     private fun continuePrompt(c: RunContext, spec: String, previous: RunRecord, inherited: Int) = buildString {
         append("Continue the implementation of issue #${c.issue.number} in ${org}/${c.repo} according to the spec below.\n\n")
         append("An earlier run of this issue (`${previous.id}`) did not finish. ")
         append("It stopped with: ${previous.error?.trim()?.take(1500) ?: "(no reason recorded)"}\n\n")
-        append("You are in a git worktree on branch `${c.branch}`. It starts at the tip of that run's branch `${previous.branch}`, ")
+        append(c.workspaceBlock)
+        append("${worktreeSentence(c)} on branch `${c.branch}`. It starts at the tip of that run's branch `${previous.branch}`, ")
         append("so it already holds $inherited commit${if (inherited == 1) "" else "s"} on top of `${c.baseRef}`. ")
-        append("Do not redo that work. First find out what exists: `git log ${c.baseRef}..HEAD` (a commit message may hold a hand-over ")
-        append("note from the previous builder), `git diff ${c.baseRef}...HEAD` and `git status`. Then finish what is missing, ")
+        append("Do not redo that work. First find out what exists: `${c.git} log ${c.baseRef}..HEAD` (a commit message may hold a hand-over ")
+        append("note from the previous builder), `${c.git} diff ${c.baseRef}...HEAD` and `${c.git} status`. Then finish what is missing, ")
         append("run the checks the previous builder may not have completed, and commit. If `${c.baseRef}` has moved on since ")
-        append("(`git log HEAD..${c.baseRef}`), merge it in and resolve any conflicts.\n")
+        append("(`${c.git} log HEAD..${c.baseRef}`), merge it in and resolve any conflicts.\n")
         append("Do not push, open pull requests or merge: the factory does that after you finish.\n")
         append(migrationLine(c)).append('\n')
         append(sandboxLine(c)).append('\n')
@@ -1340,6 +1508,7 @@ class Orchestrator(
 
     private fun fixPrompt(c: RunContext, round: Int, maxRounds: Int, changes: Map<String, Verdict>) = buildString {
         append("The reviewers requested changes. This is fix round $round of at most $maxRounds.\n")
+        append(c.workspaceBlock)
         append("Address every finding below on the same branch (`${c.branch}`), re-run the relevant checks, and commit. ")
         append("If you are convinced a finding is wrong, do not change the code for it; explain why in your final summary ")
         append("so the reviewers see your reasoning.\n")
@@ -1395,9 +1564,9 @@ class Orchestrator(
         |Review the changes on branch `${c.branch}` for issue #${c.issue.number} in ${org}/${c.repo}$after.
         |Your focus: **$role** (see your role instructions). You cannot edit files.
         |
-        |Inspect the change with `git diff ${c.baseRef}...HEAD`, `git log ${c.baseRef}..HEAD` and by reading the code; run tests or
+        |${c.workspaceBlock}Inspect the change with `${c.git} diff ${c.baseRef}...HEAD`, `${c.git} log ${c.baseRef}..HEAD` and by reading the code; run tests or
         |the app where that helps your review.
-        |${if (role in SCREENSHOT_ROLES) uiReviewNote() else ""}
+        |${if (role in SCREENSHOT_ROLES) uiReviewNote(c) else ""}
         |${c.releaseNote}${c.issueText}
         |<spec>
         |$spec
@@ -1413,8 +1582,9 @@ class Orchestrator(
     }
 
     /** For the ux and ui-design reviewers: where to start, and the port that is never theirs (docs/ARCHITECTURE.md §6 "Screenshots"). */
-    private fun uiReviewNote() =
-        "If the change touches a UI, run the app and attach screenshots as your role instructions say (read `.agern/preview.md` " +
+    private fun uiReviewNote(c: RunContext) =
+        "If the change touches a UI, run the app and attach screenshots as your role instructions say (read " +
+            "`${c.memberDir?.let { "$it/" }.orEmpty()}.agern/preview.md` " +
             "first if the repository has one). Agern itself listens on port ${cfg.port} on this host: never start anything on " +
             "that port, never stop or call that server, and never use a production service.\n"
 
@@ -1422,7 +1592,8 @@ class Orchestrator(
         append("Decide whether the pull request for issue #${c.issue.number} in ${org}/${c.repo} may be squash-merged into `${c.targetBranch}`.\n")
         append(c.releaseNote)
         append("Branch `${c.branch}`; pull request ${prUrl ?: "(none)"}; fix rounds used: $round of $maxRounds.\n")
-        append("Inspect the change with `git diff ${c.baseRef}...HEAD`. You cannot edit files.\n\n")
+        append(c.workspaceBlock)
+        append("Inspect the change with `${c.git} diff ${c.baseRef}...HEAD`. You cannot edit files.\n\n")
         append(c.issueText).append("<spec>\n").append(spec).append("\n</spec>\n\n<reviews>\n")
         for ((role, v) in reviews) {
             append("### $role — ${v.verdict}\n${v.summary}\n")

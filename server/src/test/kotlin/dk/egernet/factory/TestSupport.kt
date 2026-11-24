@@ -235,7 +235,19 @@ class FakeGitOps : GitOps {
         reads += "$ref:$path"
         return files[path]
     }
-    override fun ensureClone(id: AgentIdentity, cloneUrl: String, dir: Path, home: Path) { Files.createDirectories(dir) }
+    /** Every clone made, as `"<cloneUrl> <branch or ->"`. */
+    val clones = CopyOnWriteArrayList<String>()
+    override fun ensureClone(id: AgentIdentity, cloneUrl: String, dir: Path, home: Path, branch: String?) {
+        if (!Files.isDirectory(dir)) clones += "$cloneUrl ${branch ?: "-"}"
+        Files.createDirectories(dir)
+    }
+    /** Every detached worktree created, as `"<worktree path> @ <baseBranch>"`. */
+    val detached = CopyOnWriteArrayList<String>()
+    override fun addDetachedWorktree(id: AgentIdentity, mainDir: Path, worktree: Path, baseBranch: String, home: Path): String {
+        Files.createDirectories(worktree)
+        detached += "$worktree @ $baseBranch"
+        return "origin/$baseBranch"
+    }
     /** Runs on every worktree right after it is created (e.g. to plant files a repository could contain). */
     @Volatile var afterWorktree: (Path) -> Unit = {}
     override fun createWorktree(

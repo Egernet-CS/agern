@@ -61,7 +61,8 @@ export function RunSandboxLine({ run }: { run: Run }) {
       ) : (
         <span className="run-sbx-why">none — {WHY_NONE[sb.state] ?? sb.reason}; built and tested on the host</span>
       )}
-      <Link to={`/p/${run.repo}/sandbox`} className="run-sbx-link" aria-label={`Sandbox settings of ${run.repo}`}>
+      {/* A workspace run's sandbox is its target member's. */}
+      <Link to={`/p/${run.targetRepo ?? run.repo}/sandbox`} className="run-sbx-link" aria-label={`Sandbox settings of ${run.targetRepo ?? run.repo}`}>
         settings
       </Link>
     </p>

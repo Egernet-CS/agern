@@ -215,11 +215,16 @@ class ApiTest {
         val root = login("root", "pw-r")
 
         val projects = json(alice.get("/api/projects").bodyAsText()).jsonArray.map { it.jsonObject["name"]!!.jsonPrimitive.content }
-        assertEquals(setOf("demo-app", "private-lab"), projects.toSet())
-        assertEquals(listOf("demo-app"), json(bob.get("/api/projects").bodyAsText()).jsonArray.map { it.jsonObject["name"]!!.jsonPrimitive.content })
+        val workspace = setOf("demo-workspace", "demo-ws-app", "demo-ws-tools")
+        assertEquals(setOf("demo-app", "private-lab", "demo-ws-lab") + workspace, projects.toSet())
+        assertEquals(setOf("demo-app") + workspace, json(bob.get("/api/projects").bodyAsText()).jsonArray.map { it.jsonObject["name"]!!.jsonPrimitive.content }.toSet())
+        // New fields of a project that is not a workspace: no workspace, no members on its issues, no target on its runs.
+        assertEquals(JsonNull, json(alice.get("/api/projects/demo-app").bodyAsText()).jsonObject["workspace"])
+        assertEquals(JsonNull, json(alice.get("/api/projects").bodyAsText()).jsonArray.first { it.jsonObject["name"]!!.jsonPrimitive.content == "demo-workspace" }.jsonObject["workspace"])
         assertEquals(404, bob.get("/api/projects/private-lab/issues").status.value)
         val issues = json(alice.get("/api/projects/demo-app/issues").bodyAsText()).jsonArray
         assertEquals(3, issues.size)
+        assertTrue(issues.all { it.jsonObject["workspaceMembers"]!!.jsonArray.isEmpty() })
         assertEquals("bug", issues.first { it.jsonObject["number"]!!.jsonPrimitive.content == "2" }.jsonObject["kind"]!!.jsonPrimitive.content)
 
         val created = alice.postJson("/api/projects/demo-app/sessions", "{}")
@@ -295,7 +300,10 @@ class ApiTest {
         // A token without `repo` sees only public repositories.
         val narrowed = json(alice.putJson("/api/me/github-token", """{"token":"fake-alice~public_repo"}""").bodyAsText()).jsonObject
         assertEquals(listOf("public_repo"), narrowed["githubTokenScopes"]!!.jsonArray.map { it.jsonPrimitive.content })
-        assertEquals(listOf("demo-app"), json(alice.get("/api/projects").bodyAsText()).jsonArray.map { it.jsonObject["name"]!!.jsonPrimitive.content })
+        assertEquals(
+            setOf("demo-app", "demo-workspace", "demo-ws-app", "demo-ws-tools"),
+            json(alice.get("/api/projects").bodyAsText()).jsonArray.map { it.jsonObject["name"]!!.jsonPrimitive.content }.toSet(),
+        )
 
         val removed = json(alice.delete("/api/me/github-token") { header("X-Factory-Request", "1") }.bodyAsText()).jsonObject
         assertEquals(kotlinx.serialization.json.JsonNull, removed["githubTokenScopes"])
@@ -332,6 +340,8 @@ class ApiTest {
         assertEquals("merged", json(approved.bodyAsText()).jsonObject["status"]!!.jsonPrimitive.content)
         val run = json(bob.get("/api/runs/$runId").bodyAsText()).jsonObject
         assertEquals(7, run["stages"]!!.jsonArray.size)
+        assertEquals(JsonNull, run["targetRepo"])
+        assertEquals(JsonNull, run["targetDirectory"])
         assertEquals("opus", run["stages"]!!.jsonArray.first().jsonObject["model"]!!.jsonPrimitive.content)
         assertEquals(0, run["stages"]!!.jsonArray.first().jsonObject["round"]!!.jsonPrimitive.content.toInt(), "round 0 is the initial build")
 

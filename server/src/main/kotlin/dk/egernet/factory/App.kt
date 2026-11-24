@@ -86,6 +86,7 @@ class Services(
     val twoFactorStore = TwoFactorStore(db)
     val twoFactor = TwoFactorService(users, twoFactorStore, box)
     val access = Access(cfg, users, box, github)
+    val workspaceDefs = dk.egernet.factory.workspace.WorkspaceService(access)
     val bus = EventBus()
     val mcpRegistry = McpRegistry()
     val prompts = Prompts(cfg.githubOrg)
@@ -93,12 +94,13 @@ class Services(
     val attachments = dk.egernet.factory.agent.Attachments(cfg, dk.egernet.factory.db.AttachmentStore(db))
     val preferences = dk.egernet.factory.db.PreferenceStore(db, settings)
     val usage = dk.egernet.factory.db.ClaudeUsageStore(db, clock)
-    val agents = AgentManager(cfg, sessions, events, access, launcher, bus, mcpRegistry, settings, prompts, workspaces, scope, attachments, preferences, usage)
+    val agents = AgentManager(cfg, sessions, events, access, launcher, bus, mcpRegistry, settings, prompts, workspaces, scope, attachments, preferences, usage,
+        workspaceDefs)
     val sandboxes = SandboxManager(
         cfg, sandboxRuntime, SandboxApprovalStore(db), runs, access, git, scope,
         publishSystem = { sessionId, payload -> agents.publish(sessionId, "system", payload) },
         emitFeed = { bus.emitFeed(it) },
-        emitRun = { id -> runs.get(id)?.let { bus.emitFeed(dk.egernet.factory.agent.FeedItem.Run(runs.toDto(it))) } },
+        emitRun = { id -> runs.get(id)?.let { bus.emitFeed(dk.egernet.factory.agent.FeedItem.Run(runs.toDto(it), it.contextRepos)) } },
         approvers = {
             val known = users.all().filter { it.isAdmin }
             (known.map { OwnerDto(it.username, it.displayName) } + (cfg.admins - known.map { it.username }.toSet()).map { OwnerDto(it, it) })
@@ -128,7 +130,7 @@ class Services(
             dk.egernet.factory.images.CodexLogins(it, images, scope, clock)
         }
     val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes, screenshotStore,
-        sessions, events, images)
+        sessions, events, images, workspaceDefs)
     val screenshots = dk.egernet.factory.agent.Screenshots(cfg, screenshotStore, runs, workspaces, publishRun = { orchestrator.publish(it) })
     val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
     val releaseLocks = dk.egernet.factory.pipeline.ReleaseLocks()
@@ -143,9 +145,13 @@ class Services(
         cfg, clock, releaseStore, users, access, bus,
         releaseStarter ?: ReleaseStarter { release, owner -> releases.startScheduled(owner, release.id) },
     )
-    val releases: ReleaseService = ReleaseService(cfg, access, releaseStore, bus, releaseBuilder, releaseScheduler, releaseMerger, releaseModePolicy)
+    val releases: ReleaseService = ReleaseService(
+        cfg, access, releaseStore, bus, releaseBuilder, releaseScheduler, releaseMerger, releaseModePolicy, workspaceDefs,
+    )
     val projectIcons = dk.egernet.factory.db.ProjectIconStore(db)
-    val factory = FactoryService(cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases, images.store, projectIcons)
+    val factory = FactoryService(
+        cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases, images.store, projectIcons, workspaceDefs,
+    )
     val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes, screenshots, images)
 
     /** The start-up removal of leftover sandboxes (runs in the background; tests wait for it). */

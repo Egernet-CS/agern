@@ -26,9 +26,13 @@ fun checkoutWhy(state: CheckoutState): String {
  * The `<checkout_status>` note prepended to a chat message for the agent after a sync, or null when there is nothing
  * to tell (status `current`).
  */
-fun checkoutNote(state: CheckoutState): String? {
+fun checkoutNote(state: CheckoutState): String? =
+    checkoutNoteBody(state)?.let { "<checkout_status>\n$it\n</checkout_status>" }
+
+/** The sentence of [checkoutNote] without the `<checkout_status>` tags (also used per workspace member), or null. */
+fun checkoutNoteBody(state: CheckoutState): String? {
     val b = branchName(state.defaultBranch)
-    val body = when (state.status) {
+    return when (state.status) {
         "updated" -> {
             val from = state.updatedFrom ?: return null
             "Agern fast-forwarded this checkout of `$b` from ${short(from)} to ${short(state.head)} " +
@@ -40,7 +44,6 @@ fun checkoutNote(state: CheckoutState): String? {
                 "because ${checkoutWhy(state)}. The code you read here may be out of date: say so when you answer questions about " +
                 "the current state of the project, and use `git log HEAD..origin/$b` or `git show origin/$b:<path>` to look at " +
                 "the current code. Do not pull, merge, reset or stash on your own; ask the person first."
-        else -> return null
+        else -> null
     }
-    return "<checkout_status>\n$body\n</checkout_status>"
 }

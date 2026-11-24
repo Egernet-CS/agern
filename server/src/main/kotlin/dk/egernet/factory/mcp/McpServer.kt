@@ -239,10 +239,18 @@ class McpServer(
         val runs = ListSerializer(RunDto.serializer())
         return try {
             val text: String = when (name) {
-                "factory_list_issues" -> factory.listIssues(owner, repo, str("state") ?: "open").joinToString("\n") {
-                    "#${it.number} [${it.kind}] ${it.title}" + (it.activeRunId?.let { r -> " (active run $r)" } ?: "") +
-                        (it.release?.let { r -> " [release ${r.name}]" } ?: "")
-                }.ifEmpty { "No issues." }
+                "factory_list_issues" -> {
+                    val workspace = factory.isWorkspace(owner, repo)
+                    factory.listIssues(owner, repo, str("state") ?: "open").joinToString("\n") {
+                        "#${it.number} [${it.kind}] ${it.title}" + (it.activeRunId?.let { r -> " (active run $r)" } ?: "") +
+                            (it.release?.let { r -> " [release ${r.name}]" } ?: "") +
+                            (if (!workspace) "" else when (it.workspaceMembers.size) {
+                                0 -> " [no member label]"
+                                1 -> " [member ${it.workspaceMembers.single().directory}]"
+                                else -> " [several member labels]"
+                            })
+                    }.ifEmpty { "No issues." }
+                }
                 "factory_get_issue" -> factory.issueForAgent(owner, repo, int("number") ?: return toolError("number is required"))
                 "factory_create_issue" -> {
                     if (grant.runId != null) return toolError("Not available to pipeline agents")

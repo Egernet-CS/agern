@@ -159,6 +159,8 @@ data class StageAgentRequest(
     val extraTools: Set<String> = emptySet(),
     /** `system` events (level, text) put at the top of the stage's transcript, e.g. whether the run has a sandbox. */
     val notes: List<Pair<String, String>> = emptyList(),
+    /** The member repositories of a workspace run, recorded on the session (docs/ARCHITECTURE.md §4 "Visibility"). */
+    val contextRepos: List<String> = emptyList(),
 )
 
 /**
@@ -218,6 +220,7 @@ class AgentManager(
     private val attachments: Attachments,
     private val preferences: dk.egernet.factory.db.PreferenceStore,
     private val usageStore: dk.egernet.factory.db.ClaudeUsageStore,
+    private val workspaceDefs: dk.egernet.factory.workspace.WorkspaceService? = null,
 ) {
     private val log = LoggerFactory.getLogger(AgentManager::class.java)
 
@@ -266,6 +269,8 @@ class AgentManager(
         @Volatile var contextSent = false
         /** Chat: the "behind" checkout state (reason, HEAD, behind) this process was last told about, null when none. */
         var checkoutTold: String? = null
+        /** Chat in a workspace: the member lines of `<checkout_status>` this process was last told, null when none. */
+        var membersTold: String? = null
         /** Chat inputs (stream-json `message.content`) written to this process and not yet answered by a `result`. */
         val pending = java.util.Collections.synchronizedList(mutableListOf<JsonElement>())
 
@@ -330,7 +335,7 @@ class AgentManager(
     }
 
     fun publishFeed(sessionId: UUID) {
-        sessions.get(sessionId)?.let { bus.emitFeed(FeedItem.Session(dto(it))) }
+        sessions.get(sessionId)?.let { bus.emitFeed(FeedItem.Session(dto(it), it.contextRepos)) }
     }
 
     // ------------------------------------------------------------ chat
@@ -348,6 +353,7 @@ class AgentManager(
             try {
                 val identity = chatIdentity(owner) ?: return@launch
                 workspaces.ensureMain(identity, repo)
+                ensureChatWorkspace(s.id, owner, identity, repo)
                 syncCheckout(s.id, owner, repo)
             } catch (e: CancellationException) {
                 throw e
@@ -356,6 +362,73 @@ class AgentManager(
             }
         }
         return sessions.get(s.id)!!
+    }
+
+    /**
+     * A chat's view of a workspace project (docs/ARCHITECTURE.md §5 "Workspace projects"): the members checked out for
+     * [owner] and the system prompt's member list; null for a project that is not a workspace.
+     */
+    private data class ChatWorkspace(val checkedOut: List<MemberCheckout>, val note: String)
+
+    /**
+     * For a workspace project: clones every member [owner]'s token can read into the chat's checkout, records them on
+     * chat [sessionId] (as a union) and returns them; null otherwise. Blocking.
+     */
+    private fun ensureChatWorkspace(sessionId: UUID, owner: UserRecord, identity: AgentIdentity, repo: String): ChatWorkspace? {
+        // First, whatever the definition says (or whether it can be read at all): every member clone already in the
+        // chat's working directory is readable by the agent.
+        recordChatClones(sessionId, owner, repo)
+        val defs = workspaceDefs ?: return null
+        val state = defs.lookup(owner, repo) ?: return null
+        val resolved = defs.resolve(owner, state)
+        val wanted = resolved.filter { it.accessible && it.baseBranch != null }.map { MemberCheckout(it.directory, it.repository, it.baseBranch!!) }
+        val wc = workspaces.ensureWorkspace(identity, repo, wanted)
+        sessions.addContextRepos(sessionId, wc.checkedOut.map { it.repository })
+        recordChatClones(sessionId, owner, repo)
+        val left = resolved.filter { !it.accessible }.map { LeftOut(it.directory, it.repository, "your GitHub token cannot read it") } + wc.leftOut
+        val note = buildString {
+            if (!state.valid) {
+                append("The workspace definition `.agern/workspace.yml` is invalid (${state.firstProblem}), so only the workspace ")
+                append("repository is checked out and no run can start until it is fixed.\n")
+            }
+            if (resolved.isNotEmpty()) append("Members (directory, repository, base branch, issue label):\n")
+            wc.checkedOut.forEach { m ->
+                val label = state.members.firstOrNull { it.directory == m.directory }?.label ?: m.repository
+                append("- `${m.directory}` — ${cfg.githubOrg}/${m.repository}, base `${m.baseBranch}`, label `$label`\n")
+            }
+            left.forEach { append("- `${it.directory}` — ${cfg.githubOrg}/${it.repository}: not checked out (${it.reason})\n") }
+        }
+        return ChatWorkspace(wc.checkedOut, note)
+    }
+
+    /**
+     * Syncs the members of a workspace chat with their base branches ([Workspaces.syncMembers]) and returns the member
+     * lines of `<checkout_status>` for [l], or null when there is nothing new to tell (docs/ARCHITECTURE.md §5).
+     * Never throws.
+     */
+    private suspend fun memberCheckoutNote(l: Live, owner: UserRecord, repo: String): String? = try {
+        withContext(Dispatchers.IO) {
+            val identity = chatIdentity(owner) ?: return@withContext null
+            val ws = ensureChatWorkspace(l.sessionId, owner, identity, repo) ?: return@withContext null
+            val lines = workspaces.syncMembers(identity, repo, ws.checkedOut).mapNotNull { (m, state) ->
+                state?.let { st -> checkoutNoteBody(st)?.let { "Member `${m.directory}` (${m.repository}): $it" } }
+            }
+            val text = lines.joinToString("\n").takeIf { it.isNotEmpty() }
+            if (text == l.membersTold) null else text.also { l.membersTold = it }
+        }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        log.warn("Syncing the workspace members of chat {} failed: {}", l.sessionId, e.message)
+        null
+    }
+
+    /**
+     * Records every member clone in [owner]'s checkout of [repo] on chat [sessionId] (`context_repos`, as a union): the
+     * chat's agent can read them whether or not the current definition still lists them (docs/ARCHITECTURE.md §4).
+     */
+    private fun recordChatClones(sessionId: UUID, owner: UserRecord, repo: String) {
+        sessions.addContextRepos(sessionId, workspaces.clonesOnDisk(owner.username, repo))
     }
 
     /** The identity a chat of [owner] runs as (as in [startChat]), or null without a Claude credential. */
@@ -470,7 +543,7 @@ class AgentManager(
                     if (s.id in closed) return@withLock
                     val content = withContext(Dispatchers.IO) { attachments.content(text, attached) }
                     val l = live[s.id] ?: startChat(s.id, user)
-                    val note = checkoutNoteFor(l, syncCheckout(s.id, user, s.repo))
+                    val note = mergeNotes(checkoutNoteFor(l, syncCheckout(s.id, user, s.repo)), memberCheckoutNote(l, user, s.repo))
                     try {
                         deliver(l, if (note == null) content else withNote(content, note))
                     } catch (e: Exception) {
@@ -485,6 +558,13 @@ class AgentManager(
                 if (!isLive(s.id)) setStatus(s.id, SessionStatus.IDLE)
             }
         }
+    }
+
+    /** The workspace's `<checkout_status>` note and the member lines in one block (either may be null). */
+    private fun mergeNotes(note: String?, memberLines: String?): String? = when {
+        memberLines == null -> note
+        note == null -> "<checkout_status>\n$memberLines\n</checkout_status>"
+        else -> note.removeSuffix("</checkout_status>").trimEnd() + "\n" + memberLines + "\n</checkout_status>"
     }
 
     /** [content] (a string, or content blocks with attachments) with [note] in front, for the agent only. */
@@ -529,6 +609,14 @@ class AgentManager(
             // An advisor works in its run's worktree with the run's context; a chat in the owner's main clone.
             val launch = if (advisor) (advisorLaunch ?: error("Advisors are not available")).invoke(s, owner) else null
             val workDir = launch?.workDir ?: withContext(Dispatchers.IO) { workspaces.ensureMain(identity, s.repo) }
+            // A chat in a workspace gets the members its owner can read beside the workspace clone.
+            val chatWs = if (advisor) null else withContext(Dispatchers.IO) {
+                // Never fails quietly: a chat whose member clones cannot be recorded does not start.
+                recordChatClones(sessionId, owner, s.repo)
+                runCatching { ensureChatWorkspace(sessionId, owner, identity, s.repo) }
+                    .onFailure { log.warn("Preparing the workspace of chat {} failed: {}", sessionId, it.message) }.getOrNull()
+            }
+            val advisorWs = if (advisor && s.contextRepos.isNotEmpty()) "" else null
             // The attachment files are a cache of the database: put back what a cleaned data dir lost.
             if (!advisor) withContext(Dispatchers.IO) { attachments.materialiseSession(sessionId) }
             val mayInstall = settings.get().agentsMayInstallSoftware
@@ -538,7 +626,8 @@ class AgentManager(
             val spec = LaunchSpec(
                 sessionId = sessionId, kind = s.kind, model = s.model, workDir = workDir, home = workspaces.home(owner.username),
                 identity = identity, interactive = true, resumeClaudeSessionId = s.claudeSessionId,
-                appendSystemPrompt = prompts.system(if (advisor) ADVISOR_KIND else "chat", s.repo, mayInstall), mcpConfigJson = mcpConfig(token),
+                appendSystemPrompt = prompts.system(if (advisor) ADVISOR_KIND else "chat", s.repo, mayInstall, workspace = chatWs?.note ?: advisorWs),
+                mcpConfigJson = mcpConfig(token),
                 mcpToolTimeoutMs = cfg.mcpToolTimeoutMs,
             )
             val proc = withContext(Dispatchers.IO) { launcher.launch(spec) }
@@ -935,6 +1024,7 @@ class AgentManager(
     suspend fun runStageAgent(req: StageAgentRequest, onSession: (SessionRecord) -> Unit = {}): StageAgentResult {
         val s = sessions.create(
             req.repo, req.role, req.model, SessionStatus.STARTING, req.owner.id, req.title, req.runId, req.parentSessionId, req.issueNumber,
+            contextRepos = req.contextRepos,
         )
         publishFeed(s.id)
         onSession(s)

@@ -188,15 +188,16 @@ class SandboxManager(
     /**
      * Decides whether run [runId] gets a sandbox: reads `.agern/sandbox.yml` from [baseRef] (the commit the run's
      * worktree was created from, so a run cannot approve its own change to the file), validates it and checks the
-     * approval. Never throws; the decision is stored on the run and returned.
+     * approval. Never throws; the decision is stored on the run and returned. [definitionRepo]: the repository whose
+     * approval counts (a workspace run's target member); [repo] stays the run's project.
      */
-    suspend fun prepare(runId: UUID, repo: String, worktree: Path, baseRef: String, home: Path): RunSandboxDto {
+    suspend fun prepare(runId: UUID, repo: String, worktree: Path, baseRef: String, home: Path, definitionRepo: String = repo): RunSandboxDto {
         if (!enabled) {
             return record(runId, RunSandboxDto("disabled", "Sandboxes are switched off on this server (FACTORY_SANDBOX=off).", null, null), null, repo, worktree)
         }
         val content = try {
             withContext(Dispatchers.IO) {
-                devDefinitionSource?.invoke(repo) ?: git.readFile(worktree, baseRef, SANDBOX_FILE, home, SandboxDefinitions.MAX_BYTES)
+                devDefinitionSource?.invoke(definitionRepo) ?: git.readFile(worktree, baseRef, SANDBOX_FILE, home, SandboxDefinitions.MAX_BYTES)
             }
         } catch (e: Exception) {
             return record(runId, RunSandboxDto("invalid", "Could not read $SANDBOX_FILE from $baseRef: ${e.message}", null, null), null, repo, worktree)
@@ -210,7 +211,8 @@ class SandboxManager(
                 null, repo, worktree,
             )
             is ParsedDefinition.Valid -> {
-                val approval = withContext(Dispatchers.IO) { approvals.get(repo) }
+                // A workspace run's sandbox is approved per member repository (docs/ARCHITECTURE.md §6 "Workspace runs").
+                val approval = withContext(Dispatchers.IO) { approvals.get(definitionRepo) }
                 val def = parsed.definition
                 if (approval != null && approval.sha256 == parsed.sha256) {
                     val platforms = if (def.platforms.isEmpty()) "" else "; platforms ${def.platforms.joinToString(", ") { "${it.name} (${it.image})" }}"
@@ -746,7 +748,7 @@ class SandboxManager(
             val def = (rs.plan as? Plan.Available) ?: return@mapNotNull null
             val run = runs.get(rs.runId) ?: return@mapNotNull null
             val at = rs.createdAt ?: rs.boxes.values.minOfOrNull { it.createdAt } ?: return@mapNotNull null
-            val visible = access.canSee(admin, rs.repo)
+            val visible = access.canSee(admin, run.repo, run.contextRepos)
             val d = def.definition
             val containers = rs.boxes.values.sortedBy { it.createdAt }.map { SandboxContainerDto(it.key, it.image, it.createdAt.iso()) }
             RunningSandboxDto(

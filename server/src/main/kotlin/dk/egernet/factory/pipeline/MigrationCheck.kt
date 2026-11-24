@@ -105,8 +105,8 @@ object MigrationCheck {
         problems.take(MAX_LISTED).joinToString("; ") + if (problems.size > MAX_LISTED) " (and ${problems.size - MAX_LISTED} more)" else ""
 
     /** Why a run's pull request #[pr] into [target] was not merged; the run's needs-human reason and a held issue's note. */
-    fun runReason(target: String, pr: Int, problems: List<String>): String =
-        "Database migration conflict with `$target`: ${listed(problems)}. Pull request #$pr was not merged. Migrations " +
+    fun runReason(target: String, pr: Int, problems: List<String>, prRef: String = "#$pr"): String =
+        "Database migration conflict with `$target`: ${listed(problems)}. Pull request $prRef was not merged. Migrations " +
             "already on `$target` must stay unchanged, and a new migration needs a version above all of them. Fix the " +
             "migration on the pull request's branch and approve again, or build the issue again from the current `$target` " +
             "(in a release: Retry)."

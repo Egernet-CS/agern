@@ -24,6 +24,9 @@ Wait until `http://127.0.0.1:$PORT/` answers (a few seconds), then take screensh
 - Useful pages: `/` (projects), `/p/web-shop` (a project with issues and runs), `/agents`
   (live agents; click a run to open its run page), `/settings`, `/admin`. A merged run with the
   warning "UI change reviewed without screenshots" is in `/p/design-system` (issue #12).
+  A workspace project (several repositories side by side) is `/p/shop-workspace`: its members are in
+  the "agents & runs" pane, its issues show their member, and issue #5 has a merged workspace run.
+  As `observer` (bob) the member `ios` is marked "no access".
 - The app is a single-page app: with Chromium's `--screenshot`, pass `--virtual-time-budget=8000`,
   or the page is captured before it renders. With Playwright, wait for `networkidle` and a selector.
 - There is one (dark) theme. Check narrow layouts at 390 px width.

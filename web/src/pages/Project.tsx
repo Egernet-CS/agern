@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, ApiError, isReleaseFinished, isReleaseOpen, isRunWorking, isSessionActive, type AgentSession, type CheckoutInfo, type Issue, type IssueKind, type Release, type ReleaseMode, type Run } from '../api';
+import { api, ApiError, isReleaseFinished, isReleaseOpen, isRunWorking, isSessionActive, type AgentSession, type CheckoutInfo, type Issue, type IssueKind, type Release, type ReleaseMode, type Run, type Workspace } from '../api';
 import { ChatView } from '../components/chat/ChatView';
 import { IssueImagesDialog } from '../components/images/IssueImagesDialog';
 import { REVIEWERS, roundName } from '../components/pipeline/model';
@@ -100,7 +100,7 @@ export function ProjectPage() {
               iconUrl={p.iconUrl}
               size={28}
               defaultBranch={p.defaultBranch}
-              onChanged={(np) => project.setData(() => np)}
+              onChanged={(np) => project.setData((old) => ({ ...np, workspace: old?.workspace ?? np.workspace }))}
               onError={setIconError}
             />
           ) : (
@@ -114,6 +114,11 @@ export function ProjectPage() {
           <span className={activeAgents ? 'ph-live' : ''}><span className="live-dot" aria-hidden /> {activeAgents} agent{activeAgents === 1 ? '' : 's'}</span>
           <span>{activeRuns} run{activeRuns === 1 ? '' : 's'} in flight</span>
           {p && <span>{p.openIssues} open issues</span>}
+          {p?.workspace?.valid && (
+            <span className="tag" title="Several repositories checked out side by side (.agern/workspace.yml)">
+              workspace · {plural(p.workspace.members.length, 'member')}
+            </span>
+          )}
           {p && <a href={p.htmlUrl} target="_blank" rel="noreferrer">GitHub ↗</a>}
         </div>
         {iconError && (
@@ -134,7 +139,7 @@ export function ProjectPage() {
 
       <div className="project-grid3">
         <aside className="panel panel--issues" aria-label="Issues">
-          <IssuesPanel repo={repo} releases={releases.releases} />
+          <IssuesPanel repo={repo} releases={releases.releases} workspace={p?.workspace ?? null} />
         </aside>
         <section className="panel panel--chat" aria-label="Chat">
           <ChatPanel
@@ -155,6 +160,7 @@ export function ProjectPage() {
             sessions={sessions}
             loading={!runsBase.data || !sessionsBase.data}
             releases={releases}
+            workspace={p?.workspace ?? null}
             onSelectChat={selectSession}
             onCloseChat={setClosing}
             currentId={closedNotice ? null : current?.id ?? null}
@@ -398,7 +404,36 @@ type ReleaseFilter = 'all' | 'none' | string;
 /** Option value for "take the issues out of their release" in the bulk bar (never a release id). */
 const NO_RELEASE = '__none__';
 
-function IssuesPanel({ repo, releases }: { repo: string; releases: Release[] }) {
+/**
+ * Why a run cannot start on [i] in a workspace project (ARCHITECTURE §6 "Workspace runs"), or null when it can (or the
+ * project is not a workspace). The server refuses the same cases.
+ */
+function workspaceStartBlock(ws: Workspace | null, i: Issue): string | null {
+  if (!ws) return null;
+  if (!ws.valid) return 'Fix .agern/workspace.yml first';
+  const m = i.workspaceMembers ?? [];
+  if (m.length === 0) return 'Add one member label on GitHub first';
+  if (m.length > 1) return 'Keep exactly one member label';
+  const member = ws.members.find((x) => x.directory === m[0].directory);
+  if (member && !member.accessible) return `Your GitHub token cannot read ${member.repository}`;
+  return null;
+}
+
+/** The member an issue of a workspace project belongs to, as shown in its row. */
+function IssueMember({ ws, issue }: { ws: Workspace; issue: Issue }) {
+  const m = issue.workspaceMembers ?? [];
+  if (m.length === 0) return <span className="tag tag--plain issue-member issue-member--none">no member label</span>;
+  if (m.length > 1) return <span className="tag tag--plain issue-member issue-member--none">several member labels</span>;
+  const member = ws.members.find((x) => x.directory === m[0].directory);
+  return (
+    <>
+      <span className="tag tag--plain issue-member" title={`Member ${m[0].directory} · ${m[0].repository}`}>{m[0].directory}</span>
+      {member && !member.accessible && <span className="tag tag--plain issue-member--none">no access</span>}
+    </>
+  );
+}
+
+function IssuesPanel({ repo, releases, workspace }: { repo: string; releases: Release[]; workspace: Workspace | null }) {
   const me = useMe();
   const nav = useNavigate();
   const { noteReleases } = useFeed();
@@ -597,6 +632,7 @@ function IssuesPanel({ repo, releases }: { repo: string; releases: Release[] }) 
                 </a>
               </div>
               <div className="issue-meta">
+                {workspace && <IssueMember ws={workspace} issue={i} />}
                 {rel && (
                   <Link to={`/p/${repo}/releases/${rel.id}`} className="tag release-tag" title={`Planned in release ${rel.name}`}>
                     {rel.name}
@@ -630,8 +666,12 @@ function IssuesPanel({ repo, releases }: { repo: string; releases: Release[] }) 
                     <button
                       className="btn btn--sm btn--ghost btn--run"
                       onClick={() => void start(i)}
-                      disabled={!me.hasClaudeCredential || starting !== null}
-                      title={me.hasClaudeCredential ? 'Hand this issue to the pipeline' : 'Needs your Claude credential (Settings)'}
+                      disabled={!me.hasClaudeCredential || starting !== null || workspaceStartBlock(workspace, i) !== null}
+                      title={
+                        !me.hasClaudeCredential
+                          ? 'Needs your Claude credential (Settings)'
+                          : workspaceStartBlock(workspace, i) ?? 'Hand this issue to the pipeline'
+                      }
                     >
                       {starting === i.number ? 'Starting…' : '▶ Start run'}
                     </button>
@@ -830,6 +870,54 @@ function NewReleaseDialog({ repo, open, onClose }: { repo: string; open: boolean
 // ---------------------------------------------------------------- activity
 
 /** The project's sandbox state in one row, linking to its sandbox page; live when an admin approves or revokes. */
+/** The members of a workspace project (ARCHITECTURE §5 "Workspace projects"), or why its definition is invalid. */
+function MembersSection({ workspace }: { workspace: Workspace }) {
+  return (
+    <>
+      <div className="panel-head">
+        <h2>Members</h2>
+        {workspace.valid && <span className="muted small">{workspace.members.length}</span>}
+      </div>
+      {!workspace.valid ? (
+        <div className="ws-invalid" role="alert">
+          <p>
+            <code>.agern/workspace.yml</code> is invalid. Runs cannot start until it is fixed.
+          </p>
+          <ul>
+            {workspace.errors.map((e, n) => (
+              <li key={n} className="mono">{e}</li>
+            ))}
+          </ul>
+        </div>
+      ) : (
+        <ul className="run-list member-list">
+          {workspace.members.map((m) => (
+            <li key={m.directory} className="run-row member-row">
+              <div className="rr-top">
+                <span className="mono member-dir">{m.directory}</span>
+                {m.accessible ? (
+                  <Link to={`/p/${m.repository}`} className="member-repo">{m.repository}</Link>
+                ) : (
+                  <span className="member-repo">{m.repository}</span>
+                )}
+                {!m.accessible && (
+                  <span className="pill member-noaccess" title="Your GitHub token cannot read this repository; it is left out of your checkouts.">
+                    no access
+                  </span>
+                )}
+              </div>
+              <div className="rr-bot">
+                {m.branch ? <span className="mono member-branch">{m.branch}</span> : <span className="muted">default branch</span>}
+                <span className="tag tag--plain" title="Issues with this label belong to this member">{m.label}</span>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </>
+  );
+}
+
 function SandboxSection({ repo }: { repo: string }) {
   const reconnects = useFeedReconnects();
   const q = useAsync(() => api.sandboxStatus(repo), [repo, reconnects]);
@@ -887,6 +975,7 @@ function ActivityPanel({
   sessions,
   loading,
   releases,
+  workspace,
   onSelectChat,
   onCloseChat,
   currentId,
@@ -896,6 +985,8 @@ function ActivityPanel({
   sessions: AgentSession[];
   loading: boolean;
   releases: { releases: Release[]; loading: boolean; error: Error | undefined; reload: () => void };
+  /** The project's workspace definition; null for a project that is one repository. */
+  workspace: Workspace | null;
   onSelectChat: (id: string) => void;
   onCloseChat: (s: AgentSession) => void;
   currentId: string | null;
@@ -944,16 +1035,19 @@ function ActivityPanel({
           );
         })}
       </ul>
+      {workspace && <MembersSection workspace={workspace} />}
       <div className="panel-head">
         <h2>Releases</h2>
-        <button type="button" className="btn btn--sm" aria-label="New release" onClick={() => setCreatingRelease(true)}>
-          + New
-        </button>
+        {!workspace && (
+          <button type="button" className="btn btn--sm" aria-label="New release" onClick={() => setCreatingRelease(true)}>
+            + New
+          </button>
+        )}
       </div>
       {releases.error && <ErrorBox error={releases.error} retry={releases.reload} />}
       {releases.loading && <Loading />}
       {!releases.loading && !releases.error && releases.releases.length === 0 && (
-        <p className="muted pad">No releases yet. Create one to plan issues ahead.</p>
+        <p className="muted pad">{workspace ? 'Releases are not available for workspace projects yet.' : 'No releases yet. Create one to plan issues ahead.'}</p>
       )}
       <ul className="run-list release-list">
         {releases.releases.filter((r) => !isReleaseFinished(r)).map((r) => (
@@ -984,8 +1078,9 @@ function ActivityPanel({
         ))}
       </ul>
       <ReleaseHistory repo={repo} releases={historyOf(releases.releases)} />
-      <NewReleaseDialog repo={repo} open={creatingRelease} onClose={() => setCreatingRelease(false)} />
-      <SandboxSection repo={repo} />
+      {!workspace && <NewReleaseDialog repo={repo} open={creatingRelease} onClose={() => setCreatingRelease(false)} />}
+      {/* A workspace's sandboxes belong to its member projects. */}
+      {!workspace && <SandboxSection repo={repo} />}
       <div className="panel-head">
         <h2>Runs</h2>
       </div>
