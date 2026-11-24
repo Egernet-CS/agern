@@ -311,7 +311,9 @@ builder's transcripts start with a `warn` event ``Submodules of `<directory or r
 characters of git's output>``. No protocol restriction is relaxed (never `protocol.file.allow=always`); in fake-GitHub
 mode submodules are skipped. Agern has no SSH key, so wherever it sets up git (agents and server-side git, with or
 without a token) SSH URLs of the git host (`git@github.com:org/repo.git`, `ssh://git@github.com/org/repo.git`) are
-rewritten to its HTTPS base through two `url.<base>.insteadOf` entries in the `GIT_CONFIG_*` environment.
+rewritten to its HTTPS base through two `url.<base>.insteadOf` entries in the `GIT_CONFIG_*` environment. Agern pushes
+only a run's own branch, never a submodule: how it keeps a run from merging a pointer to a submodule commit that was
+never pushed, and from losing such commits, is §6 "Submodule pointers".
 
 ### Workspace projects
 
@@ -782,7 +784,8 @@ reaches the default branch only through the owner's approval of the release (§6
     approve) also deletes the local branch; `failed` (any stage, the time limit, no commits, set-up errors) and
     `cancelled` (also from `needs_human`, or through a release) delete the local branch unless it holds commits
     found on no other branch and no remote-tracking branch (never pushed), which are kept rather than lost. A
-    `needs_human` run is still alive and keeps its worktree until it is approved or cancelled.
+    `needs_human` run is still alive and keeps its worktree until it is approved or cancelled. Submodule commits
+    found on no remote-tracking branch of their submodule are saved as git bundles first (§6 "Submodule pointers").
   - *GitHub:* the remote branch and the open pull request of a failed or cancelled run are left untouched — they
     may hold useful commits, and only a human decides to close them. The issue gets a comment "run … failed: <reason>"
     or "… was cancelled by …", which names that pull request. A later run of the issue opens its own pull request,
@@ -847,7 +850,8 @@ other failure whose branch has commits. Commits are counted in the owner's clone
 `api_unreachable` (the stage error or exception matches e.g. "Can't reach the API", "Unable to connect to API",
 `ECONNREFUSED`, `ENOTFOUND`, `ETIMEDOUT`, `ConnectException`, or is an I/O exception), `restart` (failed by a server
 restart: "Server restarted while the run was in progress; retry it to continue or start over."), `blocked` (no
-commits), `step` (with `failedStep`), `other`. `FailureKind.INTERRUPTED` (the four kinds of the recommendation rule)
+commits), `step` (with `failedStep`), `other`; and, on a `needs_human` run whose merge was refused,
+`submodule_commit_missing` (with `failedStep` `merge`, §6 "Submodule pointers"). `FailureKind.INTERRUPTED` (the four kinds of the recommendation rule)
 is the seam for issue #57 (transient failures pause and retry automatically), which is not built here.
 
 *Who.* Options: anyone who can see the run (404 otherwise). Retry: the run's owner only — admins included in the
@@ -995,6 +999,59 @@ branch is never changed, renamed or removed (Flyway checks applied migrations by
   there, never to change one that exists there, and to check again before finishing, in every fix round and after
   any rebase or merge of that branch. A release run is told that its version must also be above every migration on
   the default branch, which the release is merged into later.
+
+### Submodule pointers
+
+Agern pushes only a run's own branch. A builder that commits inside a submodule and commits the new pointer (gitlink,
+mode `160000`) in the parent produces a pull request that would pin the target branch to a commit nobody can fetch,
+and the commit itself lives only in the run's worktree: a worktree's submodule repositories are kept in its
+administrative directory (`.git/worktrees/<name>/modules/…`), which goes when the worktree is removed. Three guards:
+
+- **Merge guard.** Before every merge of a run's pull request (the approver's `APPROVE`, the owner's approval of a
+  `needs_human` run, the step retry of a failed merge; single, release and workspace runs alike; after the database
+  migration check) and before a release is merged (approval and automatic release), `SubmoduleCheck` checks every
+  pointer the head adds or moves relative to the merge base with the target (`GitOps.changedGitlinks`: both branches
+  fetched as for §6 "Database migrations", `git diff --raw --no-renames <base>...<head>`, new mode `160000`; a removed
+  submodule does not count). The submodule's URL comes from `.gitmodules` on the head (`git config --blob`); a
+  relative URL (`../sub.git`, `./x`) is resolved against the clone's `origin` as git does (`resolveSubmoduleUrl`).
+  Whether the commit exists there is asked of the remote itself (`GitOps.remoteHasCommit`): a throw-away bare
+  repository under the owner's home fetches exactly that commit (`git fetch --depth=1 --filter=tree:0 origin <sha>`
+  as a partial clone, so only the commit object where the server supports filters) with the owner's token for the git
+  host, whose SSH URLs go over HTTPS as everywhere (§5 "Submodules"), and `GIT_PROTOCOL_FROM_USER=0` as
+  `git submodule` uses, so a repository's URL cannot make the server read another local repository. Git (rather than
+  the GitHub API) works the same for submodules on any host. "not our ref" and similar answers mean the commit is
+  missing; any other failure means it could not be checked. **Fails closed:** a missing commit, a submodule without a
+  URL, an unreachable remote and a comparison that cannot be made (no clone, a branch missing, git failing) all
+  refuse the merge; there is no override, the fix is to push the commit or reset the pointer.
+  - *A run* goes to `needs_human` through the usual path (label, comment, error) with `failedStep` `merge`, so an
+    approval or a step retry checks again once the commit is pushed. A missing commit (`failureKind`
+    `submodule_commit_missing`): "Submodule commit missing: pull request #<n> moves submodule `<path>` to commit
+    `<sha>`, which the submodule's repository does not have, so merging it would leave `<target>` pinned to a commit
+    no one can fetch. Nothing was merged. Push that commit to the submodule's repository (or reset the pointer on the
+    pull request's branch to a commit that is there), then approve again." (several pointers listed, at most 5, then
+    "(and N more)"; paths as in §6 "Database migrations"). A pointer that could not be checked (`failureKind`
+    `step`): "Submodule commit not checked: …", or "Submodule pointers not checked: …" when the branches could not be
+    compared. The texts never carry URLs or git's output, which go to the log.
+  - *A release* is refused with 409 `release_submodule_commit_missing` (or `release_submodule_check_failed`) and the
+    same text as its notice; an automatic release counts it as a refused automatic merge (§6 "Releasing").
+- **Unpushed commits are saved.** Before a run's checkout is removed (`Workspaces.removeRunCheckout`: when the run
+  ends, and when leftovers are reaped), every initialised submodule of each worktree in it (the run's worktree; for a
+  workspace run its member worktrees and root) whose HEAD or local branches hold commits found on none of its
+  remote-tracking branches (`git rev-list HEAD --branches --not --remotes`) is bundled:
+  `git bundle create workspaces/<user>/<repo>/bundles/<runId>/<path with / as _>.bundle HEAD --branches --not
+  --remotes`. When the run ends, the transcript of its last builder gets a `warn` event per bundle: "Unpushed
+  submodule commits saved: submodule `<path>` had N commit(s) up to `<sha>` that are on none of its remote branches,
+  and the run's checkout was removed. They are saved in the git bundle `<file>` on the Agern server. To recover them,
+  run `git fetch <bundle>` in a clone of the submodule (`git -C <path> fetch <file>`) and push `FETCH_HEAD` to a
+  branch of its repository." Bundles are kept until an administrator removes them.
+- **The builder.** `builder.md` tells the builder never to commit inside a submodule, to move a pointer only when the
+  task asks for it and only to a commit already on the submodule's remote, and in a workspace to change only the
+  target member and report a needed pointer bump in its summary instead. After every builder step the same
+  detection runs on the run's checkout (root and target worktree); submodules with such commits get a `warn` event in
+  the builder's transcript: "Commits inside submodules: `<path>` (N commit(s)) on none of the submodule's remote
+  branches. …".
+
+The run page makes an approver's escalation harder to override with one click (§10 "Conversation at needs human").
 
 ### Conversation at needs human
 
@@ -1410,7 +1467,9 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   so there is nothing to release."); a re-evaluation; a pull request exists (409 `release_merge_failed` with the
   notice); no conflict (409 `release_conflict`, "`release/<name>` no longer merges cleanly into `<default>`. Nothing
   was merged."); no database migration conflict (409 `release_migration_conflict`, the notice of §6 "Database
-  migrations" and " Nothing was merged."); a usable merge method (below). The pull request is read once more for its head commit, which is
+  migrations" and " Nothing was merged."); a usable merge method (below); submodule pointers whose commits exist
+  on their submodules' remotes (409 `release_submodule_commit_missing` / `release_submodule_check_failed`, §6
+  "Submodule pointers", checked right before the merge). The pull request is read once more for its head commit, which is
   passed to GitHub's merge (`sha`), so a release branch that moves after the check is refused rather than merged
   unseen. Approvals of one release are serialised by its mutex; a second, concurrent approval finds it `released`
   and answers 409 `release_not_ready`. Check ("Check again", `POST …/check`) has the same owner rule.
@@ -1904,7 +1963,7 @@ type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; 
   conversation: RunConversation;  // always present; default { sessionId: null, review: 'none', followUpFrom: null }
   continuesRunId: string | null;   // the failed run this one continues from its commits (§6 "Retrying a run")
   continuedByRunId: string | null; // the newest run that continues this one
-  failureKind: 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | null;
+  failureKind: 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | 'submodule_commit_missing' | null;
   failedStep: 'push' | 'pull_request' | 'merge' | null;  // the step after the builder that failed
   warnings: { round: number; roles: StageRole[]; text: string }[] };  // the stages' warnings per round, oldest first
 
@@ -2085,7 +2144,7 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `POST /api/releases/{id}/pause` | → `Release` | owner or admin; `building` → `paused` (else 409 `release_not_building`); the running issue finishes |
 | `POST /api/releases/{id}/resume` | → `Release` | owner only; `paused` → `building` (else 409 `release_not_paused`); 422 `claude_credential_required` |
 | `POST /api/releases/{id}/cancel` | → `Release` | owner or admin; `building`/`paused`/`ready` → `cancelled` (else 409 `release_not_building`; released: 409 `release_not_editable`); cancels the release's active runs; a release pull request is left open with a comment |
-| `POST /api/releases/{id}/approve` | → `Release` | owner only (admins included in the refusal: 403); merges the ready release's pull request (rebase, or a merge commit where rebase merging is disabled; never squash), closes its merged issues and deletes `release/<name>` (§6 "Releasing"). 409 `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`, `release_migration_conflict`, `release_merge_method_unavailable`, `release_merge_failed`; nothing changes on GitHub with any of them |
+| `POST /api/releases/{id}/approve` | → `Release` | owner only (admins included in the refusal: 403); merges the ready release's pull request (rebase, or a merge commit where rebase merging is disabled; never squash), closes its merged issues and deletes `release/<name>` (§6 "Releasing"). 409 `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`, `release_migration_conflict`, `release_submodule_commit_missing`, `release_submodule_check_failed`, `release_merge_method_unavailable`, `release_merge_failed`; nothing changes on GitHub with any of them |
 | `PUT /api/releases/{id}/mode` | `{ mode: 'manual' \| 'automatic' }` → `Release` | §6 "Release mode": `planning` anyone; `scheduled`/started: automatic owner only, manual owner or admin (403); 400 missing or unknown mode; 409 `release_not_editable` (released), `release_closed` (cancelled), `release_mode_not_allowed`. A `ready` release is re-evaluated in the background (switched to automatic and green, it is merged) |
 | `POST /api/releases/{id}/check` | → `Release` | owner only; `ready` only (409 `release_not_ready`): re-reads the pull request (opens it when the release is complete and has none, replaces one closed without merging, finishes the release when it was merged on GitHub) and its mergeability |
 | `GET /api/releases/{id}/issues/{number}/retry` | → `RetryOptions` | anyone who can see the release; the issue must be `held`/`skipped` (409 `release_issue_not_held`); the options of its linked run, or only `start_over` when it has none |
@@ -2158,7 +2217,8 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   `github_push_denied`, `claude_credential_required` (422);
   scheduling: `release_not_schedulable`, `release_not_scheduled`, `release_scheduled` (409);
   releasing: `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`,
-  `release_migration_conflict`, `release_merge_failed`, `release_merge_method_unavailable`, `release_not_editable` (409).
+  `release_migration_conflict`, `release_submodule_commit_missing`, `release_submodule_check_failed`, `release_merge_failed`,
+  `release_merge_method_unavailable`, `release_not_editable` (409).
 - Sandbox approval: stale hash → 409 `sandbox_definition_changed`; invalid definition → 422
   `sandbox_definition_invalid`.
 - "Needs Claude credential" → 422 `claude_credential_required`; too many agents → 409
@@ -2607,7 +2667,10 @@ updated). Without a `checkout` event only `~/<repo>` is shown; at the narrow bre
 has a conversation (`?stage=human`; the default selection of a `needs_human` run with a conversation). Its sub-line
 reads "reviewing changes", "changes not reviewed" or "waiting for owner". The owner gets "Talk to the agent" next to
 "✓ Approve & merge", which selects the node and focuses the composer; approve is disabled while the follow-up review
-is not `none` or the advisor is `starting`/`running`, with a hint linked by `aria-describedby`. The panel
+is not `none` or the advisor is `starting`/`running`, with a hint linked by `aria-describedby`. When the run's latest
+approver verdict is `ESCALATE` (`approverEscalation`), "✓ Approve & merge" does not merge at once: it opens the dialog
+"Merge against the approver's advice?" with the approver's summary (Markdown, a `note` "The approver's reason"), which
+pull request goes into which branch, and "Don't merge" (focused) / "Merge anyway"; only the latter approves. The panel
 (`stage-detail` layout) shows the blurb, model, cost and turns, a `role="status"` line for the review state, "Review
 again" for the owner in state `required`, and the transcript (`ChatView` in advisor mode: text only, no `/factory`
 commands, Esc interrupts) with the owner-only composer "Message the agent". Follow-up rounds are labelled

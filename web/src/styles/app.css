@@ -599,6 +599,11 @@ input[type='checkbox'] {
 .notice-action {
   flex: none;
 }
+.escalation-reason {
+  margin: 10px 0 14px;
+  max-height: 40vh;
+  overflow: auto;
+}
 .empty {
   text-align: center;
   padding: 32px 16px 40px;

@@ -22,6 +22,16 @@ data class FileChange(val status: Char, val path: String)
 data class BranchComparison(val baseFiles: List<String>, val changes: List<FileChange>)
 
 /**
+ * A submodule pointer (gitlink) a branch adds or moves ([GitOps.changedGitlinks]): the submodule at [path] now points
+ * at commit [sha]. [url] is the submodule's URL from `.gitmodules` on the head, relative URLs resolved against the
+ * parent's `origin`; null when `.gitmodules` names none for [path].
+ */
+data class GitlinkChange(val path: String, val sha: String, val url: String?)
+
+/** A submodule of a checkout ([GitOps.unpushedSubmodules]) at [path] whose HEAD or local branches hold [commits] commits found on none of its remote-tracking branches. */
+data class UnpushedSubmodule(val path: String, val head: String, val commits: Int)
+
+/**
  * The state of a main checkout relative to `origin/<defaultBranch>` after [GitOps.syncCheckout]
  * (docs/ARCHITECTURE.md §5 "Workspaces"). [branch] is null for a detached HEAD; [head] is the full HEAD sha after the
  * sync. [status] is `current`, `updated` (fast-forwarded from [updatedFrom]) or `behind` (not updated because of
@@ -116,6 +126,55 @@ interface GitOps {
      * clone or no `origin/<defaultBranch>`; throws [IllegalArgumentException] for an invalid branch name.
      */
     fun syncCheckout(id: AgentIdentity?, mainDir: Path, defaultBranch: String, home: Path, fetch: Boolean): CheckoutState? = null
+    /**
+     * The submodule pointers [headBranch] adds or moves relative to its merge base with [baseBranch], both as they are
+     * on GitHub (fetched first with [githubToken], as in [compareBranches]); removed submodules do not count. Null when
+     * the comparison cannot be made (no clone, a branch is missing); throws [GitException] when git fails.
+     */
+    fun changedGitlinks(mainDir: Path, baseBranch: String, headBranch: String, home: Path, githubToken: String?): List<GitlinkChange>? = emptyList()
+    /**
+     * Whether the repository at [url] has commit [sha] (reachable from any of its refs): fetched by sha into a
+     * throw-away repository, commit object only where the server supports filters, authenticated with [githubToken]
+     * for the git host (whose SSH URLs go over its HTTPS base). Throws [GitException] when the answer cannot be had
+     * (the remote cannot be reached, git fails otherwise).
+     */
+    fun remoteHasCommit(url: String, sha: String, home: Path, githubToken: String?): Boolean = true
+    /**
+     * The initialised submodules of the checkout [dir] (recursively) with commits on their HEAD or local branches that
+     * are on none of their remote-tracking branches: work that exists only in this checkout. Never throws.
+     */
+    fun unpushedSubmodules(dir: Path, home: Path): List<UnpushedSubmodule> = emptyList()
+    /**
+     * Writes the commits of submodule [sub] of the checkout [dir] that are on none of its remote-tracking branches
+     * (HEAD and local branches) to the bundle [file]. Throws [GitException] when git fails.
+     */
+    fun bundleSubmodule(dir: Path, sub: String, file: Path, home: Path) {}
+}
+
+/**
+ * The URL of a submodule whose `.gitmodules` URL is [url], in a repository whose `origin` is [parentUrl]: a relative
+ * URL (`./x`, `../x`) is resolved against the parent's URL as git does (each `../` drops one path segment; for an
+ * scp-like `git@host:org/repo.git` the `:` counts as a separator); any other URL is returned as it is.
+ */
+fun resolveSubmoduleUrl(parentUrl: String, url: String): String {
+    if (!url.startsWith("./") && !url.startsWith("../")) return url
+    var base = parentUrl.trimEnd('/')
+    var rel = url
+    var sep = '/'
+    while (true) {
+        when {
+            rel.startsWith("./") -> rel = rel.removePrefix("./")
+            rel.startsWith("../") -> {
+                rel = rel.removePrefix("../")
+                val i = maxOf(base.lastIndexOf('/'), base.lastIndexOf(':'))
+                if (i < 0) break
+                sep = base[i]
+                base = base.substring(0, i)
+            }
+            else -> break
+        }
+    }
+    return "$base$sep$rel"
 }
 
 /**
@@ -124,6 +183,14 @@ interface GitOps {
  */
 class CliGitOps(private val path: String, private val gitHost: String, private val localOnly: Boolean = false) : GitOps {
     private val log = LoggerFactory.getLogger(CliGitOps::class.java)
+
+    private companion object {
+        /** The mode of a gitlink (a submodule pointer) in a tree. */
+        const val GITLINK_MODE = "160000"
+        val SHA_RE = Regex("[0-9a-f]{40}|[0-9a-f]{64}")
+        /** What git and the servers say when a fetched commit does not exist there (as opposed to a remote it cannot reach). */
+        val MISSING_COMMIT_RE = Regex("(?i)not our ref|couldn'?t find remote ref|no such remote ref|not a valid object|unadvertised object")
+    }
 
     private fun git(cwd: Path?, home: Path, id: AgentIdentity?, vararg args: String, timeoutSec: Long = 600, token: String? = null): String {
         val (code, out) = gitStatus(cwd, home, id, *args, timeoutSec = timeoutSec, token = token)
@@ -137,6 +204,7 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
      */
     private fun gitStatus(
         cwd: Path?, home: Path, id: AgentIdentity?, vararg args: String, timeoutSec: Long = 600, token: String? = null,
+        env: Map<String, String> = emptyMap(),
     ): Pair<Int, String> {
         val pb = ProcessBuilder(listOf("git") + args).redirectErrorStream(true)
         if (cwd != null) pb.directory(cwd.toFile())
@@ -151,6 +219,7 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
             pb.environment()["GIT_AUTHOR_EMAIL"] = "agern@agern.local"; pb.environment()["GIT_COMMITTER_EMAIL"] = "agern@agern.local"
             pb.environment().putAll(AgentCommand.gitAuthEnvironment(token, gitHost))
         }
+        pb.environment().putAll(env)
         Files.createDirectories(home)
         val p = pb.start()
         val out = p.inputStream.bufferedReader().readText()
@@ -319,9 +388,11 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
         }
     }
 
-    override fun compareBranches(
-        mainDir: Path, baseBranch: String, headBranch: String, home: Path, githubToken: String?, dirOf: (String) -> String?,
-    ): BranchComparison? {
+    /**
+     * Fetches [baseBranch] and [headBranch] from GitHub (local branches in fake-GitHub mode) and returns their refs in
+     * the clone at [mainDir]; null when there is no clone or a branch is missing.
+     */
+    private fun fetchPair(mainDir: Path, baseBranch: String, headBranch: String, home: Path, githubToken: String?): Pair<String, String>? {
         if (!Files.isDirectory(mainDir.resolve(".git"))) return null
         require(!baseBranch.startsWith("-") && !headBranch.startsWith("-")) { "Invalid branch name" }
         val (base, head) = if (localOnly) {
@@ -337,6 +408,13 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
         for (ref in listOf(base, head)) {
             if (gitStatus(mainDir, home, null, "rev-parse", "--verify", "--quiet", "$ref^{commit}", timeoutSec = 60).first != 0) return null
         }
+        return base to head
+    }
+
+    override fun compareBranches(
+        mainDir: Path, baseBranch: String, headBranch: String, home: Path, githubToken: String?, dirOf: (String) -> String?,
+    ): BranchComparison? {
+        val (base, head) = fetchPair(mainDir, baseBranch, headBranch, home, githubToken) ?: return null
         // NUL-separated: <status> NUL <path> NUL ...
         val fields = git(mainDir, home, null, "diff", "--name-status", "--no-renames", "-z", "$base...$head", "--").split('\u0000')
         val changes = (0 until fields.size - 1 step 2).mapNotNull { i ->
@@ -350,6 +428,95 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
         val baseFiles = git(mainDir, home, null, "ls-tree", "-r", "-z", "--name-only", base, "--", *dirs.toTypedArray())
             .split('\u0000').filter { it.isNotEmpty() && dirOf(it) != null }
         return BranchComparison(baseFiles, changes)
+    }
+
+    override fun changedGitlinks(mainDir: Path, baseBranch: String, headBranch: String, home: Path, githubToken: String?): List<GitlinkChange>? {
+        // Fake GitHub: local repositories have no submodule remotes.
+        if (localOnly) return emptyList()
+        val (base, head) = fetchPair(mainDir, baseBranch, headBranch, home, githubToken) ?: return null
+        // NUL-separated: ":<old mode> <new mode> <old sha> <new sha> <status>" NUL <path> NUL ...
+        val fields = git(mainDir, home, null, "diff", "--raw", "--no-renames", "--no-abbrev", "-z", "$base...$head", "--").split('\u0000')
+        val links = (0 until fields.size - 1 step 2).mapNotNull { i ->
+            val meta = fields[i].removePrefix(":").split(' ')
+            if (meta.size < 5 || meta[1] != GITLINK_MODE) null else fields[i + 1] to meta[3]
+        }
+        if (links.isEmpty()) return emptyList()
+        val urls = submoduleUrls(mainDir, head, home)
+        val origin = gitStatus(mainDir, home, null, "remote", "get-url", "origin", timeoutSec = 60)
+            .let { (code, out) -> if (code == 0) out.trim().takeIf { it.isNotEmpty() } else null }
+        return links.map { (path, sha) ->
+            val url = urls[path]?.let { u -> if (origin != null) resolveSubmoduleUrl(origin, u) else u.takeUnless { it.startsWith(".") } }
+            GitlinkChange(path, sha, url)
+        }
+    }
+
+    /** Submodule path to URL as `.gitmodules` in commit [ref] names them; empty when it has none. */
+    private fun submoduleUrls(dir: Path, ref: String, home: Path): Map<String, String> {
+        val (code, out) = gitStatus(
+            dir, home, null, "config", "--blob", "$ref:.gitmodules", "--null", "--get-regexp", "^submodule\\..*\\.(path|url)$", timeoutSec = 60,
+        )
+        if (code != 0) return emptyMap()
+        val paths = mutableMapOf<String, String>()
+        val urls = mutableMapOf<String, String>()
+        // NUL-terminated entries: <key> LF <value>.
+        for (entry in out.split('\u0000')) {
+            val key = entry.substringBefore('\n')
+            if (key == entry) continue
+            val name = key.removePrefix("submodule.").substringBeforeLast('.')
+            when (key.substringAfterLast('.')) {
+                "path" -> paths[name] = entry.substringAfter('\n')
+                "url" -> urls[name] = entry.substringAfter('\n')
+            }
+        }
+        return paths.mapNotNull { (name, path) -> urls[name]?.let { path to it } }.toMap()
+    }
+
+    override fun remoteHasCommit(url: String, sha: String, home: Path, githubToken: String?): Boolean {
+        if (!SHA_RE.matches(sha)) throw GitException("Invalid commit id")
+        if (url.isBlank() || url.startsWith("-")) throw GitException("Invalid submodule URL")
+        Files.createDirectories(home)
+        val tmp = Files.createTempDirectory(home, "agern-submodule-check-")
+        try {
+            git(tmp, home, null, "init", "-q", "--bare", timeoutSec = 60)
+            git(tmp, home, null, "remote", "add", "origin", url, timeoutSec = 60)
+            // A partial clone: only the commit object is fetched where the server supports filters.
+            git(tmp, home, null, "config", "extensions.partialClone", "origin", timeoutSec = 60)
+            git(tmp, home, null, "config", "remote.origin.promisor", "true", timeoutSec = 60)
+            // As `git submodule` does: URLs from a repository may not use protocols that are only allowed for a user's own
+            // commands (`file`, unless the home's git config allows it), so no other repository on this server is read.
+            val (code, out) = gitStatus(
+                tmp, home, null, "fetch", "-q", "--no-tags", "--depth=1", "--filter=tree:0", "origin", sha,
+                timeoutSec = 300, token = githubToken, env = mapOf("GIT_PROTOCOL_FROM_USER" to "0"),
+            )
+            if (code == 0) return true
+            if (MISSING_COMMIT_RE.containsMatchIn(out)) return false
+            throw GitException("git fetch failed: ${out.takeLast(500).trim()}")
+        } finally {
+            tmp.toFile().deleteRecursively()
+        }
+    }
+
+    override fun unpushedSubmodules(dir: Path, home: Path): List<UnpushedSubmodule> = try {
+        if (localOnly || !Files.isRegularFile(dir.resolve(".gitmodules"))) emptyList()
+        else git(dir, home, null, "submodule", "status", "--recursive", timeoutSec = 120).lines().mapNotNull { line ->
+            // "<flag><sha> <path>[ (<describe>)]"; flag `-`: not initialised.
+            if (line.length < 2 || line[0] == '-') return@mapNotNull null
+            val rest = line.substring(1).trim()
+            val path = rest.substringAfter(' ', "").let { if (it.endsWith(")") && " (" in it) it.substringBeforeLast(" (") else it }
+            if (path.isEmpty()) return@mapNotNull null
+            val sub = dir.resolve(path)
+            val (code, out) = gitStatus(sub, home, null, "rev-list", "--count", "HEAD", "--branches", "--not", "--remotes", timeoutSec = 60)
+            val n = if (code == 0) out.trim().toIntOrNull() ?: 0 else 0
+            if (n == 0) null else UnpushedSubmodule(path, git(sub, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim(), n)
+        }
+    } catch (e: Exception) {
+        log.warn("Listing the unpushed submodule commits of {} failed: {}", dir, e.message)
+        emptyList()
+    }
+
+    override fun bundleSubmodule(dir: Path, sub: String, file: Path, home: Path) {
+        Files.createDirectories(file.parent)
+        git(dir.resolve(sub), home, null, "bundle", "create", "-q", file.toString(), "HEAD", "--branches", "--not", "--remotes", timeoutSec = 300)
     }
 
     override fun syncCheckout(id: AgentIdentity?, mainDir: Path, defaultBranch: String, home: Path, fetch: Boolean): CheckoutState? {

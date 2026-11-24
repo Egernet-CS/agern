@@ -415,7 +415,7 @@ export type Run = {
   targetDirectory?: string | null;
 };
 
-export type FailureKind = 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other';
+export type FailureKind = 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | 'submodule_commit_missing';
 export type FailedStep = 'push' | 'pull_request' | 'merge';
 
 /** `step`: retry the failed step on the same run; `continue`: a new run from its commits; `start_over`: from scratch. */

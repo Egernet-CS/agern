@@ -263,6 +263,8 @@ object FailureKind {
     const val BLOCKED = "blocked"
     /** A mechanical step after the builder failed (see [FailedStep]). */
     const val STEP = "step"
+    /** The merge was refused: a submodule pointer names a commit its remote does not have (the run needs a human). */
+    const val SUBMODULE_COMMIT_MISSING = "submodule_commit_missing"
     const val OTHER = "other"
 
     /**

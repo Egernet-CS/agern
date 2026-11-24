@@ -120,7 +120,16 @@ test('an escalated run waits for a human; only the owner can approve, and that m
   const waiting = await (await bob.page.request.get(`${BASE()}/api/runs?status=needs_human`)).json();
   expect(waiting.map((r: { id: string }) => r.id)).toContain(runId);
 
+  // The approver escalated: one click is not enough. The dialog shows its reason; "Don't merge" changes nothing.
   await page.getByRole('button', { name: '✓ Approve & merge' }).click();
+  const confirm = page.getByRole('dialog', { name: 'Merge against the approver\'s advice?' });
+  await expect(confirm).toBeVisible();
+  await expect(confirm.getByRole('note', { name: 'The approver\'s reason' })).toContainText('Fake approver says ESCALATE.');
+  await confirm.getByRole('button', { name: 'Don’t merge' }).click();
+  await expect(confirm).toBeHidden();
+  await expect(pill(page)).toHaveText('needs human');
+  await page.getByRole('button', { name: '✓ Approve & merge' }).click();
+  await confirm.getByRole('button', { name: 'Merge anyway' }).click();
   await expect(pill(page)).toHaveText('merged');
   await expect(page.locator('.pipeline g[aria-label^="needs-human: done, verdict APPROVED"]')).toBeVisible();
   await expect(page.locator('.run-error')).toHaveCount(0);
@@ -184,5 +193,6 @@ test('agent-written summaries, findings and the needs-human reason are rendered 
 
   // Leave no needs-human run behind for later spec files.
   await page.getByRole('button', { name: '✓ Approve & merge' }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Merge anyway' }).click();
   await expect(pill(page)).toHaveText('merged');
 });

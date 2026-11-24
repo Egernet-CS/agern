@@ -1025,6 +1025,7 @@ class Orchestrator(
                 builderClaudeSession = b.claudeSessionId ?: builderClaudeSession
                 builderSessionId = b.session.id
                 builderSummary = b.resultText?.trim() ?: ""
+                withContext(Dispatchers.IO) { submoduleCommitsWarning(root, worktree, home) }?.let { agents.systemEvent(b.session.id, "warn", it) }
                 val ahead = withContext(Dispatchers.IO) { workspaces.git.commitsAhead(worktree, baseRef, workspaces.home(owner.username)) }
                 if (ahead == 0) {
                     // The builder's own words say why (e.g. the issue is blocked on another one); show them with the failure.
@@ -1338,6 +1339,12 @@ class Orchestrator(
             needsHuman(run, owner, reason)
             return
         }
+        submoduleProblem(run, owner, client, pr)?.let { p ->
+            // A failed merge step: once the submodule commit is pushed, a retry of the merge (or an approval) checks again.
+            runs.setFailure(run.id, if (p.code == SubmoduleCheck.MISSING) FailureKind.SUBMODULE_COMMIT_MISSING else FailureKind.STEP, FailedStep.MERGE)
+            needsHuman(run, owner, p.text)
+            return
+        }
         try {
             client.squashMerge(org, prRepo(run), pr, prTitle(run, run.issueTitle))
         } catch (e: Exception) {
@@ -1389,6 +1396,35 @@ class Orchestrator(
     }
 
     /**
+     * Why pull request #[pr] must not be merged because of its submodule pointers (docs/ARCHITECTURE.md §6 "Submodule
+     * pointers"), or null. Every pointer the run's branch moves must name a commit its submodule's remote has. Fails
+     * closed: a check that cannot be made refuses the merge too. Blocking; never throws.
+     */
+    private fun submoduleProblem(run: RunRecord, owner: UserRecord, client: GitHubClient, pr: Int): SubmoduleCheck.Problem? {
+        val unchecked = SubmoduleCheck.Problem(
+            SubmoduleCheck.UNCHECKED,
+            "Submodule pointers not checked: the submodule pointers of pull request ${prRef(run, pr)} could not be compared " +
+                "with its target. Nothing was merged. Approve again (or retry the merge) to check again.",
+        )
+        return try {
+            val branch = run.branch ?: return null
+            val target = run.baseBranch ?: client.getRepo(org, run.repo)?.defaultBranch ?: return unchecked
+            val home = workspaces.home(owner.username)
+            val token = access.githubToken(owner)
+            val links = workspaces.withRepoLock(owner.username, run.repo) {
+                workspaces.git.changedGitlinks(gitDirOf(run, owner.username), target, branch, home, token)
+            } ?: return unchecked.also { log.warn("Run {}: the submodule pointers of {} could not be compared with {}", run.id, branch, target) }
+            SubmoduleCheck.check(
+                links, target, prRef(run, pr), has = { workspaces.git.remoteHasCommit(it.url!!, it.sha, home, token) },
+                onError = { c, e -> log.warn("Run {}: checking submodule {} at {} failed: {}", run.id, c.path, c.sha, e.message) },
+            )
+        } catch (e: Exception) {
+            log.warn("Run {}: checking the submodule pointers failed, not merging: {}", run.id, e.message)
+            unchecked
+        }
+    }
+
+    /**
      * Removes the run's sandbox, then its worktree and its local branch. A merged run's branch always goes (its work is merged); an
      * unmerged one's is kept only if it holds commits that exist nowhere else (never pushed). Blocking.
      */
@@ -1398,7 +1434,36 @@ class Orchestrator(
         val run = runs.get(runId) ?: return
         val owner = users.byId(run.ownerId) ?: return
         // Member worktrees of a workspace run first, then the run's own worktree.
-        bestEffort { workspaces.removeRunCheckout(owner.username, run.repo, run.id, keepUnpushed = !merged) }
+        var bundles = emptyList<dk.egernet.factory.agent.SubmoduleBundle>()
+        bestEffort { bundles = workspaces.removeRunCheckout(owner.username, run.repo, run.id, keepUnpushed = !merged) }
+        if (bundles.isEmpty()) return
+        // Told in the transcript of the run's last builder (docs/ARCHITECTURE.md §6 "Submodule pointers").
+        val builder = runs.stages(runId).filter { it.role == "builder" && it.sessionId != null }.maxByOrNull { it.round }?.sessionId ?: return
+        for (b in bundles) {
+            bestEffort {
+                agents.systemEvent(
+                    builder, "warn",
+                    "Unpushed submodule commits saved: submodule `${b.path}` had ${b.commits} commit(s) up to `${b.head}` that are on " +
+                        "none of its remote branches, and the run's checkout was removed. They are saved in the git bundle " +
+                        "`${b.file}` on the Agern server. To recover them, run `git fetch <bundle>` in a clone of the submodule " +
+                        "(`git -C ${b.path} fetch ${b.file}`) and push `FETCH_HEAD` to a branch of its repository.",
+                )
+            }
+        }
+    }
+
+    /**
+     * The `warn` text for submodules in which the builder committed (docs/ARCHITECTURE.md §6 "Submodule pointers"): in the
+     * run's checkout [root] and its target worktree [worktree] (the same directory outside workspaces); null when none.
+     */
+    private fun submoduleCommitsWarning(root: Path, worktree: Path, home: Path): String? {
+        val found = workspaces.git.unpushedSubmodules(root, home).map { it.path to it.commits } +
+            if (worktree == root) emptyList() else workspaces.git.unpushedSubmodules(worktree, home).map { "${root.relativize(worktree)}/${it.path}" to it.commits }
+        if (found.isEmpty()) return null
+        return "Commits inside submodules: " + found.joinToString(", ") { (path, n) -> "`$path` ($n commit(s))" } +
+            " on none of the submodule's remote branches. Agern pushes only the run's own branch, so these commits are not " +
+            "published, and a pull request whose submodule pointer names them cannot be merged. Revert the submodule change, " +
+            "or push it to the submodule's repository first."
     }
 
     private inline fun bestEffort(block: () -> Unit) {
