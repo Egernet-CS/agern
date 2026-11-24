@@ -32,7 +32,7 @@ class ReleaseSandboxTest {
 
     @AfterTest fun tearDown() {
         hang.clear()
-        world.closeAndReleaseDb()
+        world.close()
     }
 
     private val definition = "image: docker.io/library/eclipse-temurin:21-jdk\nsetup: echo setup\n" +

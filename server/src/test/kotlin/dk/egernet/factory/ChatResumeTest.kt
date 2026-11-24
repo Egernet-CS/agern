@@ -25,7 +25,7 @@ class ChatResumeTest {
         LocalProcessLauncher(bin, "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"),
     )
 
-    @AfterTest fun tearDown() = s.stop()
+    @AfterTest fun tearDown() = s.stopAndReleaseDb()
 
     private fun user(name: String, claude: String): UserRecord {
         val u = s.users.upsertOnLogin(name, name, false)

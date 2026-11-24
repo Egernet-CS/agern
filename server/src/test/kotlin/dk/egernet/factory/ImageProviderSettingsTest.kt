@@ -29,7 +29,7 @@ import kotlin.test.assertTrue
 class ImageProviderSettingsTest {
     private val provider = RecordingImageProvider()
     private val w = TestWorld(twoFactor = false, imageProviders = listOf(provider))
-    @AfterTest fun tearDown() = w.closeAndReleaseDb()
+    @AfterTest fun tearDown() = w.close()
 
     private suspend fun ApplicationTestBuilder.login(user: String, pw: String): HttpClient {
         val c = createClient { install(HttpCookies) }
@@ -141,7 +141,7 @@ class ImageProviderSettingsTest {
             assertEquals(listOf("default"), codex.models)
             assertNull(codex.unavailableReason)
         } finally {
-            plain.closeAndReleaseDb(); fake.closeAndReleaseDb()
+            plain.close(); fake.close()
         }
     }
 
@@ -177,7 +177,7 @@ class ImageProviderSettingsTest {
                 assertEquals(200, alice.save("rec", "rec-1", "rec-good-2").status.value)
             }
         } finally {
-            tw.closeAndReleaseDb()
+            tw.close()
         }
     }
 

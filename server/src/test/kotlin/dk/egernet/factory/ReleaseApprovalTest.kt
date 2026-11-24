@@ -62,11 +62,11 @@ class ReleaseApprovalTest {
     @AfterTest fun tearDown() {
         gates.keys.forEach { gates[it] = true }
         extraServices.forEach { it.stop() }
-        world.close()
+        // The extra services share the world's pool: wait until none of their coroutines uses it before it is closed.
         runBlocking {
-            for (svc in extraServices + s) withTimeoutOrNull(10_000) { svc.scope.coroutineContext[kotlinx.coroutines.Job]!!.join() }
+            for (svc in extraServices) withTimeoutOrNull(10_000) { svc.scope.coroutineContext[kotlinx.coroutines.Job]!!.join() }
         }
-        (s.db.dataSource as java.io.Closeable).close()
+        world.close()
     }
 
     // ------------------------------------------------------------ scripted agents, per issue title
@@ -697,7 +697,7 @@ class ReleaseWorkspaceTest {
     private val s = world.services
     private val alice = world.user("alice")
 
-    @AfterTest fun tearDown() = world.closeAndReleaseDb()
+    @AfterTest fun tearDown() = world.close()
 
     private fun git(dir: java.nio.file.Path, vararg args: String): String {
         val pb = ProcessBuilder(listOf("git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid") + args)

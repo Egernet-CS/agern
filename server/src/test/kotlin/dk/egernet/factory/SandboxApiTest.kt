@@ -29,7 +29,7 @@ class SandboxApiTest {
     private val world = TestWorld(twoFactor = false, sandbox = true)
     private val s = world.services
 
-    @AfterTest fun tearDown() = world.closeAndReleaseDb()
+    @AfterTest fun tearDown() = world.close()
 
     private suspend fun ApplicationTestBuilder.login(user: String, pw: String): HttpClient {
         val c = createClient { install(HttpCookies) }

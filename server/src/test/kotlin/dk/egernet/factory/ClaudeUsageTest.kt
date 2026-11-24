@@ -63,7 +63,7 @@ class ClaudeUsageTest {
                 while (s.scope.coroutineContext[kotlinx.coroutines.Job]!!.children.any { it.isActive }) delay(10)
             }
         }
-        world.closeAndReleaseDb()
+        world.close()
     }
 
     private fun json(r: String) = AppJson.parseToJsonElement(r).jsonObject

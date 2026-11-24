@@ -49,7 +49,7 @@ class CodexLoginTest {
         TestWorld(twoFactor = false, imageProviders = listOf(codex, RecordingImageProvider()) + extra).also { worlds += it }
 
     @AfterTest fun tearDown() {
-        worlds.forEach { it.closeAndReleaseDb() }
+        worlds.forEach { it.close() }
         base.parent.toFile().deleteRecursively()
     }
 

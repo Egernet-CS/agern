@@ -126,7 +126,7 @@ class MigrationGitTest {
             val prompt = world.launcher.byRole("builder").single().spec.prompt!!
             assertTrue(prompt.contains("Database migrations: the pull request merges into `main`."), prompt)
         } finally {
-            world.closeAndReleaseDb()
+            world.close()
         }
     }
 }

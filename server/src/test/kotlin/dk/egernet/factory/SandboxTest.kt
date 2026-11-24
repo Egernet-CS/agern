@@ -32,7 +32,7 @@ import kotlin.test.assertTrue
 class SandboxTest {
     private val worlds = CopyOnWriteArrayList<TestWorld>()
 
-    @AfterTest fun tearDown() = worlds.forEach { it.closeAndReleaseDb() }
+    @AfterTest fun tearDown() = worlds.forEach { it.close() }
 
     private fun world(tweak: (Config) -> Config = { it }) = TestWorld(sandbox = true, tweak = tweak).also { worlds += it }
 

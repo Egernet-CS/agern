@@ -51,7 +51,7 @@ class SandboxMcpEndpointTest {
 
     @AfterTest fun tearDown() {
         server.stop(100, 1000)
-        world.closeAndReleaseDb()
+        world.close()
     }
 
     @Test

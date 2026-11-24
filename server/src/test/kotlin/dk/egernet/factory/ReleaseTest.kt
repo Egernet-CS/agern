@@ -45,8 +45,6 @@ class ReleaseTest {
 
     @AfterTest fun tearDown() {
         world.close()
-        // These tests start no agents, so nothing uses the pool any more: give its connections back to PostgreSQL.
-        (s.db.dataSource as java.io.Closeable).close()
     }
 
     private fun json(r: String) = AppJson.parseToJsonElement(r)

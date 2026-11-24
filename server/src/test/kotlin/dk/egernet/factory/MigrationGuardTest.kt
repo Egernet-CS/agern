@@ -32,8 +32,6 @@ class MigrationGuardTest {
 
     @AfterTest fun tearDown() {
         world.close()
-        runBlocking { withTimeoutOrNull(10_000) { s.scope.coroutineContext[kotlinx.coroutines.Job]!!.join() } }
-        (s.db.dataSource as java.io.Closeable).close()
     }
 
     init {

@@ -71,8 +71,11 @@ class ReleaseScheduleTest {
 
     @AfterTest fun tearDown() {
         extraServices.forEach { it.stop() }
+        // The extra services share the world's pool: wait until none of their coroutines uses it before it is closed.
+        runBlocking {
+            for (svc in extraServices) withTimeoutOrNull(10_000) { svc.scope.coroutineContext[kotlinx.coroutines.Job]!!.join() }
+        }
         world.close()
-        (s.db.dataSource as java.io.Closeable).close()
     }
 
     private fun json(r: String) = AppJson.parseToJsonElement(r)
@@ -439,7 +442,8 @@ class ReleaseScheduleTest {
         val r = release(alice, "demo-app", "1.4")
         val at = later()
         schedule(alice, r, at)
-        world.close()
+        // Shut the first server down, but keep the pool: the restarted one below works on the same database.
+        s.stop()
 
         val restartClock = MutableClock(at.plus(Duration.ofHours(8)))
         val again = Services(s.cfg, s.db, world.github, world.git, world.launcher, clock = restartClock, releaseStarter = starter)
