@@ -7,6 +7,7 @@ import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
 import java.io.BufferedWriter
+import java.net.URI
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.attribute.PosixFilePermissions
@@ -133,19 +134,36 @@ object AgentCommand {
             "GIT_AUTHOR_EMAIL" to authorEmail(id),
             "GIT_COMMITTER_EMAIL" to authorEmail(id),
         )
-        id.githubToken?.let { env.putAll(gitTokenEnvironment(it, gitHost)) }
+        env.putAll(gitAuthEnvironment(id.githubToken, gitHost))
         return env
     }
 
-    /** The part of [gitEnvironment] that authenticates with a GitHub [token] (also used without an agent identity). */
-    fun gitTokenEnvironment(token: String, gitHost: String): Map<String, String> {
-        val basic = Base64.getEncoder().encodeToString("x-access-token:$token".toByteArray())
-        return linkedMapOf(
-            "GIT_CONFIG_COUNT" to "1",
-            "GIT_CONFIG_KEY_0" to "http.$gitHost.extraheader",
-            "GIT_CONFIG_VALUE_0" to "AUTHORIZATION: basic $basic",
-            "GH_TOKEN" to token,
-        )
+    /**
+     * The part of [gitEnvironment] that sets up git's access to [gitHost] (also used without an agent identity):
+     * SSH URLs of that host (`git@<host>:…`, `ssh://git@<host>/…`, common in `.gitmodules`) are rewritten to HTTPS,
+     * since Agern has no SSH key, and with a GitHub [token] HTTPS requests authenticate with it. The rewrite applies
+     * without a token too, so public repositories still work.
+     */
+    fun gitAuthEnvironment(token: String?, gitHost: String): Map<String, String> {
+        val base = gitHost.trimEnd('/') + "/"
+        val config = mutableListOf<Pair<String, String>>()
+        if (token != null) {
+            val basic = Base64.getEncoder().encodeToString("x-access-token:$token".toByteArray())
+            config += "http.$base.extraheader" to "AUTHORIZATION: basic $basic"
+        }
+        runCatching { URI(base).host }.getOrNull()?.takeIf { it.isNotBlank() }?.let { host ->
+            // url.<base>.insteadOf is multi-valued: both prefixes map to the same HTTPS base.
+            config += "url.$base.insteadOf" to "git@$host:"
+            config += "url.$base.insteadOf" to "ssh://git@$host/"
+        }
+        val env = linkedMapOf<String, String>()
+        if (config.isNotEmpty()) env["GIT_CONFIG_COUNT"] = config.size.toString()
+        config.forEachIndexed { i, (key, value) ->
+            env["GIT_CONFIG_KEY_$i"] = key
+            env["GIT_CONFIG_VALUE_$i"] = value
+        }
+        if (token != null) env["GH_TOKEN"] = token
+        return env
     }
 
     private fun authorEmail(id: AgentIdentity) =
