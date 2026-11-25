@@ -69,6 +69,22 @@ jobs:
           docker run --rm -v "$PWD":/src:ro debian:12 \
             bash /src/packaging/deb/smoke-test.sh "/src/build/release/agern_${VERSION}_all.deb"
 
+      # The getting-started manual with this version (scripts/manual.sh): screenshots of the mock app
+      # and the PDF. A failure here stops the release before anything is published. TeX Live is
+      # installed on the runner only (same package list as ci.yml and README.md).
+      - name: Install Chromium (headless shell)
+        working-directory: web
+        run: npx playwright install --with-deps --only-shell chromium
+      - name: Install TeX Live
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends latexmk texlive-latex-base texlive-latex-recommended \
+            texlive-latex-extra texlive-fonts-recommended texlive-pictures lmodern
+      - name: Build the manual
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: scripts/manual.sh "$VERSION"
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -85,4 +101,5 @@ jobs:
             "build/release/agern-$VERSION.tar.gz" \
             "build/release/agern_${VERSION}_all.deb" \
             build/release/install.sh \
-            build/release/SHA256SUMS
+            build/release/SHA256SUMS \
+            "build/manual/agern-manual-$VERSION.pdf"
