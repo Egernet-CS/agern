@@ -17,6 +17,7 @@ import type {
   LoginStep,
   IssueKind,
   Project,
+  ProjectSettings,
   Release,
   ReleaseMode,
   Run,
@@ -89,6 +90,8 @@ export interface Api {
   setProjectIcon(repo: string, file: File): Promise<Project>;
   /** Sets the project's icon from an image file on its default branch (copied once). Admin only; answers the updated project. */
   setProjectIconFromRepository(repo: string, path: string): Promise<Project>;
+  /** Sets the project's merge policy and its reviewers. Admin only; answers the updated project. */
+  setProjectSettings(repo: string, settings: ProjectSettings): Promise<Project>;
   /** Removes the project's icon (also when none is set). Admin only; answers the updated project. */
   deleteProjectIcon(repo: string): Promise<Project>;
   issues(repo: string, state?: 'open' | 'closed' | 'all'): Promise<Issue[]>;

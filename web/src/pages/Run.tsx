@@ -8,6 +8,7 @@ import { approverEscalation, buildNodes, humanSelectable, isFollowUp, latestStag
 import { Prompt } from '../components/chat/Prompt';
 import { PipelineDiagram } from '../components/pipeline/PipelineDiagram';
 import { RetryDialog } from '../components/ui/RetryDialog';
+import { MERGE_POLICY_LABEL } from '../components/ui/mergePolicy';
 import { Dialog, Empty, ErrorBox, KindBadge, Loading, RunStatusPill, Verdict } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
@@ -83,6 +84,14 @@ export function RunPage() {
     setParams(params, { replace: true });
   };
   const isOwner = run.owner.username === me.username;
+  // The merge policy stored on the run when it started (ARCHITECTURE §6 "Merge policy"); `github` runs are never merged by Agern.
+  const policy = run.mergePolicy ?? 'automatic';
+  const onGitHub = policy === 'github';
+  const prLink = run.prUrl ? (
+    <a href={run.prUrl} target="_blank" rel="noreferrer">{run.targetRepo ? `${run.targetRepo}#${run.prNumber}` : `pull request #${run.prNumber}`} ↗</a>
+  ) : (
+    'the pull request'
+  );
   // The approver escalated: merging overrides it, so the owner confirms with its reason in front of them.
   const escalation = approverEscalation(run);
   const advisor = run.conversation.sessionId ? sessionMap.get(run.conversation.sessionId) : undefined;
@@ -135,6 +144,9 @@ export function RunPage() {
             </>
           )}
           <div><dt>branch</dt><dd className="mono">{run.branch ?? '—'}</dd></div>
+          {!run.releaseId && policy !== 'automatic' && (
+            <div><dt>merge policy</dt><dd>{MERGE_POLICY_LABEL[policy]}</dd></div>
+          )}
           {run.baseBranch && (
             <div>
               <dt>base</dt>
@@ -157,15 +169,17 @@ export function RunPage() {
         <div className="rh-actions">
           {run.status === 'needs_human' && isOwner && (
             <>
-              <button
-                className="btn btn--approve"
-                onClick={() => (escalation !== null ? setConfirmApprove(true) : void act('approve'))}
-                disabled={busy !== null || approveHint !== null}
-                aria-describedby={approveHint ? 'approve-hint' : undefined}
-                aria-haspopup={escalation !== null ? 'dialog' : undefined}
-              >
-                {busy === 'approve' ? 'Approving…' : '✓ Approve & merge'}
-              </button>
+              {!onGitHub && (
+                <button
+                  className="btn btn--approve"
+                  onClick={() => (escalation !== null ? setConfirmApprove(true) : void act('approve'))}
+                  disabled={busy !== null || approveHint !== null}
+                  aria-describedby={approveHint ? 'approve-hint' : undefined}
+                  aria-haspopup={escalation !== null ? 'dialog' : undefined}
+                >
+                  {busy === 'approve' ? 'Approving…' : '✓ Approve & merge'}
+                </button>
+              )}
               <button
                 className="btn btn--ghost"
                 onClick={() => {
@@ -175,10 +189,10 @@ export function RunPage() {
               >
                 Talk to the agent
               </button>
-              {approveHint && <span id="approve-hint" className="muted small">{approveHint}</span>}
+              {approveHint && !onGitHub && <span id="approve-hint" className="muted small">{approveHint}</span>}
             </>
           )}
-          {run.status === 'needs_human' && !isOwner && <span className="muted small">Waiting for {run.owner.username} to approve.</span>}
+          {run.status === 'needs_human' && !isOwner && !onGitHub && <span className="muted small">Waiting for {run.owner.username} to approve.</span>}
           {(run.status === 'failed' || run.status === 'cancelled') && isOwner && (
             <button className="btn btn--primary" onClick={() => setRetrying(true)} disabled={busy !== null}>Retry…</button>
           )}
@@ -190,6 +204,31 @@ export function RunPage() {
       {run.error && (
         <div className="run-error" role="alert">
           <Markdown text={`**${run.status === 'needs_human' ? 'Needs a human:' : 'Error:'}** ${run.error}`} />
+        </div>
+      )}
+      {run.status === 'needs_human' && policy === 'owner_approves' && (
+        <div className="notice run-policy" role="note">
+          <div className="notice-text">This project requires the run owner’s approval before every merge.</div>
+        </div>
+      )}
+      {run.status === 'needs_human' && onGitHub && (
+        <div className="notice run-policy" role="note">
+          <div className="notice-text">
+            This project merges on GitHub: Agern does not merge this run. The pull request can be reviewed and merged there.
+          </div>
+        </div>
+      )}
+      {run.status === 'ready' && (
+        <div className="notice run-policy" role="status">
+          <div className="notice-text">
+            <strong>Ready for review on GitHub.</strong>
+            This project merges on GitHub: Agern does not merge. Review and merge {prLink}; this page updates when it is merged or closed.
+          </div>
+        </div>
+      )}
+      {run.status === 'merged' && run.mergedOnGitHub && (
+        <div className="notice run-policy" role="note">
+          <div className="notice-text">{run.mergedBy ? `Merged on GitHub by @${run.mergedBy}` : 'Merged on GitHub'}</div>
         </div>
       )}
       {err && <p className="form-error" role="alert">{err}</p>}

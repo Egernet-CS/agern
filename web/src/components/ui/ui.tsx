@@ -58,6 +58,8 @@ const RUN_TONE: Record<RunStatus, string> = {
   needs_human: 'escalate',
   failed: 'fail',
   cancelled: 'idle',
+  // Passed every reviewer; the pull request waits on GitHub (merge policy `github`). An existing tone, no new colour.
+  ready: 'pass',
 };
 export function RunStatusPill({ status }: { status: RunStatus }) {
   return (
