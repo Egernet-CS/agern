@@ -35,6 +35,12 @@ curl -fsSLO "$base/SHA256SUMS"
 deb=$(grep -o 'agern_[^ ]*_all\.deb' SHA256SUMS)
 curl -fsSLO "$base/$deb"
 \end{lstlisting}
+    If the first \cmd{curl} fails with \texttt{The requested URL returned error: 404}, Agern has no
+    tagged release yet. Take the rolling build of \texttt{main} instead (section~\ref{sec:version}),
+    and repeat the three \cmd{curl} lines with
+\begin{lstlisting}
+base=https://github.com/Egernet-CS/agern/releases/download/main-latest
+\end{lstlisting}
   \item Verify the download. The command must print the package name followed by \texttt{OK}:
 \begin{lstlisting}
 sha256sum --check --ignore-missing SHA256SUMS

@@ -39,6 +39,10 @@ sudo agern upgrade
 sudo agern upgrade --version 1.4.0
 sudo agern upgrade --channel main
 \end{lstlisting}
+  \item If you installed a build of \texttt{main} because there was no release yet
+    (section~\ref{sec:install-deb}), stay on that channel: \cmd{sudo agern upgrade --channel main}.
+    Without a tagged release, a plain \cmd{agern upgrade} fails with
+    \msg{agern: error: download failed: \ldots/releases/latest/download/SHA256SUMS}.
   \item If runs or agents are working, Agern refuses, because a restart fails runs in progress:
     \msg{agern: error: not restarting now, the server is busy: 1 run(s) in progress, 2 agent(s)
     working. Try again later, or use -{}-force (interrupted runs fail)}. Wait, or add
