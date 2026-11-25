@@ -61,7 +61,7 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_WEB_DIR` | unset | Built frontend directory, served with SPA fallback. Unset: the frontend embedded in `agern.jar` (classpath `web/`) is served; with neither, non-API paths answer 404 |
 | `FACTORY_CLAUDE_BIN` | `claude` | Path of the Claude CLI (tests point this at a stub) |
 | `FACTORY_CODEX_BIN` | `codex` | The OpenAI Codex CLI for the image provider `codex` (§4 "Codex login"); a bare name is resolved on `FACTORY_AGENT_PATH`. Optional: without it Codex is listed as unavailable. Tests and the e2e suite point it at `server/src/test/resources/fake-codex` |
-| `FACTORY_PUBLIC_URL` | `http://localhost:8080` | The URL browsers use. Cookie is `Secure` only when it is `https`; mutating requests and WebSocket upgrades with a different `Origin` are rejected (403). Agents reach MCP over loopback (`http://127.0.0.1:<port>/mcp`), not through this URL Text Agern writes on GitHub (comments, pull request bodies) links to its pages only when this is a public address; with an internal one (loopback, a private network, a name without a public domain) it names the page instead, so no internal address is published. |
+| `FACTORY_PUBLIC_URL` | `http://localhost:8080` | The URL browsers use. Cookie is `Secure` only when it is `https`; mutating requests and WebSocket upgrades with a different `Origin` are rejected (403). Agents reach MCP over loopback (`http://127.0.0.1:<port>/mcp`), not through this URL; personal MCP tokens (§7 "Personal tokens") reach `POST /mcp` through it (`<FACTORY_PUBLIC_URL>/mcp`), and its host (plus a non-default port) names the instance in their server name, `initialize` answer and tool descriptions. Text Agern writes on GitHub (comments, pull request bodies) links to its pages only when this is a public address; with an internal one (loopback, a private network, a name without a public domain) it names the page instead, so no internal address is published. |
 | `FACTORY_ALLOWED_ORIGINS` | empty | Extra allowed browser origins, comma list (e.g. `http://localhost:5173` for the Vite dev server) |
 | `FACTORY_MAX_AGENTS_PER_USER` | `8` | Concurrent agent processes per user |
 | `FACTORY_CHAT_IDLE_MINUTES` | `30` | Idle chat processes are stopped and resumed on next input |
@@ -101,6 +101,8 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
   growing delay. A correct password clears the username's counter (not the address's). Failures
   (`login_failed`) and locks (`login_locked`) are written to the audit table. The counters are kept
   in memory (a restart forgets them); behind a reverse proxy all clients share the proxy's address.
+  The MCP endpoint has its own throttle for guessed bearer tokens (§7 "Personal tokens"): 20 unknown
+  bearers from one client address within 15 minutes block personal tokens from that address (429).
 - `os`: a user account on the machine the factory runs on (PAM on Linux; on macOS PAM or
   `dscl . -authonly`). The password must never appear in a process argument list.
 - `ldap`: bind against the directory.
@@ -1835,7 +1837,72 @@ Agents can have graphics made by an image AI the user chose (issue #11). Claude 
 
 The server exposes an MCP endpoint (`POST /mcp`, streamable HTTP, no sessions). Every agent
 process gets its own bearer token in its `--mcp-config`; the token maps to the session and thereby
-to the owner and the repo, and dies with the process.
+to the owner and the repo, and dies with the process. These per-process tokens are kept in memory only
+(`McpRegistry`). Users can also create personal tokens for Claude on their own computer (below).
+
+### Personal tokens
+
+A user can create a personal MCP token in Settings › "Claude on your computer" and register Agern as an HTTP MCP
+server in Claude Code on their own computer (`claude mcp add --transport http <name> <FACTORY_PUBLIC_URL>/mcp
+--header "Authorization: Bearer <token>"`). The token acts as that user in one project.
+
+- *Format and storage.* `agern_pat_` followed by 32 random bytes (URL-safe base64, 256 bits). Table `mcp_tokens`
+  (migration V23) holds `user_id`, `repo`, `name`, `created_at`, `expires_at` (null: never), `last_used_at`,
+  `revoked_at` and `token_hash` = SHA-256 (hex) of the whole token — never the token itself. A salt or a slow hash
+  would add nothing with 256 random bits; lookup is by hash equality. The token is shown exactly once, in the answer
+  to its creation (`Cache-Control: no-store`); it is never logged, never written to `auth_audit` and never returned
+  again. Creating one needs a full (2FA) web session; `/mcp` ignores cookies.
+- *Scope.* One user, one project (the token's `repo`), and the tools `McpRegistry.PERSONAL_TOOLS`: the chat tools
+  without `factory_generate_image`. Calls behave as for the chat agent of that user in that project, with the same
+  permission rules (the same service methods are called): `factory_approve_run` and `factory_send_to_agent` only for
+  the user's own runs, `factory_approve_release` only for their own releases, `factory_start_run` without a Claude
+  credential answers `Register a Claude credential in Settings first`. There is no session: runs started with a
+  personal token have no `startedBySessionId`, messages to agents are recorded with `origin: "direct"`, software
+  requests have no session. `factory_approve_run` and `factory_cancel_run` refuse a run of another project (`Run
+  belongs to another project`), like `factory_get_run`. Any other tool (sandbox, screenshot, image) is refused as
+  `Tool <name> is not available to this agent`.
+- *Why no image tool.* `factory_generate_image` belongs to an agent session: files are written on the server for
+  that agent, the result is offered for selection in the chat, and the budget is per chat message. A local Claude
+  could not read the returned server path.
+- *Validity, checked on every request.* The row exists and is not revoked; `expires_at` is null or after now; the user
+  row still exists (it cascades on delete); and `Access.canSee(user, repo)` holds. Visibility comes from the user's own
+  GitHub token and is cached for 60 s, so losing GitHub access takes effect within a minute; removing the GitHub
+  token in Settings invalidates the cache, so it takes effect at once. A refused token gets 401 with JSON-RPC error
+  `-32001` and `This token was revoked`, `This token has expired` or `The token's user can no longer see <org>/<repo>`;
+  a missing bearer or one that matches nothing gets `Unauthorized`. A used token's `last_used_at` is updated at most
+  once a minute.
+- *Revocation and expiry.* The user revokes their own tokens in Settings, an admin anyone's in Admin; revoking takes
+  effect with the next request. Expired tokens stay listed (marked expired) until revoked. Revoked rows are kept for
+  30 days, so a stale client configuration is still "known" and does not count as guessing, then deleted at startup.
+  At most 50 tokens that are not revoked per user; names are unique per user and project (case-insensitive).
+- *Resolution order and throttle.* A live per-process token is accepted first and is never throttled, so a block on
+  `127.0.0.1` cannot stop agents. Otherwise a blocked client address gets 429 with `Retry-After: <seconds>` and
+  `Too many failed attempts. Try again after <ISO time>.` before the token is looked up. A failure counts only when a
+  bearer was sent and matches neither a per-process token nor any stored row (revoked and expired ones are known);
+  20 counted failures from one address (the TCP peer) within 15 minutes block it until the oldest leaves the window.
+  The failure that starts a block writes `mcp_token_locked` to `auth_audit` (with `remote`) and a WARN line. State is
+  in memory; behind a reverse proxy all clients share the proxy's address, as for logins (`X-Forwarded-For` is not
+  trusted).
+- *Identification.* `instance` is the host of `FACTORY_PUBLIC_URL` plus `:<port>` when not the default. The suggested
+  server name (`McpIdentity.serverName`) is `<instance>-<repo>` in lower case with every run of other characters than
+  `[a-z0-9]` replaced by `-`, prefixed with `agern-` unless it starts with `agern`, at most 64 characters, e.g.
+  `agern-example-agern`. For a personal token `initialize` answers `serverInfo { name: <server name>, title: "Agern ·
+  <org>/<repo> (<instance>)", version }` and instructions naming the public URL, the project and the user, and every
+  tool description in `tools/list` is prefixed with `[<org>/<repo> on <instance>] `. So several Agern instances and
+  projects can be registered side by side in one Claude. Per-process tokens keep `serverInfo.name: "agern"` and the
+  unprefixed descriptions.
+- *Attribution.* Every `tools/call` with a personal token writes one INFO log line with the tool, token id and name,
+  username, repo and outcome (`ok` / `error`) — never the token, its hash or the arguments. Creation and revocation
+  are written to `auth_audit` as `mcp_token_created` and `mcp_token_revoked` (detail `"<name>" for <repo>`, plus ` by
+  admin <username>` when an admin revokes another user's token).
+- *Transport.* Personal tokens reach `/mcp` through `FACTORY_PUBLIC_URL` (a reverse proxy in front is fine; the proxy
+  must pass `POST /mcp` and not buffer its event streams). Requests with an `Origin` header are still refused (403):
+  browsers may not call the endpoint. Streaming, progress notifications and the 405 answers below apply unchanged.
+  Authentication and the throttle complete before anything is streamed.
+- *Workspaces.* For a workspace project the token is bound to the workspace's own repository, whose visibility it
+  requires; individual tools keep their member-visibility rules.
+
+### Transport
 
 A request answered within 5 s gets one `application/json` body (notifications: 202; auth and parse errors their own
 status). A slower one from a client whose `Accept` contains `text/event-stream` is answered as an event stream, for
@@ -1849,10 +1916,13 @@ ends the writing (logged at debug level); a sandbox command the call started run
 bearer check happen before anything is streamed. `GET /mcp` and `DELETE /mcp` answer 405 (no server-initiated
 streams, no sessions, no resumption).
 
+### Tools
+
 Tools: `factory_list_issues`, `factory_get_issue`, `factory_create_issue`, `factory_start_run`,
 `factory_list_runs`, `factory_get_run`, `factory_approve_run`, `factory_cancel_run`,
 `factory_send_to_agent`, `factory_request_software`, `factory_list_releases`, `factory_create_release`,
-`factory_assign_issues`, `factory_unassign_issues`, `factory_approve_release`. Pipeline-stage agents get only `factory_get_issue`
+`factory_assign_issues`, `factory_unassign_issues`, `factory_approve_release`. Personal tokens get these
+(`PERSONAL_TOOLS`, see above). Pipeline-stage agents get only `factory_get_issue`
 and `factory_request_software`; with sandboxes switched on (`FACTORY_SANDBOX` not `off`) the builder also
 gets `factory_sandbox_info`, `factory_sandbox_exec` and `factory_sandbox_wait`; the `ux` and `ui-design` reviewers also get
 `factory_attach_screenshot`. The chat agent, the spec-writer and the builder also get `factory_generate_image`. The advisor (§6 "Conversation at needs human") gets the same two stage tools, bound to its
@@ -2218,6 +2288,14 @@ type ClaudeUsage = { credentialKind: 'oauth_token' | 'api_key' | null;
 type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   requestedBy: string; sessionId: string | null;
   status: 'pending' | 'installed' | 'denied'; note: string | null; createdAt: string; resolvedAt: string | null };
+
+type McpToken = { id: string; name: string; repo: string;            // a personal MCP token (§7); never the secret
+  owner: { username: string; displayName: string }; createdAt: string;
+  lastUsedAt: string | null; expiresAt: string | null;               // null: never used / never expires
+  expired: boolean };
+type CreatedMcpToken = { token: McpToken; secret: string;            // secret: shown once, `agern_pat_…`
+  mcpUrl: string;                                                    // FACTORY_PUBLIC_URL without trailing / + "/mcp"
+  serverName: string };                                              // suggested name in Claude (§7 "Personal tokens")
 ```
 
 ### Endpoints
@@ -2232,6 +2310,11 @@ type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
 | `POST /api/auth/totp/enroll` | `{ code }` → `LoginStep` | pending session in `enroll`; `done` step carries `recoveryCodes` |
 | `POST /api/me/recovery-codes` | `{ code }` → `{ recoveryCodes: string[] }` | regenerate; needs a current TOTP code |
 | `POST /api/admin/users/{id}/reset-2fa` | → `User` | admin |
+| `GET /api/me/mcp-tokens` | → `McpToken[]` | the caller's personal MCP tokens that are not revoked, newest first; expired ones included (`expired: true`) |
+| `POST /api/me/mcp-tokens` | `{ name, repo, expiresInDays }` → `CreatedMcpToken` | full session. `name` trimmed, 1–60 characters, no control characters (400); unique per user and project, case-insensitive (409 `mcp_token_name_taken`); `repo` visible to the caller (404); `expiresInDays` null or 1…366 (400); at most 50 active tokens (409 `too_many_mcp_tokens`). `Cache-Control: no-store`; the only answer that carries the secret. Audit `mcp_token_created` |
+| `DELETE /api/me/mcp-tokens/{id}` | → `McpToken[]` | revokes one of the caller's tokens (404 for an unknown, another user's or an already revoked one); answers the updated list. Audit `mcp_token_revoked` |
+| `GET /api/admin/mcp-tokens` | → `McpToken[]` | admin. Every user's tokens that are not revoked, newest first |
+| `DELETE /api/admin/mcp-tokens/{id}` | → `McpToken[]` | admin. Revokes any token (404 as above); answers the updated full list. Audit `mcp_token_revoked … by admin <username>` for another user's token |
 | `POST /api/auth/logout` | → 204 | |
 | `GET /api/me` | → `User` | 401 when not logged in |
 | `PUT /api/me/claude-credential` | `{ kind, value }` → `User` | clears the caller's recorded limit windows (spend is kept) and sends them a `usage` frame |

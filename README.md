@@ -56,6 +56,10 @@ Models per role are a setting. The details are in [`docs/ARCHITECTURE.md`](docs/
   can watch; sessions owned by someone else are read-only.
 - **Agents can use the factory.** The chat agent gets factory tools over MCP (list and create issues,
   start, approve and cancel runs), and `/factory run|status|approve|cancel|retry` works in the chat.
+- **Claude on your own computer.** Create a personal MCP token in Settings and add Agern as an MCP
+  server in Claude Code on your laptop: it gets the chat agent's factory tools (issues, runs, releases) in
+  one project, acting as you. Tokens are stored hashed, can expire and can be revoked at any time
+  ([below](#use-agern-from-claude-code-on-your-computer)).
 - **Generated images.** Each person can register an image AI under Settings: OpenAI or Google Gemini
   with their own API key and model, or OpenAI Codex signed in with their own ChatGPT account. When a request or issue asks for an icon, illustration or other graphics,
   the chat agent, spec-writer and builder have them generated on the server with the owner's key; chat
@@ -225,6 +229,49 @@ All configuration is `FACTORY_*` environment variables, read from `/etc/agern/ag
 service. Every variable is described in [`docs/ARCHITECTURE.md` §3](docs/ARCHITECTURE.md#3-configuration-environment-variables)
 and annotated in [`.env.example`](.env.example). The file is plain `KEY=value` lines (no shell
 expansion).
+
+## Use Agern from Claude Code on your computer
+
+Claude Code on your own computer can use Agern's factory tools — list and create issues, start, follow,
+approve and cancel runs, message a running builder, plan and approve releases — in one project, as you,
+with the same permission rules as the chat agent (no image generation).
+
+1. In Agern, open **Settings › Claude on your computer**, give the token a name (e.g. `laptop`), pick the
+   project and an expiry, and click **Create token**.
+2. The token is shown **once**, inside a ready-made command. Adjust the server name if you like and copy the
+   command into a terminal on your computer:
+
+   ```sh
+   claude mcp add --transport http agern-example-agern https://agern.example/mcp \
+     --header "Authorization: Bearer agern_pat_…"
+   ```
+
+3. Check it with `claude mcp list` (the server should show as connected), then ask Claude, e.g. "list the open
+   issues in Agern".
+
+Revoke a token in Settings when you no longer need it (an admin can revoke anyone's under Admin); it stops
+working at once. The proxy in front of Agern must pass `POST /mcp` unbuffered
+([docs/INSTALL-LINUX.md](docs/INSTALL-LINUX.md), "TLS").
+
+**Several servers and projects.** Each token covers one project on one Agern, so register one MCP server per
+project. The suggested names (`agern-<host>-<project>`) differ per instance and project, and each server tells
+Claude which Agern and project it acts on, so they can sit side by side — e.g. two projects on
+`agern.example` and one on a second instance, `lab`:
+
+```sh
+claude mcp add --transport http agern-example-agern https://agern.example/mcp \
+  --header "Authorization: Bearer agern_pat_…"
+claude mcp add --transport http agern-example-website https://agern.example/mcp \
+  --header "Authorization: Bearer agern_pat_…"
+claude mcp add --transport http agern-lab-internal-tools https://lab/mcp \
+  --header "Authorization: Bearer agern_pat_…"
+claude mcp list
+```
+
+Every tool description starts with its project and instance (e.g. `[Egernet-CS/website on agern.example]`),
+so Claude picks the server whose project you mean. See
+[`docs/ARCHITECTURE.md` §7](docs/ARCHITECTURE.md#7-chat-agent--factory-mcp) for how tokens are stored,
+checked and throttled.
 
 ## Operating
 
