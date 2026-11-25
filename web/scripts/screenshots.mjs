@@ -205,7 +205,7 @@ await shot('30-chat-attachment', D, async (p) => {
 }, { element: '.panel--chat' });
 
 // Runs.
-await shot('31-run-merged', D, async (p) => projectRun(p, '/p/design-system', 'merged', 'Dark theme tokens'), { full: true });
+await shot('31-run-merged', D, async (p) => projectRun(p, '/p/design-system', 'merged', 'Dark theme tokens'));
 await shot('32-run-reviewer-screenshots', D, async (p) => {
   await projectRun(p, '/p/web-shop', 'merged', 'Upgrade Ktor');
   await stageNode(p, 'ux').click();
@@ -234,6 +234,11 @@ await shot('35-run-retry', D, async (p) => {
   await p.waitForSelector('dialog[open], [role="dialog"]');
   await p.waitForTimeout(600);
 });
+
+// Run pages without their long transcripts: the head and the diagram fill the viewport.
+await shot('50-run-reviewing', D, async (p) => firstRunLink(p, 'Saved carts'));
+await shot('51-run-needs-human', D, async (p) => firstRunLink(p, 'new provider'));
+await shot('52-run', 'phone', async (p) => firstRunLink(p, 'Saved carts'));
 
 // Releases.
 await shot('36-project-releases', D, async (p) => {
