@@ -91,12 +91,12 @@ fi
 #   \screenshot[<width>]{<file without .png>}{<caption>}{<label>}
 SHOT_LINES=$(grep -rhE '^[[:space:]]*\\(screenshot|phoneshot)\b' "$SRC" --include='*.tex' || true)
 [ -n "$SHOT_LINES" ] || die "no \\screenshot in $SRC"
-bad=$(printf '%s\n' "$SHOT_LINES" | grep -vE '^[[:space:]]*\\(screenshot|phoneshot)(\[[^]]*\])?\{[^}]+\}.*\{[A-Za-z0-9:_-]+\}[[:space:]]*(%.*)?$' || true)
+bad=$(printf '%s\n' "$SHOT_LINES" | grep -vE '^[[:space:]]*\\(screenshot|phoneshot)(\[[^]]*\])?\{[^}]+\}.*\}\{[A-Za-z0-9:_-]+\}[[:space:]]*(%.*)?$' || true)
 [ -z "$bad" ] || die "write each \\screenshot on one line, ending with its label:
 $bad"
 FIGURES=$(printf '%s\n' "$SHOT_LINES" | sed -E 's/^[[:space:]]*\\(screenshot|phoneshot)(\[[^]]*\])?\{([^}]+)\}.*/\3/' | sort -u)
 # (A trailing comment is dropped; an escaped \% in a caption is not a comment.)
-LABELS=$(printf '%s\n' "$SHOT_LINES" | sed -E 's/([^\\])%.*$/\1/; s/[[:space:]]+$//; s/.*\{([A-Za-z0-9:_-]+)\}$/\1/' | sort)
+LABELS=$(printf '%s\n' "$SHOT_LINES" | sed -E 's/([^\\])%.*$/\1/; s/[[:space:]]+$//; s/.*\}\{([A-Za-z0-9:_-]+)\}$/\1/' | sort)
 dups=$(printf '%s\n' "$LABELS" | uniq -d)
 [ -z "$dups" ] || die "screenshot labels used twice: $(printf '%s' "$dups" | tr '\n' ' ')"
 REFS=$(grep -rhoE '\\(ref|autoref|cref|Cref|pageref|nameref)\{fig:[A-Za-z0-9:_-]+\}' "$SRC" --include='*.tex' |
