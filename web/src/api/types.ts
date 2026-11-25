@@ -245,6 +245,22 @@ export type SessionStatus = 'starting' | 'running' | 'idle' | 'done' | 'failed' 
 
 export type Owner = { username: string; displayName: string };
 
+/** A personal MCP token (docs/ARCHITECTURE.md §7 "Personal tokens"); never carries the secret. */
+export type McpToken = {
+  id: string;
+  name: string;
+  repo: string;
+  owner: Owner;
+  createdAt: string;
+  lastUsedAt: string | null;
+  /** null: never expires. */
+  expiresAt: string | null;
+  expired: boolean;
+};
+
+/** The answer to creating a token: the only place the secret ever appears. */
+export type CreatedMcpToken = { token: McpToken; secret: string; mcpUrl: string; serverName: string };
+
 export type AgentSession = {
   id: string;
   repo: string;

@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, Navigate } from 'react-router-dom';
-import { api, ApiError, type RunningSandbox, type Settings, type SoftwareRequest, type StageRole, type User } from '../api';
+import { api, ApiError, type McpToken, type RunningSandbox, type Settings, type SoftwareRequest, type StageRole, type User } from '../api';
 import { shortHash, shortImage } from '../components/sandbox/SandboxBits';
+import { McpTokenTable, RevokeMcpTokenDialog } from '../components/ui/McpTokens';
 import { Dialog, ErrorBox, Loading, Notice } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
@@ -27,6 +28,7 @@ export function AdminPage() {
       </div>
       <SandboxesCard />
       <UsersCard />
+      <McpTokensCard />
     </div>
   );
 }
@@ -435,6 +437,31 @@ function UsersCard() {
           <button className="btn btn--danger" onClick={() => void reset()} disabled={busy}>{busy ? 'Resetting…' : 'Reset 2FA'}</button>
         </div>
       </Dialog>
+    </section>
+  );
+}
+
+/** Every user's personal MCP tokens (docs/ARCHITECTURE.md §7 "Personal tokens"), with revoke. */
+function McpTokensCard() {
+  const q = useAsync(() => api.adminMcpTokens(), []);
+  const [target, setTarget] = useState<McpToken | null>(null);
+  return (
+    <section className="card settings-card" aria-labelledby="mt-h">
+      <header className="sc-head"><h2 id="mt-h">Personal MCP tokens</h2><span className="muted small">{q.data?.length ?? ''} active</span></header>
+      <p className="muted small">Tokens users created to reach this Agern from Claude on their own computers. Each acts as its user in one project.</p>
+      {q.loading && !q.data && <Loading />}
+      {q.error && <ErrorBox error={q.error} retry={q.reload} />}
+      {q.data && q.data.length === 0 && <p className="muted">No personal tokens.</p>}
+      {q.data && q.data.length > 0 && <McpTokenTable tokens={q.data} showUser onRevoke={setTarget} />}
+      <RevokeMcpTokenDialog
+        target={target}
+        admin
+        onClose={() => setTarget(null)}
+        revoke={async (t) => {
+          const left = await api.adminRevokeMcpToken(t.id);
+          q.setData(() => left);
+        }}
+      />
     </section>
   );
 }
