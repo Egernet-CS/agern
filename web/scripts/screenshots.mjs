@@ -38,11 +38,13 @@ const HIDE_MOCK_FLAG = () => {
 
 /**
  * One screenshot. Options: `full` (the whole page), `element` (a selector: only that element, via
- * locator.screenshot()), `clip` ({ x, y, width, height } in CSS pixels of the viewport).
+ * locator.screenshot()), `clip` ({ x, y, width, height } in CSS pixels of the viewport), `height` (a taller
+ * viewport, so that a tall element fits without the sticky top bar covering part of it).
  */
-async function shot(name, size, fn, { full = false, element = null, clip = null } = {}) {
+async function shot(name, size, fn, { full = false, element = null, clip = null, height = null } = {}) {
   if (only && !name.includes(only)) return;
-  const ctx = await browser.newContext({ viewport: sizes[size], deviceScaleFactor: 2, reducedMotion: 'no-preference' });
+  const viewport = height ? { ...sizes[size], height } : sizes[size];
+  const ctx = await browser.newContext({ viewport, deviceScaleFactor: 2, reducedMotion: 'no-preference' });
   await ctx.addInitScript(HIDE_MOCK_FLAG);
   const page = await ctx.newPage();
   const errors = [];
@@ -178,13 +180,13 @@ const D = 'desktop';
 
 // Settings, card by card.
 await shot('24-settings-fresh', D, go('/settings?mock=fresh'));
-await shot('25-settings-claude', D, go('/settings?mock=fresh'), { element: '#claude' });
-await shot('26-settings-github', D, go('/settings'), { element: '#github' });
-await shot('27-settings-images', D, go('/settings'), { element: '#images' });
+await shot('25-settings-claude', D, go('/settings?mock=fresh'), { element: '#claude', height: 2600 });
+await shot('26-settings-github', D, go('/settings'), { element: '#github', height: 2600 });
+await shot('27-settings-images', D, go('/settings'), { element: '#images', height: 2600 });
 await shot('28-settings-models', D, async (p) => {
   await go('/settings')(p);
   await p.waitForSelector('#models .pref-grid');
-}, { element: '#models' });
+}, { element: '#models', height: 2600 });
 
 // The project page: the icon menu (admins) and a chat message with an attachment.
 await shot('29-project-icon', D, async (p) => {
