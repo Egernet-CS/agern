@@ -310,7 +310,29 @@ data class RunDto(
     /** A workspace run: the member repository and directory it changes; null otherwise. */
     val targetRepo: String? = null,
     val targetDirectory: String? = null,
+    /** The checks on the pull request's head commit as last evaluated before a merge; null until the first evaluation. */
+    val checks: RunChecksDto? = null,
 )
+
+/**
+ * The checks a run's merge was decided on (docs/ARCHITECTURE.md §6 "Checks before a merge"). [state] is a
+ * [ReleaseChecksState]; [items] are the checks that have not passed (at most [MAX_ITEMS]); [waitingSince] and [deadline]
+ * are set only while the run is `waiting_for_checks`; [overriddenBy] / [overriddenAt] when the owner merged anyway.
+ * Names, details and URLs come from GitHub and are untrusted; [RunCheckItemDto.url] is only ever an `https://` URL.
+ */
+@Serializable
+data class RunChecksDto(
+    val state: String, val sha: String, val detail: String, val items: List<RunCheckItemDto> = emptyList(),
+    val waitingSince: String? = null, val deadline: String? = null,
+    val overriddenBy: String? = null, val overriddenAt: String? = null,
+) {
+    companion object {
+        const val MAX_ITEMS = 50
+    }
+}
+
+/** One check that has not passed: [state] `failed` (with its [conclusion]) or `pending`. */
+@Serializable data class RunCheckItemDto(val name: String, val state: String, val conclusion: String? = null, val url: String? = null)
 
 /** Ways to retry a failed run (docs/ARCHITECTURE.md §6 "Retrying a run"). */
 object RetryMode {
@@ -335,6 +357,11 @@ object FailureKind {
     const val STEP = "step"
     /** The merge was refused: a submodule pointer names a commit its remote does not have (the run needs a human). */
     const val SUBMODULE_COMMIT_MISSING = "submodule_commit_missing"
+    /**
+     * The merge was not made because the checks on the pull request's head commit failed, did not finish within the
+     * time limit or could not be read (docs/ARCHITECTURE.md §6 "Checks before a merge").
+     */
+    const val CHECKS = "checks"
     const val OTHER = "other"
 
     /**
@@ -666,7 +693,12 @@ object RunStatus {
     const val QUEUED = "queued"; const val SPEC = "spec"; const val BUILDING = "building"
     const val REVIEWING = "reviewing"; const val APPROVING = "approving"; const val MERGED = "merged"
     const val NEEDS_HUMAN = "needs_human"; const val FAILED = "failed"; const val CANCELLED = "cancelled"
-    val ACTIVE = setOf(QUEUED, SPEC, BUILDING, REVIEWING, APPROVING, NEEDS_HUMAN)
+    /**
+     * Approved, but the checks on the pull request's head commit have not passed yet: merges by itself when they do
+     * (docs/ARCHITECTURE.md §6 "Checks before a merge"). Survives a restart, like [NEEDS_HUMAN].
+     */
+    const val WAITING_FOR_CHECKS = "waiting_for_checks"
+    val ACTIVE = setOf(QUEUED, SPEC, BUILDING, REVIEWING, APPROVING, WAITING_FOR_CHECKS, NEEDS_HUMAN)
     val TERMINAL = setOf(MERGED, FAILED, CANCELLED)
     val ALL = ACTIVE + TERMINAL
 }

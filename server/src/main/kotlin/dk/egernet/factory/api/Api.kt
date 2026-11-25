@@ -124,6 +124,7 @@ private suspend fun ApplicationCall.retryReq(): dk.egernet.factory.RetryReq {
 }
 @Serializable data class CreateSessionReq(val model: String? = null)
 @Serializable data class TalkReq(val text: String = "")
+@Serializable data class MergeAnywayReq(val headSha: String = "")
 @Serializable data class InputReq(val text: String = "", val attachmentIds: List<String> = emptyList())
 @Serializable data class ResolveReq(val status: String, val note: String? = null)
 @Serializable data class ApproveSandboxReq(val sha256: String)
@@ -664,6 +665,13 @@ private fun Route.runRoutes(s: Services) {
         call.respondStoredFile(bytes, m.mediaType, "inline", name)
     }
     post("/runs/{id}/approve") { call.respond(s.factory.approveRun(call.requireUser(s), uuidParam("id"))) }
+    // "Merge anyway" despite checks that have not passed (docs/ARCHITECTURE.md §6 "Checks before a merge"): owner only.
+    post("/runs/{id}/merge-anyway") {
+        val u = call.requireUser(s)
+        val id = uuidParam("id")
+        val req = call.receive<MergeAnywayReq>()
+        call.respond(s.factory.mergeAnywayRun(u, id, req.headSha))
+    }
     post("/runs/{id}/cancel") { call.respond(s.factory.cancelRun(call.requireUser(s), uuidParam("id"))) }
     // The conversation while a run needs a human (docs/ARCHITECTURE.md §6 "Conversation at needs human").
     post("/runs/{id}/conversation") {
