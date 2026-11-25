@@ -33,6 +33,7 @@ import dk.egernet.factory.db.SandboxApprovalStore
 import dk.egernet.factory.sandbox.PodmanRuntime
 import dk.egernet.factory.sandbox.SandboxManager
 import dk.egernet.factory.sandbox.SandboxRuntime
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -73,8 +74,17 @@ class Services(
     val releaseModePolicy: dk.egernet.factory.pipeline.ReleaseModePolicy = dk.egernet.factory.pipeline.ReleaseModePolicy.ALLOW_ALL,
     /** The image providers offered in Settings; null = OpenAI and Gemini (plus the fake one in fake-GitHub mode). Tests inject fakes. */
     imageProviders: List<dk.egernet.factory.images.ImageProvider>? = null,
+    /** Called with every exception that escapes a background coroutine of [scope], after it is logged. Tests record them. */
+    onBackgroundFailure: ((Throwable) -> Unit)? = null,
 ) {
-    val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    /**
+     * Background work of the server. A failure that escapes one of its coroutines is logged (instead of going to the
+     * thread's default handler) and does not cancel the others.
+     */
+    val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + CoroutineExceptionHandler { _, e ->
+        LoggerFactory.getLogger("dk.egernet.factory").error("A background task failed", e)
+        runCatching { onBackgroundFailure?.invoke(e) }
+    })
     val box = SecretBox(cfg.masterKey)
     val users = UserStore(db)
     val webSessions = WebSessionStore(db)

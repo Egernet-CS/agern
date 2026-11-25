@@ -2792,7 +2792,11 @@ and `E2E_DB_HOST`/`E2E_DB_HOST_PORT`. A container is fine there: the no-Docker r
 One worker and no retries — the specs share one server and build on each other's state, and a flaky
 check would block Agern's automatic release merges, which wait for every check (§6 "Releases"). Gradle,
 npm and Playwright's Chromium headless shell are cached; on failure the HTML report and the traces are
-uploaded as the artifact `playwright-report`. `publish-main` needs every job.
+uploaded as the artifact `playwright-report`. A coroutine of `Services.scope` that fails logs its exception at
+ERROR (it never reaches the thread's default handler); in the server tests `TestWorld.close()` then fails the test
+that owns those services, so the failure is reported by its culprit instead of poisoning a later test. When the
+server job fails, its Gradle test report and XML results are uploaded as the artifact `server-test-report`.
+`publish-main` needs every job.
 
 **Release artifact.** One self-contained `agern.jar` (server with the built frontend embedded on
 the classpath) — the host needs only Java 17 and PostgreSQL. `FACTORY_WEB_DIR` overrides the

@@ -2,6 +2,8 @@ package dk.egernet.factory
 
 import com.zaxxer.hikari.HikariDataSource
 import dk.egernet.factory.db.Db
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -67,5 +69,26 @@ class TestDbLeakTest {
         }
         val db = TestDb.fresh()
         (db.dataSource as java.io.Closeable).close()
+    }
+
+    @Test
+    fun `a failed background coroutine fails the test that owns the services, after the pool is closed`() {
+        val pools = TestDb.openPools()
+        val world = TestWorld(twoFactor = false)
+        runBlocking { world.services.scope.launch { error("boom") }.join() }
+        assertTrue(world.services.scope.coroutineContext[kotlinx.coroutines.Job]!!.isActive, "the scope survives the failure")
+        val e = assertFailsWith<AssertionError> { world.close() }
+        assertTrue("boom" in e.message.orEmpty(), e.message)
+        assertEquals("boom", e.cause?.message)
+        assertEquals(pools, TestDb.openPools())
+        assertTrue((world.services.db.dataSource as HikariDataSource).isClosed)
+    }
+
+    @Test
+    fun `a world without background failures closes without throwing`() {
+        val world = TestWorld(twoFactor = false)
+        runBlocking { world.services.scope.launch { world.user("alice") }.join() }
+        world.close()
+        assertTrue(world.backgroundFailures.isEmpty())
     }
 }

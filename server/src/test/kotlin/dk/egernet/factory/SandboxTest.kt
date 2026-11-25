@@ -5,6 +5,8 @@ import dk.egernet.factory.mcp.McpRegistry
 import dk.egernet.factory.sandbox.ExecResult
 import dk.egernet.factory.sandbox.SandboxDefinitions
 import dk.egernet.factory.sandbox.SandboxManager
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonObject
@@ -876,6 +878,7 @@ class SandboxTest {
         val inHang = CountDownLatch(1)
         val stopped = CountDownLatch(1)
         val inHang2 = CountDownLatch(1)
+        val released = CountDownLatch(1)
         val a = linkedMapOf<String, ToolAnswer>()
         var runId: UUID? = null
         script(w) { p ->
@@ -893,7 +896,7 @@ class SandboxTest {
             do { next = execBg(w, p, "hang 2"); if (next.isError) Thread.sleep(20) } while (next.isError && next.text.startsWith("A command"))
             a["next"] = next
             inHang2.countDown()
-            a["afterRelease"] = wait(w, p, next.str("handle"))
+            released.await(10, TimeUnit.SECONDS)
             a["released"] = wait(w, p, next.str("handle"), 0)
             "ok"
         }
@@ -907,7 +910,14 @@ class SandboxTest {
         stopped.countDown()
         assertTrue(inHang2.await(10, TimeUnit.SECONDS))
         waitFor { rt.execs.count { it.second == "hang 2" } == 1 }
-        w.services.sandboxes.releaseNow(run.id)
+        // Started undispatched, the wait has reached its suspension point (awaiting the command's result) when async returns.
+        val afterRelease = runBlocking {
+            val waiting = async(start = CoroutineStart.UNDISPATCHED) { w.services.sandboxes.wait(run.id, a["next"]!!.str("handle"), null) }
+            assertTrue(waiting.isActive, "the wait is suspended on the running command")
+            w.services.sandboxes.releaseNow(run.id)
+            waiting.await()
+        }
+        released.countDown()
         hang2.countDown()
         assertEquals(0, w.services.sandboxes.inUse())
         assertTrue(rt.containers.isEmpty() && rt.networks.isEmpty(), rt.calls.toString())
@@ -925,8 +935,8 @@ class SandboxTest {
             assertTrue(a[k]!!.isError && a[k]!!.text.startsWith("An admin stopped this run's sandbox while the command ran"), "$k: ${a[k]!!.text}")
         }
         assertFalse(a["next"]!!.isError, a["next"]!!.text)
-        assertTrue(a["afterRelease"]!!.isError && a["afterRelease"]!!.text == "The run's sandbox was removed while the command ran (the run ended).",
-            a["afterRelease"]!!.text)
+        assertTrue(afterRelease.isError && afterRelease.text == "The run's sandbox was removed while the command ran (the run ended).",
+            afterRelease.text)
         assertTrue(a["released"]!!.isError && a["released"]!!.text.startsWith("This run has no sandbox"), a["released"]!!.text)
         assertEquals(0, w.services.sandboxes.inUse())
     }

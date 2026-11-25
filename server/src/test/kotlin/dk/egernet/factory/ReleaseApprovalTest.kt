@@ -27,6 +27,7 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonObject
@@ -111,11 +112,16 @@ class ReleaseApprovalTest {
 
     private fun start(id: UUID, by: UserRecord = alice) = runBlocking { s.releases.start(by, id) }
 
+    /**
+     * Polls until [cond] holds for release [id]. Each read takes the release's mutex of [services]: every state change of a
+     * release runs under it, and an evaluation writes its result in several statements, so an unlocked read could see
+     * one halfway (e.g. the pull request recorded but the old notice not cleared yet).
+     */
     private fun awaitRelease(id: UUID, what: String = "condition", services: Services = s, cond: (ReleaseRecord) -> Boolean): ReleaseRecord =
         runBlocking {
             withTimeout(15_000) {
                 while (true) {
-                    val r = services.releaseStore.get(id)!!
+                    val r = services.releaseLocks.of(id).withLock { services.releaseStore.get(id)!! }
                     if (cond(r)) return@withTimeout r
                     delay(20)
                 }
@@ -695,6 +701,20 @@ class ReleaseApprovalTest {
     }
 
     @Test
+    fun `awaiting a release never sees an evaluation halfway`() {
+        val r0 = release("halfway", listOf(issue("Halfway", "gate")))
+        start(r0.id)
+        eventually("approver of halfway") { world.launcher.byRole("approver").any { (it.spec.prompt ?: "").contains("Halfway") } }
+        // Keeps the evaluation inside the release's mutex for a while after the pull request is recorded.
+        s.releaseMerger.mergeablePollMillis = 200
+        gh.mergeableComputing = 3
+        gates["Halfway"] = true
+        val r = awaitRelease(r0.id, "pull request") { it.prNumber != null }
+        assertEquals(ReleaseMergeState.CLEAN, r.mergeState)
+        assertNull(r.notice)
+    }
+
+    @Test
     fun `after a restart every new state carries on`() {
         // (1) Ready, but the pull request could not be opened before the restart.
         val noPr = issue("No pull request yet", "gate")
@@ -718,6 +738,8 @@ class ReleaseApprovalTest {
         val actionsBefore = gh.actions.size
 
         s.stop()
+        // The old services' coroutines must be done before the restarted ones start (they would still write otherwise).
+        runBlocking { withTimeout(10_000) { s.scope.coroutineContext[kotlinx.coroutines.Job]!!.join() } }
         gh.mergeOnGitHub(r2.prNumber!!)
         assertTrue(s.releaseStore.markReleased(r3.id, "rebase", "sha-x", alice.id))
         val s2 = Services(world.cfg, s.db, gh, world.git, world.launcher)
