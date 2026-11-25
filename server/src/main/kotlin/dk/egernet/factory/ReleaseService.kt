@@ -128,7 +128,6 @@ class ReleaseService(
 
     suspend fun create(user: UserRecord, repo: String, name: String, description: String, mode: String? = null): ReleaseRecord {
         requireVisible(user, repo)
-        refuseWorkspace(user, repo)
         val n = validName(name)
         val d = validDescription(description)
         val m = validMode(mode)
@@ -153,7 +152,11 @@ class ReleaseService(
         return after
     }
 
-    /** Planned releases as before; a cancelled one by its owner or an admin (its branch and runs stay). */
+    /**
+     * Planned releases as before; a cancelled one by its owner or an admin. Its runs stay; so does its branch, except
+     * for a release of several repositories: every `release/<name>` its cancel could not delete is tried once more (best
+     * effort) before the release goes.
+     */
     suspend fun delete(user: UserRecord, id: UUID) {
         val r = visible(user, id)
         val scheduled = conflict("Cancel the scheduled start before deleting this release", "release_scheduled")
@@ -162,6 +165,7 @@ class ReleaseService(
         if (r.status == ReleaseStatus.RELEASED) throw releasedNotEditable(r.name)
         if (r.status in ReleaseStatus.ACTIVE || r.status == ReleaseStatus.READY) throw active
         if (r.status == ReleaseStatus.CANCELLED) requireOwnerOrAdmin(user, r)
+        if (r.status == ReleaseStatus.CANCELLED && r.multiRepo) merger.retryBranchDeletion(id)
         if (io { store.delete(id) }) {
             bus.emitFeed(FeedItem.ReleaseDeleted(r.repo, r.id.toString()))
         } else {
@@ -229,21 +233,18 @@ class ReleaseService(
         return startAs(owner, r)
     }
 
-    /** Checks [user]'s credentials and the project's building slot, then builds [r] as [user]. */
     /**
-     * Releases are not available for workspace projects defined by `.agern/workspace.yml` (docs/ARCHITECTURE.md §6
-     * "Workspace runs"): 409. A workspace from `.gitmodules` alone has releases of the workspace repository itself.
+     * Checks [user]'s credentials, the issues, the workspace definition (409 `workspace_invalid` when the project is a
+     * workspace whose definition is invalid) and the project's building slot, then builds [r] as [user].
      */
-    private suspend fun refuseWorkspace(user: UserRecord, repo: String) {
-        val state = workspaceDefs?.let { d -> io { d.lookup(user, repo, strict = true) } } ?: return
-        if (!state.fromSubmodules) throw dk.egernet.factory.workspace.WorkspaceService.releasesUnsupported()
-    }
-
     private suspend fun startAs(user: UserRecord, r: ReleaseRecord): ReleaseRecord {
-        refuseWorkspace(user, r.repo)
         if (user.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
         val client = access.requireClient(user)
         if (r.issues.isEmpty()) throw conflict("Add an issue to the release first", "release_empty")
+        workspaceDefs?.let { d -> io { d.lookup(user, r.repo, strict = true) } }?.takeIf { !it.valid }?.let { state ->
+            val branch = io { access.visibleRepo(user, r.repo) }?.defaultBranch ?: "the default branch"
+            throw dk.egernet.factory.workspace.WorkspaceService.invalid(state, branch)
+        }
         io { store.activeIn(r.repo) }?.takeIf { it.id != r.id }?.let {
             throw conflict("Release \"${it.name}\" of this project is already ${it.status}; only one release can build at a time", "release_already_building")
         }
@@ -357,7 +358,10 @@ class ReleaseService(
 
     /**
      * Puts the issues into [releaseId] (moving them from another release), or takes them out of their release when
-     * [releaseId] is null. All-or-nothing: every issue is checked on GitHub (exists, open) before anything changes.
+     * [releaseId] is null. All-or-nothing: every issue is checked on GitHub (exists, open) and, in a workspace project,
+     * routed to a member as a run would be ([dk.egernet.factory.workspace.WorkspaceService.memberFor]: 409
+     * `workspace_invalid`, `member_label_missing`, `member_label_ambiguous`, 403 `member_not_accessible`) before
+     * anything changes. A release that is partly released takes no new issue (409 `release_partially_merged`).
      */
     suspend fun assign(user: UserRecord, repo: String, numbers: List<Int>, releaseId: UUID?): AssignOutcome {
         requireVisible(user, repo)
@@ -376,17 +380,17 @@ class ReleaseService(
         if (target.status == ReleaseStatus.CANCELLED) throw conflict("The release is cancelled; no issues can be added", "release_closed")
         if (target.status == ReleaseStatus.RELEASED) throw releasedNotEditable(target.name)
         if (target.status in ReleaseStatus.ACTIVE || target.status == ReleaseStatus.READY) requireOwner(user, target)
+        if (target.partlyReleased) throw ReleaseMerger.partlyMerged(target.name)
         val client = access.requireClient(user)
-        // A workspace from .gitmodules: its releases build the workspace repository, so member issues stay out.
-        val ws = workspaceDefs?.let { d -> io { d.lookup(user, repo) } }?.takeIf { it.fromSubmodules }
-        val issues = nums.map { n ->
+        val found = nums.map { n ->
             val i = gh { client.getIssue(cfg.githubOrg, repo, n) } ?: throw notFound("Issue #$n not found")
             if (i.state != "open") throw conflict("Issue #$n is closed; only open issues can be planned in a release", "issue_closed")
-            ws?.membersLabelled(i.labels.map { it.name })?.firstOrNull()?.let {
-                throw dk.egernet.factory.workspace.WorkspaceService.memberInRelease(n, it)
-            }
-            IssueToAssign(n, i.title, issueKindFromLabels(i.labels.map { it.name }))
+            i
         }
+        // A workspace project: each issue must be buildable, i.e. routed to exactly one member (or, in a submodule
+        // workspace, to the workspace repository itself), exactly as a run of it would be (docs/ARCHITECTURE.md §6).
+        workspaceDefs?.let { d -> io { found.forEach { d.memberFor(user, repo, it) } } }
+        val issues = found.map { i -> IssueToAssign(i.number, i.title, issueKindFromLabels(i.labels.map { it.name })) }
         val names = io { store.list(repo) }.associate { it.id to it.name }
         val res = io { store.assign(repo, target.id, issues, actor(user)) }
         publish(res.changed)
@@ -423,6 +427,17 @@ class ReleaseService(
 
     private fun statusText(status: String) = ReleaseMerger.statusLabel(status)
 
+    /**
+     * `<org>/<repo>#<n> <state>[, <checks detail>]` per release pull request of a multi-repository release that [user]
+     * can read; null for none. Blocking (visibility is cached).
+     */
+    private fun pullsLine(user: UserRecord, r: ReleaseRecord): String? =
+        r.toDto().forViewer { access.canSee(user, it) }.repositories.filter { it.prNumber != null }.takeIf { it.isNotEmpty() }
+        ?.joinToString("; ") { p ->
+            "${cfg.githubOrg}/${p.repo}#${p.prNumber} ${p.state}" +
+                (p.checks?.detail?.takeIf { p.state == "open" }?.let { ", $it" } ?: "")
+        }
+
     /** Plain-text overview for `/factory releases` and `factory_list_releases`. */
     suspend fun describe(user: UserRecord, repo: String, withIds: Boolean): String {
         val list = list(user, repo)
@@ -438,22 +453,25 @@ class ReleaseService(
                 } else {
                     append("• ${r.name} — ${state(r)}, $n issue${if (n == 1) "" else "s"}")
                 }
+                val multi = r.multiRepo && (r.status == ReleaseStatus.READY || r.status == ReleaseStatus.RELEASED)
                 if (r.status == ReleaseStatus.READY) {
-                    r.prUrl?.let { append(", pull request $it") }
+                    if (!multi) r.prUrl?.let { append(", pull request $it") }
                     if (r.held.isNotEmpty()) append(" — ${r.held.size} held")
                     else if (r.mergeState == ReleaseMergeState.CONFLICT) append(" — conflicts with ${r.targetBranch ?: "the default branch"}")
                 }
                 if (r.status == ReleaseStatus.RELEASED) {
-                    r.prUrl?.let { append(", pull request $it") }
+                    if (!multi) r.prUrl?.let { append(", pull request $it") }
                     r.releasedAt?.let { append(", released $it") }
                 }
                 if (r.automatic && r.status !in ReleaseStatus.FINISHED) append(", releases automatically when ready")
                 if (r.status == ReleaseStatus.RELEASED && r.releasedAutomatically) append(", released automatically")
                 if (withIds) append(" (id ${r.id})")
+                if (multi) pullsLine(user, r)?.let { append("\n    Pull requests: $it") }
                 r.notice?.takeIf { r.status == ReleaseStatus.READY || r.status == ReleaseStatus.RELEASED }?.let { append("\n    Notice: $it") }
                 if (r.status == ReleaseStatus.PAUSED) r.pauseNote?.let { append("\n    Paused: $it") }
                 r.issues.forEach {
                     append("\n    #${it.number} ${it.title}")
+                    it.targetDir?.let { d -> append(" [member $d]") }
                     if (it.state != ReleaseIssueState.WAITING) {
                         append(" — ${it.state}")
                         if (it.state == ReleaseIssueState.HELD || it.state == ReleaseIssueState.SKIPPED) it.note?.let { n -> append(": $n") }

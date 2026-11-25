@@ -138,6 +138,8 @@ data class ReleaseIssueDto(
     val prNumber: Int? = null, val prUrl: String? = null,
     /** A waiting issue that was retried with `continue` or `step` from [runId]; null = built from scratch. */
     val retryMode: String? = null,
+    /** The member repository and directory its linked run targets; null without a run or for the project repository. */
+    val targetRepo: String? = null, val targetDir: String? = null,
 )
 
 /** Why a release is paused; [resumeAt] is set only for an automatic resume after a usage limit. */
@@ -186,6 +188,42 @@ data class ReleaseDto(
     val releasedAutomatically: Boolean = false,
     /** The checks on the release pull request's head commit, as last read; null until a pull request exists. */
     val checks: ReleaseChecksDto? = null,
+    /**
+     * Every repository of a release that spans several (docs/ARCHITECTURE.md §6 "Several repositories"): the member
+     * repositories in merge order (untouched ones last), then the project repository. Empty for every other release.
+     */
+    val repositories: List<ReleaseRepoDto> = emptyList(),
+) {
+    /**
+     * This release as [canSee] lets a viewer see it: a member repository the viewer cannot read keeps its name and
+     * directory, but loses its pull request link, checks and merge commit, and so do the issues built in it.
+     */
+    fun forViewer(canSee: (String) -> Boolean): ReleaseDto {
+        if (repositories.isEmpty()) return this
+        val hidden = repositories.filter { it.directory != null && !canSee(it.repo) }.map { it.repo }.toSet()
+        if (hidden.isEmpty()) return this
+        return copy(
+            repositories = repositories.map {
+                if (it.repo !in hidden) it else it.copy(accessible = false, prNumber = null, prUrl = null, checks = null, mergeCommit = null)
+            },
+            issues = issues.map { if (it.targetRepo in hidden) it.copy(prNumber = null, prUrl = null) else it },
+        )
+    }
+}
+
+/**
+ * One repository of a release that spans several: its `release/<name>` [branch] → [baseBranch], and its release pull
+ * request. [directory] is null for the project repository. [state]: `none` (not opened yet), `open` or `merged`.
+ * [issues]: the merged issues built in it. [accessible] is false (and the pull request's details null) for a viewer
+ * who cannot read the repository.
+ */
+@Serializable
+data class ReleaseRepoDto(
+    val repo: String, val directory: String?, val submodule: Boolean, val baseBranch: String?, val branch: String,
+    val state: String, val prNumber: Int? = null, val prUrl: String? = null,
+    val mergeState: String = ReleaseMergeState.UNKNOWN, val mergeMethod: String? = null, val checks: ReleaseChecksDto? = null,
+    val mergedAt: String? = null, val mergeCommit: String? = null,
+    val issues: List<Int> = emptyList(), val accessible: Boolean = true,
 )
 
 /** [state]: [ReleaseChecksState]; [detail] e.g. "Failed: build, lint"; [sha] the head commit they were read for. */

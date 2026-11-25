@@ -116,14 +116,16 @@ class McpServer(
             schema(Triple("name", "string", "Release name, e.g. '1.4' or 'chat-cleanup': letters, digits, '.', '_', '-'"),
                 Triple("description", "string", "Optional description"), required = listOf("name"))),
         Tool("factory_assign_issues", "Put open issues into a release of this project, appended in the given order. " +
-            "An issue that is in another release is moved.",
+            "An issue that is in another release is moved. In a workspace project an issue needs exactly one member label (none " +
+            "means the workspace repository itself in a submodule workspace); a refusal says which label to add.",
             schema(Triple("release", "string", "Release name or id"), Triple("issueNumbers", "integers", "Issue numbers"),
                 required = listOf("release", "issueNumbers"))),
         Tool("factory_unassign_issues", "Take issues out of whatever release of this project they are in.",
             schema(Triple("issueNumbers", "integers", "Issue numbers"), required = listOf("issueNumbers"))),
         Tool("factory_approve_release", "Merge a release that is ready to release into the default branch (one commit per " +
             "issue), close its issues and delete its branch. Only the release's owner may do this. Call it only when the person " +
-            "explicitly tells you to release that specific release.",
+            "explicitly tells you to release that specific release. In a workspace this merges one pull request per touched " +
+            "repository, members first, then the workspace repository with its submodule pointers.",
             schema(Triple("release", "string", "Release name or id"), required = listOf("release"))),
         Tool("factory_sandbox_info", "Whether this run has a sandbox (a container with the project's toolchain and services, " +
             "defined in .agern/sandbox.yml and approved by an admin) and, if not, why. When it has one: image, platforms (other " +

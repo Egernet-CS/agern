@@ -95,13 +95,34 @@ class FakeGitHub(private val org: String) : GitHub {
     val cloneUrls = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     /**
-     * Gitlinks (submodule pointers) per `"<repo>:<branch>"`, by path: what [Client.gitlinkAt] answers. A merged pull
-     * request whose head is a gitlink commit ([Client.createGitlinkCommit]) moves the base's gitlink.
+     * Gitlinks (submodule pointers) per `"<repo>:<branch>"`, by path: what [Client.gitlinkAt] answers. A branch starts
+     * with the gitlinks of the commit it is created at; moving a branch to a gitlink commit ([Client.createGitlinksCommit])
+     * gives it that commit's gitlinks; a merged pull request sets every gitlink of its head that differs on its base.
      */
     val gitlinks = java.util.concurrent.ConcurrentHashMap<String, MutableMap<String, String>>()
-    /** Gitlink commits by SHA: (path, gitlink sha); and where each branch made by a test or Agern points, by `"<repo>:<branch>"`. */
-    private val gitlinkCommits = java.util.concurrent.ConcurrentHashMap<String, Pair<String, String>>()
+    /** Gitlink commits by SHA: (parent, gitlinks set); and where each branch made by a test or Agern points, by `"<repo>:<branch>"`. */
+    private val gitlinkCommits = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Map<String, String>>>()
     private val branchHeads = java.util.concurrent.ConcurrentHashMap<String, String>()
+    /** The commit message of each gitlink commit, by SHA. */
+    val gitlinkMessages = java.util.concurrent.ConcurrentHashMap<String, String>()
+    /** Per repository: the next this many updates of a branch without force are refused (422), as when the branch moved. */
+    val refuseNextUpdates = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    /** Branches (`"<repo>:<branch>"`) whose deletion fails (403). */
+    val failDeleteBranch: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+    /** The gitlinks of commit [sha] of [repo]: a gitlink commit's are its parent's plus its own; `sha-<branch>` has the branch's. */
+    private fun linksOf(repo: String, sha: String): Map<String, String> {
+        gitlinkCommits[sha]?.let { (parent, links) -> return linksOf(repo, parent) + links }
+        if (!sha.startsWith("sha-")) return emptyMap()
+        return gitlinks["$repo:${sha.removePrefix("sha-")}"]?.toMap().orEmpty()
+    }
+
+    /** Points `<repo>:<branch>` at [sha] and gives it that commit's gitlinks. */
+    private fun moveBranch(repo: String, branch: String, sha: String) {
+        branchHeads["$repo:$branch"] = sha
+        val links = linksOf(repo, sha)
+        if (links.isEmpty()) gitlinks.remove("$repo:$branch") else gitlinks["$repo:$branch"] = java.util.concurrent.ConcurrentHashMap(links)
+    }
     /** Commits ([Client.commitExists]) that do not exist, as `"<repo>:<sha>"`; every other commit does. */
     val missingCommits: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
@@ -161,8 +182,9 @@ class FakeGitHub(private val org: String) : GitHub {
     }
 
     private fun applyMerge(m: PullMeta, number: Int, method: String): String {
-        branchHeads["${m.repo}:${m.head}"]?.let { gitlinkCommits[it] }?.let { (path, sha) ->
-            gitlinks.getOrPut("${m.repo}:${m.base}") { java.util.concurrent.ConcurrentHashMap() }[path] = sha
+        gitlinks["${m.repo}:${m.head}"]?.let { head ->
+            val base = gitlinks.getOrPut("${m.repo}:${m.base}") { java.util.concurrent.ConcurrentHashMap() }
+            for ((path, sha) in head) if (base[path] != sha) base[path] = sha
         }
         val base = commitList(m.repo, m.base)
         when (method) {
@@ -445,7 +467,9 @@ class FakeGitHub(private val org: String) : GitHub {
 
         override fun branchSha(org: String, repo: String, branch: String): String? = synchronized(this@FakeGitHub) {
             repo(org, repo)
-            if (branch == "main" || branch in branches[repo].orEmpty()) "sha-$branch" else null
+            if (branch == "main" || branch in branches[repo].orEmpty()) {
+                branchHeads["$repo:$branch"]?.takeIf { gitlinkCommits.containsKey(it) } ?: "sha-$branch"
+            } else null
         }
 
         override fun createBranch(org: String, repo: String, branch: String, sha: String) = synchronized(this@FakeGitHub) {
@@ -456,7 +480,7 @@ class FakeGitHub(private val org: String) : GitHub {
             // The new branch has the commits of the branch whose tip it starts at (`sha-<branch>`).
             val from = sha.removePrefix("sha-").takeIf { sha.startsWith("sha-") && (it == "main" || it in branches[repo].orEmpty()) } ?: "main"
             commits["$repo:$branch"] = commitList(repo, from).toMutableList()
-            branchHeads["$repo:$branch"] = sha
+            moveBranch(repo, branch, sha)
             actions += "branch $repo $branch"
             Unit
         }
@@ -511,7 +535,10 @@ class FakeGitHub(private val org: String) : GitHub {
         override fun deleteBranch(org: String, repo: String, branch: String) = synchronized(this@FakeGitHub) {
             repo(org, repo)
             if (branch == "main") throw GitHubException(422, "Cannot delete the default branch")
+            if ("$repo:$branch" in failDeleteBranch) throw GitHubException(403, "Resource not accessible by personal access token")
             branches[repo]?.remove(branch)
+            branchHeads.remove("$repo:$branch")
+            gitlinks.remove("$repo:$branch")
             commits.remove("$repo:$branch")
             // As on GitHub: open pull requests from a deleted branch are closed.
             pullMeta.forEach { (n, m) -> if (m.repo == repo && m.head == branch && m.state == "open") { m.state = "closed"; closePullList(n) } }
@@ -553,19 +580,27 @@ class FakeGitHub(private val org: String) : GitHub {
             gitlinks["$repo:$ref"]?.get(path)
         }
 
-        override fun createGitlinkCommit(org: String, repo: String, parentSha: String, path: String, sha: String, message: String): String =
+        override fun createGitlinksCommit(org: String, repo: String, parentSha: String, links: Map<String, String>, message: String): String =
             synchronized(this@FakeGitHub) {
                 repo(org, repo)
+                require(links.isNotEmpty()) { "No gitlink to set" }
                 val commit = "sha-gitlink-${gitlinkCommits.size + 1}"
-                gitlinkCommits[commit] = path to sha
-                actions += "gitlink-commit $repo $path $sha"
+                gitlinkCommits[commit] = parentSha to links.toMap()
+                for ((path, sha) in links) actions += "gitlink-commit $repo $path $sha"
+                gitlinkMessages[commit] = message
                 commit
             }
 
-        override fun forceUpdateBranch(org: String, repo: String, branch: String, sha: String) = synchronized(this@FakeGitHub) {
+        override fun forceUpdateBranch(org: String, repo: String, branch: String, sha: String, force: Boolean) = synchronized(this@FakeGitHub) {
             repo(org, repo)
             if (branch != "main" && branch !in branches[repo].orEmpty()) throw GitHubException(422, "Reference does not exist")
-            branchHeads["$repo:$branch"] = sha
+            if (!force) {
+                val n = refuseNextUpdates[repo] ?: 0
+                val current = branchHeads["$repo:$branch"]?.takeIf { gitlinkCommits.containsKey(it) } ?: "sha-$branch"
+                if (n > 0) refuseNextUpdates[repo] = n - 1
+                if (n > 0 || gitlinkCommits[sha]?.first != current) throw GitHubException(422, "Update is not a fast forward")
+            }
+            moveBranch(repo, branch, sha)
             actions += "update-branch $repo $branch"
             Unit
         }

@@ -683,15 +683,22 @@ private fun Route.runRoutes(s: Services) {
 
 // ------------------------------------------------------------------ releases (docs/ARCHITECTURE.md §6 "Releases")
 
+/**
+ * A release as [u] may see it (docs/ARCHITECTURE.md §6 "Several repositories"): the pull request details of a member
+ * repository [u] cannot read are left out.
+ */
+private suspend fun Services.releaseDto(u: dk.egernet.factory.db.UserRecord, r: dk.egernet.factory.db.ReleaseRecord): dk.egernet.factory.ReleaseDto =
+    r.toDto().let { d -> if (d.repositories.isEmpty()) d else withContext(Dispatchers.IO) { d.forViewer { access.canSee(u, it) } } }
+
 private fun Route.releaseRoutes(s: Services) {
     get("/projects/{repo}/releases") {
         val u = call.requireUser(s)
-        call.respond(s.releases.list(u, repoParam()).map { it.toDto() })
+        call.respond(s.releases.list(u, repoParam()).map { s.releaseDto(u, it) })
     }
     post("/projects/{repo}/releases") {
         val u = call.requireUser(s)
         val req = call.receive<CreateReleaseReq>()
-        call.respond(HttpStatusCode.Created, s.releases.create(u, repoParam(), req.name, req.description, req.mode).toDto())
+        call.respond(HttpStatusCode.Created, s.releaseDto(u, s.releases.create(u, repoParam(), req.name, req.description, req.mode)))
     }
     post("/projects/{repo}/releases/assign") {
         val u = call.requireUser(s)
@@ -699,17 +706,17 @@ private fun Route.releaseRoutes(s: Services) {
         val req = call.receive<AssignReq>()
         val releaseId = req.releaseId?.let { runCatching { UUID.fromString(it) }.getOrNull() ?: throw badRequest("releaseId is not a valid id") }
         s.releases.assign(u, repo, req.issueNumbers, releaseId)
-        call.respond(s.releases.list(u, repo).map { it.toDto() })
+        call.respond(s.releases.list(u, repo).map { s.releaseDto(u, it) })
     }
     get("/releases/{id}") {
         val u = call.requireUser(s)
-        call.respond(s.releases.visible(u, uuidParam("id")).toDto())
+        call.respond(s.releaseDto(u, s.releases.visible(u, uuidParam("id"))))
     }
     put("/releases/{id}") {
         val u = call.requireUser(s)
         val id = uuidParam("id")
         val req = call.receive<UpdateReleaseReq>()
-        call.respond(s.releases.update(u, id, req.name, req.description).toDto())
+        call.respond(s.releaseDto(u, s.releases.update(u, id, req.name, req.description)))
     }
     delete("/releases/{id}") {
         val u = call.requireUser(s)
@@ -720,44 +727,44 @@ private fun Route.releaseRoutes(s: Services) {
         val u = call.requireUser(s)
         val id = uuidParam("id")
         val req = call.receive<ScheduleReq>()
-        call.respond(s.releases.schedule(u, id, req.startAt).toDto())
+        call.respond(s.releaseDto(u, s.releases.schedule(u, id, req.startAt)))
     }
     delete("/releases/{id}/schedule") {
         val u = call.requireUser(s)
-        call.respond(s.releases.cancelSchedule(u, uuidParam("id")).toDto())
+        call.respond(s.releaseDto(u, s.releases.cancelSchedule(u, uuidParam("id"))))
     }
     // Building (docs/ARCHITECTURE.md §6 "Releases"): each answers the release after the change.
     post("/releases/{id}/start") {
         val u = call.requireUser(s)
-        call.respond(s.releases.start(u, uuidParam("id")).toDto())
+        call.respond(s.releaseDto(u, s.releases.start(u, uuidParam("id"))))
     }
     post("/releases/{id}/pause") {
         val u = call.requireUser(s)
-        call.respond(s.releases.pause(u, uuidParam("id")).toDto())
+        call.respond(s.releaseDto(u, s.releases.pause(u, uuidParam("id"))))
     }
     post("/releases/{id}/resume") {
         val u = call.requireUser(s)
-        call.respond(s.releases.resume(u, uuidParam("id")).toDto())
+        call.respond(s.releaseDto(u, s.releases.resume(u, uuidParam("id"))))
     }
     post("/releases/{id}/cancel") {
         val u = call.requireUser(s)
-        call.respond(s.releases.cancel(u, uuidParam("id")).toDto())
+        call.respond(s.releaseDto(u, s.releases.cancel(u, uuidParam("id"))))
     }
     // Releasing (docs/ARCHITECTURE.md §6 "Releasing"): owner only; each answers the release after the change.
     post("/releases/{id}/approve") {
         val u = call.requireUser(s)
-        call.respond(s.releases.approve(u, uuidParam("id")).toDto())
+        call.respond(s.releaseDto(u, s.releases.approve(u, uuidParam("id"))))
     }
     // Release mode (docs/ARCHITECTURE.md §6 "Release mode"): manual or automatic, until the release is finished.
     put("/releases/{id}/mode") {
         val u = call.requireUser(s)
         val id = uuidParam("id")
         val req = call.receive<ReleaseModeReq>()
-        call.respond(s.releases.setMode(u, id, req.mode).toDto())
+        call.respond(s.releaseDto(u, s.releases.setMode(u, id, req.mode)))
     }
     post("/releases/{id}/check") {
         val u = call.requireUser(s)
-        call.respond(s.releases.check(u, uuidParam("id")).toDto())
+        call.respond(s.releaseDto(u, s.releases.check(u, uuidParam("id"))))
     }
     get("/releases/{id}/issues/{number}/retry") {
         val u = call.requireUser(s)
@@ -770,13 +777,13 @@ private fun Route.releaseRoutes(s: Services) {
         val id = uuidParam("id")
         val number = call.parameters["number"]?.toIntOrNull()?.takeIf { it > 0 } ?: throw badRequest("Issue number must be a positive integer")
         // No body (older clients) = start over, as before retry modes existed.
-        call.respond(s.releases.retry(u, id, number, call.retryReq().mode).toDto())
+        call.respond(s.releaseDto(u, s.releases.retry(u, id, number, call.retryReq().mode)))
     }
     put("/releases/{id}/issues/order") {
         val u = call.requireUser(s)
         val id = uuidParam("id")
         val req = call.receive<OrderReq>()
-        call.respond(s.releases.reorder(u, id, req.issueNumbers).toDto())
+        call.respond(s.releaseDto(u, s.releases.reorder(u, id, req.issueNumbers)))
     }
 }
 
@@ -1125,7 +1132,12 @@ private fun Route.wsRoutes(s: Services) {
                     is FeedItem.Run -> FeedFrame(type = "run", run = item.run)
                     is FeedItem.Issue -> FeedFrame(type = "issue", repo = item.repo, issue = item.issue)
                     is FeedItem.SessionClosed -> FeedFrame(type = "session_closed", repo = item.repo, sessionId = item.sessionId)
-                    is FeedItem.Release -> FeedFrame(type = "release", repo = item.repo, release = item.release)
+                    // Per subscriber: a member repository they cannot read keeps its pull request details to itself.
+                    is FeedItem.Release -> FeedFrame(
+                        type = "release", repo = item.repo,
+                        release = if (item.release.repositories.isEmpty()) item.release
+                            else withContext(Dispatchers.IO) { item.release.forViewer { s.access.canSee(u, it) } },
+                    )
                     is FeedItem.ReleaseDeleted -> FeedFrame(type = "release_deleted", repo = item.repo, releaseId = item.releaseId)
                     is FeedItem.SandboxApproval -> FeedFrame(type = "sandbox_approval", repo = item.repo, approval = item.approval)
                     is FeedItem.Sandboxes, is FeedItem.Usage -> return@collect

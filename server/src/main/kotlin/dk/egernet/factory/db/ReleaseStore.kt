@@ -5,6 +5,7 @@ import dk.egernet.factory.OwnerDto
 import dk.egernet.factory.ReleaseDto
 import dk.egernet.factory.ReleaseIssueDto
 import dk.egernet.factory.ReleaseIssueState
+import dk.egernet.factory.ReleaseRepoDto
 import dk.egernet.factory.ReleaseChecksDto
 import dk.egernet.factory.ReleaseChecksState
 import dk.egernet.factory.ReleaseMergeState
@@ -27,7 +28,25 @@ data class ReleaseIssueRecord(
     val prNumber: Int? = null, val prUrl: String? = null,
     /** `continue` or `step`: a waiting issue retried from [runId] (docs/ARCHITECTURE.md §6 "Retrying a run"). */
     val retryMode: String? = null,
+    /** The member repository and directory [runId] targets; null without a run or for the project repository. */
+    val targetRepo: String? = null, val targetDir: String? = null,
 )
+
+/**
+ * A member repository in which Agern created `release/<name>` for a release (docs/ARCHITECTURE.md §6 "Several
+ * repositories"), with that repository's release pull request: the same columns as the project repository's on
+ * `releases`. [baseBranch]: the member's base branch, where its release pull request merges.
+ */
+data class ReleaseRepoRecord(
+    val repo: String, val directory: String, val submodule: Boolean, val baseBranch: String,
+    val branchCreated: Boolean = true, val branchDeleted: Boolean = false,
+    val prNumber: Int? = null, val prUrl: String? = null, val prBodySha: String? = null,
+    val mergeState: String = ReleaseMergeState.UNKNOWN, val mergeMethod: String? = null,
+    val checksState: String = ReleaseChecksState.UNKNOWN, val checksSha: String? = null, val checksDetail: String? = null,
+    val checksFailureSha: String? = null, val mergedAt: Instant? = null, val mergeSha: String? = null,
+) {
+    val merged: Boolean get() = mergedAt != null
+}
 
 data class ReleaseRecord(
     val id: UUID, val repo: String, val name: String, val description: String, val status: String,
@@ -50,8 +69,38 @@ data class ReleaseRecord(
     val mode: String = ReleaseMode.MANUAL, val releasedAutomatically: Boolean = false,
     val checksState: String = ReleaseChecksState.UNKNOWN, val checksSha: String? = null, val checksDetail: String? = null,
     val checksFailureSha: String? = null, val autoMergeFailedSha: String? = null,
+    /** The member repositories of the release ([ReleaseRepoRecord]), in the order their branches were created. */
+    val repos: List<ReleaseRepoRecord> = emptyList(),
+    /** The project repository's pull request was merged on GitHub while member pull requests remained. */
+    val prMergedAt: Instant? = null,
+    /** The project repository's `release/<name>` was deleted by a cancel or delete. */
+    val branchDeleted: Boolean = false,
 ) {
     val automatic: Boolean get() = mode == ReleaseMode.AUTOMATIC
+
+    /** A release with at least one member repository (docs/ARCHITECTURE.md §6 "Several repositories"). */
+    val multiRepo: Boolean get() = repos.isNotEmpty()
+
+    /**
+     * The member repositories at least one merged issue was built in, in merge order: the build-order position of
+     * each one's first merged issue.
+     */
+    val touchedRepos: List<ReleaseRepoRecord>
+        get() {
+            val order = merged.mapNotNull { it.targetRepo }.distinct()
+            return order.mapNotNull { t -> repos.firstOrNull { it.repo == t } }
+        }
+
+    /**
+     * Whether the project repository gets a release pull request: a merged issue was built in it, or a touched member
+     * is a submodule (its pointer must move). Always true for a release that is not multi-repository.
+     */
+    val projectTouched: Boolean
+        get() = !multiRepo || merged.any { it.targetRepo == null } || touchedRepos.any { it.submodule }
+
+    /** `ready` and at least one of its release pull requests is merged (docs/ARCHITECTURE.md §6 "Several repositories"). */
+    val partlyReleased: Boolean
+        get() = status == ReleaseStatus.READY && multiRepo && (repos.any { it.merged } || prMergedAt != null)
 
     val started: Boolean get() = status in ReleaseStatus.STARTED
 
@@ -64,7 +113,9 @@ data class ReleaseRecord(
     fun toDto() = ReleaseDto(
         id.toString(), repo, name, description, status, OwnerDto(createdByUsername, createdByDisplayName),
         createdAt.iso(), updatedAt.iso(),
-        issues.map { ReleaseIssueDto(it.number, it.title, it.kind, it.state, it.runId?.toString(), it.note, it.prNumber, it.prUrl, it.retryMode) },
+        issues.map {
+            ReleaseIssueDto(it.number, it.title, it.kind, it.state, it.runId?.toString(), it.note, it.prNumber, it.prUrl, it.retryMode, it.targetRepo, it.targetDir)
+        },
         owner = if (ownerId != null && ownerUsername != null) OwnerDto(ownerUsername, ownerDisplayName ?: ownerUsername) else null,
         branch = branch, startedAt = startedAt?.iso(), endedAt = endedAt?.iso(),
         pause = if (status == ReleaseStatus.PAUSED && pauseReason != null) ReleasePauseDto(pauseReason, pauseNote, resumeAt?.iso()) else null,
@@ -83,7 +134,44 @@ data class ReleaseRecord(
         mergeCommit = mergeSha,
         mode = mode, releasedAutomatically = releasedAutomatically,
         checks = if (prNumber != null || checksSha != null) ReleaseChecksDto(checksState, checksDetail, checksSha) else null,
+        repositories = repositoriesDto(),
     )
+
+    /** [dk.egernet.factory.ReleaseDto.repositories]: empty unless multi-repository. */
+    private fun repositoriesDto(): List<ReleaseRepoDto> {
+        if (!multiRepo) return emptyList()
+        val touched = touchedRepos
+        val members = touched + repos.filter { r -> touched.none { it.repo == r.repo } }
+        val branchName = branch ?: "release/$name"
+        val out = members.map { m ->
+            ReleaseRepoDto(
+                m.repo, m.directory, m.submodule, m.baseBranch, branchName,
+                state = when {
+                    m.merged -> "merged"
+                    m.prNumber != null -> "open"
+                    else -> "none"
+                },
+                prNumber = m.prNumber, prUrl = m.prUrl, mergeState = m.mergeState, mergeMethod = m.mergeMethod,
+                checks = if (m.prNumber != null || m.checksSha != null) ReleaseChecksDto(m.checksState, m.checksDetail, m.checksSha) else null,
+                mergedAt = m.mergedAt?.iso(), mergeCommit = m.mergeSha,
+                issues = merged.filter { it.targetRepo == m.repo }.map { it.number },
+            )
+        }
+        val projectMerged = prMergedAt != null || (status == ReleaseStatus.RELEASED && prNumber != null)
+        val project = ReleaseRepoDto(
+            repo, null, false, targetBranch, branchName,
+            state = when {
+                projectMerged -> "merged"
+                prNumber != null -> "open"
+                else -> "none"
+            },
+            prNumber = prNumber, prUrl = prUrl, mergeState = mergeState, mergeMethod = mergeMethod,
+            checks = if (prNumber != null || checksSha != null) ReleaseChecksDto(checksState, checksDetail, checksSha) else null,
+            mergedAt = (prMergedAt ?: releasedAt?.takeIf { projectMerged })?.iso(), mergeCommit = mergeSha,
+            issues = merged.filter { it.targetRepo == null }.map { it.number },
+        )
+        return out + project
+    }
 }
 
 /** Who acts on a release, for the rules of started releases (docs/ARCHITECTURE.md §6 "Releases", access table). */
@@ -142,18 +230,39 @@ class ReleaseStore(private val db: Db) {
         mode = rs.getString("release_mode"), releasedAutomatically = rs.getBoolean("released_automatically"),
         checksState = rs.getString("checks_state"), checksSha = rs.getString("checks_sha"), checksDetail = rs.getString("checks_detail"),
         checksFailureSha = rs.getString("checks_failure_sha"), autoMergeFailedSha = rs.getString("auto_merge_failed_sha"),
+        prMergedAt = rs.instantOrNull("pr_merged_at"), branchDeleted = rs.getBoolean("branch_deleted"),
     )
+
+    private fun mapRepo(rs: ResultSet) = ReleaseRepoRecord(
+        rs.getString("repo"), rs.getString("directory"), rs.getBoolean("submodule"), rs.getString("base_branch"),
+        branchCreated = rs.getBoolean("branch_created"), branchDeleted = rs.getBoolean("branch_deleted"),
+        prNumber = rs.intOrNull("pr_number"), prUrl = rs.getString("pr_url"), prBodySha = rs.getString("pr_body_sha"),
+        mergeState = rs.getString("merge_state"), mergeMethod = rs.getString("merge_method"),
+        checksState = rs.getString("checks_state"), checksSha = rs.getString("checks_sha"), checksDetail = rs.getString("checks_detail"),
+        checksFailureSha = rs.getString("checks_failure_sha"), mergedAt = rs.instantOrNull("merged_at"), mergeSha = rs.getString("merge_sha"),
+    )
+
+    private fun reposOf(ids: List<UUID>): Map<UUID, List<ReleaseRepoRecord>> {
+        if (ids.isEmpty()) return emptyMap()
+        return db.query(
+            "SELECT * FROM release_repos WHERE release_id IN (" + ids.joinToString(",") { "?" } + ") ORDER BY created_at, repo",
+            *ids.toTypedArray(),
+        ) { it.uuid("release_id") to mapRepo(it) }
+            .groupBy({ it.first }, { it.second })
+    }
 
     private fun mapIssue(rs: ResultSet) = ReleaseIssueRecord(
         rs.getInt("issue_number"), rs.getString("issue_title"), rs.getString("issue_kind"),
         rs.getString("state"), rs.uuidOrNull("run_id"), rs.getString("note"),
         rs.intOrNull("pr_number"), rs.getString("pr_url"), rs.getString("retry_mode"),
+        rs.getString("target_repo"), rs.getString("target_dir"),
     )
 
     private fun issuesOf(ids: List<UUID>): Map<UUID, List<ReleaseIssueRecord>> {
         if (ids.isEmpty()) return emptyMap()
         return db.query(
-            "SELECT ri.release_id, ri.issue_number, ri.issue_title, ri.issue_kind, ri.state, ri.run_id, ri.note, ri.retry_mode, ru.pr_number, ru.pr_url " +
+            "SELECT ri.release_id, ri.issue_number, ri.issue_title, ri.issue_kind, ri.state, ri.run_id, ri.note, ri.retry_mode, ru.pr_number, ru.pr_url, " +
+                "ru.target_repo, ru.target_dir " +
                 "FROM release_issues ri LEFT JOIN runs ru ON ru.id = ri.run_id WHERE ri.release_id IN (" +
                 ids.joinToString(",") { "?" } + ") ORDER BY ri.position, ri.added_at",
             *ids.toTypedArray(),
@@ -163,7 +272,8 @@ class ReleaseStore(private val db: Db) {
 
     private fun withIssues(list: List<ReleaseRecord>): List<ReleaseRecord> {
         val issues = issuesOf(list.map { it.id })
-        return list.map { it.copy(issues = issues[it.id] ?: emptyList()) }
+        val repos = reposOf(list.map { it.id })
+        return list.map { it.copy(issues = issues[it.id] ?: emptyList(), repos = repos[it.id] ?: emptyList()) }
     }
 
     /** Runs [block], turning a violation of the unique name index into 409 `release_name_taken`. */
@@ -284,17 +394,33 @@ class ReleaseStore(private val db: Db) {
         "Another release of this project is building; it must finish before this one can build again", "release_already_building",
     )
 
-    fun setPull(id: UUID, number: Int, url: String, bodySha: String, targetBranch: String) = db.update(
-        """UPDATE releases SET pr_number = ?, pr_url = ?, pr_body_sha = ?, target_branch = ?, merge_state = 'unknown',
-           checks_state = 'unknown', checks_sha = NULL, checks_detail = NULL, checks_head_seen_at = NULL WHERE id = ?""",
-        number, url, bodySha, targetBranch, id,
-    )
+    // A release pull request lives on `releases` (the project repository's) or on a `release_repos` row (a member's):
+    // the setters below take [memberRepo] (null: the project repository) and change exactly the same columns.
 
-    /** Forgets a release pull request that was closed on GitHub without being merged. */
-    fun clearPull(id: UUID) = db.update(
+    fun setPull(id: UUID, number: Int, url: String, bodySha: String, targetBranch: String, memberRepo: String? = null) =
+        if (memberRepo == null) db.update(
+            """UPDATE releases SET pr_number = ?, pr_url = ?, pr_body_sha = ?, target_branch = ?, merge_state = 'unknown',
+               checks_state = 'unknown', checks_sha = NULL, checks_detail = NULL, checks_head_seen_at = NULL WHERE id = ?""",
+            number, url, bodySha, targetBranch, id,
+        ) else db.update(
+            """UPDATE release_repos SET pr_number = ?, pr_url = ?, pr_body_sha = ?, merge_state = 'unknown',
+               checks_state = 'unknown', checks_sha = NULL, checks_detail = NULL, checks_head_seen_at = NULL
+               WHERE release_id = ? AND repo = ?""",
+            number, url, bodySha, id, memberRepo,
+        )
+
+    /** Forgets a release pull request that was closed on GitHub without being merged (the announcement is due again). */
+    fun clearPull(id: UUID, memberRepo: String? = null) = if (memberRepo == null) db.update(
         """UPDATE releases SET pr_number = NULL, pr_url = NULL, pr_body_sha = NULL, merge_state = 'unknown', ready_announced = false,
            checks_state = 'unknown', checks_sha = NULL, checks_detail = NULL, checks_head_seen_at = NULL WHERE id = ?""", id,
-    )
+    ) else db.tx { c ->
+        c.prepare(
+            """UPDATE release_repos SET pr_number = NULL, pr_url = NULL, pr_body_sha = NULL, merge_state = 'unknown',
+               checks_state = 'unknown', checks_sha = NULL, checks_detail = NULL, checks_head_seen_at = NULL
+               WHERE release_id = ? AND repo = ?""", arrayOf<Any?>(id, memberRepo),
+        ).use { it.executeUpdate() }
+        c.prepare("UPDATE releases SET ready_announced = false WHERE id = ?", arrayOf<Any?>(id)).use { it.executeUpdate() }
+    }
 
     /**
      * Sets the release mode while the release is not finished; false when it is `released` or `cancelled` (or gone).
@@ -304,43 +430,102 @@ class ReleaseStore(private val db: Db) {
         "UPDATE releases SET release_mode = ? WHERE id = ? AND status NOT IN ('released', 'cancelled')", mode, id,
     ) == 1
 
+    /** `WHERE` of one pull request's row: the release's, or a member repository's. */
+    private fun slot(memberRepo: String?) =
+        if (memberRepo == null) "releases" to "id = ?" else "release_repos" to "release_id = ? AND repo = ?"
+
+    private fun slotArgs(id: UUID, memberRepo: String?): Array<Any?> = if (memberRepo == null) arrayOf(id) else arrayOf(id, memberRepo)
+
     /** The checks on the pull request's head commit [sha] as last read; true when the state or detail changed. */
-    fun setChecks(id: UUID, state: String, sha: String?, detail: String?): Boolean = db.update(
-        """UPDATE releases SET checks_state = ?, checks_sha = ?, checks_detail = ? WHERE id = ?
-           AND (checks_state <> ? OR checks_sha IS DISTINCT FROM ? OR checks_detail IS DISTINCT FROM ?)""",
-        state, sha, detail, id, state, sha, detail,
-    ) == 1
+    fun setChecks(id: UUID, state: String, sha: String?, detail: String?, memberRepo: String? = null): Boolean {
+        val (table, where) = slot(memberRepo)
+        return db.update(
+            """UPDATE $table SET checks_state = ?, checks_sha = ?, checks_detail = ? WHERE $where
+               AND (checks_state <> ? OR checks_sha IS DISTINCT FROM ? OR checks_detail IS DISTINCT FROM ?)""",
+            state, sha, detail, *slotArgs(id, memberRepo), state, sha, detail,
+        ) == 1
+    }
 
     /**
      * When Agern first saw [sha] as the release pull request's head: recorded as [now] the first time (a new head, or a
      * new pull request, starts again), so the settle period survives restarts.
      */
-    fun headSeenAt(id: UUID, sha: String, now: Instant): Instant {
+    fun headSeenAt(id: UUID, sha: String, now: Instant, memberRepo: String? = null): Instant {
+        val (table, where) = slot(memberRepo)
         db.update(
-            """UPDATE releases SET checks_sha = ?, checks_head_seen_at = ? WHERE id = ?
+            """UPDATE $table SET checks_sha = ?, checks_head_seen_at = ? WHERE $where
                AND (checks_sha IS DISTINCT FROM ? OR checks_head_seen_at IS NULL)""",
-            sha, now, id, sha,
+            sha, now, *slotArgs(id, memberRepo), sha,
         )
-        return db.queryOne("SELECT checks_head_seen_at FROM releases WHERE id = ?", id) { it.instantOrNull("checks_head_seen_at") } ?: now
+        return db.queryOne("SELECT checks_head_seen_at FROM $table WHERE $where", *slotArgs(id, memberRepo)) {
+            it.instantOrNull("checks_head_seen_at")
+        } ?: now
     }
 
     /** Claims the one "checks failed" comment for head commit [sha]; true for exactly one caller per commit. */
-    fun claimChecksFailure(id: UUID, sha: String): Boolean = db.update(
-        "UPDATE releases SET checks_failure_sha = ? WHERE id = ? AND checks_failure_sha IS DISTINCT FROM ?", sha, id, sha,
-    ) == 1
+    fun claimChecksFailure(id: UUID, sha: String, memberRepo: String? = null): Boolean {
+        val (table, where) = slot(memberRepo)
+        return db.update(
+            "UPDATE $table SET checks_failure_sha = ? WHERE $where AND checks_failure_sha IS DISTINCT FROM ?",
+            sha, *slotArgs(id, memberRepo), sha,
+        ) == 1
+    }
 
     /** Records that an automatic merge of head commit [sha] was refused (it is not tried again for that commit). */
     fun setAutoMergeFailed(id: UUID, sha: String?) = db.update("UPDATE releases SET auto_merge_failed_sha = ? WHERE id = ?", sha, id)
 
-    fun setPullBody(id: UUID, bodySha: String) = db.update("UPDATE releases SET pr_body_sha = ? WHERE id = ?", bodySha, id)
+    fun setPullBody(id: UUID, bodySha: String, memberRepo: String? = null): Int {
+        val (table, where) = slot(memberRepo)
+        return db.update("UPDATE $table SET pr_body_sha = ? WHERE $where", bodySha, *slotArgs(id, memberRepo))
+    }
 
     fun setTarget(id: UUID, targetBranch: String) = db.update("UPDATE releases SET target_branch = ? WHERE id = ?", targetBranch, id)
 
     /** Sets the merge state; true only when it changed (so a transition is acted on once). */
-    fun setMergeState(id: UUID, state: String): Boolean =
-        db.update("UPDATE releases SET merge_state = ? WHERE id = ? AND merge_state <> ?", state, id, state) == 1
+    fun setMergeState(id: UUID, state: String, memberRepo: String? = null): Boolean {
+        val (table, where) = slot(memberRepo)
+        return db.update("UPDATE $table SET merge_state = ? WHERE $where AND merge_state <> ?", state, *slotArgs(id, memberRepo), state) == 1
+    }
 
-    fun setMergeMethod(id: UUID, method: String?) = db.update("UPDATE releases SET merge_method = ? WHERE id = ?", method, id)
+    fun setMergeMethod(id: UUID, method: String?, memberRepo: String? = null): Int {
+        val (table, where) = slot(memberRepo)
+        return db.update("UPDATE $table SET merge_method = ? WHERE $where", method, *slotArgs(id, memberRepo))
+    }
+
+    // ------------------------------------------------------------ member repositories (§6 "Several repositories")
+
+    /**
+     * Records that Agern created `release/<name>` in member repository [repo] from [baseBranch]; false when a row for it
+     * exists already.
+     */
+    fun insertRepo(id: UUID, repo: String, directory: String, submodule: Boolean, baseBranch: String): Boolean = db.update(
+        """INSERT INTO release_repos(release_id, repo, directory, submodule, base_branch, branch_created) VALUES (?, ?, ?, ?, ?, true)
+           ON CONFLICT (release_id, repo) DO NOTHING""",
+        id, repo, directory, submodule, baseBranch,
+    ) == 1
+
+    /** The base branch recorded for member repository [repo] of release [id], or null. */
+    fun repoBase(id: UUID, repo: String): String? =
+        db.queryOne("SELECT base_branch FROM release_repos WHERE release_id = ? AND repo = ?", id, repo) { it.getString("base_branch") }
+
+    /** Member repository [repo]'s release pull request was merged: [sha] is its base branch's commit after the merge. Once. */
+    fun setRepoMerged(id: UUID, repo: String, sha: String?): Boolean = db.update(
+        """UPDATE release_repos SET merged_at = now(), merge_sha = ?, merge_state = 'clean' WHERE release_id = ? AND repo = ?
+           AND merged_at IS NULL""",
+        sha, id, repo,
+    ) == 1
+
+    /** `release/<name>` was deleted (or found missing) in member repository [repo], or with null in the project repository. */
+    fun setBranchDeleted(id: UUID, memberRepo: String? = null) = if (memberRepo == null) {
+        db.update("UPDATE releases SET branch_deleted = true WHERE id = ?", id)
+    } else {
+        db.update("UPDATE release_repos SET branch_deleted = true WHERE release_id = ? AND repo = ?", id, memberRepo)
+    }
+
+    /** The project repository's pull request was merged on GitHub while member pull requests remain (once). */
+    fun setProjectMergedEarly(id: UUID, sha: String?): Boolean = db.update(
+        "UPDATE releases SET pr_merged_at = now(), merge_sha = ? WHERE id = ? AND pr_merged_at IS NULL", sha, id,
+    ) == 1
 
     fun setNotice(id: UUID, notice: String?) = db.update("UPDATE releases SET notice = ? WHERE id = ?", notice, id)
 
@@ -369,11 +554,13 @@ class ReleaseStore(private val db: Db) {
     /**
      * Ids of the `ready` releases the periodic re-evaluation looks at: every automatic one (it may become green), manual
      * ones whose checks are pending (so the release page shows when they finish), and every other one with a pull
-     * request (reconciled only: it may have been merged or closed on GitHub).
+     * request (reconciled only: it may have been merged or closed on GitHub). For a release of several repositories,
+     * the checks and pull requests of its member repositories count too.
      */
     fun periodicIds(): List<UUID> = db.query(
-        "SELECT id FROM releases WHERE status = 'ready' AND (release_mode = 'automatic' OR checks_state IN ('pending', 'awaiting') " +
-            "OR pr_number IS NOT NULL) ORDER BY ready_at, id",
+        "SELECT id FROM releases r WHERE status = 'ready' AND (release_mode = 'automatic' OR checks_state IN ('pending', 'awaiting') " +
+            "OR pr_number IS NOT NULL OR EXISTS (SELECT 1 FROM release_repos rr WHERE rr.release_id = r.id AND rr.merged_at IS NULL " +
+            "AND (rr.pr_number IS NOT NULL OR rr.checks_state IN ('pending', 'awaiting')))) ORDER BY ready_at, id",
     ) { it.uuid("id") }
 
     /** Ids of released releases whose clean-up did not finish (a restart in between). */
