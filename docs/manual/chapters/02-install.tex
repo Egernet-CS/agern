@@ -1,0 +1,215 @@
+\chapter{Install}\label{ch:install}
+
+\emph{You want Agern running on your server and to sign in to it as its first admin.} You install
+the Debian package, give Agern a database and a minimal configuration, install the tools the
+agents use, and sign in with two-factor authentication. Allow about half an hour.
+
+Do all of this on the server, over SSH, as a user that may use \cmd{sudo}. The
+\repodoc{INSTALL-LINUX.md}{installation guide} has the same steps with more background, and a
+section on creating the virtual machine on Proxmox.
+
+\section{Install PostgreSQL}\label{sec:postgres}
+
+Agern keeps its data in PostgreSQL~15 or newer, installed from the distribution (Debian~13 ships
+17, Ubuntu~24.04 ships 16).
+
+\begin{enumerate}
+  \item Update the package lists and install PostgreSQL:
+\begin{lstlisting}
+sudo apt update
+sudo apt install postgresql
+\end{lstlisting}
+\end{enumerate}
+
+\section{Download, verify and install the package}\label{sec:install-deb}
+
+Every release of Agern on GitHub carries the package \texttt{agern\_<version>\_all.deb} and a file
+\texttt{SHA256SUMS} with its checksum.
+
+\begin{enumerate}
+  \item Download the checksums of the latest release and, from them, the package:
+\begin{lstlisting}
+cd /tmp
+base=https://github.com/Egernet-CS/agern/releases/latest/download
+curl -fsSLO "$base/SHA256SUMS"
+deb=$(grep -o 'agern_[^ ]*_all\.deb' SHA256SUMS)
+curl -fsSLO "$base/$deb"
+\end{lstlisting}
+    If the first \cmd{curl} fails with \texttt{The requested URL returned error: 404}, Agern has no
+    tagged release yet. Take the rolling build of \texttt{main} instead (section~\ref{sec:version}),
+    and repeat the three \cmd{curl} lines with
+\begin{lstlisting}
+base=https://github.com/Egernet-CS/agern/releases/download/main-latest
+\end{lstlisting}
+  \item Verify the download. The command must print the package name followed by \texttt{OK}:
+\begin{lstlisting}
+sha256sum --check --ignore-missing SHA256SUMS
+\end{lstlisting}
+  \item Install the package with \cmd{apt}, which also installs what it depends on (a Java runtime,
+    \texttt{git}, \texttt{curl}) and what it recommends (PostgreSQL and \texttt{chromium}):
+\begin{lstlisting}
+sudo apt install "./$deb"
+\end{lstlisting}
+\end{enumerate}
+
+The package creates the system user \texttt{agern} (home and data directory
+\file{/var/lib/agern}), the control command \cmd{agern} (\cmd{agern help} lists what it can do),
+the service \texttt{agern.service} and the configuration file \file{/etc/agern/agern.env}. That
+file already contains a freshly generated \envvar{FACTORY_MASTER_KEY}, the key that encrypts
+everybody's credentials. Agern is not started yet: its configuration is incomplete.
+
+\section{Create the database}\label{sec:setup-db}
+
+\begin{enumerate}
+  \item Let Agern create its PostgreSQL role and database. The command generates a password and
+    writes \envvar{FACTORY_DB_URL}, \envvar{FACTORY_DB_USER} and \envvar{FACTORY_DB_PASSWORD} into
+    \file{/etc/agern/agern.env}; running it again changes nothing:
+\begin{lstlisting}
+sudo agern setup-db
+\end{lstlisting}
+\end{enumerate}
+Agern creates and migrates its tables itself every time it starts.
+
+\section{Write the minimal configuration}\label{sec:minimal-config}
+
+All configuration is \texttt{FACTORY\_\ldots} variables in \file{/etc/agern/agern.env}: one
+\texttt{KEY=value} per line, no shell syntax.
+
+\begin{enumerate}
+  \item Open the file:
+\begin{lstlisting}
+sudoedit /etc/agern/agern.env
+\end{lstlisting}
+  \item Set these four lines, with your own values:
+\begin{lstlisting}[style=conf]
+FACTORY_GITHUB_ORG=your-org
+FACTORY_PUBLIC_URL=http://agern.example.com:8080
+FACTORY_ADMINS=alice
+FACTORY_AUTH=os
+\end{lstlisting}
+    \begin{itemize}
+      \item \envvar{FACTORY_GITHUB_ORG}: the GitHub organization whose repositories become the projects.
+      \item \envvar{FACTORY_PUBLIC_URL}: exactly the address people will type into their browser,
+        here the server's name and Agern's port 8080. Requests from any other address are
+        refused, so \texttt{localhost} does not work from other machines (section~\ref{sec:public-url}).
+      \item \envvar{FACTORY_ADMINS}: the user names of the admins, separated by commas. Use the
+        account you create in the next section.
+      \item \envvar{FACTORY_AUTH}: how people sign in: \texttt{os} for accounts on this machine,
+        \texttt{ldap} for a directory (section~\ref{sec:users}).
+    \end{itemize}
+  \item Save the file. Leave the generated \envvar{FACTORY_MASTER_KEY} as it is.
+\end{enumerate}
+
+\begin{warning}[Back up the master key now]
+Copy the line \texttt{FACTORY\_MASTER\_KEY=\ldots} into your password manager. Every stored Claude
+credential, GitHub token and two-factor secret is encrypted with it; a database backup without the
+key is useless (chapter~\ref{ch:backup}).
+\end{warning}
+
+\section{Create the first admin's account}\label{sec:first-admin}
+
+With \texttt{FACTORY\_AUTH=os}, people sign in with an account on this machine and its password.
+
+\begin{enumerate}
+  \item Create an account for yourself, with the name you put into \envvar{FACTORY_ADMINS}, and give
+    it a password that you use nowhere else:
+\begin{lstlisting}
+sudo adduser alice
+\end{lstlisting}
+  \item Decide about the \texttt{shadow} group. To check a password, the system's PAM module has to
+    read \file{/etc/shadow}, which the \texttt{agern} user may only do as a member of the group
+    \texttt{shadow}. The package does not add it, because every agent runs as \texttt{agern} too
+    and could then read all password hashes on the machine. On a dedicated machine whose only
+    accounts are Agern users, accept that:
+\begin{lstlisting}
+sudo usermod -aG shadow agern
+\end{lstlisting}
+    If you have a directory, use LDAP instead and skip this step (section~\ref{sec:users}).
+\end{enumerate}
+
+\section{Install the agents' tools}\label{sec:agent-tools}
+
+Agents are \texttt{claude} processes that use \texttt{git} (already installed) and the GitHub CLI
+\texttt{gh}. The UX and UI design reviewers also use a headless browser to take screenshots.
+
+\begin{enumerate}
+  \item Install Claude Code for the \texttt{agern} user. It lands in
+    \file{/var/lib/agern/.local/bin}, which is on the service's \texttt{PATH}:
+\begin{lstlisting}
+sudo -u agern -H bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
+\end{lstlisting}
+  \item Install the GitHub CLI and a browser with fonts:
+\begin{lstlisting}
+sudo apt install gh
+sudo apt install chromium fonts-noto-core
+\end{lstlisting}
+    On Ubuntu, \texttt{chromium} is only a launcher for the Chromium snap; \cmd{agern doctor}
+    tells you whether that works and suggests Google Chrome's package otherwise.
+\end{enumerate}
+
+Nobody signs in to \texttt{claude} or \texttt{gh} as the \texttt{agern} user. Each person's own
+credentials are handed to the agents they start (chapter~\ref{ch:accounts}).
+
+\section{Check and start Agern}\label{sec:start}
+
+\begin{enumerate}
+  \item Let Agern check the machine:
+\begin{lstlisting}
+sudo agern doctor
+\end{lstlisting}
+    Each line starts with \texttt{ok}, \texttt{warn} or \texttt{FAIL}. A \texttt{FAIL} line says
+    what is wrong and how to fix it, for example
+    \msg{FACTORY\_GITHUB\_ORG is not set} or a missing \texttt{claude} with the command that
+    installs it. The last line sums up, for example \texttt{no problems (2 warning(s))}. Fix every
+    \texttt{FAIL} and run the doctor again. Warnings are advice: \texttt{not running ('agern start')} is expected
+    now.
+  \item Start the service. The command waits until Agern answers:
+\begin{lstlisting}
+sudo agern start
+agern status
+\end{lstlisting}
+\end{enumerate}
+
+If Agern does not come up, its log says why (\cmd{agern logs}); a configuration error is reported
+as \msg{Agern: configuration error: \ldots} and Agern stops instead of restarting in a loop
+(section~\ref{sec:troubleshooting}).
+
+\section{Sign in for the first time}\label{sec:first-login}
+
+Two-factor authentication is required for everyone. You need an authenticator app on your phone
+(1Password, Authy, Google Authenticator or similar).
+
+\begin{enumerate}
+  \item Open the address you set as \envvar{FACTORY_PUBLIC_URL} in your browser, for example
+    \url{http://agern.example.com:8080}. You see the sign-in page (figure~\ref{fig:login}).
+  \item Enter your user name and password and choose \ui{Continue}.
+  \item As this is your first sign-in, Agern asks you to \ui{Set up your authenticator}
+    (figure~\ref{fig:enroll}). Scan the QR code with your app, or enter the key shown below it,
+    then type the six-digit code the app shows and choose \ui{Confirm}.
+  \item Agern shows ten recovery codes (figure~\ref{fig:recovery-codes}). Each one lets you sign in
+    once without your phone. They are shown only now: save them in your password manager, tick
+    \ui{I have saved my recovery codes} and choose \ui{Enter the factory}.
+\end{enumerate}
+
+From now on every sign-in asks for your password and a current code from the app
+(\ui{Two-factor code}); \ui{Use a recovery code} takes one of the saved codes instead.
+
+\screenshot[0.85\linewidth]{01-login-desktop}{The sign-in page. It names the GitHub organization and the ways to sign in.}{login}
+
+\screenshot[0.8\linewidth]{03-login-enroll-desktop}{First sign-in: set up the authenticator by scanning the QR code, then confirm with a code.}{enroll}
+
+\screenshot[0.8\linewidth]{04-login-recovery-codes-desktop}{The recovery codes, shown once after enrolling.}{recovery-codes}
+
+\phoneshot{03-login-enroll-phone}{Enrolling on a phone: the same steps, one column.}{enroll-phone}
+
+After signing in you see the projects page, still empty and with two notices
+(figure~\ref{fig:first-run}): Agern does not know your GitHub token or your Claude credential yet.
+
+\screenshot{07-projects-first-run-desktop}{The first view after signing in: no projects until you add your GitHub token.}{first-run}
+
+\whatyouhave
+Agern runs on your server as the service \texttt{agern.service}, with its own database, and you
+are signed in as its first admin with two-factor authentication. As seen in
+figure~\ref{fig:enroll-phone}, the web UI works on a phone as well. Next, finish the
+configuration (HTTPS, users) in chapter~\ref{ch:configure}, or go straight to
+chapter~\ref{ch:accounts} to connect your accounts if plain HTTP on your LAN is fine for now.

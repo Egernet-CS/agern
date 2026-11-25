@@ -1,0 +1,89 @@
+% Agern: Getting Started. Build with scripts/manual.sh (screenshots, checks and the PDF), which runs
+%   latexmk -pdf -outdir=../../build/manual/tex -usepretex='\def\agernversion{<version>}' manual.tex
+% in this directory. One file per chapter in chapters/.
+\providecommand{\agernversion}{development build}
+\documentclass[11pt,a4paper,oneside,openany]{report}
+\input{preamble}
+
+\begin{document}
+\pdfbookmark[0]{Title}{title}
+\begin{titlepage}
+  \centering
+  \vspace*{3.5cm}
+  \includegraphics[width=4.2cm]{logo}\par
+  \vspace{1.2cm}
+  {\fontsize{34}{40}\selectfont\bfseries Agern: Getting Started\par}
+  \vspace{0.6cm}
+  {\Large Install Agern, set it up and put Claude agents to work on your GitHub issues\par}
+  \vspace{2.2cm}
+  {\large Agern \agernversion\par}
+  \vspace{0.3cm}
+  {\large Built \today\par}
+  \vfill
+  {\small Agern is a self-hosted software factory by Egernet. ``Agern'' is Danish for acorn.\par
+  This manual explains and links; the reference is
+  \href{https://github.com/Egernet-CS/agern/blob/main/docs/ARCHITECTURE.md}{\texttt{docs/ARCHITECTURE.md}}.\par}
+\end{titlepage}
+
+\pdfbookmark[0]{Contents}{contents}
+\tableofcontents
+
+\chapter*{How to read this manual}
+\addcontentsline{toc}{chapter}{How to read this manual}
+\markboth{How to read this manual}{}
+This manual is a guided path. Read it from start to finish and you will have installed Agern on a
+Linux server, set it up, connected your accounts, and taken a GitHub issue all the way to a merged
+pull request. It assumes that you know GitHub and a Linux shell, and nothing about Agern or
+Claude Code.
+
+Every chapter starts with what you want to achieve, walks you through numbered steps with a
+screenshot of what you should see, and ends with \emph{What you have now} and where to go next.
+
+\begin{itemize}
+  \item \textbf{Part~\ref{part:setup}, Set up Agern} (chapters~\ref{ch:what}--\ref{ch:sandboxes}): what Agern
+    is, installing it on Debian or Ubuntu, configuring it, and connecting your GitHub and Claude accounts.
+  \item \textbf{Part~\ref{part:use}, Use Agern} (chapters~\ref{ch:project}--\ref{ch:watch}): projects, the
+    project's chat agent, pipeline runs, releases and keeping an eye on the agents.
+  \item \textbf{Part~\ref{part:run}, Keep Agern running} (chapters~\ref{ch:upgrade} and~\ref{ch:backup}):
+    upgrades, backups, logs and troubleshooting.
+\end{itemize}
+
+Words in \emph{italics} where they first appear are Agern terms; they are explained in the
+glossary (appendix~\ref{app:glossary}) and listed in the index. Labels in the web UI are set like
+\ui{Start run}, commands like \cmd{sudo agern doctor}. The screenshots show Agern's demo data: the
+users alice, bob, carl and dora and demo repositories such as \texttt{web-shop}. Host names such as
+\texttt{agern.example.com}, the network \texttt{192.0.2.0/24}, the organization \texttt{your-org} and
+tokens such as \texttt{ghp\_\ldots} are placeholders for your own values.
+
+The reference documentation lives in the repository and is linked where it matters:
+\repodoc{ARCHITECTURE.md}{\texttt{docs/ARCHITECTURE.md}} (how everything works, every setting),
+\repodoc{INSTALL-LINUX.md}{\texttt{docs/INSTALL-LINUX.md}} (the installation in depth) and
+\repodoc{SANDBOXES.md}{\texttt{docs/SANDBOXES.md}} (sandboxes for project authors).
+
+\part{Set up Agern}\label{part:setup}
+\include{chapters/01-what-agern-is}
+\include{chapters/02-install}
+\include{chapters/03-configure}
+\include{chapters/04-connect-accounts}
+\include{chapters/05-sandboxes}
+
+\part{Use Agern}\label{part:use}
+\include{chapters/06-first-project}
+\include{chapters/07-project-agent}
+\include{chapters/08-first-run}
+\include{chapters/09-releases}
+\include{chapters/10-keeping-an-eye}
+
+\part{Keep Agern running}\label{part:run}
+\include{chapters/11-upgrading}
+\include{chapters/12-backup-logs-troubleshooting}
+
+\appendix
+\include{chapters/a-glossary}
+\include{chapters/b-configuration}
+
+\cleardoublepage
+\phantomsection
+\addcontentsline{toc}{chapter}{Index}
+\printindex
+\end{document}

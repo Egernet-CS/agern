@@ -1,0 +1,109 @@
+\chapter{Optional: sandboxes for builds and tests}\label{ch:sandboxes}
+
+\emph{You want the builder of each run to build and test your project in a container with the
+right toolchain and, say, its own database, instead of on the server itself.} That is what a
+\term{sandbox} is. Sandboxes are off after installing Agern; skip this chapter if your projects
+build fine with what the server has.
+
+\section{What a sandbox is, and is not}\label{sec:sandbox-what}
+
+A project describes its container in a file in its repository, \file{.agern/sandbox.yml}, the
+\term{sandbox definition}: a toolchain image, an optional setup script, sidecar services such as
+PostgreSQL, cache directories and limits, and optionally further images to test on, called
+\term[platform]{platforms}. Once an admin has approved exactly that version of the file, each run
+of the project gets its own container. The builder edits the files on the server and runs builds
+and tests in the container, which sees the run's working copy at \file{/workspace} and nothing
+else from the server. The containers run in rootless Podman as the \texttt{agern} user.
+
+A sandbox is a toolchain and resource boundary, \emph{not} a security boundary: the agent itself
+still runs on the server as \texttt{agern} (chapter~\ref{ch:what}). Never put secrets into the
+file; everybody who can see the project can read it.
+
+\section{Turn sandboxes on (on the server)}\label{sec:sandbox-enable}
+
+\begin{enumerate}
+  \item Install rootless Podman and its helpers. The package only suggests them, and
+    \cmd{agern sandbox enable} never installs packages itself:
+\begin{lstlisting}
+sudo apt install podman uidmap netavark aardvark-dns crun slirp4netns
+\end{lstlisting}
+  \item Turn sandboxes on:
+\begin{lstlisting}
+sudo agern sandbox enable
+\end{lstlisting}
+    It gives the \texttt{agern} user a range of subordinate user and group ids, starts the sandbox
+    service, and runs a self-test exactly as the server will use Podman (it pulls the small image
+    \texttt{docker.io/library/busybox}, checks networking, limits and file ownership). Only when
+    everything passes does it set \texttt{FACTORY\_SANDBOX=podman} in \file{/etc/agern/agern.env}
+    and restart Agern, and only if nobody's work is in progress; otherwise it tells you to run
+    \cmd{sudo agern restart} later.
+  \item Check the result:
+\begin{lstlisting}
+sudo agern sandbox status
+sudo agern doctor
+\end{lstlisting}
+\end{enumerate}
+
+Podman needs cgroups v2 and unprivileged user namespaces, the defaults on Debian~13 and
+Ubuntu~24.04. Limits, disk use and troubleshooting are in
+\repodoc{INSTALL-LINUX.md\#13-sandboxes}{\texttt{INSTALL-LINUX.md}, section~13}.
+
+\section{Describe the sandbox (in the project)}\label{sec:sandbox-file}
+
+\begin{enumerate}
+  \item Add \file{.agern/sandbox.yml} to the project's default branch. Only \texttt{image} is
+    required, and it must be fully qualified and come from an allowed registry. A minimal file for a
+    Gradle project with a database:
+\begin{lstlisting}[style=conf]
+image: docker.io/library/eclipse-temurin:21-jdk
+services:
+  postgres:
+    image: docker.io/library/postgres:17
+    env: { POSTGRES_DB: app, POSTGRES_USER: app, POSTGRES_PASSWORD: app }
+    ready: { command: "pg_isready -h 127.0.0.1 -U app -d app" }
+caches: [ /root/.gradle ]
+\end{lstlisting}
+    The database is reachable from the sandbox under the host name \texttt{postgres}. Every key,
+    platforms, a non-root user and examples for other toolchains are in
+    \repodoc{SANDBOXES.md}{\texttt{docs/SANDBOXES.md}}.
+  \item Merge it into the default branch. Runs read the file from the commit they start from.
+\end{enumerate}
+
+\section{Approve it (as an admin)}\label{sec:sandbox-approve}
+
+A new or changed definition waits for an admin. Until then, runs build and test on the server as
+before.
+
+\begin{enumerate}
+  \item On the \ui{Admin} page, the \ui{Sandboxes} card lists the running sandboxes and, under
+    \ui{Waiting for approval}, the projects whose file is new (\ui{needs approval}) or changed
+    since its approval (\ui{changed}) (figure~\ref{fig:admin-sandboxes}). The project page's
+    \ui{Sandbox} section links to the same page.
+  \item Open the project's card. The \ui{Sandbox} page shows what the file asks for: images, the
+    setup script, services, caches and resources (figure~\ref{fig:sandbox-pending}).
+  \item Approve only what you would run on the server yourself. Choose \ui{Approve\ldots}, read the
+    summary and choose \ui{Approve this version}. The page now shows the approved definition and
+    who approved it (figure~\ref{fig:sandbox-approved}); \ui{Revoke\ldots} withdraws the approval.
+\end{enumerate}
+
+Every change of the file needs a new approval. A run that changes the file itself still uses the
+version it started from, so a change can never approve itself.
+
+\screenshot{44-admin-sandboxes-desktop}{The Sandboxes card on the Admin page: running sandboxes and definitions waiting for approval.}{admin-sandboxes}
+
+\screenshot[0.85\linewidth]{43-sandbox-pending-desktop}{A sandbox definition waiting for an admin's approval.}{sandbox-pending}
+
+\screenshot[0.85\linewidth]{42-sandbox-approved-desktop}{An approved sandbox: its definition, who approved it, and the file.}{sandbox-approved}
+
+\section{What a run shows}\label{sec:sandbox-run}
+
+The run page names the sandbox in its \ui{SANDBOX} line: the image, the version of the
+definition and the platforms (you can see it in figure~\ref{fig:run-started} in
+chapter~\ref{ch:run}). Without an approved definition the line says why, for example that its
+sandbox definition is not approved and the run builds and tests on the host. The builder's
+transcript shows each command it runs in the sandbox, with its output.
+
+\whatyouhave
+Sandboxes are on, your project describes its container, and an admin has approved it: the next
+run builds and tests in its own container. Next, take a tour of a project in
+chapter~\ref{ch:project}.

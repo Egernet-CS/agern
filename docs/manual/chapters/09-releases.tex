@@ -1,0 +1,121 @@
+\chapter{Releases}\label{ch:releases}
+
+\emph{You want several issues built one after another, unattended, and shipped together.} A
+release is a named plan of issues for one project, in build order. Once started, Agern builds it
+on its own branch \texttt{release/<name>}: one run per issue, each merged into the release
+branch. When nothing is left to build, Agern opens one pull request from the release branch to
+the default branch, and the release is merged when you approve it, or automatically. The rules in
+full are in \repodoc{ARCHITECTURE.md\#releases}{\texttt{ARCHITECTURE.md}, ``Releases''}.
+
+\section{Create a release}\label{sec:create-release}
+
+\begin{enumerate}
+  \item On the project page, the \ui{Releases} section of the agents \& runs pane lists the releases
+    that are not finished, with their state and progress (figure~\ref{fig:project-releases}).
+    Choose its \ui{+ New}.
+  \item Give the release a \ui{Name}. Letters, digits, \texttt{.}, \texttt{\_} and \texttt{-} are
+    allowed; the name becomes the branch \texttt{release/<name>}. Add a \ui{Description} if you like.
+  \item Under \ui{When it is ready}, choose the release mode (section~\ref{sec:release-mode}):
+    \ui{Manual approval} or \ui{Release automatically}. Choose \ui{Create release}
+    (figure~\ref{fig:new-release}).
+\end{enumerate}
+
+Creating a release creates no branch and starts nothing. It is a plan, shown as \ui{in preparation},
+that anyone who can see the project may change.
+
+\screenshot[0.55\linewidth]{36-project-releases-desktop}{The releases of a project in the agents \& runs pane.}{project-releases}
+
+\screenshot{41-new-release-desktop}{Creating a release.}{new-release}
+
+\section{Assign issues and set the build order}\label{sec:assign}
+
+\begin{enumerate}
+  \item Assign issues in either place: in the project's issue list, with the release selector on
+    each issue (or select several issues and use \ui{Assign to\ldots}); or on the release page, with
+    \ui{Add an open issue} and \ui{Add}. An issue is in at most one release; assigning it again
+    moves it.
+  \item On the release page, the issues are listed \ui{in build order}
+    (figure~\ref{fig:release-planning}). Move an issue up or down with the arrows, or take it out
+    with \ui{Remove}. Put issues that others build on first.
+\end{enumerate}
+
+\screenshot{37-release-planning-desktop}{A release in preparation: its issues in build order.}{release-planning}
+
+\section{Choose the release mode}\label{sec:release-mode}
+
+The \ui{Release mode} selector on the release page (figure~\ref{fig:release-mode}) decides what
+happens when everything is built:
+
+\begin{itemize}
+  \item \ui{Manual approval}: the release waits as \ui{ready to release} until whoever started it
+    approves it.
+  \item \ui{Automatic}: once everything is built, merges cleanly and all checks on the release pull
+    request have passed, Agern merges it with the owner's GitHub token. Held issues, conflicts and
+    failed checks stop it.
+\end{itemize}
+
+While the release is in preparation anyone may change the mode. Once it is started or scheduled,
+only its owner may switch it to automatic, because it merges with the owner's token; the owner or
+an admin may switch it back to manual.
+
+\screenshot[0.85\linewidth]{40-release-mode-desktop}{The release mode of a release in preparation.}{release-mode}
+
+\section{Start or schedule it}\label{sec:start-release}
+
+\begin{enumerate}
+  \item Choose \ui{Start release} and confirm. Agern creates the branch \texttt{release/<name>} from
+    the default branch and starts the run of the first issue. You become the release's owner: all
+    its runs use your Claude credential and GitHub token.
+  \item Or choose \ui{Schedule start\ldots} and pick a time, for example tonight. At that time
+    Agern starts the release as you. If another release of the project is still building then, it
+    waits for it. \ui{Change time} and \ui{Cancel schedule} change your mind.
+\end{enumerate}
+
+Only one release per project builds at a time.
+
+\section{Follow the build, pause, and resolve held issues}\label{sec:release-building}
+
+The release page of a building release shows the branch, how many issues are merged and held, a
+status line such as \ui{Building \#58 \ldots}, and each issue's state: \ui{waiting},
+\ui{running}, \ui{merged}, \ui{held} or \ui{skipped}, with a link to its run
+(figure~\ref{fig:release-building}).
+
+\begin{enumerate}
+  \item To stop starting new issues, choose \ui{Pause}; the running issue finishes. \ui{Resume}
+    continues. When your Claude usage limit is reached, Agern pauses the release itself and
+    resumes it when the limit resets.
+  \item An issue whose run needs a human, or failed, is \ui{held}, with the reason, and the release
+    goes on with the next issue. Resolve it in one of three ways:
+    \begin{itemize}
+      \item open its \ui{run} and approve it (section~\ref{sec:needs-human}): it merges into the
+        release branch;
+      \item choose \ui{Retry} on the issue and pick how (section~\ref{sec:retry});
+      \item or choose \ui{Remove} to leave it out of this release.
+    \end{itemize}
+  \item \ui{Cancel release} stops the release; its branch stays on GitHub.
+\end{enumerate}
+
+\screenshot{38-release-building-desktop}{A building release: one issue merged, one running, one held, one waiting.}{release-building}
+
+\section{Approve and release}\label{sec:approve-release}
+
+When nothing is left to build, the release is \ui{ready to release} (figure~\ref{fig:release-ready}).
+Agern has opened the \ui{Release pull request} and shows whether it merges cleanly and the state of
+its checks (CI on GitHub). A release with held issues is incomplete and cannot be approved yet.
+
+\begin{enumerate}
+  \item Check the pull request on GitHub if you like; \ui{Check again} refreshes the merge state
+    and checks.
+  \item Choose \ui{Approve and release} and confirm. Agern merges the pull request so that each
+    issue stays one commit on the default branch, closes the issues and deletes the release branch.
+    The release is \ui{released} and moves to the project's release history.
+\end{enumerate}
+
+With \ui{Automatic} mode, Agern does this step itself once the checks pass.
+
+\screenshot{39-release-ready-desktop}{A release that is ready: its pull request, merge state, checks and the approve button.}{release-ready}
+
+\whatyouhave
+You can plan a release, order its issues, start or schedule it, keep it moving past held issues,
+and release it by hand or automatically. Next, learn to keep an eye on all agents and on your
+usage: chapter~\ref{ch:watch}.

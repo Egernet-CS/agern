@@ -1,0 +1,138 @@
+\chapter{Your first run}\label{ch:run}
+
+\emph{You want an issue implemented, reviewed and merged by agents, and to stay in control while
+it happens.} A pipeline run does exactly that (figure~\ref{fig:pipeline} in
+chapter~\ref{ch:what}). This chapter follows one run from start to merge, and shows what to do
+when a run needs you, fails or should stop.
+
+\section{Start the run}\label{sec:start-run}
+
+\begin{enumerate}
+  \item Open the project and find the issue in the issue list.
+  \item Choose \ui{Start run} on it. (In the chat, \cmd{/factory run 57} does the same, and the chat
+    agent can start runs when you ask it to.) Starting needs your Claude credential; without one
+    Agern answers \msg{Register a Claude credential in Settings first}.
+  \item Agern opens the run page (figure~\ref{fig:run-started}). You are the run's owner: it runs
+    on your credentials, and only you can approve it or talk to it.
+\end{enumerate}
+
+\screenshot{33-run-started-desktop}{A run that has just started: the spec-writer is at work.}{run-started}
+
+\section{Read the run page}\label{sec:run-page}
+
+The head of the page shows the issue, the run's status (for example \ui{spec}, \ui{building},
+\ui{reviewing}, \ui{needs human}, \ui{merged}), the owner, the current round, the branch the
+builder works on, the pull request once there is one, and how long the run has been going. The
+\ui{SANDBOX} line says whether the builder uses a sandbox (chapter~\ref{ch:sandboxes}).
+
+Below it is the pipeline diagram. Each box is a stage with its model and state:
+\ui{pending}, \ui{running} with a timer, \ui{done} with its verdict, or failed. The arrows show
+where the run goes next. The row of chips under the diagram lists the stages of each round.
+
+\begin{enumerate}
+  \item Watch the stages light up one after another: the spec-writer posts its specification on the
+    issue, the builder implements it, commits, pushes and opens a pull request, and the four
+    reviewers start together (figure~\ref{fig:run-live}).
+  \item Select a box to see that stage below the diagram: its status, verdict, model, time, cost and
+    turns, its summary and findings, and its full transcript, live while it runs.
+  \item If any reviewer answers CHANGES, the same builder conversation gets all findings and fixes
+    them in a fix round; then the four review again. The number of fix rounds is limited
+    (two by default, see section~\ref{sec:models}); a selector above the stage details switches
+    between rounds.
+  \item When all four pass, the approver decides. If it approves, Agern squash-merges the pull
+    request and closes the issue.
+\end{enumerate}
+
+\screenshot{50-run-reviewing-desktop}{A run in review: the four reviewers work in parallel.}{run-live}
+
+On a phone the run page is one column, with the diagram on top (figure~\ref{fig:run-phone}).
+
+\phoneshot{52-run-phone}{A run on a phone.}{run-phone}
+
+\section{Reviewer screenshots}\label{sec:reviewer-screenshots}
+
+The UX and UI design reviewers do not only read the change: they run the app under review in a
+headless browser and attach screenshots to their stage, each with a caption
+(figure~\ref{fig:reviewer-screenshots}). Select a thumbnail to see it large. If a change touches
+the user interface and no reviewer attached a screenshot, the run page warns
+\msg{UI change reviewed without screenshots}, as in figure~\ref{fig:run-merged}. This needs the
+headless browser installed in section~\ref{sec:agent-tools}.
+
+\screenshot{32-run-reviewer-screenshots-desktop}{A UX reviewer's verdict, finding and screenshots.}{reviewer-screenshots}
+
+\section{Steer a running agent}\label{sec:steer}
+
+You can talk to the spec-writer or the builder while it works, for example to point it at an
+existing helper or to say what to leave alone.
+
+\begin{enumerate}
+  \item Select the running spec-writer or builder in the diagram.
+  \item Below its transcript, type into \ui{Tell the spec-writer something} (or the builder) and
+    press Enter (figure~\ref{fig:run-steer}).
+  \item Your message is queued and picked up at the agent's next step, after its current tool call.
+    It is not posted on GitHub.
+\end{enumerate}
+
+\screenshot{49-run-steer-desktop}{Sending a message to the running spec-writer.}{run-steer}
+
+\section{When a run needs a human}\label{sec:needs-human}
+
+When the approver escalates, or a step needs a decision, the run stops in \ui{needs human}. The
+page says why, in a red box under the header (figure~\ref{fig:run-needs-human}). The projects
+page lists it under \ui{needs human} as well.
+
+\begin{enumerate}
+  \item Read the reason, the reviewers' findings and the pull request on GitHub.
+  \item If you have questions, choose \ui{Talk to the agent}. Ask why the run needs a human, or ask
+    for a change (figure~\ref{fig:run-talk}). A change is committed, pushed and reviewed again by
+    the four reviewers before the run can be approved. Talking never approves anything, and the
+    conversation is not posted on GitHub.
+  \item When you are satisfied, choose \ui{Approve \& merge}. If the approver advised against it,
+    Agern asks once more (\ui{Merge against the approver's advice?}); \ui{Merge anyway} squash-merges
+    the pull request, \ui{Don't merge} keeps waiting. \cmd{/factory approve} in the chat does the same.
+\end{enumerate}
+
+\screenshot{51-run-needs-human-desktop}{A run waiting for its owner after the approver escalated.}{run-needs-human}
+
+\screenshot{34-run-talk-desktop}{Talking to the agent about a run that needs a human.}{run-talk}
+
+\section{Cancel a run}\label{sec:cancel}
+
+\begin{enumerate}
+  \item Choose \ui{Cancel run} in the run's header. Only the owner and admins can.
+  \item Confirm with \ui{Cancel run}; \ui{Keep running} changes your mind. The agents stop; the branch
+    and any pull request stay on GitHub.
+\end{enumerate}
+
+\section{Retry a failed run}\label{sec:retry}
+
+A run can fail, for example when a stage takes longer than its time limit, your usage limit is
+reached, or the server restarts while it runs. The run page shows the error in red.
+
+\begin{enumerate}
+  \item Choose \ui{Retry\ldots}. The dialog offers three ways and preselects the sensible one, with
+    its reason (figure~\ref{fig:run-retry}):
+    \begin{itemize}
+      \item \ui{Retry the failed step}: only when the builder finished and a later step (push,
+        pull request, merge) failed;
+      \item \ui{Continue from the commits}: a new run starts from the old branch, reuses the spec
+        and finishes the work;
+      \item \ui{Start over}: a new run on a new branch from scratch; the old branch is left as it is.
+    \end{itemize}
+  \item Confirm with the button, which repeats your choice.
+\end{enumerate}
+
+\screenshot{35-run-retry-desktop}{Retrying a failed run.}{run-retry}
+
+\section{The merged result}\label{sec:merged}
+
+A run that the approver (or you) approved ends as \ui{merged} (figure~\ref{fig:run-merged}). The
+pull request is squash-merged into the default branch, the issue is closed on GitHub, and the run
+page keeps the whole history: every stage, its transcript, findings and screenshots, and the cost.
+
+\screenshot{31-run-merged-desktop}{A merged run, here with the warning that a UI change was reviewed without screenshots.}{run-merged}
+
+\whatyouhave
+You have taken an issue to a merged pull request, and you know how to follow a run, steer its
+agents, decide when it needs you, and cancel or retry it. Next, plan several issues as one
+release: chapter~\ref{ch:releases}.

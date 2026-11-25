@@ -1,0 +1,123 @@
+\chapter{What Agern is}\label{ch:what}
+
+\emph{You want to know what Agern does and what you need before you install it.} This chapter
+gives you the idea in two pages and the shopping list.
+
+\section{The idea}\label{sec:idea}
+
+Agern is a web application that you run on your own server. It puts Claude agents to work on
+the issues of your GitHub organization, and the organization is the source of truth:
+
+\begin{itemize}
+  \item \textbf{Repositories are projects.} Every repository of the organization that your own
+    GitHub token can read appears as a \term{project} in Agern. A \term{workspace project} is a
+    repository that brings several repositories together; its members are worked on side by side.
+  \item \textbf{Every project has a chat agent.} The project page has a terminal-like
+    \term{chat} with an \term{agent}: a Claude Code process working in a checkout of the
+    repository. You ask it about the code, attach screenshots, or let it write an issue for you
+    (chapter~\ref{ch:chat}). Each conversation with an agent, and each pipeline stage, is a
+    \term{session}.
+  \item \textbf{Issues are the work.} An \term{issue} on GitHub is a task. Anyone who can see the
+    project can hand an issue to the pipeline.
+  \item \textbf{The pipeline turns an issue into a merged pull request.} A pipeline \term{run}
+    takes one issue through fixed \term[stage]{stages}, each done by its own agent
+    (figure~\ref{fig:pipeline}). A spec-writer writes a specification. A builder implements it on
+    a branch and opens a pull request. Four \term[reviewer]{reviewers} (security, UX, UI design
+    and code quality) inspect the change in parallel, each with the \term{verdict} PASS or
+    CHANGES. Changes send the work back to the same builder for a \term[round]{fix round}. When
+    all four pass, an \term{approver} makes the final call: it approves, and Agern squash-merges
+    the pull request and closes the issue, or it escalates, and the run \term[needs human]{needs a human}: you.
+  \item \textbf{Releases bundle issues.} A \term{release} is a plan of several issues that
+    Agern builds one after another on a branch of its own and merges in one pull request
+    (chapter~\ref{ch:releases}).
+\end{itemize}
+
+The order of the stages is decided by Agern's server, not by a model: a run always goes the same
+way. Which Claude model does which job is a setting of yours (section~\ref{sec:models}).
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+      font=\sffamily\small,
+      node distance=5mm and 6mm,
+      stage/.style={draw=agernink,rounded corners=3pt,fill=white,minimum width=18mm,minimum height=8mm,align=center},
+      review/.style={stage,minimum width=17mm,minimum height=6.5mm,fill=notebg},
+      outcome/.style={stage,draw=agernamber,fill=warnbg},
+      arr/.style={-{Stealth[length=2.2mm]},thick,draw=agernink},
+      lab/.style={font=\sffamily\scriptsize,fill=white,inner sep=1pt}]
+    \node[stage] (issue) {issue};
+    \node[stage,right=of issue] (spec) {spec-writer};
+    \node[stage,right=of spec] (build) {builder};
+    \node[review,right=11mm of build,yshift=12mm] (sec) {security};
+    \node[review,below=1.5mm of sec] (ux) {ux};
+    \node[review,below=1.5mm of ux] (ui) {ui-design};
+    \node[review,below=1.5mm of ui] (code) {code};
+    \node[draw=black!45,dashed,rounded corners=4pt,inner sep=3pt,fit=(sec)(code)] (four) {};
+    \node[font=\sffamily\scriptsize,above=0mm of four] {four reviews in parallel};
+    \node[stage,right=10mm of four] (appr) {approver};
+    \node[outcome,above right=6mm and 6mm of appr] (merge) {merge};
+    \node[outcome,below right=6mm and 6mm of appr] (human) {needs human};
+    \draw[arr] (issue) -- (spec);
+    \draw[arr] (spec) -- (build);
+    \draw[arr] (build) -- (build -| four.west);
+    \draw[arr] (four.east |- appr) -- node[lab,above=2pt] {all PASS} (appr);
+    \draw[arr] (appr) |- node[lab,pos=0.72,above] {APPROVE} (merge);
+    \draw[arr] (appr) |- node[lab,pos=0.72,below] {ESCALATE} (human);
+    \draw[arr] (human) -- node[lab,right] {owner approves} (merge);
+    \draw[arr,draw=agernamber] (four.south) -- ++(0,-5mm) -| (build.south);
+    \node[lab,text=agernamber] at ($(four.south)+(-22mm,-7.5mm)$) {any CHANGES: fix round (at most 2 by default)};
+  \end{tikzpicture}
+  \caption{The pipeline of a run. Reviews that ask for changes send the work back to the builder;
+    when the approver escalates, the run waits for its owner.}
+  \label{fig:pipeline}
+\end{figure}
+
+\subsection*{Whose account pays}
+
+Agern has no Claude account and no GitHub account of its own. Each person registers their own
+Claude credential and their own GitHub token in Agern's settings (chapter~\ref{ch:accounts}). An
+agent always runs with the credentials of the person who started it, its \term{owner}. Nobody,
+not even an \term{admin}, can make an agent run on someone else's account; admins may stop or
+cancel agents, never drive them. Everybody who can read a repository can watch its agents as an
+\term{observer}, read-only.
+
+\section{What you need}\label{sec:needs}
+
+\begin{enumerate}
+  \item \textbf{A Linux server} with Debian~13 (recommended) or Ubuntu~24.04 LTS and systemd, a
+    fixed address and a name on your network. Agern itself is light; the agents are not, because
+    each one clones repositories and runs builds and tests. From
+    \repodoc{INSTALL-LINUX.md\#1-the-machine}{\texttt{INSTALL-LINUX.md}, section~1}:
+
+    \begin{center}
+    \begin{tabular}{@{}lll@{}}
+      \toprule
+      & Minimum & Recommended (a few people, several runs at once)\\
+      \midrule
+      vCPU & 4 & 8\\
+      RAM & 8 GB & 16--32 GB\\
+      Disk & 64 GB & 128 GB or more\\
+      \bottomrule
+    \end{tabular}
+    \end{center}
+  \item \textbf{A GitHub organization} whose repositories become the projects, for example
+    \texttt{your-org}.
+  \item \textbf{A GitHub token} for each person: a personal access token that can read and write
+    the organization's repositories (section~\ref{sec:github-token}).
+  \item \textbf{A Claude credential} for each person: an OAuth token from \cmd{claude setup-token}
+    (with a Claude subscription) or an Anthropic API key (section~\ref{sec:claude-credential}).
+\end{enumerate}
+
+\begin{warning}[Security boundary: use a dedicated machine]
+All agents run as one operating-system user, \texttt{agern}, with Claude Code's permission checks
+bypassed. Agents of different people can therefore read each other's work and anything else
+that user can read on the machine. Run Agern on a dedicated machine or virtual machine that holds
+nothing else of value, keep it on a trusted network, and never add the \texttt{agern} user to
+\texttt{sudo} or \texttt{docker}. Details:
+\repodoc{INSTALL-LINUX.md\#11-security-boundary}{\texttt{INSTALL-LINUX.md}, section~11}.
+\end{warning}
+
+\whatyouhave
+You know the parts of Agern (projects, chat agents, issues, runs and releases) and you have a
+server, an organization and the two credentials ready, or know where to get them. Next,
+install Agern on the server: chapter~\ref{ch:install}.

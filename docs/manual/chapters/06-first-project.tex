@@ -1,0 +1,68 @@
+\chapter{Your first project}\label{ch:project}
+
+\emph{You want to find your way around a project: its issues, its chat and what its agents are
+doing.} This chapter is a tour of the projects page and of a project's page, on a desktop and on a
+phone.
+
+\section{The projects overview}\label{sec:projects}
+
+\begin{enumerate}
+  \item Choose \ui{Projects} in the top bar. Every repository of the organization that your GitHub
+    token can read is a card, with its description, whether it is private, and how many agents and
+    runs are active in it (figure~\ref{fig:projects}).
+  \item The figures at the top count the projects, the agents active right now, the runs in flight
+    and the runs that need a human. A run that needs you is also listed there, so you do not miss it.
+  \item Choose a card to open the project.
+\end{enumerate}
+
+\screenshot{06-projects-desktop}{The projects overview.}{projects}
+
+On a phone the cards are stacked in one column (figure~\ref{fig:projects-phone}).
+
+\phoneshot{06-projects-phone}{The projects overview on a phone.}{projects-phone}
+
+\section{Project icons}\label{sec:icons}
+
+A project without an icon shows its initial. Admins can give it a picture.
+
+\begin{enumerate}
+  \item Open the project and select the icon next to its name (\ui{Change project icon}). A menu
+    opens (figure~\ref{fig:project-icon}).
+  \item Choose \ui{Upload image\ldots} and pick a PNG, JPEG, WebP, GIF or SVG file of at most 1~MB,
+    or \ui{Use a file from the repository\ldots} and enter its path, for example
+    \file{web/public/favicon.svg}. The icon is shown as a square on the card and the project page.
+  \item \ui{Remove icon} goes back to the initial.
+\end{enumerate}
+
+\screenshot[0.75\linewidth]{29-project-icon-desktop}{The project icon menu (admins only).}{project-icon}
+
+\section{The project page}\label{sec:project-page}
+
+On a desktop the project page has three panes side by side (figure~\ref{fig:project}):
+
+\begin{itemize}
+  \item \textbf{Issues} on the left: the repository's open issues with their kind
+    (feature, bug, task), filters, the release an issue belongs to, \ui{+ New} for a new issue and
+    \ui{Start run} on each issue (chapter~\ref{ch:run}).
+  \item \textbf{The chat} in the middle: your conversation with the project's agent
+    (chapter~\ref{ch:chat}). Above it, the chat selector, the agent's checkout (branch, commit and
+    how far it is behind), \ui{Close chat} and \ui{+ New chat}.
+  \item \textbf{Agents and runs} on the right: the agents working in the project, its releases,
+    its sandbox, its pipeline runs and everybody's chats.
+\end{itemize}
+
+\screenshot{08-project-desktop}{A project page: issues, chat, and agents and runs.}{project}
+
+On a phone the three panes become tabs at the top: \ui{chat}, \ui{issues} and
+\ui{agents \& runs}, with the number of active agents and runs on the last one
+(figures~\ref{fig:project-phone-chat}, \ref{fig:project-phone-issues} and~\ref{fig:project-phone-agents}).
+
+\phoneshot{08-project-phone}{The chat tab on a phone.}{project-phone-chat}
+
+\phoneshot{11-project-issues-tab-phone}{The issues tab on a phone.}{project-phone-issues}
+
+\phoneshot{12-project-activity-tab-phone}{The agents \& runs tab on a phone.}{project-phone-agents}
+
+\whatyouhave
+You know where a project's issues, chat and agents are, on a desktop and on a phone. Next, talk to
+the project's agent in chapter~\ref{ch:chat}.

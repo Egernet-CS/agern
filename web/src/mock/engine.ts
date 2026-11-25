@@ -723,7 +723,7 @@ const screenshotCaptions: Record<string, (round: number) => string[]> = {
 };
 
 function attachScreenshot(r: Run, stage: Stage, caption: string, ts: string) {
-  stage.screenshots.push({ id: uid(), caption, mediaType: 'image/png', size: 97, width: 16, height: 10, createdAt: ts });
+  stage.screenshots.push({ id: uid(), caption, mediaType: 'image/svg+xml', size: 2400, width: 320, height: 200, createdAt: ts });
   touchRun(r, ts);
 }
 

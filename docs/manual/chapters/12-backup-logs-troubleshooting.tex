@@ -1,0 +1,127 @@
+\chapter{Backup, logs and troubleshooting}\label{ch:backup}
+
+\emph{You want to be able to rebuild Agern after a disaster, and to find out quickly what is wrong
+when something does not work.}
+
+\section{Back up}\label{sec:backup}
+
+Back up two things, and keep them apart.
+
+\begin{enumerate}
+  \item \textbf{The database}, for example every night (as a cron job or systemd timer):
+\begin{lstlisting}
+sudo -u postgres pg_dump -Fc factory > /var/backups/agern-db-$(date +%F).dump
+\end{lstlisting}
+  \item \textbf{The configuration} \file{/etc/agern/agern.env}, above all \envvar{FACTORY_MASTER_KEY}.
+    Every stored Claude credential, GitHub token and two-factor secret in the database is encrypted
+    with it. A database backup without the key is useless, and the key together with the database
+    gives access to everybody's credentials: keep the key in a password manager or secrets store, not
+    next to the dumps.
+\end{enumerate}
+
+The data directory \file{/var/lib/agern} holds checkouts and caches that agents recreate. Include
+it only if you want interrupted chats to resume after a restore. Snapshots of the whole virtual
+machine are a good addition to, not a replacement for, the database dump.
+
+\section{Restore on a new machine}\label{sec:restore}
+
+\begin{enumerate}
+  \item Install PostgreSQL and the Agern package as in chapter~\ref{ch:install}, but do not start Agern.
+  \item Put your saved \file{/etc/agern/agern.env} back, owned by \texttt{root:agern} with mode 0640:
+\begin{lstlisting}
+sudo install -o root -g agern -m 0640 agern.env /etc/agern/agern.env
+\end{lstlisting}
+  \item Create the role (with the password from that file) and an empty database, restore the dump
+    and start:
+\begin{lstlisting}
+sudo agern setup-db
+sudo -u postgres pg_restore --no-owner --role=factory -d factory agern-db-2026-11-24.dump
+sudo agern start
+\end{lstlisting}
+  \item Install the agents' tools again (section~\ref{sec:agent-tools}) and run \cmd{sudo agern doctor}.
+\end{enumerate}
+
+\section{Logs and the doctor}\label{sec:logs}
+
+\begin{enumerate}
+  \item Agern logs to the system journal. Show the latest lines, or follow the log live:
+\begin{lstlisting}
+agern logs -n 200
+agern logs -f
+\end{lstlisting}
+    (\cmd{journalctl -u agern} shows the same.) Automatic upgrades log to
+    \cmd{journalctl -u agern-upgrade}, sandboxes to \cmd{journalctl -u agern-sandbox}.
+  \item When anything is odd, ask the doctor first. It checks the configuration, the database login,
+    Java, \texttt{claude}, \texttt{git} and \texttt{gh}, the headless browser, the data directory,
+    the \texttt{agern} user's privileges, sandboxes and whether the server answers:
+\begin{lstlisting}
+sudo agern doctor
+\end{lstlisting}
+  \item \cmd{agern status} says whether the service runs and whether its work is in progress.
+\end{enumerate}
+
+\section{Troubleshooting}\label{sec:troubleshooting}
+
+The messages below are exactly what Agern shows.
+
+\begingroup
+\setlength{\parskip}{0pt}
+\small
+\renewcommand{\arraystretch}{1.3}
+\begin{longtable}{@{}>{\raggedright\arraybackslash}p{0.33\linewidth}>{\raggedright\arraybackslash}p{0.25\linewidth}>{\raggedright\arraybackslash}p{0.36\linewidth}@{}}
+  \toprule
+  What you see & Cause & Fix\\
+  \midrule
+  \endhead
+  \msg{The Agern server is not answering.} (web UI, with \ui{Try again}) & The server is stopped,
+  starting, or crashed. & \cmd{agern status}; \cmd{sudo agern start}; read \cmd{agern logs}.\\
+  \msg{Origin not allowed} when signing in or saving anything & The address in the browser differs
+  from \envvar{FACTORY_PUBLIC_URL}. & Open exactly that address, or correct the variable and
+  \cmd{sudo agern restart} (section~\ref{sec:public-url}).\\
+  \texttt{agern start} fails; the log says \msg{Agern: configuration error: Environment variable
+  FACTORY\_GITHUB\_ORG is required} & A required setting is missing or invalid; Agern exits instead
+  of restarting in a loop. & Fix the named variable in \file{/etc/agern/agern.env}; run
+  \cmd{sudo agern doctor}.\\
+  \msg{Wrong username or password} although the password is right, and the doctor warns
+  \msg{FACTORY\_AUTH has 'os' but agern is not in group 'shadow'; PAM cannot check other users'
+  passwords (see the install docs)} & PAM cannot read \file{/etc/shadow} for \texttt{agern}. &
+  \cmd{sudo usermod -aG shadow agern} and \cmd{sudo agern restart}, or use LDAP
+  (section~\ref{sec:first-admin}).\\
+  \msg{Too many wrong codes. Two-factor sign-in is locked for 15 minutes.} & Five wrong two-factor
+  codes in a row. & Wait 15 minutes; check the phone's clock; use a recovery code; or ask an admin
+  for \ui{Reset 2FA} (section~\ref{sec:users}).\\
+  \msg{GitHub rejected the token (401)} in Settings & The token is wrong, expired or revoked. &
+  Create a new token (section~\ref{sec:github-token}) and paste it.\\
+  \ui{No repositories visible} on the projects page & Your token cannot read any repository of the
+  organization (fine-grained token without access to it, or the organization restricts tokens). &
+  Give the token access to the organization's repositories; ask an organization owner to approve it.\\
+  \msg{Register a GitHub token in Settings first} & You have no GitHub token registered. & Add it
+  under \ui{Settings} $\rightarrow$ \ui{GitHub}.\\
+  \msg{Register a Claude credential in Settings first} when starting a run or release, or
+  \ui{Chat is disabled} & You have no Claude credential registered. & Add it under \ui{Settings}
+  $\rightarrow$ \ui{Claude} (section~\ref{sec:claude-credential}).\\
+  \msg{You already have 8 agents running} & You reached \envvar{FACTORY_MAX_AGENTS_PER_USER}. &
+  Close chats you no longer need, wait for runs to finish, or raise the limit.\\
+  The doctor says \msg{claude not found on \ldots} & Claude Code is not installed for the
+  \texttt{agern} user. & Run the command the doctor prints (section~\ref{sec:agent-tools}).\\
+  The doctor warns \msg{FACTORY\_PUBLIC\_URL is http://localhost:8080 --- set the URL people
+  type in their browser, or every browser request from the LAN is rejected} & The public URL was
+  never set. & Set \envvar{FACTORY_PUBLIC_URL} (section~\ref{sec:minimal-config}).\\
+  \msg{agern: error: not restarting now, the server is busy: \ldots{} Try again later, or use
+  -{}-force (interrupted runs fail)} & \cmd{agern upgrade} or \cmd{agern sandbox disable} while
+  work is in progress. & Wait until runs finish, or add \cmd{--force} (chapter~\ref{ch:upgrade}).\\
+  A run page says its sandbox definition is not approved & \file{.agern/sandbox.yml} is new or
+  changed. & An admin approves it on the project's \ui{Sandbox} page (section~\ref{sec:sandbox-approve}).\\
+  \bottomrule
+\end{longtable}
+\endgroup
+
+When none of this helps,
+\repodoc{INSTALL-LINUX.md}{\texttt{INSTALL-LINUX.md}} has more detail on every part of the
+installation, and \repodoc{ARCHITECTURE.md}{\texttt{ARCHITECTURE.md}} on how Agern works.
+
+\whatyouhave
+Your data is backed up and you know how to restore it, where the logs are, and how to fix the
+common problems. You have read the whole path: Agern is installed, configured and in use. The
+appendices are for looking things up: the glossary (appendix~\ref{app:glossary}) and the
+configuration quick reference (appendix~\ref{app:config}).

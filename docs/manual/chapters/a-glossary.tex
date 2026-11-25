@@ -1,0 +1,61 @@
+\chapter{Glossary}\label{app:glossary}
+
+\emph{You want to look up an Agern term.} Each term points to where the manual explains it.
+
+\begin{description}[style=nextline,leftmargin=1.5em,font=\normalfont\bfseries]
+  \item[admin]\label{gl:admin}\index{admin} A user named in \envvar{FACTORY_ADMINS}. Admins see the
+    \ui{Admin} page, approve sandbox definitions, reset other users' two-factor setup, and may stop
+    or cancel anybody's agents and runs, but never drive them (section~\ref{sec:users}).
+  \item[agent]\label{gl:agent}\index{agent} A Claude Code process that Agern starts for a person:
+    the chat agent of a project, or the agent of one pipeline stage. It runs with its owner's
+    credentials (section~\ref{sec:idea}).
+  \item[approver]\label{gl:approver}\index{approver} The last stage of a run. After all four
+    reviewers pass, it approves (the pull request is merged) or escalates (the run needs a human)
+    (chapter~\ref{ch:run}).
+  \item[channel]\label{gl:channel}\index{channel} Where upgrades come from: \texttt{stable} (tagged
+    releases) or \texttt{main} (the rolling build \texttt{main-latest}) (section~\ref{sec:version}).
+  \item[chat]\label{gl:chat}\index{chat} A conversation with a project's agent on the project page.
+    Others can read it; only its owner can write in it (chapter~\ref{ch:chat}).
+  \item[fix round]\label{gl:round}\index{round}\index{fix round|see{round}} See \emph{round}.
+  \item[issue]\label{gl:issue}\index{issue} A GitHub issue of a project's repository: a task that a
+    run can implement (section~\ref{sec:new-issue}).
+  \item[needs human]\label{gl:needs-human}\index{needs human} The state of a run that waits for its
+    owner, because the approver escalated or a step needs a decision. The owner can talk to an agent
+    about it and approve it (section~\ref{sec:needs-human}).
+  \item[observer]\label{gl:observer}\index{observer} Anyone who watches a session they do not own.
+    Observing is read-only (section~\ref{sec:observe}).
+  \item[owner]\label{gl:owner}\index{owner} The person who started a chat, run or release. Its
+    agents run on the owner's Claude credential and GitHub token, and only the owner drives them.
+  \item[platform]\label{gl:platform}\index{platform} A further container image named in a sandbox
+    definition, on which the builder can also build and test, for example an older JDK
+    (chapter~\ref{ch:sandboxes}).
+  \item[project]\label{gl:project}\index{project} A repository of the GitHub organization, as Agern
+    shows it. You see the projects your GitHub token can read (chapter~\ref{ch:project}).
+  \item[release]\label{gl:release}\index{release} A named plan of issues of one project, built one
+    after another on the branch \texttt{release/<name>} and merged in one pull request
+    (chapter~\ref{ch:releases}).
+  \item[release mode]\label{gl:release-mode}\index{release mode} Whether a ready release waits for
+    its owner's approval (manual) or is merged by Agern once it is complete and its checks pass
+    (automatic) (section~\ref{sec:release-mode}).
+  \item[reviewer]\label{gl:reviewer}\index{reviewer} One of the four stages that inspect a change in
+    parallel and read-only: security, UX, UI design and code quality. Each gives a verdict
+    (section~\ref{sec:run-page}).
+  \item[round]\label{gl:round-term} Also \emph{fix round}. One pass of builder and reviewers. Round~0
+    is the first build; each time a reviewer asks for changes, the same builder conversation fixes
+    them in the next round, up to a limit (section~\ref{sec:run-page}).
+  \item[run]\label{gl:run}\index{run} One pipeline run: an issue taken through spec, build, reviews
+    and approval to a merged pull request (chapter~\ref{ch:run}).
+  \item[sandbox]\label{gl:sandbox}\index{sandbox} A run's own container for builds and tests, in
+    rootless Podman (chapter~\ref{ch:sandboxes}).
+  \item[sandbox definition]\label{gl:sandbox-definition}\index{sandbox definition} The file
+    \file{.agern/sandbox.yml} that describes a project's sandbox. Each version needs an admin's
+    approval (section~\ref{sec:sandbox-approve}).
+  \item[session]\label{gl:session}\index{session} One agent's conversation, with its transcript:
+    a chat, or one stage of a run.
+  \item[stage]\label{gl:stage}\index{stage} One step of a run, done by its own agent: spec-writer,
+    builder, the four reviewers, approver (figure~\ref{fig:pipeline}).
+  \item[verdict]\label{gl:verdict}\index{verdict} A reviewer's result: PASS, or CHANGES with
+    findings. The approver's verdict is APPROVE or ESCALATE.
+  \item[workspace project]\label{gl:workspace}\index{workspace project} A project that brings several
+    repositories together as members; its issues name the member they concern (section~\ref{sec:idea}).
+\end{description}

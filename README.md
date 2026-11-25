@@ -38,6 +38,31 @@ issue ─▶ spec-writer ─▶ builder ─┬─▶ security  ─┐
 The orchestration is a deterministic state machine in the server, not something a model decides.
 Models per role are a setting. The details are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
+## Manual
+
+**Agern: Getting Started** is a PDF manual for people new to Agern: a guided path, with screenshots,
+from installing Agern on Debian or Ubuntu and connecting your GitHub and Claude accounts to your
+first project, chat, pipeline run and release, and on to upgrades, backups and troubleshooting.
+Download `agern-manual-<version>.pdf` from the assets of the
+[latest release](https://github.com/Egernet-CS/agern/releases/latest), or from the
+[`main-latest`](https://github.com/Egernet-CS/agern/releases/tag/main-latest) pre-release for the
+`main` channel.
+
+Its LaTeX sources are in [`docs/manual/`](docs/manual/); the screenshots are taken from the mock app
+by `web/scripts/screenshots.mjs`, never committed. To build it yourself you need Node.js (24), the
+Playwright Chromium (`cd web && npm ci && npx playwright install chromium`) and TeX Live with
+`latexmk`; on Debian/Ubuntu, the packages CI uses:
+
+```sh
+sudo apt-get install --no-install-recommends latexmk texlive-latex-base texlive-latex-recommended \
+  texlive-latex-extra texlive-fonts-recommended texlive-pictures lmodern
+scripts/manual.sh                   # screenshots + PDF; or: scripts/manual.sh 1.2.3
+```
+
+The PDF lands in `build/manual/agern-manual-<version>.pdf`, the screenshots in
+`build/manual/screenshots/`. `--shots-only` needs no TeX, `--pdf-only` reuses the screenshots,
+`--help` explains the rest.
+
 ## Features
 
 - **Per-user Claude credentials and the ownership rule.** Each person registers their own Claude
@@ -316,17 +341,19 @@ The script checks that the version is semantic, the tree is clean, you are on `m
 Nothing is built locally. The [release workflow](.github/workflows/release.yml) then runs the
 frontend checks and server tests, builds the jar with that version (`scripts/package.sh`, which you
 can also run locally; `--deb` needs `dpkg-deb`) and publishes a GitHub Release with
-`agern-1.2.0.tar.gz`, `install.sh`, `agern_1.2.0_all.deb` and `SHA256SUMS`. Versions with a suffix
+`agern-1.2.0.tar.gz`, `install.sh`, `agern_1.2.0_all.deb`, `SHA256SUMS` and the manual
+`agern-manual-1.2.0.pdf` (not in `SHA256SUMS`). Versions with a suffix
 (`1.3.0-rc.1`) become pre-releases, which `agern upgrade` without a version ignores. Every push to
-`main` also publishes a `.deb` as the rolling pre-release `main-latest` (the `main` channel).
+`main` also publishes a `.deb` and the manual as the rolling pre-release `main-latest` (the `main` channel).
 
 ## Repository
 
 ```
 server/      Kotlin + Ktor backend          web/        React + TypeScript frontend
 packaging/   installer, agern CLI, service units, deb/ (Debian package)
-scripts/     release.sh, package.sh, main-version.sh
-docs/        architecture and API contract, INSTALL-LINUX.md, SANDBOXES.md (for project authors)
+scripts/     release.sh, package.sh, main-version.sh, manual.sh (builds the manual)
+docs/        architecture and API contract, INSTALL-LINUX.md, SANDBOXES.md (for project authors),
+             manual/ (the getting-started manual, LaTeX)
 art/         Blender sources of the artwork
 ```
 
