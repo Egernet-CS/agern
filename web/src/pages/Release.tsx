@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { api, ApiError, isReleaseActive, releaseReadiness, type Release, type ReleaseChecks, type ReleaseIssue, type ReleaseMode } from '../api';
+import { api, ApiError, isReleaseActive, releaseReadiness, type Release, type ReleaseChecks, type ReleaseIssue, type ReleaseMode, type ReleaseRepo } from '../api';
 import { RetryDialog } from '../components/ui/RetryDialog';
 import { Dialog, Empty, ErrorBox, IssueStateBadge, KindBadge, Loading, Notice, ReleaseStatusPill } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
@@ -194,7 +194,10 @@ export function ReleasePage() {
   const skipped = count('skipped');
   const running = release.issues.find((i) => i.state === 'running');
   // A released release's branch is deleted on GitHub: shown as text, not linked.
-  const branchUrl = project.data && release.branch && status !== 'released' ? `${project.data.htmlUrl}/tree/${release.branch}` : undefined;
+  // A multi-repository release's branches are also deleted when it is cancelled.
+  const multi = release.repositories.length > 0;
+  const branchGone = status === 'released' || (multi && status === 'cancelled');
+  const branchUrl = project.data && release.branch && !branchGone ? `${project.data.htmlUrl}/tree/${release.branch}` : undefined;
   const statusLine = releaseStatusLine(release, running, held);
 
   return (
@@ -335,6 +338,8 @@ export function ReleasePage() {
         </p>
       )}
 
+      {multi && started && !ready && <ReleaseReposSection release={release} />}
+
       {ready && (
         <ReleasePullSection
           release={release}
@@ -385,6 +390,11 @@ export function ReleasePage() {
                       <span className="ro-note small">{i.retryMode === 'step' ? 'Retries the failed step of its run' : 'Continues from the commits of its run'} when its turn comes.</span>
                     )}
                   </span>
+                  {i.targetDir && (
+                    <span className="tag tag--plain issue-member" title={`Member ${i.targetDir}${i.targetRepo ? ` · ${i.targetRepo}` : ''}`}>
+                      {i.targetDir}
+                    </span>
+                  )}
                   {started && <IssueStateBadge state={i.state} />}
                   {i.runId && (
                     <Link to={`/p/${repo}/runs/${i.runId}`} className="ro-run small" aria-label={`run of #${i.number}`}>
@@ -392,8 +402,8 @@ export function ReleasePage() {
                     </Link>
                   )}
                   {i.prUrl && (
-                    <a href={i.prUrl} target="_blank" rel="noreferrer" className="ro-run small" aria-label={`pull request #${i.prNumber} of #${i.number}`}>
-                      PR #{i.prNumber}
+                    <a href={i.prUrl} target="_blank" rel="noreferrer" className="ro-run small" aria-label={i.targetRepo ? `pull request ${i.targetRepo} #${i.prNumber} of #${i.number}` : `pull request #${i.prNumber} of #${i.number}`}>
+                      {i.targetRepo ? `${i.targetRepo} #${i.prNumber}` : `PR #${i.prNumber}`}
                     </a>
                   )}
                   <span className="ro-actions">
@@ -482,7 +492,12 @@ export function ReleasePage() {
       <Dialog open={confirmCancel} onClose={() => setConfirmCancel(false)} title="Cancel release?">
         <div className="form">
           <p>
-            {ready ? (
+            {multi ? (
+              <>
+                Cancel release “{release.name}”? {ready ? 'Agern will not merge it.' : 'The running issue is stopped and no more are built.'} The branch{' '}
+                <code>{release.branch ?? `release/${release.name}`}</code> is deleted in every repository of the release.
+              </>
+            ) : ready ? (
               <>
                 Cancel release “{release.name}”? Agern will not merge it.{release.prNumber ? ` Pull request #${release.prNumber} and the` : ' The'} branch{' '}
                 <code>{release.branch ?? `release/${release.name}`}</code> stay on GitHub as they are.
@@ -509,6 +524,11 @@ export function ReleasePage() {
           <p>
             {status === 'planning' ? (
               <>Delete release “{release.name}”? This only removes the plan. Its {n} issue{n === 1 ? '' : 's'} stay open and unassigned.</>
+            ) : multi ? (
+              <>
+                Delete release “{release.name}”? Its {n} issue{n === 1 ? '' : 's'} stay open and unassigned; the branch{' '}
+                <code>{release.branch ?? `release/${release.name}`}</code> is deleted in every repository of the release.
+              </>
             ) : (
               <>
                 Delete release “{release.name}”? Its {n} issue{n === 1 ? '' : 's'} stay open and unassigned; the branch{' '}
@@ -562,6 +582,7 @@ function releaseStatusLine(release: Release, running: ReleaseIssue | undefined, 
       return `${note}${running ? ` #${running.number} is finishing; no further issue starts.` : ''}`;
     }
     case 'cancelled':
+      if (release.repositories.length > 0) return `Cancelled ${timeAgo(release.endedAt)}. ${branch} was deleted in every repository of the release.`;
       return `Cancelled ${timeAgo(release.endedAt)}. What was merged stays on ${branch}.`;
     default:
       // `ready` and `released` have their own sections.
@@ -596,6 +617,7 @@ function readyLine(release: Release, target: string) {
     return `Incomplete: ${held.length} issue${held.length === 1 ? ' is' : 's are'} held (${held.map((i) => `#${i.number}`).join(', ')}). Approve or retry their runs, or move them out, before releasing.`;
   }
   if (readiness === 'empty') return 'Nothing was merged into the release branch, so there is nothing to release.';
+  if (release.repositories.length > 0) return reposReadyLine(release);
   if (release.mergeState === 'conflict')
     return (
       <>
@@ -607,6 +629,120 @@ function readyLine(release: Release, target: string) {
     return 'This repository only allows squash merges. Allow rebase merging or merge commits in its GitHub settings to release.';
   if (release.mergeState === 'clean') return `Ready to release. Merges cleanly into ${target}.`;
   return 'Ready to release. Mergeability has not been confirmed yet.';
+}
+
+/** Whether a repository of a multi-repository release has (or gets) a release pull request. */
+function touched(r: ReleaseRepo, all: ReleaseRepo[]): boolean {
+  if (r.issues.length > 0 || r.state !== 'none') return true;
+  // The workspace repository moves the pointers of touched submodule members.
+  return r.directory === null && all.some((m) => m.submodule && m.issues.length > 0);
+}
+
+/** The pull requests approval still has to merge, in merge order. */
+function pendingRepos(release: Release): ReleaseRepo[] {
+  return release.repositories.filter((r) => r.state !== 'merged' && touched(r, release.repositories));
+}
+
+const repoBlocked = (r: ReleaseRepo) => r.mergeState === 'conflict' || r.mergeMethod === 'unavailable';
+
+/** The readiness of a complete multi-repository release: all clean, or the first repository that is not. */
+function reposReadyLine(release: Release) {
+  const pending = pendingRepos(release);
+  if (pending.length === 0) return 'All pull requests of this release are merged.';
+  const first = pending.find((r) => r.state === 'none' || r.mergeState !== 'clean' || r.mergeMethod === 'unavailable');
+  if (!first) return `Ready to release. All ${pending.length} pull request${pending.length === 1 ? '' : 's'} merge${pending.length === 1 ? 's' : ''} cleanly.`;
+  const base = first.baseBranch ?? 'its default branch';
+  if (first.mergeState === 'conflict')
+    return (
+      <>
+        <code>{first.branch}</code> of {first.repo} no longer merges cleanly into {base}. Agern will not merge the release. Resolve the conflicts on
+        the release branch, then check again.
+      </>
+    );
+  if (first.mergeMethod === 'unavailable')
+    return `${first.repo} only allows squash merges. Allow rebase merging or merge commits in its GitHub settings to release.`;
+  if (first.state === 'none') return `Ready to release. The pull request of ${first.repo} has not been opened yet.`;
+  return `Ready to release. Mergeability of the pull request of ${first.repo} has not been confirmed yet.`;
+}
+
+/** The checks of several pull requests as one: the worst state among them. */
+function worstChecks(repos: ReleaseRepo[]): { checks: ReleaseChecks; repo: string } | null {
+  const order: ReleaseChecks['state'][] = ['failed', 'unknown', 'pending', 'awaiting', 'passed', 'none'];
+  for (const state of order) {
+    const r = repos.find((x) => x.checks?.state === state);
+    if (r?.checks) return { checks: r.checks, repo: r.repo };
+  }
+  return null;
+}
+
+const REPO_STATE_LABEL: Record<ReleaseRepo['state'], string> = { none: 'not opened yet', open: 'open', merged: 'merged' };
+const REPO_STATE_TONE: Record<ReleaseRepo['state'], string> = { none: 'idle', open: 'active', merged: 'pass' };
+
+/** How an open release pull request stands against its base branch, in words. */
+function repoMergeWords(r: ReleaseRepo): string | null {
+  if (r.state !== 'open') return null;
+  if (r.mergeMethod === 'unavailable') return 'only squash merges allowed';
+  if (r.mergeState === 'conflict') return `conflicts with ${r.baseBranch ?? 'its default branch'}`;
+  if (r.mergeState === 'clean') return 'merges cleanly';
+  return 'mergeability not confirmed yet';
+}
+
+/** The release pull requests of a multi-repository release, one per repository, in merge order. */
+function ReleaseRepoList({ release }: { release: Release }) {
+  return (
+    <ul className="release-repos">
+      {release.repositories.map((r) => {
+        const words = repoMergeWords(r);
+        const isTouched = touched(r, release.repositories);
+        return (
+          <li key={r.repo} className={`release-repo release-repo--${r.state}`}>
+            <p className="release-repo-line">
+              <strong className="mono release-repo-name">{r.repo}</strong>
+              <span className="tag tag--plain issue-member" title={r.directory ? `Member directory ${r.directory}` : 'The workspace repository'}>
+                {r.directory ?? 'workspace repository'}
+              </span>
+              <span className={`pill pill--${REPO_STATE_TONE[r.state]}`}>
+                <span className="pill-dot" aria-hidden />
+                {REPO_STATE_LABEL[r.state]}
+              </span>
+            </p>
+            <p className="release-repo-line small">
+              {r.prNumber !== null && r.prUrl && (
+                <a href={r.prUrl} target="_blank" rel="noreferrer" className="mono" aria-label={`release pull request #${r.prNumber} of ${r.repo}`}>
+                  #{r.prNumber}
+                </a>
+              )}
+              <span className="mono muted">
+                {r.branch} → {r.baseBranch ?? 'the default branch'}
+              </span>
+              {words && <span>{words}</span>}
+              {r.state === 'merged' && r.mergeCommit && (
+                <span>
+                  merged at <code title={r.mergeCommit}>{r.mergeCommit.slice(0, 12)}</code>
+                </span>
+              )}
+              {r.issues.length > 0 && <span className="muted">{r.issues.map((n) => `#${n}`).join(', ')}</span>}
+              {!isTouched && <span className="muted">Nothing to release in this repository.</span>}
+            </p>
+            {!r.accessible && <p className="release-repo-line small muted">You cannot read this repository</p>}
+            {r.checks && <ChecksLine checks={r.checks} />}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+/** A started multi-repository release outside `ready`: the release pull requests of its repositories. */
+function ReleaseReposSection({ release }: { release: Release }) {
+  return (
+    <section className="release-pr" aria-labelledby="release-repos-h">
+      <div className="section-head">
+        <h2 id="release-repos-h">Pull requests</h2>
+      </div>
+      <ReleaseRepoList release={release} />
+    </section>
+  );
 }
 
 /** `ready`: the release pull request, whether it can be merged, and (owner only) "Check again" / "Approve and release". */
@@ -629,33 +765,43 @@ function ReleasePullSection({
 }) {
   const target = release.targetBranch ?? 'the default branch';
   const readiness = releaseReadiness(release);
-  const blocked = readiness !== 'complete' || release.mergeState === 'conflict' || release.mergeMethod === 'unavailable';
-  const approvable = !blocked && release.prNumber !== null;
-  const method = approvable ? methodWords(release, target, false) : '';
-  const auto = release.mode === 'automatic' && approvable ? automaticLine(release.checks) : null;
+  const multi = release.repositories.length > 0;
+  const pending = multi ? pendingRepos(release) : [];
+  const blocked = multi
+    ? readiness !== 'complete' || pending.some(repoBlocked)
+    : readiness !== 'complete' || release.mergeState === 'conflict' || release.mergeMethod === 'unavailable';
+  const approvable = multi ? !blocked && pending.length > 0 && pending.every((r) => r.state === 'open') : !blocked && release.prNumber !== null;
+  // Each repository merges with its own method; the list says how each one stands.
+  const method = approvable && !multi ? methodWords(release, target, false) : '';
+  const checks = multi ? (worstChecks(pending)?.checks ?? null) : release.checks;
+  const auto = release.mode === 'automatic' && approvable ? automaticLine(checks) : null;
   return (
     <section className="release-pr" aria-labelledby="release-pr-h">
       <div className="section-head">
-        <h2 id="release-pr-h">Release pull request</h2>
+        <h2 id="release-pr-h">{multi ? 'Pull requests' : 'Release pull request'}</h2>
       </div>
-      <p className="release-pr-link">
-        {release.prNumber !== null && release.prUrl ? (
-          <>
-            <a href={release.prUrl} target="_blank" rel="noreferrer" className="mono">
-              #{release.prNumber}
-            </a>
-            <span className="mono small muted">
-              {release.branch ?? `release/${release.name}`} → {target}
-            </span>
-          </>
-        ) : (
-          <span className="muted">No pull request yet.</span>
-        )}
-      </p>
+      {multi ? (
+        <ReleaseRepoList release={release} />
+      ) : (
+        <p className="release-pr-link">
+          {release.prNumber !== null && release.prUrl ? (
+            <>
+              <a href={release.prUrl} target="_blank" rel="noreferrer" className="mono">
+                #{release.prNumber}
+              </a>
+              <span className="mono small muted">
+                {release.branch ?? `release/${release.name}`} → {target}
+              </span>
+            </>
+          ) : (
+            <span className="muted">No pull request yet.</span>
+          )}
+        </p>
+      )}
       <p id="release-ready-status" className={`release-status release-status--${blocked ? 'blocked' : 'ready'}`} role="status">
         {readyLine(release, target)}
       </p>
-      {release.checks && <ChecksLine checks={release.checks} />}
+      {!multi && release.checks && <ChecksLine checks={release.checks} />}
       {method && <p className="muted small">{method}</p>}
       {auto && <p className="muted small release-auto">{auto}</p>}
       {isOwner ? (
@@ -803,7 +949,8 @@ function ReleasedFacts({ release, repo }: { release: Release; repo: string }) {
             {' '}· {target} at <code title={release.mergeCommit}>{shortSha(release.mergeCommit)}</code>
           </>
         )}
-        . Its issues were closed and the branch {release.branch ?? `release/${release.name}`} was deleted. <Link to={`/p/${repo}`}>Back to {repo}</Link>
+        . Its issues were closed and the branch {release.branch ?? `release/${release.name}`} was deleted
+        {release.repositories.length > 0 ? ' in every repository of the release' : ''}. <Link to={`/p/${repo}`}>Back to {repo}</Link>
       </p>
     </div>
   );
@@ -830,25 +977,52 @@ function ApproveReleaseDialog({
     release.mergeMethod === 'merge'
       ? `with a merge commit: ${issues}, one commit each, plus the merge commit`
       : `by rebasing (or with a merge commit if GitHub cannot rebase it): ${issues}, one commit each`;
+  const multi = release.repositories.length > 0;
+  const pending = multi ? pendingRepos(release) : [];
   // Approval is never blocked by checks (the owner decides), but it says what it would override.
-  const checks = release.checks;
+  const worst = multi ? worstChecks(pending) : release.checks ? { checks: release.checks, repo: '' } : null;
+  const checks = worst?.checks;
+  const which = multi && worst ? `the pull request of ${worst.repo}` : 'this pull request';
   const warning =
     checks?.state === 'failed'
-      ? `Checks failed on this pull request (${checks.detail ?? 'a check failed'}). Approving merges it anyway.`
+      ? `Checks failed on ${which} (${checks.detail ?? 'a check failed'}). Approving merges it anyway.`
       : checks?.state === 'pending'
-        ? `Some checks have not finished yet (${checks.detail ?? 'pending'}). Approving merges it without waiting for them.`
+        ? `Some checks on ${which} have not finished yet (${checks.detail ?? 'pending'}). Approving merges it without waiting for them.`
         : checks?.state === 'awaiting'
-          ? 'No checks have appeared on this pull request yet; CI may not have started. Approving merges it without waiting for them.'
+          ? `No checks have appeared on ${which} yet; CI may not have started. Approving merges it without waiting for them.`
           : checks?.state === 'unknown'
-          ? 'The checks on this pull request could not be read. Approving merges it without them.'
+          ? `The checks on ${which} could not be read. Approving merges it without them.`
           : null;
   return (
     <Dialog open={open} onClose={onClose} title={`Release ${release.name}?`}>
       <div className="form">
-        <p>
-          This merges pull request #{release.prNumber} into {target} {how}. The issues are closed and the branch release/{release.name} is deleted. This
-          cannot be undone.
-        </p>
+        {multi ? (
+          <>
+            <p>This merges these pull requests, in this order:</p>
+            <ol className="release-approve-order">
+              {pending.map((r) => (
+                <li key={r.repo}>
+                  <span className="mono">
+                    {r.repo}
+                    {r.prNumber !== null ? ` #${r.prNumber}` : ''}
+                  </span>{' '}
+                  <span className="muted small">
+                    ({r.branch} → {r.baseBranch ?? 'the default branch'})
+                  </span>
+                </li>
+              ))}
+            </ol>
+            <p>
+              Member pull requests are merged first; then the submodule pointers are moved and the workspace pull request is merged. The issues are
+              closed and the branch release/{release.name} is deleted in every repository of the release. This cannot be undone.
+            </p>
+          </>
+        ) : (
+          <p>
+            This merges pull request #{release.prNumber} into {target} {how}. The issues are closed and the branch release/{release.name} is deleted. This
+            cannot be undone.
+          </p>
+        )}
         {warning && <p className="release-warning">{warning}</p>}
         <div className="dialog-actions">
           <button type="button" className="btn btn--ghost" onClick={onClose} disabled={busy} data-autofocus>

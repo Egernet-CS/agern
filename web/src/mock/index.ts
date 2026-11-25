@@ -70,7 +70,6 @@ import {
   MockError,
   ORG,
   issueMembers,
-  refuseWorkspaceReleases,
   startRun,
   stopSession,
   workspaceOf,
@@ -445,7 +444,7 @@ export const mockApi: Api = {
       project(r.repo);
       return r;
     }),
-  createRelease: (repo, body) => ok(() => (project(repo), refuseWorkspaceReleases(repo), createRelease(repo, body, me()))),
+  createRelease: (repo, body) => ok(() => (project(repo), createRelease(repo, body, me()))),
   updateRelease: (id, body) =>
     ok(() => {
       const r = getRelease(id);
@@ -477,7 +476,7 @@ export const mockApi: Api = {
       project(r.repo);
       return reorderRelease(r, numbers, me());
     }),
-  startRelease: (id) => ok(() => withRelease(id, (r) => (refuseWorkspaceReleases(r.repo), startRelease(r, me())))),
+  startRelease: (id) => ok(() => withRelease(id, (r) => startRelease(r, me()))),
   pauseRelease: (id) => ok(() => withRelease(id, (r) => pauseRelease(r, me()))),
   resumeRelease: (id) => ok(() => withRelease(id, (r) => resumeRelease(r, me()))),
   cancelRelease: (id) => ok(() => withRelease(id, (r) => cancelRelease(r, me()))),

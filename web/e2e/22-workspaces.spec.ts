@@ -22,10 +22,10 @@ test('the project page shows the members, and each issue its member', async ({ p
   await expect(members(page).filter({ hasText: 'demo-ws-tools' })).toContainText('tools/cli');
   await expect(members(page).filter({ hasText: 'demo-ws-tools' })).toContainText('main');
   await expect(members(page).filter({ hasText: 'demo-ws-lab' })).not.toContainText('no access');
-  // Sandboxes and releases belong to the member projects.
+  // Sandboxes belong to the member projects; releases span them.
   await expect(page.getByRole('heading', { name: 'Sandbox' })).toHaveCount(0);
-  await expect(page.getByRole('button', { name: 'New release' })).toHaveCount(0);
-  await expect(page.locator('.panel--activity')).toContainText('Releases are not available for workspace projects yet.');
+  await expect(page.getByRole('button', { name: 'New release' })).toBeVisible();
+  await expect(page.locator('.panel--activity')).not.toContainText('Releases are not available for workspace projects yet.');
 
   await expect(issueRow(page, 'Show prices with currency').locator('.issue-member')).toHaveText('app');
   await expect(startButton(page, 'Show prices with currency')).toBeEnabled();
