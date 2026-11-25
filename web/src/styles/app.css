@@ -2225,6 +2225,31 @@ html.app-locked #root {
   content: '$ ';
   color: var(--amber);
 }
+/* Personal MCP tokens (Settings › Claude on your computer): long commands wrap instead of overflowing. */
+.mcp-cmd code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 0.85rem;
+}
+.mcp-secret code::before {
+  content: none;
+}
+.mcp-create-fields {
+  display: grid;
+  grid-template-columns: 2fr 2fr 1fr;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+.mcp-tokens-table td {
+  white-space: nowrap;
+}
+.mcp-expired {
+  color: var(--text-3);
+  font-style: italic;
+}
 .admin-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -2706,6 +2731,9 @@ html.app-locked #root {
   }
   .form-grid {
     grid-template-columns: 110px 1fr;
+  }
+  .mcp-create-fields {
+    grid-template-columns: 1fr;
   }
   .enroll {
     flex-direction: column;

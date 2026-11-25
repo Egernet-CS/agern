@@ -182,6 +182,11 @@ HTTPS put a reverse proxy (Caddy, nginx) on the same machine in front of it, set
 (`/api/ws/…`) and should send `X-Forwarded-For` (Caddy does by default; nginx:
 `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`) — besides logging, that header is
 what keeps the host-local endpoint `/api/internal/activity` from answering through the proxy.
+The proxy must also pass `POST /mcp` (personal MCP tokens: Claude Code on users' own computers reaches
+Agern's factory tools through `FACTORY_PUBLIC_URL`, docs/ARCHITECTURE.md §7 "Personal tokens") and must not
+buffer its responses: slow tool calls are answered as an event stream that can run for minutes (Caddy
+streams by default; nginx: `proxy_buffering off;` and a `proxy_read_timeout` of at least `30m` for
+`location /mcp`).
 
 ## 8. Upgrades, rollback and automatic upgrades
 

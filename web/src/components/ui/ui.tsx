@@ -200,12 +200,13 @@ export function Dialog({ open, onClose, title, children, wide }: { open: boolean
   );
 }
 
-export function CopyButton({ text, label = 'Copy' }: { text: string; label?: string }) {
+export function CopyButton({ text, label = 'Copy', disabled }: { text: string; label?: string; disabled?: boolean }) {
   const [done, setDone] = useState(false);
   return (
     <button
       type="button"
       className="btn btn--ghost btn--sm"
+      disabled={disabled}
       onClick={async () => {
         if (await copyText(text)) {
           setDone(true);

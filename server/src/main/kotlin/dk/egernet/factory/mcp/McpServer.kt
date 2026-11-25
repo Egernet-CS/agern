@@ -30,9 +30,10 @@ import java.util.UUID
 
 /**
  * Minimal MCP server (streamable HTTP transport, no sessions): initialize, notifications/initialized, ping, tools/list,
- * tools/call. Every call acts as the owner of the agent process the bearer token belongs to. [handle] answers one request
- * body with one JSON body; `POST /mcp` (api/Api.kt) turns a slow answer into an event stream with progress notifications
- * ([progressToken]) so the client does not give up on it.
+ * tools/call. Every call acts as the owner of the agent process the bearer token belongs to, or as the user of a personal
+ * token in its project ([McpAuthenticator], docs/ARCHITECTURE.md §7 "Personal tokens"). [handle] answers one request
+ * body with one JSON body; `POST /mcp` (api/Api.kt) authenticates first ([authenticate]) and turns a slow answer into an
+ * event stream with progress notifications ([progressToken]) so the client does not give up on it.
  */
 class McpServer(
     private val registry: McpRegistry,
@@ -44,7 +45,12 @@ class McpServer(
     private val sandboxes: dk.egernet.factory.sandbox.SandboxManager,
     private val screenshots: dk.egernet.factory.agent.Screenshots,
     private val images: dk.egernet.factory.images.ImageService,
+    private val auth: McpAuthenticator,
+    cfg: dk.egernet.factory.Config,
 ) {
+    private val publicUrl = cfg.publicUrl.trimEnd('/')
+    private val org = cfg.githubOrg
+    private val instance = McpIdentity.instance(cfg.publicUrl)
     private val log = LoggerFactory.getLogger(McpServer::class.java)
 
     private data class Tool(val name: String, val description: String, val schema: JsonObject)
@@ -169,9 +175,29 @@ class McpServer(
                 Triple("reason", "string", "Why it is needed"), required = listOf("name", "reason"))),
     ).associateBy { it.name }
 
-    /** Result of handling one HTTP request body: null means 202 with no body (only notifications). */
-    suspend fun handle(bearer: String?, body: String): Pair<Int, String?> {
-        val grant = bearer?.let { registry.lookup(it) } ?: return 401 to rpcError(JsonNull, -32001, "Unauthorized").toString()
+    /** Checks [bearer] from client address [remote]; see [McpAuthenticator]. */
+    suspend fun authenticate(bearer: String?, remote: String): McpAuth = auth.authenticate(bearer, remote)
+
+    /** The JSON-RPC error body for a refused bearer. */
+    fun authError(a: McpAuth): String = when (a) {
+        is McpAuth.Unauthorized -> rpcError(JsonNull, -32001, a.message).toString()
+        is McpAuth.Throttled -> rpcError(JsonNull, -32001, "Too many failed attempts. Try again after ${a.until}.").toString()
+        is McpAuth.Granted -> error("not an error")
+    }
+
+    /**
+     * Result of handling one HTTP request body: null means 202 with no body (only notifications). Authenticates [bearer]
+     * as coming from [remote] first (401, or 429 for a blocked address).
+     */
+    suspend fun handle(bearer: String?, body: String, remote: String = "local"): Pair<Int, String?> =
+        when (val a = authenticate(bearer, remote)) {
+            is McpAuth.Granted -> handle(a.grant, body)
+            is McpAuth.Unauthorized -> 401 to authError(a)
+            is McpAuth.Throttled -> 429 to authError(a)
+        }
+
+    /** Handles one request body for an already authenticated [grant]. */
+    suspend fun handle(grant: McpGrant, body: String): Pair<Int, String?> {
         val parsed = try {
             AppJson.parseToJsonElement(body)
         } catch (e: Exception) {
@@ -197,23 +223,50 @@ class McpServer(
                 "initialize" -> rpcResult(id, buildJsonObject {
                     put("protocolVersion", params["protocolVersion"]?.jsonPrimitive?.contentOrNull ?: "2025-06-18")
                     putJsonObject("capabilities") { putJsonObject("tools") { put("listChanged", false) } }
-                    putJsonObject("serverInfo") { put("name", "agern"); put("version", version) }
-                    put("instructions", "Agern software factory tools for the repository this agent works on.")
+                    if (grant.personal == null) {
+                        putJsonObject("serverInfo") { put("name", "agern"); put("version", version) }
+                        put("instructions", "Agern software factory tools for the repository this agent works on.")
+                    } else {
+                        val owner = users.byId(grant.ownerId)
+                        putJsonObject("serverInfo") {
+                            put("name", McpIdentity.serverName(publicUrl, grant.repo))
+                            put("title", "Agern · $org/${grant.repo} ($instance)")
+                            put("version", version)
+                        }
+                        put("instructions", "Agern software factory at $publicUrl (instance $instance). Every tool of this server " +
+                            "acts on the project $org/${grant.repo} on that instance only, as the Agern user ${owner?.username ?: "?"}. " +
+                            "Other Agern servers registered in this client are other instances or other projects: pick the server " +
+                            "whose project the person means.")
+                    }
                 })
                 "ping" -> rpcResult(id, JsonObject(emptyMap()))
                 "tools/list" -> rpcResult(id, buildJsonObject {
                     putJsonArray("tools") {
                         tools.values.filter { it.name in grant.tools }.forEach { t ->
-                            addJsonObject { put("name", t.name); put("description", t.description); put("inputSchema", t.schema) }
+                            val description = if (grant.personal == null) t.description else "[$org/${grant.repo} on $instance] ${t.description}"
+                            addJsonObject { put("name", t.name); put("description", description); put("inputSchema", t.schema) }
                         }
                     }
                 })
-                "tools/call" -> rpcResult(id, callTool(grant, params))
+                "tools/call" -> rpcResult(id, if (grant.personal == null) callTool(grant, params) else callPersonal(grant, params))
                 else -> rpcError(id, -32601, "Method not found: $method")
             }
         } catch (e: Exception) {
             log.warn("MCP {} failed: {}", method, e.message)
             rpcError(id, -32603, "Internal error")
+        }
+    }
+
+    /** A tool call with a personal token: logged with the token and user, never with the token itself or the arguments. */
+    private suspend fun callPersonal(grant: McpGrant, params: JsonObject): JsonObject {
+        val token = grant.personal!!
+        val name = params["name"]?.jsonPrimitive?.contentOrNull
+        var outcome = "error"
+        try {
+            return callTool(grant, params).also { if (it["isError"] == null) outcome = "ok" }
+        } finally {
+            log.info("MCP personal token call: tool={} token={} (\"{}\") user={} repo={} outcome={}",
+                name?.take(80), token.id, token.name, users.byId(grant.ownerId)?.username, grant.repo, outcome)
         }
     }
 
@@ -270,8 +323,16 @@ class McpServer(
                     AppJson.encodeToString(RunDto.serializer(), factory.listRuns(owner, repo, false).firstOrNull { it.id == r.id.toString() }
                         ?: return toolError("Run not found"))
                 }
-                "factory_approve_run" -> factory.approveRun(owner, uuid("runId")).let { "Run ${it.id}: ${it.status}" + (it.error?.let { e -> " — $e" } ?: "") }
-                "factory_cancel_run" -> factory.cancelRun(owner, uuid("runId")).let { "Run ${it.id}: ${it.status}" }
+                "factory_approve_run" -> {
+                    val runId = uuid("runId")
+                    if (grant.personal != null && factory.visibleRun(owner, runId).repo != repo) return toolError("Run belongs to another project")
+                    factory.approveRun(owner, runId).let { "Run ${it.id}: ${it.status}" + (it.error?.let { e -> " — $e" } ?: "") }
+                }
+                "factory_cancel_run" -> {
+                    val runId = uuid("runId")
+                    if (grant.personal != null && factory.visibleRun(owner, runId).repo != repo) return toolError("Run belongs to another project")
+                    factory.cancelRun(owner, runId).let { "Run ${it.id}: ${it.status}" }
+                }
                 "factory_send_to_agent" -> {
                     if (grant.runId != null) return toolError("Not available to pipeline agents")
                     val ids = listOf("runId", "sessionId").associateWith { k -> str(k)?.trim()?.takeIf { it.isNotEmpty() } }
@@ -322,7 +383,8 @@ class McpServer(
                     val background = args["background"]?.let { el ->
                         (el as? JsonPrimitive)?.takeIf { !it.isString }?.booleanOrNull ?: return toolError("background must be true or false")
                     } ?: false
-                    sandboxes.exec(runId, grant.sessionId, str("command") ?: return toolError("command is required"), timeout, platform, background)
+                    val sessionId = grant.sessionId ?: return toolError("Sandboxes belong to pipeline runs; chats have none")
+                    sandboxes.exec(runId, sessionId, str("command") ?: return toolError("command is required"), timeout, platform, background)
                         .let { if (it.isError) return toolError(it.text) else it.text }
                 }
                 "factory_sandbox_wait" -> {
@@ -335,7 +397,7 @@ class McpServer(
                     sandboxes.wait(runId, handle, waitSeconds).let { if (it.isError) return toolError(it.text) else it.text }
                 }
                 "factory_attach_screenshot" ->
-                    screenshots.attach(grant.sessionId, grant.runId, repo, owner, str("path"), str("caption"))
+                    screenshots.attach(grant.sessionId ?: return toolError("Only reviewers of a run can attach screenshots"), grant.runId, repo, owner, str("path"), str("caption"))
                 "factory_generate_image" -> images.generate(grant, owner, args)
                 "factory_request_software" -> {
                     val sr = factory.requestSoftware(owner, repo, grant.sessionId, str("name") ?: "", str("reason") ?: "")
