@@ -4,9 +4,25 @@
 import { ApiError, type Api, type Channel } from '../api/api';
 import * as images from './images';
 
-/** A 16×10 PNG sketching a page with a sidebar, used for every mock screenshot. */
-const SCREENSHOT_PNG =
-  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAKCAIAAAAy3EnLAAAAKElEQVR42mOQVTEhCTGQrEFIXAkZictq4UcM/zd6ISMaaCDZScNAAwAkqEt/fIx+TwAAAABJRU5ErkJggg==';
+/**
+ * A light-theme sketch of a shop page with an open cart drawer (demo content, 320×200), used for every mock
+ * screenshot a reviewer attaches: recognisable in the run page and in the manual's figures.
+ */
+const SCREENSHOT_SVG =
+  'data:image/svg+xml;charset=utf-8,' +
+  encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="320" height="200" viewBox="0 0 320 200" font-family="sans-serif">' +
+      '<rect width="320" height="200" fill="#f6f4ef"/>' +
+      '<rect width="320" height="24" fill="#ffffff"/><rect x="10" y="8" width="44" height="8" rx="2" fill="#2d6a4f"/>' +
+      '<rect x="230" y="8" width="24" height="8" rx="2" fill="#c9c4b8"/><rect x="262" y="8" width="24" height="8" rx="2" fill="#c9c4b8"/>' +
+      [0, 1, 2].map((i) => `<rect x="${10 + i * 62}" y="36" width="54" height="54" rx="4" fill="#e3ddd0"/><rect x="${10 + i * 62}" y="96" width="40" height="6" rx="2" fill="#8a8476"/><rect x="${10 + i * 62}" y="106" width="24" height="6" rx="2" fill="#2d6a4f"/>`).join('') +
+      '<rect x="0" y="24" width="200" height="176" fill="#000000" fill-opacity="0.18"/>' +
+      '<rect x="200" y="24" width="120" height="176" fill="#ffffff"/><text x="210" y="42" font-size="10" font-weight="700" fill="#1f2421">Your cart</text>' +
+      [0, 1, 2].map((i) => `<rect x="210" y="${52 + i * 28}" width="20" height="20" rx="3" fill="#e3ddd0"/><rect x="236" y="${55 + i * 28}" width="50" height="5" rx="2" fill="#8a8476"/><rect x="236" y="${64 + i * 28}" width="26" height="5" rx="2" fill="#c9c4b8"/><text x="310" y="${64 + i * 28}" font-size="7" text-anchor="end" fill="#1f2421">24.99</text>`).join('') +
+      '<line x1="210" y1="140" x2="310" y2="140" stroke="#e3ddd0"/><text x="210" y="154" font-size="8" fill="#1f2421">Total</text><text x="310" y="154" font-size="8" font-weight="700" text-anchor="end" fill="#1f2421">74.97 kr</text>' +
+      '<rect x="210" y="164" width="100" height="22" rx="4" fill="#2d6a4f"/><text x="260" y="179" font-size="8" font-weight="700" text-anchor="middle" fill="#ffffff">Checkout</text>' +
+      '</svg>',
+  );
 import { isRunActive, isSessionActive, type AgentSession, type Attachment, type ClientConfig, type Issue, type LoginStep, type Preferences, type Release, type Run, type StageRole, type User } from '../api/types';
 import {
   announceIssue,
@@ -535,8 +551,8 @@ export const mockApi: Api = {
       URL.revokeObjectURL(a.url);
       attachments.delete(id);
     }),
-  // One small PNG stands in for every screenshot (the mock has no image bytes).
-  screenshotUrl: () => SCREENSHOT_PNG,
+  // One demo sketch stands in for every screenshot (the mock has no image bytes).
+  screenshotUrl: () => SCREENSHOT_SVG,
   sessionImages: (id) => ok(() => images.sessionImages(session(id).id)),
   issueImages: (repo, n) =>
     ok(() => {
