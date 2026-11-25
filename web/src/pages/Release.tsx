@@ -987,7 +987,7 @@ function ApproveReleaseDialog({
     checks?.state === 'failed'
       ? `Checks failed on ${which} (${checks.detail ?? 'a check failed'}). Approving merges it anyway.`
       : checks?.state === 'pending'
-        ? `Some checks on ${which} have not finished yet (${checks.detail ?? 'pending'}). Approving merges it without waiting for them.`
+        ? `Some checks${multi ? ` on ${which}` : ''} have not finished yet (${checks.detail ?? 'pending'}). Approving merges it without waiting for them.`
         : checks?.state === 'awaiting'
           ? `No checks have appeared on ${which} yet; CI may not have started. Approving merges it without waiting for them.`
           : checks?.state === 'unknown'
