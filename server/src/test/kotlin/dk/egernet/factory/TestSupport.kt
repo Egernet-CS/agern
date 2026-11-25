@@ -44,29 +44,40 @@ object TestDb {
      */
     const val MAX_OPEN_POOLS = 10
 
-    /** The pools handed out by [fresh], with where each was created (closed ones are dropped on the next [fresh]). */
-    private val pools = CopyOnWriteArrayList<Pair<HikariDataSource, Throwable>>()
+    /** A pool handed out by [fresh]: its database's name and where it was created. */
+    private class Pool(val dataSource: HikariDataSource, val database: String, val createdAt: Throwable)
+
+    /** The pools handed out by [fresh] (closed ones are forgotten, and their databases dropped, on the next [fresh]). */
+    private val pools = CopyOnWriteArrayList<Pool>()
 
     /**
      * A fresh database per call, migrated from [migrations] (the application's own by default). Its pool must be closed
      * when the test ends: [TestWorld.close], [Services.stopAndReleaseDb] or closing [Db.dataSource] directly.
      */
     fun fresh(migrations: String = Db.MIGRATIONS): Db {
-        pools.removeIf { it.first.isClosed }
+        // A test database takes several megabytes in the embedded server's data directory (under the temp dir): drop
+        // the databases nobody uses any more, so the disk use stays bounded by the pools open at once.
+        val closedPools = pools.filter { it.dataSource.isClosed }
+        pools.removeAll(closedPools.toSet())
+        for (p in closedPools) {
+            runCatching {
+                pg.postgresDatabase.connection.use { c -> c.createStatement().use { it.execute("DROP DATABASE IF EXISTS ${p.database} WITH (FORCE)") } }
+            }
+        }
         check(pools.size < MAX_OPEN_POOLS) {
             "$MAX_OPEN_POOLS test database pools are still open; close them when the test ends " +
                 "(TestWorld.close() or Services.stopAndReleaseDb()). Created by: " +
-                pools.joinToString(", ") { creationSite(it.second) }
+                pools.joinToString(", ") { creationSite(it.createdAt) }
         }
         val name = "t${System.nanoTime()}_${counter.incrementAndGet()}"
         pg.postgresDatabase.connection.use { c -> c.createStatement().use { it.execute("CREATE DATABASE $name") } }
         val db = Db.connect(pg.getJdbcUrl("postgres", name), "postgres", "postgres", poolSize = 5, migrations = migrations)
-        pools += (db.dataSource as HikariDataSource) to Throwable("pool created here")
+        pools += Pool(db.dataSource as HikariDataSource, name, Throwable("pool created here"))
         return db
     }
 
     /** The number of pools from [fresh] that are not closed yet. */
-    fun openPools(): Int = pools.count { !it.first.isClosed }
+    fun openPools(): Int = pools.count { !it.dataSource.isClosed }
 
     /** The number of client connections the embedded PostgreSQL has, apart from the one asking. */
     fun clientConnections(): Int = pg.postgresDatabase.connection.use { c ->
@@ -355,9 +366,12 @@ class TestWorld(
     val realGitOps: FailingPushGit? = cliGit?.let { FailingPushGit(it) }
     val launcher = FakeLauncher()
     val sandboxRuntime = FakeSandboxRuntime()
+    /** Exceptions that escaped a background coroutine of [services]; [close] fails the test when there are any. */
+    val backgroundFailures = CopyOnWriteArrayList<Throwable>()
     val services = Services(
         cfg, TestDb.fresh(), github, gitOps ?: realGitOps ?: git, launcher ?: this.launcher, loginThrottle = loginThrottle, clock = clock,
         releaseStarter = releaseStarter, sandboxRuntime = if (sandbox) sandboxRuntime else null, imageProviders = imageProviders,
+        onBackgroundFailure = { backgroundFailures += it },
     )
 
     /** Puts `.agern/sandbox.yml` on the default branch (GitHub API and git alike); null removes it. */
@@ -391,9 +405,21 @@ class TestWorld(
      * Stops the services and gives the pool's connections back to PostgreSQL (see [Services.stopAndReleaseDb]); the
      * embedded server allows only so many. Calling it again does nothing. A test that simulates a restart on the same
      * database calls `services.stop()` instead, which leaves the pool open.
+     *
+     * Throws an [AssertionError] afterwards when a background coroutine of the services failed, so the failure is
+     * reported by the test that caused it (not by whichever test happens to run next).
      */
     fun close() {
-        if (closed.compareAndSet(false, true)) services.stopAndReleaseDb()
+        if (closed.compareAndSet(false, true)) {
+            services.stopAndReleaseDb()
+            val failures = backgroundFailures.toList()
+            if (failures.isNotEmpty()) {
+                throw AssertionError(
+                    "A background coroutine of this test's services failed: " + failures.joinToString("; ") { it.toString() },
+                    failures.first(),
+                ).apply { failures.drop(1).forEach { addSuppressed(it) } }
+            }
+        }
     }
 }
 
