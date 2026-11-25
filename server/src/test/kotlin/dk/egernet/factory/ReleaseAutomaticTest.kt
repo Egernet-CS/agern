@@ -2,10 +2,12 @@ package dk.egernet.factory
 
 import dk.egernet.factory.db.ReleaseRecord
 import dk.egernet.factory.db.UserRecord
+import dk.egernet.factory.github.CheckItem
 import dk.egernet.factory.github.ChecksSummary
 import dk.egernet.factory.github.GhCheckRun
 import dk.egernet.factory.github.GhCombinedStatus
 import dk.egernet.factory.github.GhCommitStatus
+import dk.egernet.factory.github.GhWorkflowRun
 import dk.egernet.factory.mcp.McpGrant
 import dk.egernet.factory.mcp.McpRegistry
 import dk.egernet.factory.pipeline.ReleaseModePolicy
@@ -281,6 +283,8 @@ class ReleaseAutomaticTest {
 
     @Test
     fun `checks that cannot be read hold an automatic release with a notice`() {
+        // Only the release pull request's checks: the issue's own run must merge first (its gate reads them too).
+        gh.checksFailureBranchPrefix = "release/"
         gh.checksFailure = 403
         val r0 = release("u", listOf(issue("Unreadable")), mode = ReleaseMode.AUTOMATIC)
         start(r0.id)
@@ -740,6 +744,7 @@ class ReleaseAutomaticTest {
     fun `checks add up as GitHub reports them`() {
         fun of(statuses: List<Pair<String, String>>, runs: List<GhCheckRun>, total: Int = statuses.size, state: String = "pending") =
             ChecksSummary.of(GhCombinedStatus(state, total, statuses.map { GhCommitStatus(it.first, it.second) }), runs)
+                .let { ChecksSummary(it.state, it.detail) } // state and detail; the structured lists are tested below
         assertEquals(ChecksSummary("none", "No checks"), of(emptyList(), emptyList()))
         assertEquals("passed", of(listOf("ci" to "success"), listOf(GhCheckRun("b", "completed", "neutral"), GhCheckRun("c", "completed", "skipped"))).state)
         assertEquals(ChecksSummary("pending", "Pending: ci, b"), of(listOf("ci" to "pending"), listOf(GhCheckRun("b", "queued"))))
@@ -749,6 +754,51 @@ class ReleaseAutomaticTest {
         }
         // More statuses than listed: the combined state decides for the rest.
         assertEquals(ChecksSummary("failed", "Failed: commit status"), of(listOf("a" to "success"), emptyList(), total = 150, state = "failure"))
+    }
+
+    @Test
+    fun `workflow runs count as checks, latest per workflow and event, with structured lists`() {
+        val none = GhCombinedStatus("pending", 0, emptyList())
+        fun wr(id: Long, name: String, status: String, conclusion: String? = null, workflow: Long = name.hashCode().toLong(), event: String = "push") =
+            GhWorkflowRun(id, name, workflow, event, status, conclusion, "https://github.com/o/r/actions/runs/$id")
+        // Queued but not started: no check runs at all, only the workflow run shows it.
+        val queued = ChecksSummary.of(none, emptyList(), listOf(wr(1, "CI", "queued")))
+        assertEquals("pending", queued.state)
+        assertEquals(listOf(CheckItem("CI", "https://github.com/o/r/actions/runs/1")), queued.pending)
+        // Startup failure: failed, with its conclusion and link.
+        val startup = ChecksSummary.of(none, emptyList(), listOf(wr(2, "CI", "completed", "startup_failure")))
+        assertEquals(ChecksSummary("failed", "Failed: CI", listOf(CheckItem("CI", "https://github.com/o/r/actions/runs/2", "startup_failure"))), startup)
+        assertEquals("failed", ChecksSummary.of(none, emptyList(), listOf(wr(3, "CI", "completed", "cancelled"))).state)
+        // A passing workflow run is one passed check; an older failed run of the same workflow and event does not count.
+        assertEquals(
+            ChecksSummary("passed", "1 check passed"),
+            ChecksSummary.of(none, emptyList(), listOf(wr(4, "CI", "completed", "failure"), wr(5, "CI", "completed", "success"))),
+        )
+        // Another event of the same workflow is its own run.
+        assertEquals("failed", ChecksSummary.of(none, emptyList(), listOf(wr(5, "CI", "completed", "success"), wr(4, "CI", "completed", "failure", event = "pull_request"))).state)
+        // Failed beats pending; statuses and check runs carry their URLs into the lists.
+        val mixed = ChecksSummary.of(
+            GhCombinedStatus("failure", 1, listOf(GhCommitStatus("ci/lint", "failure", "https://ci.example/lint"))),
+            listOf(GhCheckRun("build", "in_progress", null, "https://github.com/o/r/runs/9")),
+        )
+        assertEquals("failed", mixed.state)
+        assertEquals(listOf(CheckItem("ci/lint", "https://ci.example/lint", "failure")), mixed.failing)
+        assertEquals(listOf(CheckItem("build", "https://github.com/o/r/runs/9")), mixed.pending)
+    }
+
+    @Test
+    fun `a refused workflow runs read falls back to statuses and check runs`() {
+        val c = gh.client("fake-alice")
+        gh.setCheckRun("demo-app", "release/z", "build", "completed", "success")
+        gh.setWorkflowRun("demo-app", "release/z", "CI", "completed", "failure")
+        assertEquals("failed", ChecksSummary.read(c, "test-org", "demo-app", "sha-release/z-1").state)
+        gh.workflowRunsFailure = 403
+        val errors = mutableListOf<Exception>()
+        assertEquals("passed", ChecksSummary.read(c, "test-org", "demo-app", "sha-release/z-1") { errors += it }.state)
+        assertEquals(1, errors.size)
+        // A refused status read is not ignored.
+        gh.checksFailure = 403
+        kotlin.test.assertFailsWith<dk.egernet.factory.github.GitHubException> { ChecksSummary.read(c, "test-org", "demo-app", "sha-release/z-1") }
     }
 
     @Test
@@ -763,7 +813,7 @@ class ReleaseAutomaticTest {
             )
             val c = gh.client("fake-alice")
             val sha = "sha-release/x-3"
-            assertEquals(ChecksSummary("failed", "Failed: build"), ChecksSummary.of(c.combinedStatus("test-org", "demo-app", sha), c.checkRuns("test-org", "demo-app", sha)))
+            assertEquals("failed" to "Failed: build", ChecksSummary.of(c.combinedStatus("test-org", "demo-app", sha), c.checkRuns("test-org", "demo-app", sha)).let { it.state to it.detail })
             assertEquals("none", ChecksSummary.of(c.combinedStatus("test-org", "demo-app", "sha-release/y-1"), c.checkRuns("test-org", "demo-app", "sha-release/y-1")).state)
             // Set in memory, the test's own checks win.
             gh.setStatus("demo-app", "release/x", "ci/e2e", "success")

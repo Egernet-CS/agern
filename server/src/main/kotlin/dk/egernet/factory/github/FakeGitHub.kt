@@ -135,6 +135,10 @@ class FakeGitHub(private val org: String) : GitHub {
     val checkRunsByBranch = java.util.concurrent.ConcurrentHashMap<String, MutableMap<String, GhCheckRun>>()
     /** Lets tests make reading checks fail with this HTTP status (e.g. 403 for a token without the permission). */
     @Volatile var checksFailure: Int? = null
+    /** When set, [checksFailure] applies only to head branches starting with this (e.g. `release/`). */
+    @Volatile var checksFailureBranchPrefix: String? = null
+    private fun checksFailureFor(sha: String): Int? =
+        checksFailure?.takeIf { val prefix = checksFailureBranchPrefix; prefix == null || branchOfSha(sha).startsWith(prefix) }
     /** How often the checks were read (combined status reads). */
     val checkReads = java.util.concurrent.atomic.AtomicInteger()
 
@@ -145,10 +149,33 @@ class FakeGitHub(private val org: String) : GitHub {
     }
 
     /** Sets (or with null [status] removes) the check run [name] on [branch]'s head. */
-    fun setCheckRun(repo: String, branch: String, name: String, status: String?, conclusion: String? = null) {
+    fun setCheckRun(repo: String, branch: String, name: String, status: String?, conclusion: String? = null, url: String? = null) {
         val m = checkRunsByBranch.getOrPut("$repo:$branch") { java.util.concurrent.ConcurrentHashMap() }
-        if (status == null) m.remove(name) else m[name] = GhCheckRun(name, status, conclusion)
+        if (status == null) m.remove(name) else m[name] = GhCheckRun(name, status, conclusion, url)
     }
+
+    /** GitHub Actions workflow runs per head branch (`"<repo>:<branch>"`), by workflow name (one run per workflow). */
+    val workflowRunsByBranch = java.util.concurrent.ConcurrentHashMap<String, MutableMap<String, GhWorkflowRun>>()
+    private val workflowRunIds = java.util.concurrent.atomic.AtomicLong(9000)
+    /** Lets tests make reading workflow runs alone fail with this HTTP status (e.g. 403 for a token without Actions access). */
+    @Volatile var workflowRunsFailure: Int? = null
+
+    /** Sets (or with null [status] removes) the workflow run of workflow [name] on [branch]'s head; each call is a newer run. */
+    fun setWorkflowRun(repo: String, branch: String, name: String, status: String?, conclusion: String? = null, url: String? = null) {
+        val m = workflowRunsByBranch.getOrPut("$repo:$branch") { java.util.concurrent.ConcurrentHashMap() }
+        if (status == null) m.remove(name)
+        else m[name] = GhWorkflowRun(workflowRunIds.incrementAndGet(), name, name.hashCode().toLong(), "pull_request", status, conclusion, url)
+    }
+
+    /** As if someone pushed a commit titled [title] to [branch]: the head SHA of its pull request changes. */
+    fun addCommit(repo: String, branch: String, title: String) = synchronized(this) {
+        commitList(repo, branch) += title
+        actions += "commit $repo $branch $title"
+        Unit
+    }
+
+    /** The head SHA each squash merge was pinned to, by pull request number (null: merged without one). */
+    val squashMergeShas = java.util.concurrent.ConcurrentHashMap<Int, String>()
 
     /** The head branch of a fake head commit `sha-<branch>-<n>` (as [Client.getPull] reports it). */
     private fun branchOfSha(sha: String): String = sha.removePrefix("sha-").substringBeforeLast('-')
@@ -156,13 +183,17 @@ class FakeGitHub(private val org: String) : GitHub {
     /**
      * Development (FACTORY_DEV_FAKE_GITHUB): a directory where `<repo>/<branch>.json` sets the checks of that branch's
      * head while the server runs (e.g. `demo-app/release/1.0.json`), for an end-to-end test or a developer:
-     * `{"statuses": {"ci/lint": "success"}, "checkRuns": [{"name": "build", "status": "completed", "conclusion": "failure"}]}`.
-     * Checks set with [setStatus] or [setCheckRun] take precedence.
+     * `{"statuses": {"ci/lint": "success"}, "checkRuns": [{"name": "build", "status": "completed", "conclusion": "failure"}]}`,
+     * optionally with `"workflowRuns": [{"id": 1, "name": "CI", "workflow_id": 7, "status": "queued"}]`.
+     * Checks set with [setStatus], [setCheckRun] or [setWorkflowRun] take precedence.
      */
     @Volatile var checksDir: java.nio.file.Path? = null
 
     @kotlinx.serialization.Serializable
-    private data class ChecksFile(val statuses: Map<String, String> = emptyMap(), val checkRuns: List<GhCheckRun> = emptyList())
+    private data class ChecksFile(
+        val statuses: Map<String, String> = emptyMap(), val checkRuns: List<GhCheckRun> = emptyList(),
+        val workflowRuns: List<GhWorkflowRun> = emptyList(),
+    )
 
     private fun checksFile(repo: String, branch: String): ChecksFile? {
         val dir = checksDir ?: return null
@@ -454,11 +485,15 @@ class FakeGitHub(private val org: String) : GitHub {
             return fileBytesOf(repo, path)?.let { if (it.size > maxBytes) it.copyOf(maxBytes.toInt()) else it }
         }
 
-        override fun squashMerge(org: String, repo: String, number: Int, title: String) = synchronized(this@FakeGitHub) {
+        override fun squashMerge(org: String, repo: String, number: Int, title: String, expectedHeadSha: String?) = synchronized(this@FakeGitHub) {
             repo(org, repo)
             if (failMerge) throw GitHubException(405, "Pull Request is not mergeable")
             if (failingMerge(repo)) throw GitHubException(405, "Base branch was modified. Review and try the merge again.")
             val m = pullMeta[number]
+            if (m != null && expectedHeadSha != null && expectedHeadSha != "sha-${m.head}-${commitList(repo, m.head).size}") {
+                throw GitHubException(409, "GitHub merge pull request failed: 409 Head branch was modified. Review and try the merge again.")
+            }
+            if (expectedHeadSha != null) squashMergeShas[number] = expectedHeadSha
             if (m != null) applyMerge(m, number, "squash")
             else pulls.values.forEach { l -> l.replaceAll { if (it.number == number) it.copy(state = "merged") else it } }
             actions += "merge $repo #$number"
@@ -548,7 +583,7 @@ class FakeGitHub(private val org: String) : GitHub {
 
         override fun combinedStatus(org: String, repo: String, sha: String): GhCombinedStatus = synchronized(this@FakeGitHub) {
             repo(org, repo)
-            checksFailure?.let { throw GitHubException(it, "GitHub GET commit status failed: $it Resource not accessible by personal access token") }
+            checksFailureFor(sha)?.let { throw GitHubException(it, "GitHub GET commit status failed: $it Resource not accessible by personal access token") }
             checkReads.incrementAndGet()
             val branch = branchOfSha(sha)
             val set = statuses["$repo:$branch"]?.takeIf { it.isNotEmpty() } ?: checksFile(repo, branch)?.statuses.orEmpty()
@@ -564,10 +599,18 @@ class FakeGitHub(private val org: String) : GitHub {
 
         override fun checkRuns(org: String, repo: String, sha: String): List<GhCheckRun> = synchronized(this@FakeGitHub) {
             repo(org, repo)
-            checksFailure?.let { throw GitHubException(it, "GitHub GET check runs failed: $it Resource not accessible by personal access token") }
+            checksFailureFor(sha)?.let { throw GitHubException(it, "GitHub GET check runs failed: $it Resource not accessible by personal access token") }
             val branch = branchOfSha(sha)
             (checkRunsByBranch["$repo:$branch"]?.values?.takeIf { it.isNotEmpty() } ?: checksFile(repo, branch)?.checkRuns.orEmpty())
                 .sortedBy { it.name }
+        }
+
+        override fun workflowRuns(org: String, repo: String, sha: String): List<GhWorkflowRun> = synchronized(this@FakeGitHub) {
+            repo(org, repo)
+            workflowRunsFailure?.let { throw GitHubException(it, "GitHub GET workflow runs failed: $it Resource not accessible by personal access token") }
+            val branch = branchOfSha(sha)
+            (workflowRunsByBranch["$repo:$branch"]?.values?.takeIf { it.isNotEmpty() } ?: checksFile(repo, branch)?.workflowRuns.orEmpty())
+                .sortedByDescending { it.id }
         }
 
         override fun commitExists(org: String, repo: String, sha: String): Boolean = synchronized(this@FakeGitHub) {
