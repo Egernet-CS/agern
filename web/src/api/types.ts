@@ -151,6 +151,39 @@ export type ReleaseIssue = {
   prUrl: string | null;
   /** A waiting issue retried with `continue` or `step` from `runId`; null when it is built from scratch. */
   retryMode?: 'continue' | 'step' | null;
+  /** The member repository the issue's run targets; null without a run or for the project (workspace) repository. */
+  targetRepo: string | null;
+  /** That member's directory in the workspace; null like `targetRepo`. */
+  targetDir: string | null;
+};
+
+/** The state of one repository's release pull request in a multi-repository release. */
+export type ReleaseRepoState = 'none' | 'open' | 'merged';
+
+/**
+ * One repository of a release that spans several (a workspace project): its `release/<name>` branch and release pull
+ * request. `accessible` false: the viewer cannot read the repository, so `prNumber`, `prUrl`, `checks` and
+ * `mergeCommit` are null.
+ */
+export type ReleaseRepo = {
+  repo: string;
+  /** The member's directory in the workspace; null for the project (workspace) repository. */
+  directory: string | null;
+  submodule: boolean;
+  baseBranch: string | null;
+  /** `release/<name>`. */
+  branch: string;
+  state: ReleaseRepoState;
+  prNumber: number | null;
+  prUrl: string | null;
+  mergeState: ReleaseMergeState;
+  mergeMethod: ReleaseMergeMethod | null;
+  checks: ReleaseChecks | null;
+  mergedAt: string | null;
+  mergeCommit: string | null;
+  /** The merged issues built in this repository. */
+  issues: number[];
+  accessible: boolean;
 };
 
 export type ReleasePauseReason = 'manual' | 'usage_limit' | 'credentials';
@@ -204,6 +237,11 @@ export type Release = {
   releasedAutomatically: boolean;
   /** The checks on the release pull request, as last read; null until it has one. */
   checks: ReleaseChecks | null;
+  /**
+   * Empty unless the release spans several repositories: then member repositories in merge order (untouched last),
+   * followed by the project repository (`directory` null). The fields above describe the project repository's PR.
+   */
+  repositories: ReleaseRepo[];
 };
 
 /** Building or paused: at most one per project. */

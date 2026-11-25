@@ -422,7 +422,7 @@ function workspaceStartBlock(ws: Workspace | null, i: Issue): string | null {
 
 /**
  * A workspace whose members come from `.gitmodules` alone (ARCHITECTURE §6 "Workspace runs"): its own issues (no member
- * label) are runs of the workspace repository, and it has releases and a sandbox of its own.
+ * label) are runs of the workspace repository, and it has a sandbox of its own.
  */
 const fromSubmodules = (ws: Workspace | null) => ws?.path === '.gitmodules';
 
@@ -1062,8 +1062,9 @@ function ActivityPanel({
 }) {
   useNow(5000);
   const me = useMe();
-  // Releases and the sandbox belong to the project unless it is a workspace.yml workspace (§6 "Workspace runs").
-  const ownReleases = !workspace || fromSubmodules(workspace);
+  // Every project has releases (a workspace's span its members); the sandbox belongs to the project unless it is a
+  // workspace.yml workspace (§6 "Workspace runs").
+  const ownSandbox = !workspace || fromSubmodules(workspace);
   const active = sessions.filter(isSessionActive);
   const runList = runs.slice(0, 12);
   const chats = sessions.filter((s) => s.kind === 'chat');
@@ -1109,16 +1110,14 @@ function ActivityPanel({
       {workspace && <MembersSection repo={repo} workspace={workspace} />}
       <div className="panel-head">
         <h2>Releases</h2>
-        {ownReleases && (
-          <button type="button" className="btn btn--sm" aria-label="New release" onClick={() => setCreatingRelease(true)}>
-            + New
-          </button>
-        )}
+        <button type="button" className="btn btn--sm" aria-label="New release" onClick={() => setCreatingRelease(true)}>
+          + New
+        </button>
       </div>
       {releases.error && <ErrorBox error={releases.error} retry={releases.reload} />}
       {releases.loading && <Loading />}
       {!releases.loading && !releases.error && releases.releases.length === 0 && (
-        <p className="muted pad">{ownReleases ? 'No releases yet. Create one to plan issues ahead.' : 'Releases are not available for workspace projects yet.'}</p>
+        <p className="muted pad">No releases yet. Create one to plan issues ahead.</p>
       )}
       <ul className="run-list release-list">
         {releases.releases.filter((r) => !isReleaseFinished(r)).map((r) => (
@@ -1149,9 +1148,9 @@ function ActivityPanel({
         ))}
       </ul>
       <ReleaseHistory repo={repo} releases={historyOf(releases.releases)} />
-      {ownReleases && <NewReleaseDialog repo={repo} open={creatingRelease} onClose={() => setCreatingRelease(false)} />}
+      <NewReleaseDialog repo={repo} open={creatingRelease} onClose={() => setCreatingRelease(false)} />
       {/* A workspace's sandboxes belong to its member projects (a submodule workspace's own runs use its own). */}
-      {ownReleases && <SandboxSection repo={repo} />}
+      {ownSandbox && <SandboxSection repo={repo} />}
       <div className="panel-head">
         <h2>Runs</h2>
       </div>

@@ -6,7 +6,6 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
-import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.AfterTest
@@ -53,13 +52,15 @@ class WorkspaceRoutingTest {
         assertEquals("member_label_missing", none.code)
         assertEquals(
             "Issue #3 has no member label. Add exactly one of these labels on GitHub to say which repository it belongs to: " +
-                "`app` (demo-ws-app), `demo-ws-tools` (demo-ws-tools), `lab` (demo-ws-lab).",
+                "`app` (demo-ws-app), `demo-ws-tools` (demo-ws-tools), `lab` (demo-ws-lab). " +
+                "You can set it with `gh issue edit 3 --repo test-org/demo-workspace --add-label \"<label>\"`.",
             none.message,
         )
         val several = refusal(4)
         assertEquals("member_label_ambiguous", several.code)
         assertEquals(
-            "Issue #4 carries the labels of several members (app, demo-ws-tools). A run changes one member: keep exactly one of them.",
+            "Issue #4 carries the labels of several members (app, demo-ws-tools). A run changes one member: keep exactly one of them. " +
+                "You can set it with `gh issue edit 4 --repo test-org/demo-workspace --remove-label \"<label>\"`.",
             several.message,
         )
         // bob cannot read demo-ws-lab: 403, and no run was created for any refusal.
@@ -223,24 +224,20 @@ class WorkspaceRoutingTest {
     }
 
     @Test
-    fun `releases are refused for workspace projects`() {
-        val e = assertFailsWith<ApiException> { runBlocking { s.releases.create(alice, ws, "1.0", "") } }
-        assertEquals(409, e.status.value)
-        assertEquals("workspace_releases_unsupported", e.code)
-        assertEquals("Releases are not available for workspace projects yet.", e.message)
-        val e2 = assertFailsWith<ApiException> {
-            runBlocking { s.orchestrator.startReleaseRun(alice, ws, 1, UUID.randomUUID(), "release/1.0") }
-        }
-        assertEquals("workspace_releases_unsupported", e2.code)
-        // A release created before the file existed cannot be started either.
-        world.github.setFile(ws, WORKSPACE_FILE, null)
-        s.workspaceDefs.invalidate()
+    fun `releases are available for workspace projects`() {
         val r = runBlocking { s.releases.create(alice, ws, "1.0", "") }
+        // An issue with one member label is planned; the routing refusals of runs apply, all or nothing.
         runBlocking { s.releases.assign(alice, ws, listOf(1), r.id) }
+        assertEquals("member_label_missing", assertFailsWith<ApiException> { runBlocking { s.releases.assign(alice, ws, listOf(2, 3), r.id) } }.code)
+        assertEquals(listOf(1), s.releaseStore.get(r.id)!!.issues.map { it.number })
+        // An invalid definition refuses the start (after the release_empty check, before the claim).
+        world.github.setFile(ws, WORKSPACE_FILE, "members: [")
+        s.workspaceDefs.invalidate()
+        val e = assertFailsWith<ApiException> { runBlocking { s.releases.start(alice, r.id) } }
+        assertEquals("workspace_invalid", e.code)
+        assertEquals(ReleaseStatus.PLANNING, s.releaseStore.get(r.id)!!.status)
         world.github.setFile(ws, WORKSPACE_FILE, FakeGitHub.DEMO_WORKSPACE_FILE)
         s.workspaceDefs.invalidate()
-        val e3 = assertFailsWith<ApiException> { runBlocking { s.releases.start(alice, r.id) } }
-        assertEquals("workspace_releases_unsupported", e3.code)
     }
 
     @Test

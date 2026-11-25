@@ -65,7 +65,7 @@ test('the members come from the submodules', async ({ page }) => {
   await expect(startButton(page, 'Add a health endpoint')).toBeEnabled();
   await expect(issueRow(page, 'Update the architecture notes').locator('.issue-member')).toHaveText('workspace repository');
   await expect(startButton(page, 'Update the architecture notes')).toBeEnabled();
-  // Releases (of the workspace repository's own issues) and its sandbox are available.
+  // Releases and its sandbox are available.
   await expect(page.getByRole('button', { name: 'New release' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Sandbox' })).toBeVisible();
 });

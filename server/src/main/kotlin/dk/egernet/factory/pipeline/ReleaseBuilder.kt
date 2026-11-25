@@ -53,6 +53,8 @@ class ReleaseBuilder(
     private val scope: CoroutineScope,
     private val locks: ReleaseLocks,
     private val merger: ReleaseMerger,
+    /** Routes a member issue to its member repository, as for a single run (docs/ARCHITECTURE.md §6 "Workspace runs"). */
+    private val workspaceDefs: dk.egernet.factory.workspace.WorkspaceService? = null,
 ) {
     private val log = LoggerFactory.getLogger(ReleaseBuilder::class.java)
     private val org get() = cfg.githubOrg
@@ -132,7 +134,9 @@ class ReleaseBuilder(
     /**
      * `building`, `paused` or `ready` → `cancelled`: the running issue is held, every active run of the release is
      * cancelled (as [user]), waiting issues stay waiting and nothing starts afterwards. The branch, and the release pull
-     * request if there is one, are left alone; the pull request gets a comment saying Agern will not merge it.
+     * request if there is one, are left alone; the pull request gets a comment saying Agern will not merge it. A
+     * release of several repositories instead deletes `release/<name>` in every repository of the release
+     * ([ReleaseMerger.commentCancelled]).
      */
     suspend fun cancel(user: UserRecord, id: UUID) {
         lock(id).withLock {
@@ -172,7 +176,9 @@ class ReleaseBuilder(
      * builds again for it (409 `release_already_building` while another release of the project holds the slot).
      */
     suspend fun retry(owner: UserRecord, id: UUID, number: Int, requested: String? = null) {
-        val (_, before) = io { retryable(id, number) }
+        val (current, before) = io { retryable(id, number) }
+        // Nothing is built again while some of its pull requests are merged (docs/ARCHITECTURE.md §6 "Several repositories").
+        if (current.partlyReleased) throw ReleaseMerger.partlyMerged(current.name)
         val oldRunRecord = before.runId?.let { io { runs.get(it) } }
         val mode = if (oldRunRecord == null) {
             if (requested != null && requested != RetryMode.START_OVER && requested != RetryMode.RECOMMENDED) {
@@ -287,9 +293,16 @@ class ReleaseBuilder(
                     val branch = r.branch ?: "release/${r.name}"
                     val run = when {
                         previous != null && next.retryMode == RetryMode.STEP -> orchestrator.retryStep(owner, previous)
-                        previous != null && next.retryMode == RetryMode.CONTINUE ->
-                            orchestrator.startReleaseRun(owner, r.repo, next.number, r.id, branch, continuesFrom = previous)
-                        else -> orchestrator.startReleaseRun(owner, r.repo, next.number, r.id, branch)
+                        previous != null && next.retryMode == RetryMode.CONTINUE -> {
+                            // A continuation keeps the target of the run it continues; its member branch exists already.
+                            val expected = Orchestrator.ExpectedTarget(previous.targetRepo)
+                            if (previous.targetRepo != null) io { ensureMemberBranch(r, owner, client, previous.targetRepo, previous.targetDir) }
+                            orchestrator.startReleaseRun(owner, r.repo, next.number, r.id, branch, continuesFrom = previous, expectedTarget = expected)
+                        }
+                        else -> {
+                            val expected = io { prepareTarget(r, owner, client, next.number) }
+                            orchestrator.startReleaseRun(owner, r.repo, next.number, r.id, branch, expectedTarget = expected)
+                        }
                     }
                     io { store.setIssue(id, next.number, ReleaseIssueState.RUNNING, null, run.id) }
                     publish(id)
@@ -311,6 +324,56 @@ class ReleaseBuilder(
         }
         if (io { store.get(id) }?.status == ReleaseStatus.READY) merger.evaluate(id, becameReady)
     }
+
+    /**
+     * The repository issue #[number] of [r] is built in, resolved once as for a single run (null in [Orchestrator.ExpectedTarget]:
+     * the project repository); a member gets its release branch first ([ensureMemberBranch]). Throws what routing throws
+     * (e.g. `member_label_missing` when the label changed after planning), which holds the issue. Blocking.
+     */
+    private fun prepareTarget(r: ReleaseRecord, owner: UserRecord, client: GitHubClient, number: Int): Orchestrator.ExpectedTarget {
+        val defs = workspaceDefs ?: return Orchestrator.ExpectedTarget(null)
+        val issue = client.getIssue(org, r.repo, number) ?: throw dk.egernet.factory.notFound("Issue #$number not found")
+        val m = defs.memberFor(owner, r.repo, issue) ?: return Orchestrator.ExpectedTarget(null)
+        ensureMemberBranch(r, owner, client, m.repository, m.directory, m.member.submodule, m.baseBranch)
+        return Orchestrator.ExpectedTarget(m.repository)
+    }
+
+    /**
+     * Makes sure `release/<name>` exists in member repository [repo] for release [r] (docs/ARCHITECTURE.md §6 "Several
+     * repositories"): nothing when Agern created it already for this release; otherwise it is created from the tip of
+     * the member's [baseBranch] with the owner's token and recorded. 409 `release_branch_exists` when the branch exists
+     * there already (Agern never adopts a branch it did not create). Blocking.
+     */
+    private fun ensureMemberBranch(
+        r: ReleaseRecord, owner: UserRecord, client: GitHubClient, repo: String, directory: String?,
+        submodule: Boolean? = null, baseBranch: String? = null,
+    ) {
+        if (store.get(r.id)?.repos?.any { it.repo == repo } == true) return
+        // Only a continuation gets here without a resolved member: its release branch was created with its first run.
+        val dir = directory ?: throw conflict("The member directory of $org/$repo is unknown", "member_changed")
+        val base = baseBranch ?: workspaceDefs?.resolved(owner, r.repo)?.firstOrNull { it.repository == repo }?.baseBranch
+            ?: throw conflict("$org/$repo is no longer a member of the workspace", "member_changed")
+        val sub = submodule ?: (workspaceDefs?.resolved(owner, r.repo)?.firstOrNull { it.repository == repo }?.member?.submodule ?: false)
+        val branch = r.branch ?: "release/${r.name}"
+        try {
+            val sha = client.branchSha(org, repo, base)
+                ?: throw ApiException(HttpStatusCode.BadGateway, "github_error", "Branch `$base` was not found in $org/$repo")
+            if (client.branchSha(org, repo, branch) != null) throw memberBranchExists(branch, repo)
+            client.createBranch(org, repo, branch, sha)
+        } catch (e: GitHubException) {
+            throw when {
+                e.status == 422 -> memberBranchExists(branch, repo)
+                e.status in setOf(401, 403, 404) -> unprocessable("Your GitHub token cannot create branches in $repo.", "github_push_denied")
+                else -> ApiException(HttpStatusCode.BadGateway, "github_error", e.message ?: "GitHub error")
+            }
+        }
+        store.insertRepo(r.id, repo, dir, sub, base)
+        log.info("Release {}: created {} in {} from {}", r.id, branch, repo, base)
+    }
+
+    private fun memberBranchExists(branch: String, repo: String) = conflict(
+        "Branch $branch already exists in $org/$repo; delete it or rename the release.", "release_branch_exists",
+    )
 
     /** [keepRun]: the run a retry continued or resumed, kept linked so the issue can be retried again. */
     private suspend fun holdUnstarted(id: UUID, number: Int, reason: String, keepRun: UUID? = null) {

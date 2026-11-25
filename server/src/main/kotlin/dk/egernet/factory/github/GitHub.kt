@@ -209,9 +209,18 @@ interface GitHubClient {
      * Creates (without moving any branch) a commit with the single parent [parentSha] whose tree is the parent's with
      * the gitlink at [path] set to [sha] (Git Data API: tree with `base_tree`, then commit). Returns the new commit's SHA.
      */
-    fun createGitlinkCommit(org: String, repo: String, parentSha: String, path: String, sha: String, message: String): String
-    /** Moves the existing [branch] to [sha], also when that is not a fast-forward. */
-    fun forceUpdateBranch(org: String, repo: String, branch: String, sha: String)
+    fun createGitlinkCommit(org: String, repo: String, parentSha: String, path: String, sha: String, message: String): String =
+        createGitlinksCommit(org, repo, parentSha, mapOf(path to sha), message)
+    /**
+     * Creates (without moving any branch) a commit with the single parent [parentSha] whose tree is the parent's with
+     * every gitlink in [links] (path → commit) set, in one tree. Returns the new commit's SHA.
+     */
+    fun createGitlinksCommit(org: String, repo: String, parentSha: String, links: Map<String, String>, message: String): String
+    /**
+     * Moves the existing [branch] to [sha]. With [force] (the default) also when that is not a fast-forward; without,
+     * GitHub refuses (422) an update that is not a fast-forward, e.g. because the branch moved meanwhile.
+     */
+    fun forceUpdateBranch(org: String, repo: String, branch: String, sha: String, force: Boolean = true)
     /** The repository's issue labels (at most a few thousand). */
     fun listLabels(org: String, repo: String): List<GhLabel>
     /**
@@ -448,14 +457,17 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
             return (e as? kotlinx.serialization.json.JsonPrimitive)?.content
         }
 
-        override fun createGitlinkCommit(org: String, repo: String, parentSha: String, path: String, sha: String, message: String): String {
+        override fun createGitlinksCommit(org: String, repo: String, parentSha: String, links: Map<String, String>, message: String): String {
+            require(links.isNotEmpty()) { "No gitlink to set" }
             val base = "/repos/${enc(org)}/${enc(repo)}/git"
             val parentTree = shaOf(ok(send("GET", "$base/commits/${enc(parentSha)}"), "GET commit"), "tree", "sha")
                 ?: throw GitHubException(502, "GitHub GET commit returned no tree")
             val tree = shaOf(ok(send("POST", "$base/trees", buildJsonObject {
                 put("base_tree", parentTree)
                 putJsonArray("tree") {
-                    add(buildJsonObject { put("path", path); put("mode", "160000"); put("type", "commit"); put("sha", sha) })
+                    for ((path, sha) in links) {
+                        add(buildJsonObject { put("path", path); put("mode", "160000"); put("type", "commit"); put("sha", sha) })
+                    }
                 }
             }), "create tree"), "sha") ?: throw GitHubException(502, "GitHub create tree returned no sha")
             return shaOf(ok(send("POST", "$base/commits", buildJsonObject {
@@ -476,9 +488,9 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
             return true
         }
 
-        override fun forceUpdateBranch(org: String, repo: String, branch: String, sha: String) {
+        override fun forceUpdateBranch(org: String, repo: String, branch: String, sha: String, force: Boolean) {
             ok(send("PATCH", "/repos/${enc(org)}/${enc(repo)}/git/refs/heads/${encBranch(branch)}",
-                buildJsonObject { put("sha", sha); put("force", true) }), "update branch")
+                buildJsonObject { put("sha", sha); put("force", force) }), "update branch")
         }
 
         override fun checkRuns(org: String, repo: String, sha: String): List<GhCheckRun> {

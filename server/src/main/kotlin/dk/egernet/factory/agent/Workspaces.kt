@@ -436,6 +436,11 @@ class Workspaces(private val cfg: Config, val git: GitOps, private val github: G
         git.forgetBranch(mainDir(username, repo), branch, home(username))
     }
 
+    /** [GitOps.forgetBranch] in [username]'s clone of member [directory] of workspace [repo], under the clone's lock. Blocking. */
+    fun forgetMemberBranch(username: String, repo: String, directory: String, branch: String) = withRepoLock(username, repo) {
+        git.forgetBranch(memberPath(mainDir(username, repo), directory), branch, home(username))
+    }
+
     /** [reapRunWorktrees] for every user's clone of every repository on disk (at server start). */
     fun reapAllRunWorktrees(live: (UUID) -> Boolean): List<UUID> {
         val root = cfg.dataDir.resolve("workspaces")

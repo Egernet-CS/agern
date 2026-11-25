@@ -70,7 +70,9 @@ class SubmoduleParentRunTest {
         assertEquals("member_label_ambiguous", code { start(both) })
         // demo-workspace is defined by .agern/workspace.yml: an unlabelled issue (#3) is refused as before.
         assertEquals("member_label_missing", code { start(3, "demo-workspace") })
-        assertEquals("workspace_releases_unsupported", code { runBlocking { s.releases.create(alice, "demo-workspace", "r", "") } })
+        // Releases are available there; a member label is still needed to plan an issue.
+        val r = runBlocking { s.releases.create(alice, "demo-workspace", "r", "") }
+        assertEquals("member_label_missing", code { runBlocking { s.releases.assign(alice, "demo-workspace", listOf(3), r.id) } })
     }
 
     private fun awaitRelease(id: UUID, done: (ReleaseRecord) -> Boolean): ReleaseRecord {
@@ -84,31 +86,30 @@ class SubmoduleParentRunTest {
     }
 
     @Test
-    fun `a release builds issues of the workspace repository, never a member's`() {
+    fun `a release plans member issues and builds unlabelled issues in the workspace repository`() {
         val r = runBlocking { s.releases.create(alice, ws, "1.0", "") }
-        // Issue #1 carries demo-shop-api's label: refused with a clear message, nothing assigned.
-        val e = assertFailsWith<ApiException> { runBlocking { s.releases.assign(alice, ws, listOf(1), r.id) } }
-        assertEquals("member_in_release", e.code)
-        assertEquals(
-            "Issue #1 carries the label of member `services/api` (demo-shop-api). A release builds the workspace repository " +
-                "itself: remove the label, or run the issue on its own.",
-            e.message,
-        )
+        // Issue #1 carries demo-shop-api's label: accepted (it is built in the member).
+        runBlocking { s.releases.assign(alice, ws, listOf(1), r.id) }
+        runBlocking { s.releases.assign(alice, ws, listOf(1), null) }
         val plain = gh.addIssue(ws, "Write the changelog", "x").number
         val labelledLater = gh.addIssue(ws, "Fix the API docs", "x").number
         runBlocking { s.releases.assign(alice, ws, listOf(plain, labelledLater), r.id) }
-        // A member label added after planning holds the issue when its turn comes.
+        // Two member labels added after planning hold the issue when its turn comes.
         synchronized(gh) {
-            gh.repos.getValue(ws).issues.replaceAll { if (it.number == labelledLater) it.copy(labels = listOf(GhLabel("demo-shop-api"))) else it }
+            gh.repos.getValue(ws).issues.replaceAll {
+                if (it.number == labelledLater) it.copy(labels = listOf(GhLabel("demo-shop-api"), GhLabel("demo-shop-web"))) else it
+            }
         }
         runBlocking { s.releases.start(alice, r.id) }
         val settled = awaitRelease(r.id) { rel -> rel.issues.none { it.state == ReleaseIssueState.WAITING || it.state == ReleaseIssueState.RUNNING } }
         assertEquals(ReleaseIssueState.MERGED, settled.issues.single { it.number == plain }.state)
         val held = settled.issues.single { it.number == labelledLater }
         assertEquals(ReleaseIssueState.HELD, held.state)
-        assertTrue(held.note!!.contains("carries the label of member `services/api`"), held.note)
+        assertTrue(held.note!!.contains("carries the labels of several members"), held.note)
         val run = s.runs.list(ws, activeOnly = false).single { it.issueNumber == plain }
         assertNull(run.targetRepo)
         assertTrue(gh.actions.any { it.startsWith("pr $ws factory/release-1.0/issue-$plain-") }, gh.actions.toString())
+        // Only the workspace repository was touched: no member branch, the release stays single-repository.
+        assertTrue(settled.repos.isEmpty())
     }
 }

@@ -129,16 +129,16 @@ class Services(
         (images.provider("codex") as? dk.egernet.factory.images.CodexImageProvider)?.let {
             dk.egernet.factory.images.CodexLogins(it, images, scope, clock)
         }
-    val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes, screenshotStore,
-        sessions, events, images, workspaceDefs)
-    val screenshots = dk.egernet.factory.agent.Screenshots(cfg, screenshotStore, runs, workspaces, publishRun = { orchestrator.publish(it) })
     val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
+    val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes, screenshotStore,
+        sessions, events, images, workspaceDefs, releaseStore)
+    val screenshots = dk.egernet.factory.agent.Screenshots(cfg, screenshotStore, runs, workspaces, publishRun = { orchestrator.publish(it) })
     val releaseLocks = dk.egernet.factory.pipeline.ReleaseLocks()
     val releaseMerger = dk.egernet.factory.pipeline.ReleaseMerger(
         cfg, releaseStore, users, access, workspaces, bus, releaseLocks, scope, releaseModePolicy, clock,
     )
     val releaseBuilder = dk.egernet.factory.pipeline.ReleaseBuilder(
-        cfg, releaseStore, runs, users, access, orchestrator, bus, scope, releaseLocks, releaseMerger,
+        cfg, releaseStore, runs, users, access, orchestrator, bus, scope, releaseLocks, releaseMerger, workspaceDefs,
     )
     // A scheduled start goes through the same start as "start now" (ReleaseService.startScheduled), as the owner.
     val releaseScheduler: ReleaseScheduler = ReleaseScheduler(

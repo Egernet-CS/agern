@@ -112,6 +112,11 @@ interface GitOps {
      */
     fun forgetBranch(mainDir: Path, branch: String, home: Path) {}
     /**
+     * Fetches [branch] from origin into its remote-tracking ref in the clone at [mainDir], so `origin/<branch>` is
+     * current (a member release run reads its sandbox definition there). A failed fetch is logged; never throws.
+     */
+    fun fetchBranch(id: AgentIdentity?, mainDir: Path, branch: String, home: Path) {}
+    /**
      * Compares [headBranch] with [baseBranch] in the clone at [mainDir], both as they are on GitHub (fetched first with
      * [githubToken]): what the head changes relative to their merge base, and the files on the base's tip. Only paths
      * for which [dirOf] names a directory count; the base is listed only under the directories the changes touch, and
@@ -381,6 +386,12 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
             val branch = lines.firstOrNull { it.startsWith("branch ") }?.removePrefix("branch ")?.removePrefix("refs/heads/")
             WorktreeInfo(Path.of(path), branch)
         }
+    }
+
+    override fun fetchBranch(id: AgentIdentity?, mainDir: Path, branch: String, home: Path) {
+        if (localOnly || branch.isBlank() || branch.startsWith("-") || !Files.exists(mainDir.resolve(".git"))) return
+        runCatching { git(mainDir, home, id, "fetch", "--no-tags", "origin", "+refs/heads/$branch:refs/remotes/origin/$branch", timeoutSec = 60) }
+            .onFailure { log.warn("git fetch of {} failed in {}: {}", branch, mainDir, it.message) }
     }
 
     override fun forgetBranch(mainDir: Path, branch: String, home: Path) {

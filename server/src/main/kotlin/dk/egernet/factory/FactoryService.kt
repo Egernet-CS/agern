@@ -483,8 +483,19 @@ class FactoryService(
         fun approvedReply(r: dk.egernet.factory.db.ReleaseRecord): String {
             val closed = r.merged.size
             val target = r.targetBranch ?: "the default branch"
+            val issues = "$closed issue${if (closed == 1) "" else "s"} closed."
+            if (r.multiRepo) {
+                // Every merged release pull request, and where each submodule pointer now points.
+                val pulls = r.toDto().repositories.filter { it.state == "merged" }.joinToString(", ") { p ->
+                    (p.prUrl ?: "${p.repo}#${p.prNumber}") + " into ${p.baseBranch ?: "the default branch"}"
+                }
+                val pointers = r.touchedRepos.filter { it.submodule && it.mergeSha != null }
+                    .joinToString(", ") { "`${it.directory}` → `${it.mergeSha!!.take(12)}`" }
+                return "Release \"${r.name}\" is released: merged $pulls" +
+                    (if (pointers.isNotEmpty()) "; submodule pointers $pointers" else "") + ". $issues" + (r.notice?.let { " $it" } ?: "")
+            }
             return "Release \"${r.name}\" is released: pull request ${r.prUrl ?: "#${r.prNumber}"} merged into $target, " +
-                "$closed issue${if (closed == 1) "" else "s"} closed." + (r.notice?.let { " $it" } ?: "")
+                issues + (r.notice?.let { " $it" } ?: "")
         }
 
         /** The reply to `/factory release mode`. */

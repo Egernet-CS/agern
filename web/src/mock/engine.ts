@@ -1141,8 +1141,12 @@ export function issueMembers(repo: string, issue: Issue): { directory: string; r
   return w.members.filter((m) => labels.has(m.label.toLowerCase())).map((m) => ({ directory: m.directory, repository: m.repository }));
 }
 
-/** The member a run of [issue] changes, with the server's refusals (ARCHITECTURE §6 "Workspace runs"); null outside a workspace. */
-function workspaceTarget(repo: string, issue: Issue, user: User): { repository: string; directory: string; branch: string } | null {
+/**
+ * The member [issue] belongs to by its label, with the server's refusals for a missing or ambiguous label
+ * (ARCHITECTURE §6 "Workspace runs"); null outside a workspace. The mock's workspaces are all workspace.yml ones, so an
+ * unlabelled issue is always refused (in a submodule workspace it would belong to the workspace repository).
+ */
+function workspaceMember(repo: string, issue: Issue): MockMember | null {
   const w = db.workspaces[repo];
   if (!w) return null;
   if (!w.valid) {
@@ -1165,16 +1169,17 @@ function workspaceTarget(repo: string, issue: Issue, user: User): { repository: 
       `Issue #${issue.number} carries the labels of several members (${matching.map((m) => m.label).join(', ')}). A run changes one member: keep exactly one of them.`,
     );
   }
-  const m = matching[0];
+  return matching[0];
+}
+
+/** The member a run of [issue] changes, with the server's refusals (ARCHITECTURE §6 "Workspace runs"); null outside a workspace. */
+function workspaceTarget(repo: string, issue: Issue, user: User): { repository: string; directory: string; branch: string } | null {
+  const m = workspaceMember(repo, issue);
+  if (!m) return null;
   if (!canRead(m, user)) {
     throw new MockError(403, 'member_not_accessible', `Your GitHub token cannot read ${ORG}/${m.repository} (member \`${m.directory}\`), so you cannot run this issue.`);
   }
   return { repository: m.repository, directory: m.directory, branch: m.branch ?? 'main' };
-}
-
-/** Releases are not available for workspace projects (409 like the server). */
-export function refuseWorkspaceReleases(repo: string) {
-  if (db.workspaces[repo]) throw new MockError(409, 'workspace_releases_unsupported', 'Releases are not available for workspace projects yet.');
 }
 
 export class MockError extends Error {
@@ -1403,6 +1408,7 @@ export function createRelease(
     mode,
     releasedAutomatically: false,
     checks: null,
+    repositories: [],
   };
   db.releases.set(r.id, r);
   feed({ type: 'release', repo, release: r });
@@ -1502,6 +1508,8 @@ export function assignIssues(repo: string, numbers: number[], releaseId: string 
     if (target) {
       if (!i) throw new MockError(404, 'not_found', `Issue #${n} not found`);
       if (i.state !== 'open') throw new MockError(409, 'issue_closed', `Issue #${n} is closed; only open issues can be planned in a release`);
+      // A workspace's issue is built in the member its label names: the same label rules as a run.
+      if (!target.issues.some((x) => x.number === n)) workspaceMember(repo, i);
     }
     const source = sourceOf(n);
     if (!source || source === target) return [];
@@ -1525,7 +1533,11 @@ export function assignIssues(repo: string, numbers: number[], releaseId: string 
   if (target) {
     for (const n of adds) {
       const i = db.issues[repo]!.find((x) => x.number === n)!;
-      target.issues.push({ number: n, title: i.title, kind: i.kind, state: 'waiting', runId: null, note: null, prNumber: null, prUrl: null });
+      const m = workspaceMember(repo, i);
+      target.issues.push({
+        number: n, title: i.title, kind: i.kind, state: 'waiting', runId: null, note: null, prNumber: null, prUrl: null,
+        targetRepo: m?.repository ?? null, targetDir: m?.directory ?? null,
+      });
       changed.add(target);
     }
     if (adds.length && target.status === 'ready') Object.assign(target, { status: 'building', readyAt: null });
@@ -2132,7 +2144,7 @@ function seed() {
   const spring = createRelease('web-shop', { name: '1.4', description: 'Checkout polish before the spring campaign.\nShip together.' }, alice, Date.now() - 2 * 86400_000);
   const planned = (repo: string, n: number): Release['issues'][number] => {
     const i = db.issues[repo].find((x) => x.number === n)!;
-    return { number: n, title: i.title, kind: i.kind, state: 'waiting', runId: null, note: null, prNumber: null, prUrl: null };
+    return { number: n, title: i.title, kind: i.kind, state: 'waiting', runId: null, note: null, prNumber: null, prUrl: null, targetRepo: null, targetDir: null };
   };
   spring.issues = [51, 55, 57].map((n) => planned('web-shop', n));
   const cleanup = createRelease('web-shop', { name: 'chat-cleanup', description: '' }, bob, Date.now() - 86400_000);

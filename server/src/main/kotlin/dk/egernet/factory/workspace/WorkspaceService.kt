@@ -28,7 +28,7 @@ data class WorkspaceState(
 
     /**
      * The members come from `.gitmodules` alone (no `.agern/workspace.yml`): an issue without a member label is a run
-     * of the workspace repository itself, and releases (of such runs) are available.
+     * of the workspace repository itself.
      */
     val fromSubmodules: Boolean get() = path == GITMODULES_FILE
 
@@ -126,12 +126,13 @@ class WorkspaceService(private val access: Access, private val ttlMillis: Long =
             matching.isEmpty() && state.fromSubmodules -> return null
             matching.isEmpty() -> throw conflict(
                 "Issue #${issue.number} has no member label. Add exactly one of these labels on GitHub to say which repository " +
-                    "it belongs to: " + state.members.joinToString(", ") { "`${it.label}` (${it.repository})" } + ".",
+                    "it belongs to: " + state.members.joinToString(", ") { "`${it.label}` (${it.repository})" } + ". " +
+                    labelHint(issue.number, repo, "--add-label"),
                 "member_label_missing",
             )
             matching.size > 1 -> throw conflict(
                 "Issue #${issue.number} carries the labels of several members (${matching.joinToString(", ") { it.label }}). " +
-                    "A run changes one member: keep exactly one of them.",
+                    "A run changes one member: keep exactly one of them. " + labelHint(issue.number, repo, "--remove-label"),
                 "member_label_ambiguous",
             )
         }
@@ -139,6 +140,10 @@ class WorkspaceService(private val access: Access, private val ttlMillis: Long =
         if (!resolved.accessible || resolved.baseBranch == null) throw notAccessible(resolved.member)
         return resolved
     }
+
+    /** The sentence that tells an agent (or a person) how to fix an issue's member label with `gh`. */
+    private fun labelHint(number: Int, repo: String, flag: String) =
+        "You can set it with `gh issue edit $number --repo $org/$repo $flag \"<label>\"`."
 
     fun notAccessible(m: WorkspaceMember) = ApiException(
         HttpStatusCode.Forbidden, "member_not_accessible",
@@ -150,14 +155,5 @@ class WorkspaceService(private val access: Access, private val ttlMillis: Long =
             "The workspace definition ${state.path} is invalid: ${state.firstProblem}. Fix it on `$defaultBranch` first.",
             "workspace_invalid",
         )
-
-        /** An issue of a submodule workspace with a member label cannot be built by a release (it builds the workspace repository). */
-        fun memberInRelease(number: Int, m: WorkspaceMember) = conflict(
-            "Issue #$number carries the label of member `${m.directory}` (${m.repository}). A release builds the workspace " +
-                "repository itself: remove the label, or run the issue on its own.",
-            "member_in_release",
-        )
-
-        fun releasesUnsupported() = conflict("Releases are not available for workspace projects yet.", "workspace_releases_unsupported")
     }
 }
