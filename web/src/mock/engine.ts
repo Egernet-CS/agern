@@ -1219,6 +1219,19 @@ export function approveRun(r: Run, by: User) {
   setRunStatus(r, 'merged', iso(Date.now()));
 }
 
+/** "Merge anyway" (docs/ARCHITECTURE.md §6 "Checks before a merge"): owner only, bound to the checks' head commit. */
+export function mergeAnywayRun(r: Run, by: User, headSha: string) {
+  if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner of this run can merge it.');
+  const c = r.checks;
+  if ((r.status !== 'needs_human' && r.status !== 'waiting_for_checks') || !r.prNumber || !c || !['failed', 'pending', 'awaiting', 'unknown'].includes(c.state))
+    throw new MockError(409, 'run_not_overridable', 'Only a run whose checks blocked its merge can be merged anyway.');
+  if (c.sha !== headSha) throw new MockError(409, 'checks_changed', 'The checks changed since you looked. Look at them again before merging.');
+  const now = iso(Date.now());
+  r.checks = { ...c, waitingSince: null, deadline: null, overriddenBy: by.username, overriddenAt: now };
+  r.error = null;
+  setRunStatus(r, 'merged', now);
+}
+
 export function cancelRun(r: Run) {
   const adv = r.conversation.sessionId ? db.sessions.get(r.conversation.sessionId) : undefined;
   if (adv && !['done', 'failed', 'stopped'].includes(adv.status)) stopSession(adv);

@@ -3430,3 +3430,20 @@ html.app-locked #root {
   gap: 2px;
   overflow-wrap: anywhere;
 }
+
+/* Checks before a merge (docs/ARCHITECTURE.md §6 "Checks before a merge"). */
+.run-checks {
+  padding: 10px 14px;
+  margin-bottom: 14px;
+}
+.run-checks .notice-text,
+.escalation-reason .notice-text {
+  overflow-wrap: anywhere;
+}
+.checks-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+.run-override {
+  margin: 6px 0 0;
+}

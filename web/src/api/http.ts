@@ -177,6 +177,7 @@ export const httpApi: Api = {
   },
   run: (id) => get(`/api/runs/${enc(id)}`),
   approveRun: (id) => post(`/api/runs/${enc(id)}/approve`),
+  mergeAnywayRun: (id, headSha) => post(`/api/runs/${enc(id)}/merge-anyway`, { headSha }),
   cancelRun: (id) => post(`/api/runs/${enc(id)}/cancel`),
   talkToRun: (id, text) => post(`/api/runs/${enc(id)}/conversation`, { text }),
   reviewRun: (id) => post(`/api/runs/${enc(id)}/review`),

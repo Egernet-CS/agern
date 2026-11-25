@@ -48,6 +48,7 @@ import {
   checkRelease,
   setReleaseMode,
   approveRun,
+  mergeAnywayRun,
   approveSandbox,
   cancelRun,
   reviewRun,
@@ -515,6 +516,12 @@ export const mockApi: Api = {
     ok(() => {
       const r = run(id);
       approveRun(r, me());
+      return r;
+    }),
+  mergeAnywayRun: (id, headSha) =>
+    ok(() => {
+      const r = run(id);
+      mergeAnywayRun(r, me(), headSha);
       return r;
     }),
   runRetryOptions: (id) => ok(() => retryOptionsFor(run(id))),

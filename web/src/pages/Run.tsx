@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, ApiError, isRunActive, isRunWorking, type AgentSession, type GeneratedImage, type Run, type Screenshot, type StageRole } from '../api';
+import { api, ApiError, BLOCKING_CHECK_STATES, isRunActive, isRunWorking, type AgentSession, type GeneratedImage, type Run, type RunCheckItem, type Screenshot, type StageRole } from '../api';
 import { ChatView } from '../components/chat/ChatView';
 import { RunSandboxLine } from '../components/sandbox/SandboxBits';
 import { Markdown } from '../components/chat/Markdown';
@@ -11,7 +11,7 @@ import { RetryDialog } from '../components/ui/RetryDialog';
 import { Dialog, Empty, ErrorBox, KindBadge, Loading, RunStatusPill, Verdict } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
-import { between, bytes, cost, modelLabel, shortId, timeAgo } from '../lib/format';
+import { between, bytes, cost, dateTime, modelLabel, shortId, timeAgo } from '../lib/format';
 import { useLiveRun, useLiveSessions } from '../lib/realtime';
 import { useNow } from '../lib/useNow';
 
@@ -34,9 +34,10 @@ export function RunPage() {
   const run = useLiveRun(runQ.data);
   const sessions = useLiveSessions(sessQ.data, (s) => s.runId === runId);
   const sessionMap = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions]);
-  const [busy, setBusy] = useState<'approve' | 'cancel' | null>(null);
+  const [busy, setBusy] = useState<'approve' | 'cancel' | 'merge-anyway' | null>(null);
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [confirmApprove, setConfirmApprove] = useState(false);
+  const [confirmMergeAnyway, setConfirmMergeAnyway] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const navigate = useNavigate();
   const [err, setErr] = useState<string | null>(null);
@@ -96,11 +97,22 @@ export function RunPage() {
           ? 'The agent is still working.'
           : null;
 
-  const act = async (kind: 'approve' | 'cancel') => {
+  // Checks before the merge (docs/ARCHITECTURE.md §6 "Checks before a merge"): the owner may merge anyway while they block it.
+  const checks = run.checks ?? null;
+  const checksBlock = checks !== null && BLOCKING_CHECK_STATES.includes(checks.state);
+  const canMergeAnyway =
+    isOwner && run.prNumber !== null && checksBlock && (run.status === 'waiting_for_checks' || run.status === 'needs_human');
+
+  const act = async (kind: 'approve' | 'cancel' | 'merge-anyway') => {
     setBusy(kind);
     setErr(null);
     try {
-      const r = kind === 'approve' ? await api.approveRun(run.id) : await api.cancelRun(run.id);
+      const r =
+        kind === 'approve'
+          ? await api.approveRun(run.id)
+          : kind === 'merge-anyway'
+            ? await api.mergeAnywayRun(run.id, checks?.sha ?? '')
+            : await api.cancelRun(run.id);
       runQ.setData(() => r);
     } catch (e) {
       setErr((e as Error).message);
@@ -108,8 +120,14 @@ export function RunPage() {
       setBusy(null);
       setConfirmCancel(false);
       setConfirmApprove(false);
+      setConfirmMergeAnyway(false);
     }
   };
+  const mergeAnywayButton = canMergeAnyway && (
+    <button className="btn btn--ghost" onClick={() => setConfirmMergeAnyway(true)} disabled={busy !== null} aria-haspopup="dialog">
+      Merge anyway…
+    </button>
+  );
 
   return (
     <div className="page page--wide runpage">
@@ -154,6 +172,9 @@ export function RunPage() {
           <div><dt>started</dt><dd>{timeAgo(run.createdAt, now)}</dd></div>
         </dl>
         <RunSandboxLine run={run} />
+        {run.status === 'merged' && checks?.overriddenBy && (
+          <p className="muted small run-override">Merged by {checks.overriddenBy} despite checks: {checks.detail}</p>
+        )}
         <div className="rh-actions">
           {run.status === 'needs_human' && isOwner && (
             <>
@@ -175,10 +196,12 @@ export function RunPage() {
               >
                 Talk to the agent
               </button>
+              {mergeAnywayButton}
               {approveHint && <span id="approve-hint" className="muted small">{approveHint}</span>}
             </>
           )}
           {run.status === 'needs_human' && !isOwner && <span className="muted small">Waiting for {run.owner.username} to approve.</span>}
+          {run.status === 'waiting_for_checks' && (isOwner ? mergeAnywayButton : <span className="muted small">Waiting for checks; it merges by itself.</span>)}
           {(run.status === 'failed' || run.status === 'cancelled') && isOwner && (
             <button className="btn btn--primary" onClick={() => setRetrying(true)} disabled={busy !== null}>Retry…</button>
           )}
@@ -193,6 +216,7 @@ export function RunPage() {
         </div>
       )}
       {err && <p className="form-error" role="alert">{err}</p>}
+      {run.status === 'waiting_for_checks' && checks && <WaitingForChecks checks={checks} />}
       {(run.warnings ?? []).map((w) => {
         // "<title>: <detail>" — the title in bold, the detail as a sentence.
         const cut = w.text.indexOf(':');
@@ -259,6 +283,41 @@ export function RunPage() {
         </div>
       </Dialog>
 
+      <Dialog open={confirmMergeAnyway && canMergeAnyway} onClose={() => setConfirmMergeAnyway(false)} title="Merge without passing checks?">
+        <div className="notice notice--warn escalation-reason" role="note" aria-label="Checks that have not passed">
+          <div className="notice-text">
+            {checks && checks.items.length > 0 ? (
+              <ul className="checks-list">
+                {checks.items.map((c, i) => (
+                  <li key={i}>
+                    <CheckName item={c} /> — {c.state === 'failed' ? `failed (${c.conclusion ?? 'unknown'})` : 'pending'}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              checks?.detail
+            )}
+          </div>
+        </div>
+        {escalation !== null && (
+          <>
+            <p>The approver did not approve this change and asked for a human:</p>
+            <div className="notice notice--warn escalation-reason" role="note" aria-label="The approver's reason">
+              <div className="notice-text"><Markdown text={escalation} /></div>
+            </div>
+          </>
+        )}
+        <p>
+          Merging squash-merges {run.prNumber ? <>pull request #{run.prNumber}</> : 'the pull request'} into{' '}
+          <code>{run.baseBranch ?? 'the default branch'}</code> now, without waiting for these checks. Your decision is recorded on the run and on the
+          pull request.
+        </p>
+        <div className="dialog-actions">
+          <button className="btn btn--ghost" onClick={() => setConfirmMergeAnyway(false)} data-autofocus>Don’t merge</button>
+          <button className="btn btn--approve" onClick={() => void act('merge-anyway')} disabled={busy !== null}>{busy === 'merge-anyway' ? 'Merging…' : 'Merge anyway'}</button>
+        </div>
+      </Dialog>
+
       <Dialog open={confirmCancel} onClose={() => setConfirmCancel(false)} title="Cancel this run?">
         <p>Running agents are stopped. The branch {run.branch && <code>{run.branch}</code>} and any pull request stay on GitHub.</p>
         <div className="dialog-actions">
@@ -266,6 +325,36 @@ export function RunPage() {
           <button className="btn btn--danger" onClick={() => void act('cancel')} disabled={busy !== null}>{busy === 'cancel' ? 'Cancelling…' : 'Cancel run'}</button>
         </div>
       </Dialog>
+    </div>
+  );
+}
+
+/** A check's name: a link (new tab) when GitHub gave an https URL. Name and URL are untrusted and rendered as text. */
+function CheckName({ item }: { item: RunCheckItem }) {
+  return item.url?.startsWith('https://') ? (
+    <a href={item.url} target="_blank" rel="noopener noreferrer">{item.name}</a>
+  ) : (
+    <span>{item.name}</span>
+  );
+}
+
+/** While the run waits for the checks on its pull request's head commit: what it waits for and until when. */
+function WaitingForChecks({ checks }: { checks: NonNullable<Run['checks']> }) {
+  const pending = checks.items.filter((c) => c.state === 'pending');
+  const detail = checks.detail.replace(/[.\s]+$/, '');
+  return (
+    <div className="notice run-checks" role="status">
+      <div className="notice-text">
+        Waiting for checks on <code>{checks.sha.slice(0, 7)}</code>. {detail}. The pull request is merged automatically when they pass
+        {checks.deadline ? <>; Agern stops waiting at {dateTime(checks.deadline)}.</> : '.'}
+        {pending.length > 0 && (
+          <ul className="checks-list">
+            {pending.map((c, i) => (
+              <li key={i}><CheckName item={c} /></li>
+            ))}
+          </ul>
+        )}
+      </div>
     </div>
   );
 }

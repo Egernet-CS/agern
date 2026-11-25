@@ -54,6 +54,7 @@ const RUN_TONE: Record<RunStatus, string> = {
   building: 'active',
   reviewing: 'active',
   approving: 'active',
+  waiting_for_checks: 'active',
   merged: 'pass',
   needs_human: 'escalate',
   failed: 'fail',
@@ -63,7 +64,7 @@ export function RunStatusPill({ status }: { status: RunStatus }) {
   return (
     <span className={`pill pill--${RUN_TONE[status]}`}>
       <span className="pill-dot" aria-hidden />
-      {status.replace('_', ' ')}
+      {status.replaceAll('_', ' ')}
     </span>
   );
 }

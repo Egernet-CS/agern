@@ -431,6 +431,8 @@ export type RunStatus =
   | 'building'
   | 'reviewing'
   | 'approving'
+  /** Approved; merges by itself once the checks on the pull request's head commit pass (docs/ARCHITECTURE.md §6). */
+  | 'waiting_for_checks'
   | 'merged'
   | 'needs_human'
   | 'failed'
@@ -477,9 +479,33 @@ export type Run = {
   /** A workspace run: the member repository and directory it changes (its `baseBranch` is the member's); null otherwise. */
   targetRepo?: string | null;
   targetDirectory?: string | null;
+  /** The checks on the pull request's head commit as last evaluated before a merge; null until the first evaluation. */
+  checks?: RunChecks | null;
 };
 
-export type FailureKind = 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | 'submodule_commit_missing';
+/** One check that has not passed. Name and URL come from GitHub (untrusted); `url` is only ever an `https://` URL. */
+export type RunCheckItem = { name: string; state: 'failed' | 'pending'; conclusion: string | null; url: string | null };
+
+/** The checks a run's merge was decided on (docs/ARCHITECTURE.md §6 "Checks before a merge"). */
+export type RunChecks = {
+  state: 'awaiting' | 'pending' | 'passed' | 'failed' | 'none' | 'unknown';
+  /** The head commit they were read for. */
+  sha: string;
+  detail: string;
+  /** At most 50. */
+  items: RunCheckItem[];
+  /** Set only while `waiting_for_checks`. */
+  waitingSince: string | null;
+  deadline: string | null;
+  /** Set when the owner merged anyway. */
+  overriddenBy: string | null;
+  overriddenAt: string | null;
+};
+
+/** Checks states that block a merge (and that the owner may merge anyway). */
+export const BLOCKING_CHECK_STATES: RunChecks['state'][] = ['failed', 'pending', 'awaiting', 'unknown'];
+
+export type FailureKind = 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | 'submodule_commit_missing' | 'checks';
 export type FailedStep = 'push' | 'pull_request' | 'merge';
 
 /** `step`: retry the failed step on the same run; `continue`: a new run from its commits; `start_over`: from scratch. */
@@ -766,7 +792,7 @@ export type FeedFrame =
   | { type: 'usage' };
 
 /** Agents are working on these runs. */
-export const WORKING_RUN_STATUSES: RunStatus[] = ['queued', 'spec', 'building', 'reviewing', 'approving'];
+export const WORKING_RUN_STATUSES: RunStatus[] = ['queued', 'spec', 'building', 'reviewing', 'approving', 'waiting_for_checks'];
 /** Not finished: what `GET /api/runs?active=true` returns (working + needs_human). */
 export const ACTIVE_RUN_STATUSES: RunStatus[] = [...WORKING_RUN_STATUSES, 'needs_human'];
 

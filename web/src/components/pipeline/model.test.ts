@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { Run, Stage, Verdict } from '../../api/types';
-import { approverEscalation } from './model.ts';
+import { approverEscalation, buildNodes } from './model.ts';
 
 const approver = (round: number, verdict: Verdict | null, summary: string | null) =>
   ({ role: 'approver', round, verdict, summary, status: 'done' }) as unknown as Stage;
@@ -22,4 +22,37 @@ test('no escalation: an approved run whose merge failed, or a run that no longer
   assert.equal(approverEscalation(run('needs_human', [approver(0, 'APPROVE', 'fine')])), null);
   assert.equal(approverEscalation(run('needs_human', [])), null);
   assert.equal(approverEscalation(run('merged', [approver(0, 'ESCALATE', 'risky')])), null);
+});
+
+// The merge node and the checks before a merge (docs/ARCHITECTURE.md §6 "Checks before a merge").
+const full = (status: Run['status'], extra: Partial<Run> = {}) =>
+  ({
+    status, stages: [approver(0, 'APPROVE', 'fine')], round: 0, maxRounds: 2, issueNumber: 1, issueTitle: 't', issueKind: 'task',
+    createdAt: '2026-01-01T00:00:00Z', endedAt: null, prNumber: 7, baseBranch: null, targetRepo: null,
+    conversation: { sessionId: null, review: 'none', followUpFrom: null }, failureKind: null, checks: null, ...extra,
+  }) as unknown as Run;
+const mergeNode = (r: Run) => buildNodes(r, new Map()).merge;
+const checks = (overriddenBy: string | null = null) =>
+  ({ state: 'failed', sha: 'abc', detail: 'Failed: build', items: [], waitingSince: null, deadline: null, overriddenBy, overriddenAt: null }) as Run['checks'];
+
+test('the merge node runs while the run waits for checks', () => {
+  const n = mergeNode(full('waiting_for_checks'));
+  assert.equal(n.state, 'running');
+  assert.equal(n.sub, 'waiting for checks');
+});
+
+test('the merge node fails when checks blocked the merge, not for other needs-human reasons', () => {
+  const n = mergeNode(full('needs_human', { failureKind: 'checks', checks: checks() }));
+  assert.equal(n.state, 'failed');
+  assert.equal(n.tone, 'fail');
+  assert.equal(n.sub, 'checks not passed');
+  assert.equal(mergeNode(full('needs_human')).state, 'pending');
+});
+
+test('a merge despite checks is noted on the merge node', () => {
+  const n = mergeNode(full('merged', { checks: checks('alice') }));
+  assert.equal(n.state, 'done');
+  assert.equal(n.verdict, 'MERGED');
+  assert.equal(n.note, 'despite checks');
+  assert.equal(mergeNode(full('merged', { checks: { ...checks()!, state: 'passed' } })).note, null);
 });

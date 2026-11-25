@@ -178,6 +178,11 @@ export interface Api {
   runs(filter?: { active?: boolean; status?: RunStatus[] }): Promise<Run[]>;
   run(id: string): Promise<Run>;
   approveRun(id: string): Promise<Run>;
+  /**
+   * Owner only: merges although the checks on `headSha` have not passed (docs/ARCHITECTURE.md §6 "Checks before a
+   * merge"). 409 `run_not_overridable` / `checks_changed` / `review_required` / `review_in_progress` / `agent_busy`.
+   */
+  mergeAnywayRun(id: string, headSha: string): Promise<Run>;
   cancelRun(id: string): Promise<Run>;
   /**
    * Owner only (403 for everyone else, admins included): a message to the run's advisor while it needs a human. 409
