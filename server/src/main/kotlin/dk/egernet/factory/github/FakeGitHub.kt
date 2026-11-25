@@ -15,7 +15,9 @@ class FakeGitHub(private val org: String) : GitHub {
                     /** Files on the default branch, by path (only what tests put there). */
                     val files: MutableMap<String, String> = mutableMapOf(),
                     /** Binary files on the default branch, by path (only what tests put there); they take precedence. */
-                    val byteFiles: MutableMap<String, ByteArray> = mutableMapOf())
+                    val byteFiles: MutableMap<String, ByteArray> = mutableMapOf(),
+                    /** Labels created through [Client.createLabel], by lower-case name (labels on issues exist too). */
+                    val labels: MutableMap<String, GhLabel> = mutableMapOf())
 
     val repos = mutableMapOf<String, Repo>()
     val actions = CopyOnWriteArrayList<String>()
@@ -71,6 +73,37 @@ class FakeGitHub(private val org: String) : GitHub {
     @Volatile var hideMergeSettings = false
     /** Lets tests make opening pull requests fail. */
     @Volatile var failCreatePull = false
+    /** Per repository: the next this many merges (squash or not) fail with 405, as when the base moved under a pull request. */
+    val failNextMerges = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private fun failingMerge(repo: String): Boolean {
+        val n = failNextMerges[repo] ?: 0
+        if (n <= 0) return false
+        failNextMerges[repo] = n - 1
+        return true
+    }
+
+    /** Lets tests make label creation fail with this HTTP status (e.g. 403 for a token without push access). */
+    @Volatile var createLabelFailure: Int? = null
+
+    /**
+     * Development: creating labels in a repository fails with 403 while `<filesDir>/<repo>/.agern-fake/labels-readonly`
+     * exists (an end-to-end test switches it on and off).
+     */
+    private fun labelsReadOnly(repo: String) = dirFile(repo, ".agern-fake/labels-readonly") != null
+
+    /** Clone URLs by repository instead of `fake://…` (a test with real remotes: local bare repositories). */
+    val cloneUrls = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /**
+     * Gitlinks (submodule pointers) per `"<repo>:<branch>"`, by path: what [Client.gitlinkAt] answers. A merged pull
+     * request whose head is a gitlink commit ([Client.createGitlinkCommit]) moves the base's gitlink.
+     */
+    val gitlinks = java.util.concurrent.ConcurrentHashMap<String, MutableMap<String, String>>()
+    /** Gitlink commits by SHA: (path, gitlink sha); and where each branch made by a test or Agern points, by `"<repo>:<branch>"`. */
+    private val gitlinkCommits = java.util.concurrent.ConcurrentHashMap<String, Pair<String, String>>()
+    private val branchHeads = java.util.concurrent.ConcurrentHashMap<String, String>()
+    /** Commits ([Client.commitExists]) that do not exist, as `"<repo>:<sha>"`; every other commit does. */
+    val missingCommits: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
     /**
      * Checks per head branch (`"<repo>:<branch>"`), as GitHub reports them for the branch's current head commit:
@@ -128,6 +161,9 @@ class FakeGitHub(private val org: String) : GitHub {
     }
 
     private fun applyMerge(m: PullMeta, number: Int, method: String): String {
+        branchHeads["${m.repo}:${m.head}"]?.let { gitlinkCommits[it] }?.let { (path, sha) ->
+            gitlinks.getOrPut("${m.repo}:${m.base}") { java.util.concurrent.ConcurrentHashMap() }[path] = sha
+        }
         val base = commitList(m.repo, m.base)
         when (method) {
             "squash" -> base += m.title
@@ -145,7 +181,7 @@ class FakeGitHub(private val org: String) : GitHub {
     }
 
     override val isFake = true
-    override fun cloneUrl(org: String, repo: String) = "fake://$org/$repo"
+    override fun cloneUrl(org: String, repo: String) = cloneUrls[repo] ?: "fake://$org/$repo"
 
     fun addRepo(name: String, description: String? = null, private: Boolean = false, visibleTo: Set<String>? = null): Repo =
         synchronized(this) { Repo(name, description, private, visibleTo).also { repos[name] = it } }
@@ -214,7 +250,25 @@ class FakeGitHub(private val org: String) : GitHub {
             addIssue("demo-app", "Update dependencies", "Bump all dependencies to their latest minor versions.")
             addIssue("private-lab", "Experiment with caching", "Try an in-memory cache for the slow endpoint.")
             seedWorkspace()
+            seedSubmoduleWorkspace()
         }
+
+        /** The `.gitmodules` of the seeded `demo-shop` (docs/ARCHITECTURE.md §5 "Workspace projects"). */
+        fun demoShopGitmodules(org: String) = """
+            |[submodule "api"]
+            |	path = services/api
+            |	url = git@github.com:$org/demo-shop-api.git
+            |[submodule "web"]
+            |	path = web
+            |	url = ../demo-shop-web.git
+            |	branch = main
+            |[submodule "cli"]
+            |	path = tools/cli
+            |	url = ../demo-ws-tools.git
+            |[submodule "vendor/icons"]
+            |	path = vendor/icons
+            |	url = https://github.com/another-org/icons.git
+            |""".trimMargin()
 
         /** The workspace definition of the seeded `demo-workspace` (docs/ARCHITECTURE.md §3). */
         val DEMO_WORKSPACE_FILE = """
@@ -249,6 +303,29 @@ class FakeGitHub(private val org: String) : GitHub {
         addIssue("demo-workspace", "Document the release process", "Nobody knows how a release is made.")
         addIssue("demo-workspace", "Share the price formatter", "The app and the CLI format prices differently.", listOf("app", "demo-ws-tools"))
         addIssue("demo-workspace", "Try a faster search index", "An experiment for the lab.", listOf("lab"))
+    }
+
+    /**
+     * A workspace built from git submodules: `demo-shop` has no `.agern/workspace.yml`, only a `.gitmodules` with the
+     * members `services/api` (`demo-shop-api`, an SSH URL), `web` (`demo-shop-web`, a relative URL) and `tools/cli`
+     * (`demo-ws-tools`, whose label no issue carries yet, so it is missing until Agern creates it) and a submodule
+     * of another organization (context only), issues labelled with a member's repository name and one without a
+     * member label (a run of `demo-shop` itself).
+     */
+    fun seedSubmoduleWorkspace() {
+        addRepo("demo-shop", "A workspace built from git submodules: the shop's API and web app")
+        addRepo("demo-shop-api", "The shop's API, a submodule of demo-shop")
+        addRepo("demo-shop-web", "The shop's web app, a submodule of demo-shop")
+        setFile("demo-shop", ".gitmodules", demoShopGitmodules(org))
+        gitlinks["demo-shop:main"] = java.util.concurrent.ConcurrentHashMap(
+            mapOf(
+                "services/api" to "0".repeat(39) + "1", "web" to "0".repeat(39) + "2", "tools/cli" to "0".repeat(39) + "4",
+                "vendor/icons" to "0".repeat(39) + "3",
+            ),
+        )
+        addIssue("demo-shop", "Add a health endpoint", "The load balancer needs GET /health.", listOf("enhancement", "demo-shop-api"))
+        addIssue("demo-shop", "Show the cart total in the header", "Users cannot see what the cart costs.", listOf("demo-shop-web"))
+        addIssue("demo-shop", "Update the architecture notes", "docs/architecture.md still describes the old checkout.")
     }
 
     private inner class Client(val login: String, val scopes: List<String>) : GitHubClient {
@@ -358,6 +435,7 @@ class FakeGitHub(private val org: String) : GitHub {
         override fun squashMerge(org: String, repo: String, number: Int, title: String) = synchronized(this@FakeGitHub) {
             repo(org, repo)
             if (failMerge) throw GitHubException(405, "Pull Request is not mergeable")
+            if (failingMerge(repo)) throw GitHubException(405, "Base branch was modified. Review and try the merge again.")
             val m = pullMeta[number]
             if (m != null) applyMerge(m, number, "squash")
             else pulls.values.forEach { l -> l.replaceAll { if (it.number == number) it.copy(state = "merged") else it } }
@@ -378,6 +456,7 @@ class FakeGitHub(private val org: String) : GitHub {
             // The new branch has the commits of the branch whose tip it starts at (`sha-<branch>`).
             val from = sha.removePrefix("sha-").takeIf { sha.startsWith("sha-") && (it == "main" || it in branches[repo].orEmpty()) } ?: "main"
             commits["$repo:$branch"] = commitList(repo, from).toMutableList()
+            branchHeads["$repo:$branch"] = sha
             actions += "branch $repo $branch"
             Unit
         }
@@ -421,6 +500,7 @@ class FakeGitHub(private val org: String) : GitHub {
                 if (method == "merge" && allowMergeCommit == false) throw GitHubException(405, "Merge commits are not allowed on this repository.")
                 if (m.state != "open") throw GitHubException(405, "Pull Request is not mergeable")
                 if (failMerge || "$repo:${m.head}" in conflicting) throw GitHubException(405, "Pull Request is not mergeable")
+                if (failingMerge(repo)) throw GitHubException(405, "Base branch was modified. Review and try the merge again.")
                 if (method == "rebase" && "$repo:${m.head}" in notRebaseable) throw GitHubException(405, "This branch can't be rebased")
                 if (commitTitle != null) m.title = commitTitle
                 val sha = applyMerge(m, number, method)
@@ -462,6 +542,50 @@ class FakeGitHub(private val org: String) : GitHub {
             (checkRunsByBranch["$repo:$branch"]?.values?.takeIf { it.isNotEmpty() } ?: checksFile(repo, branch)?.checkRuns.orEmpty())
                 .sortedBy { it.name }
         }
+
+        override fun commitExists(org: String, repo: String, sha: String): Boolean = synchronized(this@FakeGitHub) {
+            repo(org, repo)
+            "$repo:$sha" !in missingCommits
+        }
+
+        override fun gitlinkAt(org: String, repo: String, path: String, ref: String): String? = synchronized(this@FakeGitHub) {
+            repo(org, repo)
+            gitlinks["$repo:$ref"]?.get(path)
+        }
+
+        override fun createGitlinkCommit(org: String, repo: String, parentSha: String, path: String, sha: String, message: String): String =
+            synchronized(this@FakeGitHub) {
+                repo(org, repo)
+                val commit = "sha-gitlink-${gitlinkCommits.size + 1}"
+                gitlinkCommits[commit] = path to sha
+                actions += "gitlink-commit $repo $path $sha"
+                commit
+            }
+
+        override fun forceUpdateBranch(org: String, repo: String, branch: String, sha: String) = synchronized(this@FakeGitHub) {
+            repo(org, repo)
+            if (branch != "main" && branch !in branches[repo].orEmpty()) throw GitHubException(422, "Reference does not exist")
+            branchHeads["$repo:$branch"] = sha
+            actions += "update-branch $repo $branch"
+            Unit
+        }
+
+        override fun listLabels(org: String, repo: String): List<GhLabel> = synchronized(this@FakeGitHub) {
+            val r = repo(org, repo)
+            // As on GitHub, every label an issue carries exists in the repository.
+            (r.labels.values + r.issues.flatMap { it.labels }).distinctBy { it.name.lowercase() }
+        }
+
+        override fun createLabel(org: String, repo: String, name: String, color: String, description: String): Boolean =
+            synchronized(this@FakeGitHub) {
+                val r = repo(org, repo)
+                createLabelFailure?.let { throw GitHubException(it, "Resource not accessible by personal access token") }
+                if (labelsReadOnly(repo)) throw GitHubException(403, "Resource not accessible by personal access token")
+                if (listLabels(org, repo).any { it.name.equals(name, ignoreCase = true) }) return@synchronized false
+                r.labels[name.lowercase()] = GhLabel(name, color)
+                actions += "create-label $repo $name"
+                true
+            }
 
         private fun closePullList(number: Int) =
             pulls.values.forEach { l -> l.replaceAll { if (it.number == number) it.copy(state = "closed") else it } }

@@ -22,8 +22,11 @@ fun requireSafeSegment(s: String, what: String): String {
     return s
 }
 
-/** A workspace member to check out: its validated [directory], [repository] and effective [baseBranch]. */
-data class MemberCheckout(val directory: String, val repository: String, val baseBranch: String)
+/**
+ * A workspace member to check out: its validated [directory], [repository] and effective [baseBranch]. [submodule]: the
+ * member is a git submodule of the workspace repository at [directory] (docs/ARCHITECTURE.md §5 "Workspace projects").
+ */
+data class MemberCheckout(val directory: String, val repository: String, val baseBranch: String, val submodule: Boolean = false)
 
 /** A member left out of a checkout, and why (for the agents and the logs). */
 data class LeftOut(val directory: String, val repository: String, val reason: String)
@@ -48,9 +51,15 @@ data class RunCheckout(
  */
 data class SubmoduleBundle(val path: String, val head: String, val commits: Int, val file: Path)
 
-/** One entry of `members.json`: a member directory Agern has cloned into the workspace clone. */
+/**
+ * One entry of `members.json`: a member directory Agern has cloned into the workspace clone, or ([submodule]) a
+ * submodule checkout of the workspace clone that Agern uses as a member's clone. Either is the clone run worktrees of
+ * that member are added to and removed from.
+ */
 @Serializable
-data class ClonedMember(val directory: String, val repository: String)
+data class ClonedMember(val directory: String, val repository: String, val submodule: Boolean = false) {
+    fun sameAs(m: MemberCheckout) = directory == m.directory && repository == m.repository && submodule == m.submodule
+}
 
 /**
  * Layout under FACTORY_DATA_DIR: homes/<user>, workspaces/<user>/<repo>/{main,runs/<runId>}. A workspace project adds
@@ -136,6 +145,7 @@ class Workspaces(private val cfg: Config, val git: GitOps, private val github: G
     private fun recordMember(username: String, repo: String, m: ClonedMember) {
         val current = clonedMembers(username, repo)
         if (m in current) return
+        Files.createDirectories(membersFile(username, repo).parent)
         val list = current.filter { it.directory != m.directory } + m
         Files.writeString(membersFile(username, repo), AppJson.encodeToString(membersSer, list))
     }
@@ -171,10 +181,49 @@ class Workspaces(private val cfg: Config, val git: GitOps, private val github: G
         Files.writeString(f, text, java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND)
     }
 
-    /** The clone of member [m] in [username]'s workspace [repo] when Agern has cloned it there, else null. */
+    /**
+     * The clone of member [m] in [username]'s workspace [repo] when Agern has cloned it there (or, for a submodule
+     * member, uses the submodule checkout there), else null.
+     */
     private fun memberClone(username: String, repo: String, m: MemberCheckout): Path? {
         val dir = memberPath(mainDir(username, repo), m.directory)
-        return dir.takeIf { ClonedMember(m.directory, m.repository) in clonedMembers(username, repo) && Files.isDirectory(it) }
+        return dir.takeIf { clonedMembers(username, repo).any { c -> c.sameAs(m) } && Files.isDirectory(it) }
+    }
+
+    /** Whether [dir] is the top of a git checkout: a `.git` directory (a clone) or file (a submodule or worktree). */
+    private fun isCheckout(dir: Path): Boolean = Files.exists(dir.resolve(".git"), java.nio.file.LinkOption.NOFOLLOW_LINKS)
+
+    /** An empty directory, as git leaves a submodule that is not checked out. */
+    private fun isEmptyDir(dir: Path): Boolean =
+        Files.isDirectory(dir, java.nio.file.LinkOption.NOFOLLOW_LINKS) && Files.list(dir).use { !it.findAny().isPresent }
+
+    /**
+     * Makes the submodule checkout at `main/<directory>` member [m]'s clone: initialised with
+     * `git submodule update --init` when it is not checked out yet (in fake-GitHub mode, where local repositories have no
+     * submodules, a local repository stands in for it). Returns why it cannot be used, or null. Under the clone's lock.
+     */
+    private fun ensureSubmoduleClone(id: AgentIdentity, repo: String, main: Path, dir: Path, m: MemberCheckout): String? {
+        val nofollow = java.nio.file.LinkOption.NOFOLLOW_LINKS
+        if (Files.exists(dir, nofollow) && !Files.isDirectory(dir, nofollow)) {
+            return "the directory is occupied: it is not a submodule checkout of ${m.repository}"
+        }
+        if (!isCheckout(dir) && memberClone(id.username, repo, m) == null) {
+            val err = git.updateSubmodules(id, main, home(id.username), only = listOf(m.directory))
+            if (!isCheckout(dir)) {
+                // Fake GitHub: the workspace clone is a local repository without submodules; a local one stands in.
+                if (!github.isFake || Files.isRegularFile(main.resolve(".gitmodules"))) {
+                    return "the submodule could not be fetched" + (err?.let { ": ${it.trim().takeLast(300)}" } ?: "")
+                }
+                if (Files.exists(dir, nofollow) && !isEmptyDir(dir)) return "the directory is occupied: it is not a submodule checkout of ${m.repository}"
+                try {
+                    git.ensureClone(id, github.cloneUrl(cfg.githubOrg, m.repository), dir, home(id.username), m.baseBranch)
+                } catch (e: Exception) {
+                    return "it could not be checked out: ${e.message?.take(300)}"
+                }
+            }
+        }
+        recordMember(id.username, repo, ClonedMember(m.directory, m.repository, submodule = true))
+        return null
     }
 
     /**
@@ -195,6 +244,10 @@ class Workspaces(private val cfg: Config, val git: GitOps, private val github: G
                 when {
                     !noSymlinks(main, dir) ->
                         left += LeftOut(m.directory, m.repository, "a symbolic link in the workspace repository is in the way")
+                    m.submodule -> when (val why = ensureSubmoduleClone(id, repo, main, dir, m)) {
+                        null -> ok += m
+                        else -> left += LeftOut(m.directory, m.repository, why)
+                    }
                     ours -> {
                         exclude(main, m.directory)
                         ok += m
@@ -228,7 +281,8 @@ class Workspaces(private val cfg: Config, val git: GitOps, private val github: G
      */
     fun syncMembers(id: AgentIdentity, repo: String, members: List<MemberCheckout>): List<Pair<MemberCheckout, CheckoutState?>> =
         withRepoLock(id.username, repo) {
-            members.mapNotNull { m ->
+            // A submodule member follows the commit the workspace repository pins (synced with it), not its base branch.
+            members.filter { !it.submodule }.mapNotNull { m ->
                 val dir = memberClone(id.username, repo, m) ?: return@mapNotNull null
                 val key = "${id.username}/$repo/${m.directory}"
                 val now = System.currentTimeMillis()
@@ -255,11 +309,12 @@ class Workspaces(private val cfg: Config, val git: GitOps, private val github: G
         val home = home(id.username)
         val subs = mutableListOf<Pair<String, String>>()
         git.addDetachedWorktree(id, main, root, defaultBranch, home)
-        git.updateSubmodules(id, root, home)?.let { subs += repo to it }
+        // A submodule target is not fetched into the root: its directory becomes a worktree of the submodule's clone.
+        git.updateSubmodules(id, root, home, skip = listOfNotNull(target.directory.takeIf { target.submodule }))?.let { subs += repo to it }
         val tClone = memberClone(id.username, repo, target)
             ?: throw GitException("Member `${target.directory}` (${target.repository}) is not checked out in the workspace")
         val tWt = memberPath(root, target.directory)
-        if (Files.exists(tWt) || !noSymlinks(root, tWt)) {
+        if (!noSymlinks(root, tWt) || (Files.exists(tWt, java.nio.file.LinkOption.NOFOLLOW_LINKS) && !(target.submodule && isEmptyDir(tWt)))) {
             throw GitException("The directory `${target.directory}` is occupied in the workspace repository")
         }
         val baseRef = git.createWorktree(id, tClone, tWt, branch, target.baseBranch, home, startFrom)
@@ -268,9 +323,16 @@ class Workspaces(private val cfg: Config, val git: GitOps, private val github: G
         val left = mutableListOf<LeftOut>()
         for (o in others) {
             try {
-                val clone = memberClone(id.username, repo, o) ?: throw GitException("it is not checked out in the workspace")
                 val wt = memberPath(root, o.directory)
-                if (Files.exists(wt) || !noSymlinks(root, wt)) throw GitException("the directory is occupied in the workspace repository")
+                // A submodule member is context at the commit the workspace pins: the root's submodule checkout.
+                if (o.submodule && noSymlinks(root, wt) && isCheckout(wt)) {
+                    members += o
+                    continue
+                }
+                val clone = memberClone(id.username, repo, o) ?: throw GitException("it is not checked out in the workspace")
+                if (!noSymlinks(root, wt) || (Files.exists(wt, java.nio.file.LinkOption.NOFOLLOW_LINKS) && !(o.submodule && isEmptyDir(wt)))) {
+                    throw GitException("the directory is occupied in the workspace repository")
+                }
                 git.addDetachedWorktree(id, clone, wt, o.baseBranch, home)
                 git.updateSubmodules(id, wt, home)?.let { subs += o.directory to it }
                 members += o
@@ -303,6 +365,9 @@ class Workspaces(private val cfg: Config, val git: GitOps, private val github: G
             // A symbolic link of the workspace repository at a member path was never a worktree of ours: never follow it
             // (removing the root worktree removes the link itself).
             if (!noSymlinks(root, wt)) continue
+            // A submodule checkout of the root (context, not a worktree of the member's clone) goes with the root,
+            // whose unpushed submodule commits are bundled below.
+            if (m.submodule && isSubmoduleCheckout(wt)) continue
             bundles += bundleUnpushed(wt, "${m.directory}/", out, home)
             git.removeWorktree(clone, wt, home, keepUnpushed)
         }
@@ -322,6 +387,17 @@ class Workspaces(private val cfg: Config, val git: GitOps, private val github: G
                 .onFailure { log.warn("Bundling the unpushed commits of submodule {} in {} failed: {}", s.path, checkout, it.message) }
                 .getOrNull()?.let { SubmoduleBundle(path, s.head, s.commits, file) }
         }
+    }
+
+    /**
+     * Whether [wt] is a submodule checkout (its `.git` file points into a `modules/` directory) rather than a linked
+     * worktree (`…/worktrees/<name>`). False when it does not exist or cannot be read.
+     */
+    private fun isSubmoduleCheckout(wt: Path): Boolean {
+        val f = wt.resolve(".git")
+        if (!Files.isRegularFile(f, java.nio.file.LinkOption.NOFOLLOW_LINKS)) return false
+        val gitdir = runCatching { Files.readString(f).trim() }.getOrNull()?.removePrefix("gitdir:")?.trim() ?: return false
+        return Path.of(gitdir).parent?.fileName?.toString() != "worktrees"
     }
 
     fun <T> withRepoLock(username: String, repo: String, block: () -> T): T =

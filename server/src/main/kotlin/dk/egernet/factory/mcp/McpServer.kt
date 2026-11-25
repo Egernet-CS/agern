@@ -241,11 +241,12 @@ class McpServer(
             val text: String = when (name) {
                 "factory_list_issues" -> {
                     val workspace = factory.isWorkspace(owner, repo)
+                    val noLabel = if (factory.isSubmoduleWorkspace(owner, repo)) " [workspace repository]" else " [no member label]"
                     factory.listIssues(owner, repo, str("state") ?: "open").joinToString("\n") {
                         "#${it.number} [${it.kind}] ${it.title}" + (it.activeRunId?.let { r -> " (active run $r)" } ?: "") +
                             (it.release?.let { r -> " [release ${r.name}]" } ?: "") +
                             (if (!workspace) "" else when (it.workspaceMembers.size) {
-                                0 -> " [no member label]"
+                                0 -> noLabel
                                 1 -> " [member ${it.workspaceMembers.single().directory}]"
                                 else -> " [several member labels]"
                             })

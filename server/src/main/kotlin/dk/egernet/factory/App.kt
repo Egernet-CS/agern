@@ -86,7 +86,7 @@ class Services(
     val twoFactorStore = TwoFactorStore(db)
     val twoFactor = TwoFactorService(users, twoFactorStore, box)
     val access = Access(cfg, users, box, github)
-    val workspaceDefs = dk.egernet.factory.workspace.WorkspaceService(access)
+    val workspaceDefs = dk.egernet.factory.workspace.WorkspaceService(access, gitHost = cfg.gitHost)
     val bus = EventBus()
     val mcpRegistry = McpRegistry()
     val prompts = Prompts(cfg.githubOrg)
@@ -149,8 +149,10 @@ class Services(
         cfg, access, releaseStore, bus, releaseBuilder, releaseScheduler, releaseMerger, releaseModePolicy, workspaceDefs,
     )
     val projectIcons = dk.egernet.factory.db.ProjectIconStore(db)
+    val memberLabels = dk.egernet.factory.workspace.MemberLabels(access)
     val factory = FactoryService(
         cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases, images.store, projectIcons, workspaceDefs,
+        memberLabels,
     )
     val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes, screenshots, images)
 
@@ -212,8 +214,7 @@ class Services(
     companion object {
         fun production(cfg: Config): Services {
             val db = Db.connect(cfg.dbUrl, cfg.dbUser, cfg.dbPassword)
-            val gitHost = if (cfg.githubApiUrl == "https://api.github.com") "https://github.com/"
-            else cfg.githubApiUrl.substringBefore("/api/").trimEnd('/') + "/"
+            val gitHost = cfg.gitHost
             val github: GitHub = if (cfg.fakeGithub) {
                 LoggerFactory.getLogger("dk.egernet.factory").warn("!!!!!!!! FACTORY_DEV_FAKE_GITHUB: using an in-memory fake GitHub. Tokens 'fake-<login>' are accepted. !!!!!!!!")
                 FakeGitHub.seeded(cfg.githubOrg).apply {

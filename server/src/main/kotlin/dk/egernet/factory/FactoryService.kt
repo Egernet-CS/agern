@@ -14,7 +14,6 @@ import dk.egernet.factory.github.GhIssue
 import dk.egernet.factory.github.GhRepo
 import dk.egernet.factory.github.GitHubException
 import dk.egernet.factory.pipeline.Orchestrator
-import dk.egernet.factory.workspace.WORKSPACE_FILE
 import dk.egernet.factory.workspace.WorkspaceState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -37,6 +36,7 @@ class FactoryService(
     private val images: dk.egernet.factory.db.ImageStore,
     private val icons: dk.egernet.factory.db.ProjectIconStore,
     private val workspaces: dk.egernet.factory.workspace.WorkspaceService,
+    private val memberLabels: dk.egernet.factory.workspace.MemberLabels? = null,
 ) {
     private val org get() = cfg.githubOrg
 
@@ -68,6 +68,9 @@ class FactoryService(
     /** Whether [repo] is a workspace project for [user] (who can see it). */
     suspend fun isWorkspace(user: UserRecord, repo: String): Boolean = workspaceOf(user, repo) != null
 
+    /** Whether [repo] is a workspace whose members come from `.gitmodules` alone (unlabelled issues are its own runs). */
+    suspend fun isSubmoduleWorkspace(user: UserRecord, repo: String): Boolean = workspaceOf(user, repo)?.fromSubmodules == true
+
     /** The workspace definition of [repo] as [user] sees it (null: not a workspace). Blocking-safe. */
     private suspend fun workspaceOf(user: UserRecord, repo: String): WorkspaceState? =
         withContext(Dispatchers.IO) { workspaces.lookup(user, repo) }
@@ -95,14 +98,41 @@ class FactoryService(
         val ws = withContext(Dispatchers.IO) {
             workspaces.lookup(user, r.name)?.let { state ->
                 WorkspaceDto(
-                    WORKSPACE_FILE, state.valid, state.errors,
+                    state.path, state.valid, state.errors,
                     workspaces.resolve(user, state).map {
-                        WorkspaceMemberDto(it.directory, it.repository, if (it.accessible) it.baseBranch else it.member.branch, it.member.label, it.accessible)
+                        WorkspaceMemberDto(
+                            it.directory, it.repository, if (it.accessible) it.baseBranch else it.member.branch, it.member.label,
+                            it.accessible, it.member.submodule,
+                        )
                     },
+                    state.contextOnly.map { it.path },
+                    // Created once when missing; what still is missing is shown with a button (never fails the page).
+                    memberLabels?.missing(user, r.name, state).orEmpty(),
                 )
             }
         }
         return projectWithIcon(r).copy(workspace = ws)
+    }
+
+    /**
+     * `POST /api/projects/{repo}/workspace/labels`: creates the member labels missing in workspace [repo] with [user]'s
+     * token (docs/ARCHITECTURE.md §5 "Member labels"). 409 `not_a_workspace` / `workspace_invalid`; 403
+     * `labels_forbidden` when GitHub lets the token create none of them.
+     */
+    suspend fun createMemberLabels(user: UserRecord, repo: String): MemberLabelsDto {
+        val r = withContext(Dispatchers.IO) { access.requireVisible(user, repo) }
+        val state = withContext(Dispatchers.IO) { workspaces.lookup(user, r.name, strict = true) }
+            ?: throw dk.egernet.factory.conflict("$org/${r.name} is not a workspace project", "not_a_workspace")
+        if (!state.valid) throw dk.egernet.factory.workspace.WorkspaceService.invalid(state, r.defaultBranch)
+        val labels = memberLabels ?: throw dk.egernet.factory.conflict("Member labels are not available", "not_a_workspace")
+        val outcome = gh { labels.ensure(user, r.name, state) }
+        if (outcome.forbidden && outcome.created.isEmpty()) {
+            throw ApiException(
+                io.ktor.http.HttpStatusCode.Forbidden, "labels_forbidden",
+                "Your GitHub token cannot create labels in $org/${r.name}: " + outcome.missing.joinToString(", ") + " are still missing.",
+            )
+        }
+        return MemberLabelsDto(outcome.created, outcome.missing)
     }
 
     private suspend fun projectWithIcon(r: GhRepo): ProjectDto {

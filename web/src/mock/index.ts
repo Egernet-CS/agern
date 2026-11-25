@@ -414,6 +414,7 @@ export const mockApi: Api = {
   setReleaseMode: (id, mode) => ok(() => withRelease(id, (r) => setReleaseMode(r, mode, me()))),
 
   projectRuns: (repo) => ok(() => (project(repo), [...db.runs.values()].filter((r) => r.repo === repo).sort(byNewest))),
+  createMemberLabels: (repo) => ok(() => (project(repo), { created: [], missing: [] })),
   startRun: (repo, n) =>
     ok(() => {
       project(repo);

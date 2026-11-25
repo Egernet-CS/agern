@@ -342,6 +342,8 @@ class TestWorld(
     realGit: Boolean = false,
     /** The image providers (null: the production default list). */
     imageProviders: List<dk.egernet.factory.images.ImageProvider>? = null,
+    /** Git operations to use instead of [FakeGitOps] or [realGit] (e.g. real git with local remotes). */
+    gitOps: GitOps? = null,
 ) {
     val dataDir: Path = Files.createTempDirectory("agern-test")
     val cfg = tweak(testConfig(dataDir, twoFactor).let { if (sandbox) it.copy(sandbox = it.sandbox.copy(mode = "podman")) else it })
@@ -354,7 +356,7 @@ class TestWorld(
     val launcher = FakeLauncher()
     val sandboxRuntime = FakeSandboxRuntime()
     val services = Services(
-        cfg, TestDb.fresh(), github, realGitOps ?: git, launcher ?: this.launcher, loginThrottle = loginThrottle, clock = clock,
+        cfg, TestDb.fresh(), github, gitOps ?: realGitOps ?: git, launcher ?: this.launcher, loginThrottle = loginThrottle, clock = clock,
         releaseStarter = releaseStarter, sandboxRuntime = if (sandbox) sandboxRuntime else null, imageProviders = imageProviders,
     )
 

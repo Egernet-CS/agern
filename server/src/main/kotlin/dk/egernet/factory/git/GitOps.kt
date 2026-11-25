@@ -60,9 +60,11 @@ interface GitOps {
     }
     /**
      * `git submodule update --init --recursive` in the checkout [dir] when it has a `.gitmodules` file, with [id]'s git
-     * authentication. Null when there is nothing to do or it worked, else git's output. Never throws.
+     * authentication: only the submodules at the paths [only] when it is not empty, and never those at the paths
+     * [skip] (left uninitialised: a workspace run's submodule target). Null when there is nothing to do or it worked,
+     * else git's output. Never throws.
      */
-    fun updateSubmodules(id: AgentIdentity?, dir: Path, home: Path): String? = null
+    fun updateSubmodules(id: AgentIdentity?, dir: Path, home: Path, only: List<String> = emptyList(), skip: List<String> = emptyList()): String? = null
     /**
      * Creates a worktree on a new branch from the up-to-date [baseBranch] (the default branch, or `release/<name>`
      * for a release run). Returns the base ref used. With [startFrom] the branch starts at the tip of that branch
@@ -231,7 +233,7 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
     }
 
     override fun ensureClone(id: AgentIdentity, cloneUrl: String, dir: Path, home: Path, branch: String?) {
-        if (Files.isDirectory(dir.resolve(".git"))) {
+        if (Files.exists(dir.resolve(".git"))) {
             if (!localOnly) runCatching { git(dir, home, id, "fetch", "--prune", "origin") }
                 .onFailure { log.warn("git fetch failed in {}: {}", dir, it.message) }
             return
@@ -267,14 +269,31 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
         return base
     }
 
-    override fun updateSubmodules(id: AgentIdentity?, dir: Path, home: Path): String? {
+    override fun updateSubmodules(id: AgentIdentity?, dir: Path, home: Path, only: List<String>, skip: List<String>): String? {
         // Fake GitHub: local repositories have no remotes to fetch submodules from.
         if (localOnly || !Files.isRegularFile(dir.resolve(".gitmodules"))) return null
         return try {
-            val (code, out) = gitStatus(dir, home, id, "submodule", "update", "--init", "--recursive")
+            require((only + skip).none { it.isBlank() || it.startsWith("-") || it.startsWith(":") }) { "Invalid submodule path" }
+            // A skipped submodule is turned off for this command only (`submodule.<name>.update=none`).
+            val off = if (skip.isEmpty()) emptyList() else submoduleNames(dir, home).filter { (_, path) -> path in skip }
+                .flatMap { (name, _) -> listOf("-c", "submodule.$name.update=none") }
+            val args = off + listOf("submodule", "update", "--init", "--recursive") + (if (only.isEmpty()) emptyList() else listOf("--") + only)
+            val (code, out) = gitStatus(dir, home, id, *args.toTypedArray())
             if (code == 0) null else out.trim().ifEmpty { "git submodule update failed with exit code $code" }
         } catch (e: Exception) {
             e.message ?: e.javaClass.simpleName
+        }
+    }
+
+    /** (name, path) of every submodule `.gitmodules` in [dir] declares. */
+    private fun submoduleNames(dir: Path, home: Path): List<Pair<String, String>> {
+        val (code, out) = gitStatus(dir, home, null, "config", "-f", ".gitmodules", "-z", "--get-regexp", "^submodule\\..*\\.path$", timeoutSec = 60)
+        if (code != 0) return emptyList()
+        // -z: "<key>\n<value>\u0000" per entry.
+        return out.split('\u0000').filter { it.isNotEmpty() }.mapNotNull { e ->
+            val key = e.substringBefore('\n')
+            val value = e.substringAfter('\n', "").takeIf { '\n' in e } ?: return@mapNotNull null
+            key.removePrefix("submodule.").removeSuffix(".path") to value
         }
     }
 
@@ -312,7 +331,7 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
     }
 
     override fun branchCommits(id: AgentIdentity?, mainDir: Path, branch: String, baseBranch: String, home: Path): Int? = try {
-        if (!Files.isDirectory(mainDir.resolve(".git")) || baseBranch.startsWith("-")) null
+        if (!Files.exists(mainDir.resolve(".git")) || baseBranch.startsWith("-")) null
         else branchRef(id, mainDir, branch, home)?.let { ref ->
             val base = if (localOnly) "refs/heads/$baseBranch" else "refs/remotes/origin/$baseBranch"
             val (code, out) = gitStatus(mainDir, home, null, "rev-list", "--count", ref, "--not", base, timeoutSec = 60)
@@ -353,7 +372,7 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
     }
 
     override fun listWorktrees(mainDir: Path, home: Path): List<WorktreeInfo> {
-        if (!Files.isDirectory(mainDir.resolve(".git"))) return emptyList()
+        if (!Files.exists(mainDir.resolve(".git"))) return emptyList()
         git(mainDir, home, null, "worktree", "prune")
         val out = git(mainDir, home, null, "worktree", "list", "--porcelain")
         return out.split(Regex("\n\\s*\n")).mapNotNull { block ->
@@ -366,7 +385,7 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
 
     override fun forgetBranch(mainDir: Path, branch: String, home: Path) {
         try {
-            if (!Files.isDirectory(mainDir.resolve(".git")) || branch.startsWith("-")) return
+            if (!Files.exists(mainDir.resolve(".git")) || branch.startsWith("-")) return
             runCatching { git(mainDir, home, null, "update-ref", "-d", "refs/remotes/origin/$branch") }
             if (gitStatus(mainDir, home, null, "rev-parse", "--verify", "--quiet", "refs/heads/$branch").first != 0) return
             if (listWorktrees(mainDir, home).any { it.branch == branch }) {
@@ -393,7 +412,7 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
      * the clone at [mainDir]; null when there is no clone or a branch is missing.
      */
     private fun fetchPair(mainDir: Path, baseBranch: String, headBranch: String, home: Path, githubToken: String?): Pair<String, String>? {
-        if (!Files.isDirectory(mainDir.resolve(".git"))) return null
+        if (!Files.exists(mainDir.resolve(".git"))) return null
         require(!baseBranch.startsWith("-") && !headBranch.startsWith("-")) { "Invalid branch name" }
         val (base, head) = if (localOnly) {
             "refs/heads/$baseBranch" to "refs/heads/$headBranch"
@@ -521,7 +540,7 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
 
     override fun syncCheckout(id: AgentIdentity?, mainDir: Path, defaultBranch: String, home: Path, fetch: Boolean): CheckoutState? {
         require(defaultBranch.isNotBlank() && !defaultBranch.startsWith("-")) { "Invalid branch name" }
-        if (!Files.isDirectory(mainDir.resolve(".git"))) return null
+        if (!Files.exists(mainDir.resolve(".git"))) return null
         val branch = gitStatus(mainDir, home, null, "symbolic-ref", "--quiet", "--short", "HEAD", timeoutSec = 60)
             .let { (code, out) -> if (code == 0) out.trim().takeIf { it.isNotEmpty() } else null }
         val head = git(mainDir, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim()
@@ -584,7 +603,7 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
             }
             // A directory git does not know (any more), or could not remove, goes too.
             if (Files.exists(worktree)) worktree.toFile().deleteRecursively()
-            if (Files.isDirectory(mainDir.resolve(".git"))) runCatching { git(mainDir, home, null, "worktree", "prune") }
+            if (Files.exists(mainDir.resolve(".git"))) runCatching { git(mainDir, home, null, "worktree", "prune") }
             val branch = entry?.branch ?: return
             if (keepUnpushed) {
                 val unique = runCatching {

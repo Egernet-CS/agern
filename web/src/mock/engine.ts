@@ -1110,7 +1110,7 @@ function makeRun(repo: string, issue: Issue, owner: User, createdMs: number, sta
 }
 
 /** A declared workspace member (ARCHITECTURE §5 "Workspace projects"). */
-type MockMember = { directory: string; repository: string; branch: string | null; label: string; visibleTo?: string[] };
+type MockMember = { directory: string; repository: string; branch: string | null; label: string; visibleTo?: string[]; submodule?: boolean };
 
 const canRead = (m: MockMember, user: User) => !m.visibleTo || m.visibleTo.includes(user.username);
 
@@ -1123,8 +1123,13 @@ export function workspaceOf(repo: string, user: User): Workspace | null {
     valid: w.valid,
     errors: w.errors,
     members: w.valid
-      ? w.members.map((m) => ({ directory: m.directory, repository: m.repository, branch: canRead(m, user) ? m.branch ?? 'main' : m.branch, label: m.label, accessible: canRead(m, user) }))
+      ? w.members.map((m) => ({
+          directory: m.directory, repository: m.repository, branch: canRead(m, user) ? m.branch ?? 'main' : m.branch, label: m.label,
+          accessible: canRead(m, user), submodule: m.submodule ?? false,
+        }))
       : [],
+    contextOnly: [],
+    missingLabels: [],
   };
 }
 
@@ -2007,7 +2012,7 @@ function seed() {
     errors: [],
     members: [
       { directory: 'shop', repository: 'web-shop', branch: 'dev', label: 'shop' },
-      { directory: 'libs/design', repository: 'design-system', branch: null, label: 'design' },
+      { directory: 'libs/design', repository: 'design-system', branch: null, label: 'design', submodule: true },
       { directory: 'ios', repository: 'ios-companion', branch: 'feature/scanner', label: 'ios', visibleTo: ['alice', 'carl', 'dora'] },
     ],
   };

@@ -201,6 +201,24 @@ interface GitHubClient {
     fun combinedStatus(org: String, repo: String, sha: String): GhCombinedStatus
     /** The latest check runs of [sha] (at most a few hundred). */
     fun checkRuns(org: String, repo: String, sha: String): List<GhCheckRun>
+    /** Whether commit [sha] exists in [repo] (`GET /repos/{o}/{r}/commits/{sha}`: 404 and 422 mean it does not). */
+    fun commitExists(org: String, repo: String, sha: String): Boolean
+    /** The commit the gitlink (submodule pointer) at [path] points at on [ref]; null when [path] is no gitlink there. */
+    fun gitlinkAt(org: String, repo: String, path: String, ref: String): String?
+    /**
+     * Creates (without moving any branch) a commit with the single parent [parentSha] whose tree is the parent's with
+     * the gitlink at [path] set to [sha] (Git Data API: tree with `base_tree`, then commit). Returns the new commit's SHA.
+     */
+    fun createGitlinkCommit(org: String, repo: String, parentSha: String, path: String, sha: String, message: String): String
+    /** Moves the existing [branch] to [sha], also when that is not a fast-forward. */
+    fun forceUpdateBranch(org: String, repo: String, branch: String, sha: String)
+    /** The repository's issue labels (at most a few thousand). */
+    fun listLabels(org: String, repo: String): List<GhLabel>
+    /**
+     * Creates the issue label [name] with [color] (6 hex digits) and [description]. False when a label of that name
+     * already exists (422 `already_exists`); other refusals surface as [GitHubException] (403/404: no permission).
+     */
+    fun createLabel(org: String, repo: String, name: String, color: String, description: String): Boolean
 }
 
 /** The merge methods [GitHubClient.mergePull] accepts: never `squash`. */
@@ -406,6 +424,61 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
             // per_page caps the statuses listed; the combined state itself covers every context.
             val r = send("GET", "/repos/${enc(org)}/${enc(repo)}/commits/${enc(sha)}/status?per_page=100")
             return AppJson.decodeFromString(GhCombinedStatus.serializer(), ok(r, "GET commit status"))
+        }
+
+        override fun commitExists(org: String, repo: String, sha: String): Boolean {
+            val r = send("GET", "/repos/${enc(org)}/${enc(repo)}/commits/${enc(sha)}")
+            if (r.statusCode() == 404 || r.statusCode() == 422) return false
+            ok(r, "GET commit")
+            return true
+        }
+
+        override fun gitlinkAt(org: String, repo: String, path: String, ref: String): String? {
+            val p = path.split('/').joinToString("/") { enc(it) }
+            val r = send("GET", "/repos/${enc(org)}/${enc(repo)}/contents/$p?ref=${enc(ref)}")
+            if (r.statusCode() == 404) return null
+            val o = AppJson.parseToJsonElement(ok(r, "GET contents")) as? JsonObject ?: return null
+            if ((o["type"] as? kotlinx.serialization.json.JsonPrimitive)?.content != "submodule") return null
+            return (o["sha"] as? kotlinx.serialization.json.JsonPrimitive)?.content
+        }
+
+        private fun shaOf(body: String, vararg path: String): String? {
+            var e: kotlinx.serialization.json.JsonElement? = AppJson.parseToJsonElement(body)
+            for (k in path) e = (e as? JsonObject)?.get(k)
+            return (e as? kotlinx.serialization.json.JsonPrimitive)?.content
+        }
+
+        override fun createGitlinkCommit(org: String, repo: String, parentSha: String, path: String, sha: String, message: String): String {
+            val base = "/repos/${enc(org)}/${enc(repo)}/git"
+            val parentTree = shaOf(ok(send("GET", "$base/commits/${enc(parentSha)}"), "GET commit"), "tree", "sha")
+                ?: throw GitHubException(502, "GitHub GET commit returned no tree")
+            val tree = shaOf(ok(send("POST", "$base/trees", buildJsonObject {
+                put("base_tree", parentTree)
+                putJsonArray("tree") {
+                    add(buildJsonObject { put("path", path); put("mode", "160000"); put("type", "commit"); put("sha", sha) })
+                }
+            }), "create tree"), "sha") ?: throw GitHubException(502, "GitHub create tree returned no sha")
+            return shaOf(ok(send("POST", "$base/commits", buildJsonObject {
+                put("message", message)
+                put("tree", tree)
+                putJsonArray("parents") { add(parentSha) }
+            }), "create commit"), "sha") ?: throw GitHubException(502, "GitHub create commit returned no sha")
+        }
+
+        override fun listLabels(org: String, repo: String): List<GhLabel> =
+            paged("/repos/${enc(org)}/${enc(repo)}/labels?per_page=100", GhLabel.serializer(), maxPages = 30)
+
+        override fun createLabel(org: String, repo: String, name: String, color: String, description: String): Boolean {
+            val r = send("POST", "/repos/${enc(org)}/${enc(repo)}/labels",
+                buildJsonObject { put("name", name); put("color", color); put("description", description) })
+            if (r.statusCode() == 422 && r.body().contains("already_exists")) return false
+            ok(r, "create label")
+            return true
+        }
+
+        override fun forceUpdateBranch(org: String, repo: String, branch: String, sha: String) {
+            ok(send("PATCH", "/repos/${enc(org)}/${enc(repo)}/git/refs/heads/${encBranch(branch)}",
+                buildJsonObject { put("sha", sha); put("force", true) }), "update branch")
         }
 
         override fun checkRuns(org: String, repo: String, sha: String): List<GhCheckRun> {

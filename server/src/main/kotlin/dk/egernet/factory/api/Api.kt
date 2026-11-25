@@ -517,6 +517,10 @@ private fun Route.projectRoutes(s: Services) {
         withContext(Dispatchers.IO) { s.access.requireVisible(u, repo) }
         call.respond(s.factory.listRuns(u, repo, activeOnly = false))
     }
+    // Member labels of a workspace project (docs/ARCHITECTURE.md §5 "Member labels"), with the caller's own token.
+    post("/projects/{repo}/workspace/labels") {
+        call.respond(s.factory.createMemberLabels(call.requireUser(s), repoParam()))
+    }
     post("/projects/{repo}/runs") {
         val u = call.requireUser(s)
         val req = call.receive<CreateRunReq>()
