@@ -4,6 +4,8 @@ import type {
   Attachment,
   ClaudeUsage,
   ClientConfig,
+  CreatedMcpToken,
+  McpToken,
   CodexLogin,
   GeneratedImage,
   PreferenceOverrides,
@@ -49,6 +51,16 @@ export interface Api {
   totpEnroll(code: string): Promise<LoginStep>;
   regenerateRecoveryCodes(code: string): Promise<{ recoveryCodes: string[] }>;
   resetTwoFactor(userId: string): Promise<User>;
+  /** The caller's personal MCP tokens (not revoked), newest first. */
+  mcpTokens(): Promise<McpToken[]>;
+  /** 400 bad name or expiry, 404 project not visible, 409 `mcp_token_name_taken` / `too_many_mcp_tokens`. */
+  createMcpToken(body: { name: string; repo: string; expiresInDays: number | null }): Promise<CreatedMcpToken>;
+  /** Revokes one of the caller's tokens; answers the updated list. */
+  revokeMcpToken(id: string): Promise<McpToken[]>;
+  /** Admin: every user's personal MCP tokens. */
+  adminMcpTokens(): Promise<McpToken[]>;
+  /** Admin: revokes any token; answers the updated full list. */
+  adminRevokeMcpToken(id: string): Promise<McpToken[]>;
   logout(): Promise<void>;
   me(): Promise<User>;
   putClaudeCredential(kind: CredentialKind, value: string): Promise<User>;

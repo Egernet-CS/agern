@@ -1,10 +1,11 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { useLocation } from 'react-router-dom';
-import { api, type CodexLogin, type CredentialKind, type PreferenceOverrides, type Preferences, type StageRole } from '../api';
+import { api, type CodexLogin, type CreatedMcpToken, type CredentialKind, type McpToken, type PreferenceOverrides, type Preferences, type StageRole } from '../api';
 import { CodeInput } from '../components/ui/CodeInput';
 import { RecoveryCodes } from '../components/ui/RecoveryCodes';
 import { UsageBlock } from '../components/ui/UsageBlock';
-import { CopyButton, Dialog, ErrorBox, Notice } from '../components/ui/ui';
+import { McpTokenTable, RevokeMcpTokenDialog } from '../components/ui/McpTokens';
+import { CopyButton, Dialog, ErrorBox, Loading, Notice } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useAuth, useMe } from '../lib/auth';
 
@@ -30,6 +31,7 @@ export function SettingsPage() {
       <ClaudeSection />
       <GithubSection />
       <ImageSection />
+      <McpTokensSection />
       <ModelsSection />
       <SecuritySection />
       <p className="muted small pad-top">Signed in as <strong>{me.username}</strong>{me.isAdmin ? ' · admin' : ''}.</p>
@@ -283,6 +285,150 @@ function ImageSection() {
         </form>
       )}
     </section>
+  );
+}
+
+// ---------------------------------------------------------------- personal MCP tokens
+
+const EXPIRY_CHOICES: { label: string; days: number | null }[] = [
+  { label: '30 days', days: 30 },
+  { label: '90 days', days: 90 },
+  { label: '1 year', days: 365 },
+  { label: 'Never', days: null },
+];
+const SERVER_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
+
+/**
+ * Personal MCP tokens (docs/ARCHITECTURE.md §7 "Personal tokens"): create one per computer and project, see the
+ * `claude mcp add` command once, list and revoke them.
+ */
+function McpTokensSection() {
+  const tokens = useAsync(() => api.mcpTokens(), []);
+  const projects = useAsync(() => api.projects(), []);
+  const [name, setName] = useState('');
+  const [repo, setRepo] = useState('');
+  const [expiry, setExpiry] = useState('90');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [created, setCreated] = useState<CreatedMcpToken | null>(null);
+  const [target, setTarget] = useState<McpToken | null>(null);
+  const list = projects.data ?? [];
+  const chosenRepo = list.some((p) => p.name === repo) ? repo : list[0]?.name ?? '';
+  const noProjects = !!projects.data && list.length === 0;
+  const create = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!name.trim() || !chosenRepo) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      const c = await api.createMcpToken({ name: name.trim(), repo: chosenRepo, expiresInDays: expiry === 'never' ? null : Number(expiry) });
+      setCreated(c);
+      setName('');
+      tokens.setData((d) => [c.token, ...(d ?? [])]);
+    } catch (e2) {
+      setErr((e2 as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const closeCreated = () => {
+    // The secret leaves component state here; the list is fetched again.
+    setCreated(null);
+    tokens.reload();
+  };
+  return (
+    <section className="card settings-card" id="mcp-tokens" aria-labelledby="mcp-h">
+      <header className="sc-head">
+        <h2 id="mcp-h">Claude on your computer</h2>
+        {tokens.data && <span className="muted small">{tokens.data.length === 1 ? '1 token' : `${tokens.data.length} tokens`}</span>}
+      </header>
+      <p>Create a token to use this Agern’s factory tools — issues, runs, releases — from Claude Code on your own computer. A token works in one project and acts as you.</p>
+      {tokens.loading && !tokens.data && <Loading />}
+      {tokens.error && <ErrorBox error={tokens.error} retry={tokens.reload} />}
+      {tokens.data && tokens.data.length === 0 && <p className="muted">No tokens yet.</p>}
+      {tokens.data && tokens.data.length > 0 && <McpTokenTable tokens={tokens.data} onRevoke={setTarget} />}
+      {projects.error && <ErrorBox error={projects.error} retry={projects.reload} />}
+      <form className="form mcp-create" onSubmit={create} aria-label="Create a token">
+        <fieldset className="mcp-create-fields" disabled={noProjects || !projects.data}>
+          <legend className="sr-only">New token</legend>
+          <div className="field">
+            <label htmlFor="mcp-name">Name</label>
+            <input id="mcp-name" autoComplete="off" spellCheck={false} maxLength={60} placeholder="laptop" value={name} onChange={(e) => setName(e.target.value)} />
+          </div>
+          <div className="field">
+            <label htmlFor="mcp-repo">Project</label>
+            <select id="mcp-repo" value={chosenRepo} onChange={(e) => setRepo(e.target.value)}>
+              {list.map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}
+            </select>
+          </div>
+          <div className="field">
+            <label htmlFor="mcp-expiry">Expires</label>
+            <select id="mcp-expiry" value={expiry} onChange={(e) => setExpiry(e.target.value)}>
+              {EXPIRY_CHOICES.map((c) => <option key={c.label} value={c.days === null ? 'never' : String(c.days)}>{c.label}</option>)}
+            </select>
+          </div>
+        </fieldset>
+        {noProjects && <p className="muted small">You see no projects — add a GitHub token first.</p>}
+        {err && <p className="form-error" role="alert">{err}</p>}
+        <div className="row">
+          <button className="btn btn--primary" disabled={busy || !name.trim() || !chosenRepo}>{busy ? 'Creating…' : 'Create token'}</button>
+        </div>
+      </form>
+      <Dialog open={!!created} onClose={closeCreated} title="Your new token" wide>
+        {created && <CreatedTokenView created={created} onDone={closeCreated} />}
+      </Dialog>
+      <RevokeMcpTokenDialog
+        target={target}
+        onClose={() => setTarget(null)}
+        revoke={async (t) => {
+          const left = await api.revokeMcpToken(t.id);
+          tokens.setData(() => left);
+        }}
+      />
+    </section>
+  );
+}
+
+/** The once-only view of a new token: an editable server name and the `claude mcp add` command built from it. */
+function CreatedTokenView({ created, onDone }: { created: CreatedMcpToken; onDone: () => void }) {
+  const [serverName, setServerName] = useState(created.serverName);
+  const valid = SERVER_NAME_RE.test(serverName);
+  const command = `claude mcp add --transport http ${serverName} ${created.mcpUrl} --header "Authorization: Bearer ${created.secret}"`;
+  return (
+    <div className="form">
+      <p className="muted"><strong>Shown only once.</strong> Copy the command now; Agern stores only a hash.</p>
+      <p className="small">
+        Token <strong>{created.token.name}</strong> for <code>{created.token.repo}</code>. Run this on your computer, where Claude Code is installed:
+      </p>
+      <div className="field">
+        <label htmlFor="mcp-server-name">Server name in Claude</label>
+        <input
+          id="mcp-server-name"
+          className="mono"
+          autoComplete="off"
+          spellCheck={false}
+          maxLength={64}
+          value={serverName}
+          aria-invalid={!valid}
+          aria-describedby={valid ? 'mcp-server-name-help' : 'mcp-server-name-error'}
+          onChange={(e) => setServerName(e.target.value)}
+        />
+        {valid ? (
+          <span id="mcp-server-name-help" className="muted small">Each Agern project you add needs its own name.</span>
+        ) : (
+          <span id="mcp-server-name-error" className="form-error small" role="alert">Use letters, digits and - only</span>
+        )}
+      </div>
+      <div className="cmd mcp-cmd"><code data-testid="mcp-command">{command}</code><CopyButton text={command} disabled={!valid} /></div>
+      <div className="field">
+        <span className="field-label" id="mcp-secret-label">Token</span>
+        <div className="cmd mcp-cmd mcp-secret"><code aria-labelledby="mcp-secret-label" data-testid="mcp-secret">{created.secret}</code><CopyButton text={created.secret} label="Copy token" /></div>
+      </div>
+      <p className="muted small">Then check it with <code>claude mcp list</code>.</p>
+      <div className="dialog-actions">
+        <button type="button" className="btn btn--primary" onClick={onDone}>I have copied it</button>
+      </div>
+    </div>
   );
 }
 

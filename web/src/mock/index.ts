@@ -23,7 +23,7 @@ const SCREENSHOT_SVG =
       '<rect x="210" y="164" width="100" height="22" rx="4" fill="#2d6a4f"/><text x="260" y="179" font-size="8" font-weight="700" text-anchor="middle" fill="#ffffff">Checkout</text>' +
       '</svg>',
   );
-import { isRunActive, isSessionActive, type AgentSession, type Attachment, type ClientConfig, type Issue, type LoginStep, type Preferences, type Release, type Run, type StageRole, type User } from '../api/types';
+import { isRunActive, isSessionActive, type AgentSession, type Attachment, type ClientConfig, type Issue, type LoginStep, type McpToken, type Preferences, type Release, type Run, type StageRole, type User } from '../api/types';
 import {
   announceIssue,
   assignIssues,
@@ -112,6 +112,31 @@ function recoveryCodes() {
   const part = () => Array.from({ length: 4 }, () => a[Math.floor(Math.random() * a.length)]).join('');
   return Array.from({ length: 10 }, () => `${part()}-${part()}`);
 }
+
+// ---- personal MCP tokens (in memory; the "secret" is fake and only ever returned by create)
+
+type MockMcpToken = McpToken & { revoked: boolean };
+const mcpTokens: MockMcpToken[] = [
+  {
+    id: 'mcp-seed-bob', name: 'workstation', repo: 'web-shop', owner: { username: 'bob', displayName: 'Bob Kjær' },
+    createdAt: new Date(Date.now() - 6 * 86_400_000).toISOString(), lastUsedAt: new Date(Date.now() - 3_600_000).toISOString(),
+    expiresAt: new Date(Date.now() + 84 * 86_400_000).toISOString(), expired: false, revoked: false,
+  },
+];
+/** Like the server's McpIdentity.serverName, for the mock's public URL (the page's own origin). */
+function mockServerName(repo: string) {
+  const base = `${location.host}-${repo}`.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  const prefixed = base.startsWith('agern') ? base : `agern-${base}`;
+  return prefixed.slice(0, 64).replace(/-+$/, '');
+}
+function mcpTokenDto(t: MockMcpToken): McpToken {
+  return {
+    id: t.id, name: t.name, repo: t.repo, owner: t.owner, createdAt: t.createdAt, lastUsedAt: t.lastUsedAt, expiresAt: t.expiresAt,
+    expired: t.expiresAt !== null && Date.parse(t.expiresAt) <= Date.now(),
+  };
+}
+const ownMcpTokens = () => mcpTokens.filter((t) => !t.revoked && t.owner.username === me().username).map(mcpTokenDto);
+const allMcpTokens = () => mcpTokens.filter((t) => !t.revoked).map(mcpTokenDto);
 
 const clone = <T>(v: T): T => structuredClone(v);
 const wait = (ms = 120 + Math.random() * 180) => new Promise((r) => setTimeout(r, ms));
@@ -262,6 +287,45 @@ export const mockApi: Api = {
       db.failures.delete(u.username);
       db.lockedUntil.delete(u.username);
       return u;
+    }),
+  mcpTokens: () => ok(ownMcpTokens),
+  createMcpToken: ({ name, repo, expiresInDays }) =>
+    ok(() => {
+      const u = me();
+      const n = name.trim();
+      if (!n || n.length > 60 || [...n].some((c) => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127)) throw new MockError(400, 'bad_request', 'name must be 1 to 60 characters without control characters');
+      if (expiresInDays !== null && (expiresInDays < 1 || expiresInDays > 366)) throw new MockError(400, 'bad_request', 'expiresInDays must be between 1 and 366, or null');
+      project(repo);
+      const active = mcpTokens.filter((t) => !t.revoked && t.owner.username === u.username);
+      if (active.length >= 50) throw new MockError(409, 'too_many_mcp_tokens', 'You have 50 tokens; revoke one first');
+      if (active.some((t) => t.repo === repo && t.name.toLowerCase() === n.toLowerCase())) {
+        throw new MockError(409, 'mcp_token_name_taken', `You already have a token named "${n}" for ${repo}`);
+      }
+      const now = Date.now();
+      const t: MockMcpToken = {
+        id: `mcp-${now.toString(36)}`, name: n, repo, owner: { username: u.username, displayName: u.displayName },
+        createdAt: new Date(now).toISOString(), lastUsedAt: null,
+        expiresAt: expiresInDays === null ? null : new Date(now + expiresInDays * 86_400_000).toISOString(), expired: false, revoked: false,
+      };
+      mcpTokens.push(t);
+      const secret = `agern_pat_mock${Array.from({ length: 39 }, () => 'abcdefghijklmnopqrstuvwxyz0123456789-_'[Math.floor(Math.random() * 38)]).join('')}`;
+      return { token: mcpTokenDto(t), secret, mcpUrl: `${location.origin}/mcp`, serverName: mockServerName(repo) };
+    }),
+  revokeMcpToken: (id) =>
+    ok(() => {
+      const t = mcpTokens.find((x) => x.id === id && !x.revoked && x.owner.username === me().username);
+      if (!t) throw new MockError(404, 'not_found', 'Token not found');
+      t.revoked = true;
+      return ownMcpTokens();
+    }),
+  adminMcpTokens: () => ok(() => (needAdmin(), allMcpTokens())),
+  adminRevokeMcpToken: (id) =>
+    ok(() => {
+      needAdmin();
+      const t = mcpTokens.find((x) => x.id === id && !x.revoked);
+      if (!t) throw new MockError(404, 'not_found', 'Token not found');
+      t.revoked = true;
+      return allMcpTokens();
     }),
   logout: () =>
     ok(() => {

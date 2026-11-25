@@ -294,7 +294,8 @@ class ImageService(
     suspend fun generate(grant: McpGrant, owner: UserRecord, rawArgs: JsonObject): String {
         require(owner.id == grant.ownerId) { "owner must be the grant's owner" }
         // Who may call: derived from the grant's session, never from arguments.
-        val session = withContext(Dispatchers.IO) { sessions.get(grant.sessionId) }
+        val sessionId = grant.sessionId ?: throw forbidden("Only the chat agent, the spec-writer and the builder can generate images")
+        val session = withContext(Dispatchers.IO) { sessions.get(sessionId) }
         if (session == null || session.kind !in KINDS || session.ownerId != owner.id || session.repo != grant.repo) {
             throw forbidden("Only the chat agent, the spec-writer and the builder can generate images")
         }
