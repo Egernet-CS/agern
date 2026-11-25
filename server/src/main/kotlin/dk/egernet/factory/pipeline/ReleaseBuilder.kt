@@ -153,7 +153,6 @@ class ReleaseBuilder(
     private fun retryable(id: UUID, number: Int): Pair<ReleaseRecord, dk.egernet.factory.db.ReleaseIssueRecord> {
         val r = store.get(id) ?: throw dk.egernet.factory.notFound("Release not found")
         if (r.status !in ReleaseStatus.ACTIVE && r.status != ReleaseStatus.READY) throw conflict("The release is not building", "release_not_building")
-        if (r.partlyReleased) throw ReleaseMerger.partlyMerged(r.name)
         val issue = r.issues.firstOrNull { it.number == number } ?: throw dk.egernet.factory.notFound("Issue #$number is not in this release")
         if (issue.state != ReleaseIssueState.HELD && issue.state != ReleaseIssueState.SKIPPED) {
             throw conflict("Issue #$number is ${issue.state}; only held or skipped issues can be retried", "release_issue_not_held")
@@ -177,7 +176,9 @@ class ReleaseBuilder(
      * builds again for it (409 `release_already_building` while another release of the project holds the slot).
      */
     suspend fun retry(owner: UserRecord, id: UUID, number: Int, requested: String? = null) {
-        val (_, before) = io { retryable(id, number) }
+        val (current, before) = io { retryable(id, number) }
+        // Nothing is built again while some of its pull requests are merged (docs/ARCHITECTURE.md §6 "Several repositories").
+        if (current.partlyReleased) throw ReleaseMerger.partlyMerged(current.name)
         val oldRunRecord = before.runId?.let { io { runs.get(it) } }
         val mode = if (oldRunRecord == null) {
             if (requested != null && requested != RetryMode.START_OVER && requested != RetryMode.RECOMMENDED) {
