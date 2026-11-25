@@ -37,6 +37,8 @@ class FakeGitHub(private val org: String) : GitHub {
     data class PullMeta(
         val repo: String, val head: String, val base: String, var title: String,
         var state: String = "open", var merged: Boolean = false, var mergeCommit: String? = null,
+        /** Who merged it on GitHub ([mergeOnGitHub]); null for merges by Agern. */
+        var mergedBy: String? = null,
     )
     val pullMeta = java.util.concurrent.ConcurrentHashMap<Int, PullMeta>()
     /**
@@ -172,8 +174,14 @@ class FakeGitHub(private val org: String) : GitHub {
         return runCatching { dk.egernet.factory.AppJson.decodeFromString(ChecksFile.serializer(), java.nio.file.Files.readString(f)) }.getOrNull()
     }
 
-    /** As if a person merged pull request [number] on GitHub (rebase), outside Agern. */
-    fun mergeOnGitHub(number: Int) = synchronized(this) { applyMerge(pullMeta.getValue(number), number, "rebase") }
+    /** As if a person ([by]) merged pull request [number] on GitHub (rebase), outside Agern. */
+    fun mergeOnGitHub(number: Int, by: String? = "someone") = synchronized(this) {
+        pullMeta.getValue(number).mergedBy = by
+        applyMerge(pullMeta.getValue(number), number, "rebase")
+    }
+
+    /** Lets tests make requesting reviewers fail with this HTTP status (e.g. 422 for an unknown reviewer). */
+    @Volatile var requestReviewersFailure: Int? = null
 
     /** As if a person closed pull request [number] on GitHub without merging it. */
     fun closePull(number: Int) = synchronized(this) {
@@ -502,9 +510,18 @@ class FakeGitHub(private val org: String) : GitHub {
                 rebaseable = if (m.state != "open" || computing || hideRebaseable) null else "$repo:${m.head}" !in notRebaseable,
                 mergeableState = if (m.state != "open" || computing) "unknown" else if (clean) "clean" else "dirty",
                 head = GhRef(m.head, "sha-${m.head}-${commitList(repo, m.head).size}"), base = GhRef(m.base, "sha-${m.base}"),
-                mergeCommitSha = m.mergeCommit,
+                mergeCommitSha = m.mergeCommit, mergedBy = m.mergedBy?.let { GhLogin(it) },
             )
         }
+
+        override fun requestReviewers(org: String, repo: String, number: Int, reviewers: List<String>, teamReviewers: List<String>) =
+            synchronized(this@FakeGitHub) {
+                repo(org, repo)
+                if (reviewers.isEmpty() && teamReviewers.isEmpty()) return@synchronized
+                requestReviewersFailure?.let { throw GitHubException(it, "Reviews may only be requested from collaborators.") }
+                actions += "reviewers $repo #$number ${reviewers.joinToString(",")} teams=${teamReviewers.joinToString(",")}"
+                Unit
+            }
 
         override fun updatePull(org: String, repo: String, number: Int, title: String, body: String) = synchronized(this@FakeGitHub) {
             repo(org, repo)

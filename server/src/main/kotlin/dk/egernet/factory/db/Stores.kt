@@ -398,6 +398,11 @@ data class RunRecord(
     val targetDir: String? = null,
     /** Member repositories checked out for this run (docs/ARCHITECTURE.md §4 "Visibility"). */
     val contextRepos: List<String> = emptyList(),
+    /** [dk.egernet.factory.MergePolicy] snapshotted when the run was created (docs/ARCHITECTURE.md §6 "Merge policy"). */
+    val mergePolicy: String = dk.egernet.factory.MergePolicy.AUTOMATIC,
+    /** The pull request was merged on GitHub, outside Agern; [mergedBy] is who merged it, when GitHub reports it. */
+    val mergedOnGitHub: Boolean = false,
+    val mergedBy: String? = null,
 )
 
 class RunStore(private val db: Db) {
@@ -417,6 +422,7 @@ class RunStore(private val db: Db) {
         rs.uuidOrNull("continues_run_id"), rs.getString("spec"), rs.getString("builder_summary"),
         rs.getString("failure_kind"), rs.getString("failed_step"),
         rs.getString("target_repo"), rs.getString("target_dir"), splitRepos(rs.getString("context_repos")),
+        rs.getString("merge_policy"), rs.getBoolean("merged_on_github"), rs.getString("merged_by"),
     )
 
     private fun mapStage(rs: ResultSet) = StageRecord(
@@ -434,6 +440,7 @@ class RunStore(private val db: Db) {
         repo: String, issueNumber: Int, issueTitle: String, issueKind: String, maxRounds: Int, ownerId: UUID, startedBy: UUID?,
         releaseId: UUID? = null, baseBranch: String? = null, continuesRunId: UUID? = null, spec: String? = null,
         targetRepo: String? = null, targetDir: String? = null, contextRepos: List<String> = emptyList(),
+        mergePolicy: String = dk.egernet.factory.MergePolicy.AUTOMATIC,
     ): RunRecord? {
         val id = UUID.randomUUID()
         val inserted = db.tx { c ->
@@ -445,11 +452,11 @@ class RunStore(private val db: Db) {
             if (active > 0) return@tx false
             c.prepare(
                 """INSERT INTO runs(id, repo, issue_number, issue_title, issue_kind, status, max_rounds, owner_id, started_by_session_id,
-                     release_id, base_branch, continues_run_id, spec, target_repo, target_dir, context_repos)
-                   VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     release_id, base_branch, continues_run_id, spec, target_repo, target_dir, context_repos, merge_policy)
+                   VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 arrayOf<Any?>(
                     id, repo, issueNumber, issueTitle, issueKind, maxRounds, ownerId, startedBy, releaseId, baseBranch, continuesRunId, spec,
-                    targetRepo, targetDir, joinRepos(contextRepos),
+                    targetRepo, targetDir, joinRepos(contextRepos), mergePolicy,
                 ),
             ).use { it.executeUpdate() }
             true
@@ -522,10 +529,13 @@ class RunStore(private val db: Db) {
         releaseId, map = ::map,
     )
 
-    /** Pull request numbers of earlier runs of the issue that ended without merging (their PRs may still be open). */
+    /**
+     * Pull request numbers of earlier runs of the issue that ended without merging (their PRs may still be open): failed,
+     * cancelled, and `ready` runs whose pull request waits on GitHub.
+     */
     fun earlierUnmergedPulls(repo: String, issueNumber: Int, exceptRunId: UUID, targetRepo: String? = null): List<Int> = db.query(
         """SELECT DISTINCT pr_number FROM runs WHERE repo = ? AND issue_number = ? AND id <> ? AND pr_number IS NOT NULL
-           AND status IN ('failed','cancelled') AND target_repo IS NOT DISTINCT FROM CAST(? AS text) ORDER BY pr_number""",
+           AND status IN ('failed','cancelled','ready') AND target_repo IS NOT DISTINCT FROM CAST(? AS text) ORDER BY pr_number""",
         repo, issueNumber, exceptRunId, targetRepo,
     ) { it.getInt("pr_number") }
 
@@ -549,6 +559,37 @@ class RunStore(private val db: Db) {
         """UPDATE runs SET status = ?, error = CASE WHEN ? THEN NULL ELSE COALESCE(?, error) END, updated_at = now(),
            ended_at = CASE WHEN ? THEN now() ELSE ended_at END WHERE id = ?""",
         status, clearError, error, status in RunStatus.TERMINAL, id,
+    )
+
+    /**
+     * The runs whose pull request Agern follows on GitHub (docs/ARCHITECTURE.md §6 "Merge policy"): every `ready` run,
+     * and `needs_human` runs of policy `github`; only those with a pull request.
+     */
+    fun followable(): List<RunRecord> = db.query(
+        """$select WHERE r.pr_number IS NOT NULL
+           AND (r.status = 'ready' OR (r.status = 'needs_human' AND r.merge_policy = 'github')) ORDER BY r.created_at""",
+        map = ::map,
+    )
+
+    /**
+     * A `ready` run whose pull request was merged on GitHub becomes `merged` (with [mergedBy]); conditional on the run
+     * still being `ready`, and `ended_at` stays as it was. False when the run is no longer `ready`.
+     */
+    fun readyToMerged(id: UUID, mergedBy: String?): Boolean = db.update(
+        """UPDATE runs SET status = 'merged', merged_on_github = true, merged_by = ?, error = NULL, updated_at = now()
+           WHERE id = ? AND status = 'ready'""",
+        mergedBy, id,
+    ) == 1
+
+    /** A `ready` run whose pull request was closed on GitHub becomes `cancelled` with [error]; `ended_at` stays. */
+    fun readyToCancelled(id: UUID, error: String): Boolean = db.update(
+        "UPDATE runs SET status = 'cancelled', error = ?, updated_at = now() WHERE id = ? AND status = 'ready'",
+        error, id,
+    ) == 1
+
+    /** Records that the run's pull request was merged on GitHub, by [mergedBy] when known. */
+    fun setMergedOnGitHub(id: UUID, mergedBy: String?) = db.update(
+        "UPDATE runs SET merged_on_github = true, merged_by = ?, updated_at = now() WHERE id = ?", mergedBy, id,
     )
 
     fun setStageRound(runId: UUID, role: String, round: Int) = db.update(
@@ -653,6 +694,7 @@ class RunStore(private val db: Db) {
             continuesRunId = r.continuesRunId?.toString(), continuedByRunId = continuedBy(r.id)?.toString(),
             failureKind = r.failureKind, failedStep = r.failedStep,
             targetRepo = r.targetRepo, targetDirectory = r.targetDir,
+            mergePolicy = r.mergePolicy, mergedOnGitHub = r.mergedOnGitHub, mergedBy = r.mergedBy,
             warnings = stageRows.filter { it.warning != null }.groupBy { it.round }.toSortedMap()
                 .map { (round, list) -> dk.egernet.factory.RunWarningDto(round, list.map { it.role }, list.first().warning!!) },
         )

@@ -97,6 +97,8 @@ data class GhPullInfo(
     val head: GhRef = GhRef(),
     val base: GhRef = GhRef(),
     @SerialName("merge_commit_sha") val mergeCommitSha: String? = null,
+    /** Who merged it; null while open or when GitHub does not report it. */
+    @SerialName("merged_by") val mergedBy: GhLogin? = null,
 )
 
 /** One commit status (`GET /repos/{o}/{r}/commits/{ref}/status`, the latest per context): [state] is `success`, `pending`, `failure` or `error`. */
@@ -186,6 +188,11 @@ interface GitHubClient {
     fun createBranch(org: String, repo: String, branch: String, sha: String)
     /** One pull request with its mergeability; null when it does not exist. */
     fun getPull(org: String, repo: String, number: Int): GhPullInfo?
+    /**
+     * Requests [reviewers] (GitHub logins) and [teamReviewers] (team slugs of [org]) on pull request [number]
+     * (`POST /repos/{o}/{r}/pulls/{n}/requested_reviewers`). Nothing is sent when both are empty.
+     */
+    fun requestReviewers(org: String, repo: String, number: Int, reviewers: List<String>, teamReviewers: List<String>)
     /** Replaces a pull request's title and body. */
     fun updatePull(org: String, repo: String, number: Int, title: String, body: String)
     /**
@@ -402,6 +409,15 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
             val r = send("GET", "/repos/${enc(org)}/${enc(repo)}/pulls/$number")
             if (r.statusCode() == 404) return null
             return AppJson.decodeFromString(GhPullInfo.serializer(), ok(r, "GET pull request"))
+        }
+
+        override fun requestReviewers(org: String, repo: String, number: Int, reviewers: List<String>, teamReviewers: List<String>) {
+            if (reviewers.isEmpty() && teamReviewers.isEmpty()) return
+            ok(send("POST", "/repos/${enc(org)}/${enc(repo)}/pulls/$number/requested_reviewers",
+                buildJsonObject {
+                    putJsonArray("reviewers") { reviewers.forEach { add(it) } }
+                    putJsonArray("team_reviewers") { teamReviewers.forEach { add(it) } }
+                }), "request reviewers")
         }
 
         override fun updatePull(org: String, repo: String, number: Int, title: String, body: String) {

@@ -97,7 +97,8 @@ class McpServer(
             schema(Triple("activeOnly", "boolean", "Only runs that are not finished"))),
         Tool("factory_get_run", "Get a pipeline run with its stages, verdicts and findings.",
             schema(Triple("runId", "string", "Run id"), required = listOf("runId"))),
-        Tool("factory_approve_run", "Merge a run that waits in needs_human. Only the run's owner may do this.",
+        Tool("factory_approve_run", "Merge a run that waits in needs_human. Only the run's owner may do this. Refused for " +
+            "projects that merge on GitHub (merge policy `github`): their pull requests are reviewed and merged there.",
             schema(Triple("runId", "string", "Run id"), required = listOf("runId"))),
         Tool("factory_cancel_run", "Cancel a pipeline run.",
             schema(Triple("runId", "string", "Run id"), required = listOf("runId"))),
