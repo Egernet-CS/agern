@@ -1052,21 +1052,31 @@ pointer not bumped.** Moving … failed: <message>. Bump it by hand.``). The bum
 before the run is set to `merged`, so the outcome is on the issue when the run settles; it never fails the run. The workspace clone
 itself is not touched: its submodule moves when a chat sync fast-forwards it.
 
-**Releases** are not available for workspace projects defined by `.agern/workspace.yml` in this step: creating one
-(`POST /api/projects/{repo}/releases`, `factory_create_release`, `/factory release create`), starting one (now or
-scheduled) and `Orchestrator.startReleaseRun` answer 409 `workspace_releases_unsupported` "Releases are not available
-for workspace projects yet."
+**Releases** are available in every workspace project (§6 "Releases", "Several repositories"). Planning an issue
+into a release (`assign`, `factory_assign_issues`, `/factory release add`, the release picker) routes it as a run
+would be routed, with the planner's token (`WorkspaceService.memberFor`), all or nothing: 409 `workspace_invalid`,
+`member_label_missing` (`.agern/workspace.yml` only), `member_label_ambiguous` and 403 `member_not_accessible` refuse
+it with the run's text. An issue with one member label is built in that member; in a submodule workspace an issue
+without one is built in the workspace repository. Taking issues out needs no routing. Starting a release of a
+workspace whose definition is invalid answers 409 `workspace_invalid`. The owner's token routes the issue again when
+its run starts; a label that changed after planning holds it ("Could not start a run: …"). The two refusal texts end
+with a hint an agent can act on: ``You can set it with `gh issue edit <n> --repo <org>/<workspace> --add-label
+"<label>"`.`` (missing) or the same with `--remove-label` (ambiguous); MCP tools return the message as their error.
 
-A **submodule workspace** (members from `.gitmodules` alone) has releases of the workspace repository itself, as for
-a project that is one repository: a release builds only issues without a member label (runs of the workspace
-repository; member runs, their pull requests in other repositories and pointer bumps do not fit a release branch).
-Planning an issue that carries a member label (`assign`, `factory_assign_issues`) answers 409 `member_in_release`
-``Issue #<n> carries the label of member `<directory>` (<repository>). A release builds the workspace repository
-itself: remove the label, or run the issue on its own.``; a label added after planning holds the issue when its run
-would start (`Orchestrator.startReleaseRun` refuses with the same text, the release builder holds it with "Could not
-start a run: …").
+A **member release run** is an ordinary workspace run (above) with `base_branch = release/<name>`, whatever the
+member's own base branch: its target worktree starts at the tip of `release/<name>` in the member repository (the
+root and the other members are as for a single run: a release run does not see other members' unmerged release
+work), its branch is `factory/release-<name>/issue-<n>-<slug>-<run>` there, its pull request goes to `release/<name>`
+of the member (title `<issue title> (<org>/<workspace>#<n>)`, body starting "Issue <org>/<workspace>#<n> · release
+`<name>`", no closing keyword) and is squash-merged there, without a pointer bump and without closing the issue
+("**Agern: merged** pull request <org>/<member>#<p> into `release/<name>` of <org>/<member> (approved by …). The issue
+stays open until the release is released."). Its prompts carry the workspace block with base branch `release/<name>`;
+for a submodule target the last sentence reads "Agern moves the pointer in <org>/<workspace> when the release is
+released." Its `defaultBranch` (release note, migration line) is the member's base branch recorded for the release
+(`release_repos.base_branch`), and its sandbox definition is read from that branch (fetched), never from
+`release/<name>`, and approved per member repository.
 
-Not in this step: runs that change several members (one pull request per member, merge order), runs of the workspace
+Not in this step: runs that change several members at once, runs of the workspace
 repository itself in a workspace defined by `.agern/workspace.yml`, choosing the member in Agern, members outside the
 organization (such submodules are context only).
 
@@ -1131,7 +1141,9 @@ administrative directory (`.git/worktrees/<name>/modules/…`), which goes when 
 
 - **Merge guard.** Before every merge of a run's pull request (the approver's `APPROVE`, the owner's approval of a
   `needs_human` run, the step retry of a failed merge; single, release and workspace runs alike; after the database
-  migration check) and before a release is merged (approval and automatic release), `SubmoduleCheck` checks every
+  migration check) and before a release is merged (approval and automatic release; for a multi-repository release
+  before each member pull request, in the member's clone, and before the project repository's pull request, after
+  its pointers were moved and read back), `SubmoduleCheck` checks every
   pointer the head adds or moves relative to the merge base with the target (`GitOps.changedGitlinks`: both branches
   fetched as for §6 "Database migrations", `git diff --raw --no-renames <base>...<head>`, new mode `160000`; a removed
   submodule does not count). The submodule's URL comes from `.gitmodules` on the head (`git config --blob`); a
@@ -1454,6 +1466,15 @@ release mode (#41). Single runs are unaffected and still merge into the default 
     texts or `ApiException` messages, never tokens or raw exception text.
   - *Restart.* All state is in the database. A time that passed while the server was down is handled at the
     first tick, not skipped; `waiting_for` is recomputed by ticks.
+- **Member branches.** In a workspace, `release/<name>` is created in a member repository only when one of its issues
+  is about to be built (after the skip check, before the run): resolved once as for a single run, then, unless a
+  `release_repos` row for that member exists already, created from the tip of the member's effective base branch with
+  the owner's token and recorded (`repo`, `directory`, `submodule`, `base_branch`, `branch_created`). A missing base
+  branch ("Branch `<base>` was not found in <org>/<member>"), an existing `release/<name>` there (409
+  `release_branch_exists`: "Branch release/<name> already exists in <org>/<member>; delete it or rename the release."),
+  a token that cannot create branches and a routing refusal all hold the issue ("Could not start a run: …") and the
+  build goes on. A release with at least one such row is a **multi-repository release** ("Several repositories"
+  below); one without behaves exactly as a release of a single repository.
 - **Building.** Issues are built one at a time, lowest position first among `waiting` issues; no second run of a
   release starts while one of its issues is `running`. The builder (`ReleaseBuilder`) is event-driven — start, a
   run settling, resume, retry, adding an issue, restart and the resume ticker each call `advance`, which runs under
@@ -1462,7 +1483,7 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   `skipped` ("Closed on GitHub"); one with an active run outside the release becomes `skipped` ("Has an active run
   outside the release"). A skipped issue never blocks the build and can be retried. If a run cannot be started for
   another reason, the issue is `held` with the message and the build goes on.
-- **Release runs** are created as the release owner, with the owner's preferences as for single runs, with
+- **Release runs** (of a member issue: §6 "Workspace runs", "member release run") are created as the release owner, with the owner's preferences as for single runs, with
   `releaseId` and `baseBranch = release/<name>`, and go through the unchanged pipeline except: the branch is
   `factory/release-<name>/issue-<n>-<slug>-<run>`; the worktree is created from the current tip of the release branch
   (fetched first), so it builds on the issues merged before it; the pull request targets the release branch and its
@@ -1495,7 +1516,15 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   The release branch and what was merged into it are left alone; nothing starts afterwards. If the release has a
   release pull request, it is left open and gets one comment "**Agern:** release `<name>` was cancelled in Agern by
   @<user>. Agern will not merge this pull request; it and the branch `release/<name>` are left as they are." A
-  cancelled release is final: it cannot be restarted and its name stays taken until it is deleted.
+  cancelled release is final: it cannot be restarted and its name stays taken until it is deleted. A
+  **multi-repository** release instead comments once on each open release pull request ("**Agern:** release `<name>`
+  was cancelled in Agern by @<user>. Agern will not merge this pull request. The branch `release/<name>` is deleted in
+  every repository of the release, which closes this pull request; the issues' own pull requests remain as the record
+  of what was built.") and deletes `release/<name>` in every member repository where Agern created it and in the
+  project repository (whose pointer commits must not stay mergeable once the member branches are gone), recording
+  each deletion (`branch_deleted`; a missing branch counts as deleted). Failures do not fail the cancel; they become
+  the notice "Cancelled, but could not delete `release/<name>` in <repo>: <message>[; …]", after the "Merged: …" part
+  of the report when the release was partly released.
 - **Usage limit.** The stage agent recognises the owner's Claude usage limit in the CLI stream: a
   `rate_limit_event` whose `rate_limit_info.status` is `rejected`, an `assistant` line with `error: "rate_limit"`,
   or a failing `result` whose text matches `usage limit|session limit|weekly limit|hit your limit`; the reset time
@@ -1526,7 +1555,9 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   A `scheduled` release cannot be deleted (409 `release_scheduled`, "Cancel the scheduled start before deleting
   this release"). A `building`, `paused` or `ready` release cannot be deleted (409 `release_active`, "Cancel the release first"); a cancelled
   one can (owner or admin): the plan and its assignments go, the branch stays on GitHub and its runs keep existing
-  with `releaseId` null. A released release cannot be deleted (409 `release_not_editable`).
+  with `releaseId` null; for a multi-repository release every branch its cancel could not delete is first tried once
+  more (best effort, logged), and its `release_repos` rows go with it. A released release cannot be deleted (409
+  `release_not_editable`).
 
 #### Releasing
 
@@ -1723,6 +1754,69 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   `factory/release-<name>/…` branches and pull requests are not touched (their worktrees and local branches went when
   each run merged). Agern does nothing further: no tag, no version; the repository's own GitHub Actions for pushes to
   the default branch run as usual.
+- **Several repositories** (a multi-repository release, "Member branches" above). Ready, complete and empty are
+  decided from the issues as for any release. A member repository is **touched** when a `merged` issue was built by a
+  run with that `target_repo`; the project repository is touched when a `merged` issue was built in it or a touched
+  member is a submodule (its pointer must move). Each touched repository gets one release pull request; the member
+  ones live on their `release_repos` row (the same columns as the project repository's on `releases`).
+  - *Re-evaluation* (all triggers above, owner's token): for each touched, unmerged member in **merge order** (the
+    build-order position of its first merged issue) exactly what is done for the single pull request (reconcile,
+    open `release/<name>` → the row's base branch, title and body by hash, mergeability, method from that
+    repository's settings, checks with the settle period, the migration comparison in the member's clone). Then the
+    **pointers**: for each touched submodule member the desired gitlink is its merge commit when merged, else the tip
+    of its `release/<name>`; when any differs on the project repository's `release/<name>`, one commit (Git Data API,
+    every changed gitlink in one tree) is put on that branch's tip **without force** (`Release <name>: point <dir>[,
+    …] at release/<name>`, or `Release <name>: bump <dir> to <sha12>[, …]` when all are merge commits); a refused
+    update (the branch moved) is retried once from the new tip, then becomes the notice "Could not move the submodule
+    pointers on `release/<name>`: <message>". Then the project repository's pull request, when it is touched (a
+    `.agern/workspace.yml` workspace whose touched members are not submodules has none: `prNumber` stays null).
+  - *Texts.* A member pull request: title `Release <name>`; body "Release **<name>** of <org>/<workspace>: the part in
+    <org>/<member>, built by Agern for @<owner>.", the description, "## Issues" (`- <org>/<workspace>#<n> <title>
+    (pull request #<p>)`), "## Other pull requests of this release" (URLs) and the mode paragraph ending "Do not merge
+    it by hand: Agern merges the member pull requests first and then moves the submodule pointers." The project
+    repository's adds "## Submodule pointers" (`` - `<dir>` → <org>/<member> `release/<name>` (pull request <url>) ``),
+    lists member issues as `- #<n> <title> (pull request <org>/<member>#<p>)` and ends the same way. No closing keywords.
+  - *Ready to release* only when every touched repository has an open (or merged) release pull request and none has a
+    conflict, a migration conflict or an unusable method; an automatic release also needs the checks of every open one
+    green. The announcement goes once per transition to every open release pull request; a conflict comment to the
+    one that conflicts; "Checks failed on pull request <org>/<repo>#<n> …" names it. The periodic round covers every
+    open release pull request.
+  - *Approval* (same people, same refusal order): every refusal that changes nothing on GitHub is checked for all
+    unmerged release pull requests first (messages name a member's repository, e.g. "`release/<name>` of
+    <org>/<member> no longer merges cleanly into `<base>`. Nothing was merged."). Then, under the release's mutex: each
+    member pull request in merge order (its submodule guard in the member's clone, then `mergePull` with that
+    repository's method and the head read before; stored as merged at once with the commit GitHub reports, so it is
+    never merged twice); then, if the project repository is touched, the pointer step with merge commits only, every
+    gitlink read back (`gitlinkAt`) and checked to equal the member's merge commit (`commitExists`), the release guard
+    (§6 "Submodule pointers"), a fresh read and the merge of its pull request. The project repository's default
+    branch is only ever changed by that last merge, so it never points at a commit that is not on a member's base
+    branch. Checks on the final pointer commit are not waited for: with required checks GitHub refuses the merge, the
+    release stops partly released, and the owner approves again once they are green.
+  - *Partly released* (`ready` and at least one of its pull requests merged): any failure after the first merge stops
+    at once and merges, retries or reverts nothing else; approval answers 409 `release_partially_merged` with the
+    report "Releasing `<name>` stopped partway. Merged: <org>/<a>#<p> (`<base>` at `<sha12>`)[, …]. Not merged:
+    <org>/<b>#<q>: <reason>[; <org>/<ws>#<r>: not attempted]. The pull requests that are not merged are left open for a
+    human: fix the problem, then approve again on <release page> (Agern continues with what is not merged), or merge
+    them by hand.", which is the notice and one comment ("**Agern:** releasing …") on every pull request still open.
+    While partly released no issue can be added or retried (409 `release_partially_merged`: "Release "<name>" is
+    partly merged; finish releasing it first."), and an automatic release is merged only by an approval or "Check
+    again" (`auto_merge_failed_sha` is a SHA-256 over the sorted `<repo>:<head>` of the unmerged pull requests). A
+    failure before any merge keeps the codes and "Nothing was merged." texts of a single release.
+  - *Merged on GitHub.* A member pull request found merged is recorded with its merge commit; the release finishes
+    (`releasedBy` null) only when every touched repository is merged. The project repository's found merged while a
+    touched member is not is recorded (`pr_merged_at`) with the notice "Pull request #<n> of <org>/<workspace> was
+    merged on GitHub before the member pull requests. Approve to merge those; the submodule pointers must then be
+    bumped by hand."; approval then merges the members and finishes, keeps the submodule members' `release/<name>` and
+    the notice lists "`<dir>`: bump to `<sha12>`, then delete `release/<name>` in <org>/<member>".
+  - *After the merge* each merged issue's closing comment names the release pull request of its repository and that
+    repository's base branch and merge commit; `release/<name>` is deleted in the project repository and in every
+    member repository where Agern created it (touched or not), and forgotten in the owner's workspace and member clones.
+  - *Merge order* in a `.agern/workspace.yml` workspace is the same; there are no pointers to move unless a touched
+    member is a submodule.
+  - *API.* `Release.repositories` lists the member repositories in merge order (untouched last), then the project
+    repository; a viewer who cannot read a member gets `accessible: false` without its pull request link, checks and
+    merge commit (HTTP responses and `release` feed frames, per subscriber). `/factory releases` and
+    `factory_list_releases` list every release pull request and mark member issues ` [member <dir>]`.
 - **History.** Released and cancelled releases stay listed (newest first on the project page, collapsed under
   "History") with their read-only release page: what they contained (issues, their runs and pull requests), who
   started and released them and when, the release pull request and the merge commit.
@@ -1982,8 +2076,8 @@ Release tools (§6 "Releases"), chat agents only; the three mutating ones also r
 or id of a release of this project; `issueNumbers`: an array of integers, `"#5"` accepted; assigns or moves) and
 `factory_unassign_issues { issueNumbers }`. `factory_list_issues` appends ` [release <name>]` to assigned issues,
 and for a workspace project ` [member <directory>]`, ` [no member label]` or ` [several member labels]` to every
-issue (§6 "Workspace runs"); `factory_start_run` and `/factory run` report the routing refusals as their message, and
-`factory_create_release` / `/factory release create` answer `workspace_releases_unsupported` there.
+issue (§6 "Workspace runs"); `factory_start_run`, `/factory run`, `factory_assign_issues` and `/factory release add`
+report the routing refusals as their message, including the `gh issue edit … --add-label` hint.
 `factory_approve_release { release }` (a name or id; chat agents only, refused for run-bound tokens) approves a
 `ready` release as the chat's owner, with the same checks and refusals as the HTTP endpoint (§6 "Releasing") as tool
 errors, and answers `Release "<name>" is released: pull request <url> merged into <default>, N issue(s) closed.`;
@@ -2081,7 +2175,16 @@ type ReleaseIssue = { number: number; title: string; kind: IssueKind;   // title
   runId: string | null;                     // the issue's latest release run
   note: string | null;                      // why it is held or skipped, or that it will be built again
   prNumber: number | null; prUrl: string | null;     // that run's pull request into the release branch
-  retryMode: 'continue' | 'step' | null };  // a waiting issue retried from runId (§6 "Retrying a run")
+  retryMode: 'continue' | 'step' | null;    // a waiting issue retried from runId (§6 "Retrying a run")
+  targetRepo: string | null; targetDir: string | null };  // the member its run targets; null: project repository / no run
+type ReleaseRepo = { repo: string; directory: string | null;   // null: the project repository
+  submodule: boolean; baseBranch: string | null; branch: string;
+  state: 'none' | 'open' | 'merged';        // its release pull request
+  prNumber: number | null; prUrl: string | null; mergeState: 'unknown' | 'clean' | 'conflict';
+  mergeMethod: 'rebase' | 'merge' | 'unavailable' | null; checks: Release['checks'];
+  mergedAt: string | null; mergeCommit: string | null;
+  issues: number[];                         // merged issues built in it
+  accessible: boolean };                    // false: the viewer cannot read it (no pull request details)
 type Release = { id: string; repo: string; name: string; description: string;
   status: 'planning' | 'scheduled' | 'building' | 'paused' | 'ready' | 'released' | 'cancelled';
                                             // planning: "in preparation"; ready: "ready to release"
@@ -2107,7 +2210,8 @@ type Release = { id: string; repo: string; name: string; description: string;
   mode: 'manual' | 'automatic';             // §6 "Release mode"
   releasedAutomatically: boolean;           // merged by Agern for the owner (automatic mode)
   checks: { state: 'unknown' | 'awaiting' | 'none' | 'pending' | 'passed' | 'failed';   // on the pull request's head commit
-            detail: string | null; sha: string | null } | null };         // null until there is a pull request
+            detail: string | null; sha: string | null } | null;           // null until there is a pull request
+  repositories: ReleaseRepo[] };            // §6 "Several repositories"; [] unless multi-repository
 
 type StageRole = 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
 type SessionKind = 'chat' | 'advisor' | StageRole;   // advisor: the agent a run's owner talks to at needs_human
@@ -2345,22 +2449,22 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `GET /api/projects/{repo}/issues/{number}` | → `Issue` (with `body`) | |
 | `POST /api/projects/{repo}/issues` | `{ title, body, kind }` → `Issue` | |
 | `GET /api/projects/{repo}/releases` | → `Release[]` | newest first (`createdAt` desc), each with its issues in order |
-| `POST /api/projects/{repo}/releases` | `{ name, description?, mode? }` → 201 `Release` | 400 invalid name, description or mode (`manual` default, `automatic`); 409 `release_name_taken`; 409 `release_mode_not_allowed` (#24 seam); 409 `workspace_releases_unsupported` for a workspace project. Starts nothing |
+| `POST /api/projects/{repo}/releases` | `{ name, description?, mode? }` → 201 `Release` | 400 invalid name, description or mode (`manual` default, `automatic`); 409 `release_name_taken`; 409 `release_mode_not_allowed` (#24 seam). Starts nothing |
 | `GET /api/releases/{id}` | → `Release` | 404 unknown or invisible |
 | `PUT /api/releases/{id}` | `{ name, description }` → `Release` | rename or edit; same validation as create. Started: owner or admin, and a different name → 409 `release_name_locked`; released: 409 `release_not_editable`. Editing a ready release updates its pull request's body |
 | `DELETE /api/releases/{id}` | → 204 | removes the plan and its assignments; the issues are untouched on GitHub. `scheduled` → 409 `release_scheduled`; `building`/`paused`/`ready` → 409 `release_active`; `released` → 409 `release_not_editable`; `cancelled`: owner or admin, the branch stays and its runs keep existing with `releaseId` null |
-| `POST /api/releases/{id}/start` | → `Release` | the caller becomes the owner; creates `release/<name>` and builds (§6 "Releases"). 409 `release_not_planning` (also while scheduled), 422 `claude_credential_required`, 409 `release_empty`, 409 `release_already_building`, 409 `release_branch_exists`, 422 `github_push_denied`, 409 `workspace_releases_unsupported` (also for a scheduled start) |
+| `POST /api/releases/{id}/start` | → `Release` | the caller becomes the owner; creates `release/<name>` and builds (§6 "Releases"). 409 `release_not_planning` (also while scheduled), 422 `claude_credential_required`, 409 `release_empty`, 409 `release_already_building`, 409 `release_branch_exists`, 422 `github_push_denied`, 409 `workspace_invalid` for a workspace whose definition is invalid (also for a scheduled start) |
 | `PUT /api/releases/{id}/schedule` | `{ startAt: string }` → `Release` | set (`planning`, caller becomes owner) or change (`scheduled`, owner or admin, owner unchanged) the scheduled start. In order: 404 invisible; 400 "startAt must be an ISO-8601 time" (an instant with `Z` or offset), "The start time must be in the future", "The start time is too far ahead (at most a year)" (> 366 days); set: 422 `claude_credential_required`, 403 without a GitHub token; change: 403 "Only <owner> or an admin can change this schedule"; other states: 409 `release_not_schedulable`. Stored at millisecond precision |
 | `DELETE /api/releases/{id}/schedule` | → `Release` | cancel: back to `planning`, `owner`/`scheduledAt`/`waitingFor` null, `startFailure` kept. 409 `release_not_scheduled` when not scheduled (also once the start has begun), else 403 unless owner or admin |
 | `POST /api/releases/{id}/pause` | → `Release` | owner or admin; `building` → `paused` (else 409 `release_not_building`); the running issue finishes |
 | `POST /api/releases/{id}/resume` | → `Release` | owner only; `paused` → `building` (else 409 `release_not_paused`); 422 `claude_credential_required` |
 | `POST /api/releases/{id}/cancel` | → `Release` | owner or admin; `building`/`paused`/`ready` → `cancelled` (else 409 `release_not_building`; released: 409 `release_not_editable`); cancels the release's active runs; a release pull request is left open with a comment |
-| `POST /api/releases/{id}/approve` | → `Release` | owner only (admins included in the refusal: 403); merges the ready release's pull request (rebase, or a merge commit where rebase merging is disabled; never squash), closes its merged issues and deletes `release/<name>` (§6 "Releasing"). 409 `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`, `release_migration_conflict`, `release_submodule_commit_missing`, `release_submodule_check_failed`, `release_merge_method_unavailable`, `release_merge_failed`; nothing changes on GitHub with any of them |
+| `POST /api/releases/{id}/approve` | → `Release` | owner only (admins included in the refusal: 403); merges the ready release's pull request (rebase, or a merge commit where rebase merging is disabled; never squash), closes its merged issues and deletes `release/<name>` (§6 "Releasing"). 409 `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`, `release_migration_conflict`, `release_submodule_commit_missing`, `release_submodule_check_failed`, `release_merge_method_unavailable`, `release_merge_failed`; nothing changes on GitHub with any of them; a multi-repository release merges its member pull requests first and answers 409 `release_partially_merged` with the per-repository report when it stops after a merge (§6 "Several repositories") |
 | `PUT /api/releases/{id}/mode` | `{ mode: 'manual' \| 'automatic' }` → `Release` | §6 "Release mode": `planning` anyone; `scheduled`/started: automatic owner only, manual owner or admin (403); 400 missing or unknown mode; 409 `release_not_editable` (released), `release_closed` (cancelled), `release_mode_not_allowed`. A `ready` release is re-evaluated in the background (switched to automatic and green, it is merged) |
 | `POST /api/releases/{id}/check` | → `Release` | owner only; `ready` only (409 `release_not_ready`): re-reads the pull request (opens it when the release is complete and has none, replaces one closed without merging, finishes the release when it was merged on GitHub) and its mergeability |
 | `GET /api/releases/{id}/issues/{number}/retry` | → `RetryOptions` | anyone who can see the release; the issue must be `held`/`skipped` (409 `release_issue_not_held`); the options of its linked run, or only `start_over` when it has none |
-| `POST /api/releases/{id}/issues/{number}/retry` | `{ mode?: … }` (body optional) → `Release` | no body or no mode = `start_over`, as before; `continue`/`step`/`recommended` as in §6 "Retrying a run" (409 `retry_mode_unavailable`); owner only; release `building`/`paused`/`ready` (else 409 `release_not_building`; released: 409 `release_not_editable`), issue `held`/`skipped` (else 409 `release_issue_not_held`); it is built again (a `ready` release builds again: 409 `release_already_building` while another release of the project builds) |
-| `POST /api/projects/{repo}/releases/assign` | `{ issueNumbers: number[], releaseId: string \| null }` → `Release[]` | assigns or moves the issues to that release of `{repo}` (404 otherwise), or takes them out with `releaseId: null` (numbers in no release are ignored, no GitHub calls). 1–100 positive numbers, duplicates collapsed (400 otherwise; an invalid `releaseId` is 400). Every issue is fetched with the caller's token: unknown → 404 "Issue #n not found", closed → 409 `issue_closed`; all-or-nothing. Target `building`/`paused`/`ready`: owner only, appended as `waiting` (a `ready` target builds again: 409 `release_already_building` while another release of the project builds); target `cancelled`: 409 `release_closed`; target `released`: 409 `release_not_editable`. An issue leaving a `building`/`paused`/`ready` release: owner or admin, and only `waiting`, `held` or `skipped` (else 409 `release_issue_started`); leaving a `cancelled` one: owner or admin; leaving a `released` one: 409 `release_not_editable`. A still active run of an issue that leaves is cancelled. Answers all releases of the project after the change |
+| `POST /api/releases/{id}/issues/{number}/retry` | `{ mode?: … }` (body optional) → `Release` | no body or no mode = `start_over`, as before; `continue`/`step`/`recommended` as in §6 "Retrying a run" (409 `retry_mode_unavailable`); owner only; release `building`/`paused`/`ready` (else 409 `release_not_building`; released: 409 `release_not_editable`), issue `held`/`skipped` (else 409 `release_issue_not_held`); it is built again (a `ready` release builds again: 409 `release_already_building` while another release of the project builds); a partly released release: 409 `release_partially_merged` |
+| `POST /api/projects/{repo}/releases/assign` | `{ issueNumbers: number[], releaseId: string \| null }` → `Release[]` | assigns or moves the issues to that release of `{repo}` (404 otherwise), or takes them out with `releaseId: null` (numbers in no release are ignored, no GitHub calls). 1–100 positive numbers, duplicates collapsed (400 otherwise; an invalid `releaseId` is 400). Every issue is fetched with the caller's token: unknown → 404 "Issue #n not found", closed → 409 `issue_closed`; in a workspace project routed as a run (409 `workspace_invalid`, `member_label_missing`, `member_label_ambiguous`, 403 `member_not_accessible`); all-or-nothing; a partly released target: 409 `release_partially_merged`. Target `building`/`paused`/`ready`: owner only, appended as `waiting` (a `ready` target builds again: 409 `release_already_building` while another release of the project builds); target `cancelled`: 409 `release_closed`; target `released`: 409 `release_not_editable`. An issue leaving a `building`/`paused`/`ready` release: owner or admin, and only `waiting`, `held` or `skipped` (else 409 `release_issue_started`); leaving a `cancelled` one: owner or admin; leaving a `released` one: 409 `release_not_editable`. A still active run of an issue that leaves is cancelled. Answers all releases of the project after the change |
 | `PUT /api/releases/{id}/issues/order` | `{ issueNumbers: number[] }` → `Release` | the new complete order; anything but exactly the current issues → 409 `release_issues_changed`, nothing changes. `building`/`paused`/`ready`: owner only, and every issue that is not `waiting` keeps its index (409 `release_issue_started`); `cancelled`: 409 `release_closed`; `released`: 409 `release_not_editable` |
 | `GET /api/projects/{repo}/sandbox` | → `SandboxStatus` | anyone who can see the project; the file is read with the caller's token from the default branch |
 | `POST /api/projects/{repo}/sandbox/approval` | `{ sha256 }` → `SandboxStatus` | admin (403 otherwise; 404 when the admin cannot see the project or there is no file). Approves exactly the content with that hash, replacing the project's earlier approval; 400 malformed hash, 409 `sandbox_definition_changed` when the file now has another hash, 422 `sandbox_definition_invalid` |
@@ -2430,12 +2534,12 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
   scheduling: `release_not_schedulable`, `release_not_scheduled`, `release_scheduled` (409);
   releasing: `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`,
   `release_migration_conflict`, `release_submodule_commit_missing`, `release_submodule_check_failed`, `release_merge_failed`,
-  `release_merge_method_unavailable`, `release_not_editable` (409).
+  `release_merge_method_unavailable`, `release_partially_merged`, `release_not_editable` (409).
 - Sandbox approval: stale hash → 409 `sandbox_definition_changed`; invalid definition → 422
   `sandbox_definition_invalid`.
 - "Needs Claude credential" → 422 `claude_credential_required`; too many agents → 409
   `too_many_agents`; issue already has an active run → 409 `active_run_exists`; workspace projects (§6 "Workspace
-  runs"): 409 `workspace_invalid`, `member_label_missing`, `member_label_ambiguous`, `workspace_releases_unsupported`,
+  runs"): 409 `workspace_invalid`, `member_label_missing`, `member_label_ambiguous`,
   403 `member_not_accessible`; missing CSRF header
   → 403 `csrf`; foreign `Origin` → 403 `bad_origin`.
 - A new chat session starts `idle` without a process; the first input launches the CLI

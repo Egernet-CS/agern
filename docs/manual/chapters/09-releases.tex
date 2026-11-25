@@ -115,6 +115,23 @@ With \ui{Automatic} mode, Agern does this step itself once the checks pass.
 
 \screenshot{39-release-ready-desktop}{A release that is ready: its pull request, merge state, checks and the approve button.}{release-ready}
 
+\subsection{Releases in workspaces}\label{sec:workspace-releases}
+
+In a workspace project a release can mix issues of several members and of the workspace repository
+itself. Each issue needs its member label, as for a run: Agern refuses to plan an issue without
+one (in a \texttt{.agern/workspace.yml} workspace), with several, or for a member you cannot read,
+and says which label to add. The project agent can plan such releases for you in the chat.
+
+Each issue is built on \texttt{release/<name>} in its own repository; Agern creates that branch in a
+member when the first of its issues is built. When the release is ready, the release page lists
+one pull request per repository under \ui{Pull requests}, with its state and checks, and the
+release is ready only when all of them merge cleanly. Approving merges the member pull requests
+first, then moves the submodule pointers in the workspace to the members' merge commits and merges
+the workspace pull request. If something fails partway, Agern stops, says which repositories were
+merged and which were not, and leaves the rest open: fix the problem and approve again, and Agern
+continues with what is not merged. Cancelling such a release deletes its branch in every
+repository.
+
 \whatyouhave
 You can plan a release, order its issues, start or schedule it, keep it moving past held issues,
 and release it by hand or automatically. Next, learn to keep an eye on all agents and on your
