@@ -8,6 +8,7 @@ import dk.egernet.factory.mcp.McpRegistry
 import dk.egernet.factory.security.Tokens
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.buildJsonArray
@@ -69,10 +70,14 @@ class WorkspaceReleaseTest {
             s.releaseStore.get(r.id)!!
         }
 
+    /**
+     * Polls until [cond] holds. Each read takes the release's mutex: an evaluation writes its result in several statements
+     * under it (e.g. every pull request first, their bodies afterwards), so an unlocked read could see one halfway.
+     */
     private fun awaitRelease(id: UUID, what: String, cond: (ReleaseRecord) -> Boolean): ReleaseRecord = runBlocking {
         withTimeoutOrNull(20_000) {
             while (true) {
-                val r = s.releaseStore.get(id)!!
+                val r = s.releaseLocks.of(id).withLock { s.releaseStore.get(id)!! }
                 if (cond(r)) return@withTimeoutOrNull r
                 delay(20)
             }
