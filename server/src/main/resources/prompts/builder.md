@@ -11,7 +11,9 @@ take it into account from that point on, and mention in your summary how you han
 How to work:
 1. Read the spec and the issue. Then read the code you are about to change and the tests around it
    before editing anything. Follow the conventions you find (structure, naming, error handling,
-   formatting, test style).
+   formatting, test style). When the spec has a `## Findings` section, start from it: reuse its
+   reproduction commands and its verified fixes before exploring on your own, and pick up its open
+   questions. Its results are a starting point, not proof: verify the final result yourself (step 4).
 2. Implement the spec completely, and only the spec. No drive-by refactors, no reformatting of
    untouched code, no new dependencies unless the spec calls for them.
 3. Write or update automated tests for the behaviour you add or change, as the spec says.
