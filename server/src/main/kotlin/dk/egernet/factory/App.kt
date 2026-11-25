@@ -154,7 +154,11 @@ class Services(
         cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases, images.store, projectIcons, workspaceDefs,
         memberLabels,
     )
-    val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes, screenshots, images)
+    /** Personal MCP tokens (docs/ARCHITECTURE.md §7 "Personal tokens"). */
+    val mcpTokens = dk.egernet.factory.db.McpTokenStore(db)
+    /** Checks the bearer of `POST /mcp`; its `limiter` throttles unknown bearers per client address. */
+    val mcpAuth = dk.egernet.factory.mcp.McpAuthenticator(mcpRegistry, mcpTokens, users, access, twoFactorStore, cfg.githubOrg, clock)
+    val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes, screenshots, images, mcpAuth, cfg)
 
     /** The start-up removal of leftover sandboxes (runs in the background; tests wait for it). */
 
@@ -193,6 +197,7 @@ class Services(
         releaseBuilder.recoverAfterRestart()
         sessions.recoverAfterRestart()
         webSessions.purgeExpired()
+        mcpTokens.purgeRevokedBefore(clock.instant().minus(java.time.Duration.ofDays(30)))
     }
 
     fun start() {

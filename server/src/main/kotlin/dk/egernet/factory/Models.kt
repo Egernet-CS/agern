@@ -195,6 +195,19 @@ data class ReleaseDto(
 
 @Serializable data class OwnerDto(val username: String, val displayName: String)
 
+/** A personal MCP token (docs/ARCHITECTURE.md §7 "Personal tokens"); never carries the token or its hash. */
+@Serializable
+data class McpTokenDto(
+    val id: String, val name: String, val repo: String, val owner: OwnerDto, val createdAt: String,
+    val lastUsedAt: String?, val expiresAt: String?, val expired: Boolean,
+)
+
+/** `expiresInDays`: null = never, else 1…366. */
+@Serializable data class CreateMcpTokenReq(val name: String, val repo: String, val expiresInDays: Int? = null)
+
+/** The answer to creating a token: the only place [secret] ever appears. */
+@Serializable data class CreatedMcpTokenDto(val token: McpTokenDto, val secret: String, val mcpUrl: String, val serverName: String)
+
 @Serializable
 data class AgentSessionDto(
     val id: String, val repo: String, val kind: String, val model: String, val status: String,

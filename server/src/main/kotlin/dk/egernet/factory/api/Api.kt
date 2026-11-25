@@ -73,6 +73,7 @@ import io.ktor.util.AttributeKey
 import io.ktor.websocket.CloseReason
 import io.ktor.websocket.Frame
 import io.ktor.websocket.close
+import dk.egernet.factory.mcp.McpAuth
 import dk.egernet.factory.mcp.McpServer
 import io.ktor.server.response.respondTextWriter
 import kotlinx.coroutines.CoroutineStart
@@ -285,9 +286,23 @@ fun Application.installApi(s: Services) {
                 return@post
             }
             val bearer = call.request.header(HttpHeaders.Authorization)?.takeIf { it.startsWith("Bearer ", ignoreCase = true) }?.substring(7)?.trim()
+            // Authentication (and the throttle for unknown bearers) completes before anything is answered or streamed; a
+            // reverse proxy in front is fine (personal tokens arrive through FACTORY_PUBLIC_URL).
+            val grant = when (val a = s.mcp.authenticate(bearer, call.remote())) {
+                is McpAuth.Granted -> a.grant
+                is McpAuth.Unauthorized -> {
+                    call.respondText(s.mcp.authError(a), ContentType.Application.Json, HttpStatusCode.Unauthorized)
+                    return@post
+                }
+                is McpAuth.Throttled -> {
+                    val wait = java.time.Duration.between(s.clock.instant(), a.until).toSeconds().coerceAtLeast(1)
+                    call.response.header(HttpHeaders.RetryAfter, wait.toString())
+                    call.respondText(s.mcp.authError(a), ContentType.Application.Json, HttpStatusCode.TooManyRequests)
+                    return@post
+                }
+            }
             val request = call.receiveText()
-            // The bearer check happens at once inside handle(); only an authorised call can still be running later.
-            val pending = call.async { s.mcp.handle(bearer, request) }
+            val pending = call.async { s.mcp.handle(grant, request) }
             val early = withTimeoutOrNull(cfg.mcpStreamAfterMs) { pending.await() }
             val acceptsStream = call.request.header(HttpHeaders.Accept)?.contains("text/event-stream", ignoreCase = true) == true
             if (early != null || !acceptsStream) {
@@ -410,7 +425,11 @@ private fun Route.authRoutes(s: Services) {
     }
 }
 
+/** At most this many personal MCP tokens that are not revoked, per user. */
+private const val MAX_MCP_TOKENS = 50
+
 private fun Route.meRoutes(s: Services) {
+    val cfg = s.cfg
     get("/me") { call.respond(call.requireUser(s).toDto()) }
     put("/me/claude-credential") {
         val u = call.requireUser(s)
@@ -479,6 +498,50 @@ private fun Route.meRoutes(s: Services) {
     put("/me/preferences") {
         val u = call.requireUser(s)
         call.respond(s.preferences.put(u.id, call.receive<dk.egernet.factory.PreferenceOverridesDto>()))
+    }
+    // Personal MCP tokens (docs/ARCHITECTURE.md §7 "Personal tokens"): the secret appears only in the create answer.
+    get("/me/mcp-tokens") {
+        val u = call.requireUser(s)
+        call.respond(s.mcpTokens.listForUser(u.id).map { it.toDto(s.clock.instant()) })
+    }
+    post("/me/mcp-tokens") {
+        val u = call.requireUser(s)
+        val req = call.receive<dk.egernet.factory.CreateMcpTokenReq>()
+        val name = req.name.trim()
+        if (name.isEmpty() || name.length > 60 || name.any { it.isISOControl() }) {
+            throw badRequest("name must be 1 to 60 characters without control characters")
+        }
+        val expiresInDays = req.expiresInDays
+        if (expiresInDays != null && expiresInDays !in 1..366) throw badRequest("expiresInDays must be between 1 and 366, or null")
+        val repo = requireSafeSegment(req.repo.trim(), "repository name")
+        withContext(Dispatchers.IO) { s.access.requireVisible(u, repo) }
+        if (s.mcpTokens.countActive(u.id) >= MAX_MCP_TOKENS) {
+            throw conflict("You have $MAX_MCP_TOKENS tokens; revoke one first", "too_many_mcp_tokens")
+        }
+        if (s.mcpTokens.nameTaken(u.id, repo, name)) {
+            throw conflict("You already have a token named \"$name\" for $repo", "mcp_token_name_taken")
+        }
+        val secret = dk.egernet.factory.mcp.McpAuthenticator.newToken()
+        val now = s.clock.instant()
+        val rec = s.mcpTokens.create(
+            u.id, repo, name, Tokens.sha256Hex(secret), now, expiresInDays?.let { now.plus(java.time.Duration.ofDays(it.toLong())) },
+        )
+        s.twoFactorStore.audit(u.id, u.username, "mcp_token_created", "\"$name\" for $repo", call.remote())
+        log.info("User {} created personal MCP token {} (\"{}\") for {}", u.username, rec.id, name, repo)
+        call.response.header(HttpHeaders.CacheControl, "no-store")
+        call.respond(
+            dk.egernet.factory.CreatedMcpTokenDto(
+                rec.toDto(now), secret, cfg.publicUrl.trimEnd('/') + "/mcp",
+                dk.egernet.factory.mcp.McpIdentity.serverName(cfg.publicUrl, repo),
+            ),
+        )
+    }
+    delete("/me/mcp-tokens/{id}") {
+        val u = call.requireUser(s)
+        val rec = s.mcpTokens.revoke(uuidParam("id"), s.clock.instant(), userId = u.id) ?: throw notFound("Token not found")
+        s.twoFactorStore.audit(u.id, u.username, "mcp_token_revoked", "\"${rec.name}\" for ${rec.repo}", call.remote())
+        log.info("User {} revoked personal MCP token {} (\"{}\")", u.username, rec.id, rec.name)
+        call.respond(s.mcpTokens.listForUser(u.id).map { it.toDto(s.clock.instant()) })
     }
     post("/me/recovery-codes") {
         val u = call.requireUser(s)
@@ -948,6 +1011,18 @@ private fun Route.adminRoutes(s: Services) {
         call.respond(s.settings.put(merged))
     }
     get("/admin/users") { call.requireAdmin(s); call.respond(s.users.all().map { it.toDto() }) }
+    get("/admin/mcp-tokens") {
+        call.requireAdmin(s)
+        call.respond(s.mcpTokens.listAll().map { it.toDto(s.clock.instant()) })
+    }
+    delete("/admin/mcp-tokens/{id}") {
+        val admin = call.requireAdmin(s)
+        val rec = s.mcpTokens.revoke(uuidParam("id"), s.clock.instant()) ?: throw notFound("Token not found")
+        val by = if (rec.userId != admin.id) " by admin ${admin.username}" else ""
+        s.twoFactorStore.audit(rec.userId, rec.ownerUsername, "mcp_token_revoked", "\"${rec.name}\" for ${rec.repo}$by", call.remote())
+        log.info("Admin {} revoked personal MCP token {} (\"{}\") of {}", admin.username, rec.id, rec.name, rec.ownerUsername)
+        call.respond(s.mcpTokens.listAll().map { it.toDto(s.clock.instant()) })
+    }
     post("/admin/users/{id}/reset-2fa") {
         val admin = call.requireAdmin(s)
         val target = s.users.byId(uuidParam("id")) ?: throw notFound("User not found")
