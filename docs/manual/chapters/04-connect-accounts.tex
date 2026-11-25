@@ -1,0 +1,119 @@
+\chapter{Connect your accounts}\label{ch:accounts}
+
+\emph{You want to see your organization's projects and start agents that work for you.} For that,
+Agern needs two things from you: a Claude credential that pays for your agents, and a GitHub token
+that decides which repositories you see and that your agents push with. Both are yours alone:
+Agern encrypts them, never shows them again (not to you, not to admins), and uses them only for
+agents you start. Every person who uses Agern does this once.
+
+Open \ui{Settings} in the top bar. As a new user, every card says what is missing
+(figure~\ref{fig:settings-fresh}).
+
+\screenshot{24-settings-fresh-desktop}{Settings of a new user: no Claude credential and no GitHub token yet.}{settings-fresh}
+
+\section{Your Claude credential}\label{sec:claude-credential}
+
+Agents are the \texttt{claude} command-line tool running without a terminal, and they need a
+credential that bills to you. There are two kinds:
+
+\begin{itemize}
+  \item an \textbf{OAuth token} from \cmd{claude setup-token}, for a Claude subscription (it starts
+    with \texttt{sk-ant-oat01-}), or
+  \item an \textbf{Anthropic API key} for pay-as-you-go (it starts with \texttt{sk-ant-api03-}).
+\end{itemize}
+
+\begin{enumerate}
+  \item On \emph{your own} computer, with Claude Code installed and signed in, run:
+\begin{lstlisting}
+claude setup-token
+\end{lstlisting}
+    It opens a browser and then prints a long-lived token. (With an API key, create one in the
+    Anthropic console instead.)
+  \item In the \ui{Claude} card (figure~\ref{fig:settings-claude}) choose \ui{OAuth token
+    (setup-token)} or \ui{Anthropic API key}, paste the value into the field and choose \ui{Save}.
+  \item The card's status changes to \ui{OAuth token registered} (or \ui{API key registered}).
+    \ui{Replace} and \ui{Remove} change or delete it later.
+\end{enumerate}
+
+\screenshot[0.8\linewidth]{25-settings-claude-desktop}{The Claude card: how to get a token, and where to paste it.}{settings-claude}
+
+\section{Your GitHub token}\label{sec:github-token}
+
+The token decides which repositories you see, and your agents push branches and open pull
+requests with it. GitHub enforces the access; Agern never widens it.
+
+\begin{enumerate}
+  \item On GitHub, under \emph{Settings $\rightarrow$ Developer settings $\rightarrow$ Personal access
+    tokens}, create either
+    \begin{itemize}
+      \item a \textbf{fine-grained token} for the organization with \textbf{Contents},
+        \textbf{Issues} and \textbf{Pull requests}: read \& write, plus \textbf{Metadata}: read; or
+      \item a \textbf{classic token} with the \texttt{repo} scope.
+    \end{itemize}
+    These are the permissions the \ui{GitHub} card lists (figure~\ref{fig:settings-github}).
+  \item Paste it into \ui{Personal access token} in the \ui{GitHub} card and choose \ui{Save}.
+    Agern checks it with GitHub (\ui{Checking with GitHub\ldots}) and refuses a token GitHub rejects.
+  \item The card now says \ui{connected as @}\emph{your-login} and shows the kind of token and,
+    for a classic token, its scopes. If a classic token lacks \texttt{repo}, a warning asks you to
+    create one with the \texttt{repo} and \texttt{read:org} scopes.
+\end{enumerate}
+
+\screenshot[0.8\linewidth]{26-settings-github-desktop}{The GitHub card with a registered classic token and its scopes.}{settings-github}
+
+\section{Models and cost}\label{sec:models}
+
+Every chat and run you start runs on your Claude account. The \ui{Models \& cost} card
+(figure~\ref{fig:settings-models}) lets you choose cheaper models per job and shows your usage.
+
+\begin{enumerate}
+  \item Look at the \ui{Usage} block: what you spent through Agern today and this month, and how
+    much of Claude's usage limits is used. Claude reports these while one of your agents runs.
+  \item To save money, choose the preset \ui{Economy}: Sonnet for chat and spec, Haiku for the four
+    reviewers, at most one fix round. \ui{Default} returns to the factory defaults.
+  \item Or set a model per role: type an alias (\texttt{opus}, \texttt{sonnet}, \texttt{haiku}) or
+    a full model id into the row of \texttt{chat}, \texttt{spec-writer}, \texttt{builder}, a
+    reviewer or \texttt{approver}. Empty means the default. \ui{fix rounds} sets how often the
+    builder may answer reviewer changes before a human decides.
+  \item Choose \ui{Save models}. New chats and runs use the choice; a run keeps the models it
+    started with.
+\end{enumerate}
+
+\screenshot[0.8\linewidth]{28-settings-models-desktop}{Models \& cost: presets, the usage block and a model per role.}{settings-models}
+
+\section{Optional: image generation}\label{sec:images}
+
+When a request or an issue asks for an icon, an illustration or other graphics, agents can have
+them made by an image AI on your account.
+
+\begin{enumerate}
+  \item In the \ui{Image generation} card (figure~\ref{fig:settings-images}) choose a provider:
+    OpenAI or Google Gemini with your own API key and a model, or OpenAI Codex signed in with your
+    ChatGPT account.
+  \item For an API-key provider, paste the key, keep or change the model and choose \ui{Save}; the
+    provider checks the key first. For Codex, choose \ui{Connect ChatGPT}, open the address shown
+    and enter the code.
+\end{enumerate}
+
+Without a provider, agents simply do not generate images. Codex is only offered when the server
+has the \texttt{codex} tool installed.
+
+\screenshot[0.8\linewidth]{27-settings-images-desktop}{The image generation card with a provider set up.}{settings-images}
+
+\section{Check that it works}\label{sec:check-accounts}
+
+\begin{enumerate}
+  \item Choose \ui{Projects} in the top bar. The repositories of the organization that your token
+    can read appear as cards (figure~\ref{fig:projects} in the next chapter). If the page says
+    \ui{No repositories visible}, your token cannot read any repository of the organization.
+  \item Open a project, choose \ui{Start chat} if there is no chat yet, and ask something, for
+    example ``What does this repository do?''. The agent answers within seconds, showing the
+    tools it uses (figure~\ref{fig:check-chat}).
+\end{enumerate}
+
+\screenshot{09-project-streaming-desktop}{A chat answering: the agent reads the code and replies.}{check-chat}
+
+\whatyouhave
+Your Claude credential and GitHub token are registered, you have chosen your models, and a chat
+answers. Agern is ready for real work. If your projects need a toolchain or a database for their
+builds and tests, set up sandboxes in chapter~\ref{ch:sandboxes}; otherwise continue with your
+first project in chapter~\ref{ch:project}.

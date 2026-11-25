@@ -1,0 +1,84 @@
+\chapter{Talk to the project agent}\label{ch:chat}
+
+\emph{You want answers about your code, and you want to turn an idea into a well-written issue.}
+The project's chat agent is Claude Code working in your own checkout of the repository, with your
+Claude credential. It can read the code, run commands, and use Agern itself: list and create
+issues, start, approve and cancel runs.
+
+\section{Ask about the code}\label{sec:ask}
+
+\begin{enumerate}
+  \item Open a project. If you have no chat there yet, choose \ui{Start chat}; \ui{+ New chat}
+    starts another, fresh conversation later.
+  \item Type your question into the prompt at the bottom (\ui{Ask the agent, or /factory \ldots})
+    and press Enter. Shift+Enter makes a new line.
+  \item Watch the answer stream in: the agent's thinking, each tool it uses (reading files,
+    searching, running commands) with its result, and the reply. The line under the reply shows
+    how long it took, what it cost and how many turns it took (figure~\ref{fig:check-chat} in
+    chapter~\ref{ch:accounts}).
+  \item Press Esc to interrupt the agent if it heads the wrong way, and tell it what you meant.
+\end{enumerate}
+
+A chat keeps its context: follow-up questions build on what came before. An idle chat's process
+is stopped after a while; your next message resumes the conversation. Others can read your chat,
+but only you can write in it.
+
+\section{Attach screenshots and files}\label{sec:attachments}
+
+\begin{enumerate}
+  \item Choose \ui{+} next to the prompt (\ui{Attach files}), or paste or drop files onto the chat.
+  \item The files appear as chips above the prompt while they upload. Write your message and send it.
+  \item Images are shown to the agent as images (very large ones as a smaller copy); other files are
+    saved for it to read (figure~\ref{fig:chat-attachment}).
+\end{enumerate}
+
+By default a file may have up to 20~MB, a message up to 50~MB in up to ten files. Commands
+starting with \cmd{/factory} take no attachments.
+
+\screenshot[0.8\linewidth]{30-chat-attachment-desktop}{A message with an attached screenshot, and the agent's answer.}{chat-attachment}
+
+\section{Turn an idea into an issue}\label{sec:new-issue}
+
+There are two ways.
+
+\begin{enumerate}
+  \item \textbf{With the agent.} Describe the idea in the chat and ask the agent to file an issue,
+    for example: ``Write an issue for sharing a wishlist by link. Look at how carts are stored
+    first.'' The agent reads the code, drafts the issue and creates it on GitHub with your token;
+    it appears in the issue list at once. This usually gives the better issue, because the agent
+    knows the code.
+  \item \textbf{By hand.} Choose \ui{+ New} above the issue list. In the dialog
+    (figure~\ref{fig:new-issue}) choose the kind (\ui{feature}, \ui{bug} or \ui{task}), enter a
+    \ui{Title} and a \ui{Description} in Markdown, and choose \ui{Create issue}.
+\end{enumerate}
+
+A good issue says what is wrong or wanted and how you will know it is done; the spec-writer of a
+run turns it into a full specification (chapter~\ref{ch:run}).
+
+\screenshot[0.85\linewidth]{23-new-issue-desktop}{Creating an issue by hand.}{new-issue}
+
+\section{Factory commands}\label{sec:factory-commands}
+
+The chat also understands a few commands that act directly, without asking the model. Type
+\cmd{/} at the start of the prompt to see them (figure~\ref{fig:autocomplete}):
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  Command & What it does\\
+  \midrule
+  \cmd{/factory run <issue>} & Start a pipeline run for an issue\\
+  \cmd{/factory status} & List runs in this project\\
+  \cmd{/factory approve [runId]} & Approve a run waiting for a human\\
+  \cmd{/factory cancel <runId>} & Cancel a run\\
+  \cmd{/factory help} & Show factory commands\\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\screenshot{10-project-autocomplete-desktop}{The factory commands, suggested as you type.}{autocomplete}
+
+\whatyouhave
+You can ask the agent about the code, show it screenshots and files, and turn an idea into an
+issue, by asking the agent or with \ui{+ New}. Next, hand that issue to the pipeline:
+chapter~\ref{ch:run}.

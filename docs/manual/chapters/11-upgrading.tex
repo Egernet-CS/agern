@@ -1,0 +1,92 @@
+\chapter{Upgrading}\label{ch:upgrade}
+
+\emph{You want to install new versions of Agern safely, and go back if one misbehaves.} The
+\cmd{agern} command downloads a version from GitHub, verifies its checksum, installs it with
+\cmd{apt-get}, restarts Agern and waits until it answers with the new version. If it does not come
+up, the previous version is reinstalled automatically.
+
+\section{Which version you run}\label{sec:version}
+
+\begin{enumerate}
+  \item In the web UI, open the user menu (your name, top right). Its last line shows the running
+    version (figure~\ref{fig:user-menu}).
+  \item On the server, \cmd{agern version} shows the installed version, the previous one kept for a
+    rollback, and what the running server reports.
+\end{enumerate}
+
+\screenshot[0.45\linewidth]{48-user-menu-desktop}{The user menu with the running version (here the demo's).}{user-menu}
+
+There are two \term[channel]{channels}:
+
+\begin{itemize}
+  \item \textbf{stable} (the default): tagged releases such as \texttt{1.4.0}. Releases with a suffix,
+    such as \texttt{1.5.0-rc.1}, are pre-releases and are only installed when you name them.
+  \item \textbf{main}: the rolling build \texttt{main-latest}, rebuilt after every change merged into
+    Agern's \texttt{main} branch. Its versions look like \texttt{1.4.1-main.20261119101500.g1a2b3c4}:
+    after the last release, before the next, in commit order. Choose it only for a factory whose
+    users accept that a bad merge reaches them minutes later.
+\end{itemize}
+
+\section{Upgrade by hand}\label{sec:upgrade}
+
+\begin{enumerate}
+  \item Upgrade to the latest release:
+\begin{lstlisting}
+sudo agern upgrade
+\end{lstlisting}
+    Or to a specific release, or to the newest build of \texttt{main}:
+\begin{lstlisting}
+sudo agern upgrade --version 1.4.0
+sudo agern upgrade --channel main
+\end{lstlisting}
+  \item If runs or agents are working, Agern refuses, because a restart fails runs in progress:
+    \msg{agern: error: not restarting now, the server is busy: 1 run(s) in progress, 2 agent(s)
+    working. Try again later, or use -{}-force (interrupted runs fail)}. Wait, or add
+    \cmd{--force} if you accept that.
+  \item Check the result with \cmd{agern version}, or in the user menu.
+\end{enumerate}
+
+Your configuration in \file{/etc/agern/agern.env} is never touched by an upgrade. Database changes
+run when the new version starts.
+
+\section{Roll back}\label{sec:rollback}
+
+\begin{enumerate}
+  \item If the new version misbehaves, reinstall the previous package, which \cmd{agern upgrade}
+    kept in \file{/var/cache/agern}:
+\begin{lstlisting}
+sudo agern rollback
+\end{lstlisting}
+\end{enumerate}
+
+A rollback does not undo database changes. Rolling back across a change of the database schema is
+only safe if the older version tolerates the newer schema.
+
+\section{Upgrade automatically}\label{sec:auto-upgrade}
+
+Agern can install new versions by itself, when nobody's work is in progress.
+
+\begin{enumerate}
+  \item Turn it on, optionally for the main channel:
+\begin{lstlisting}
+sudo agern auto-upgrade on
+sudo agern auto-upgrade on --channel main
+\end{lstlisting}
+  \item Every 15 minutes a timer looks for a newer version. It installs it as soon as no run is
+    queued, specifying, building, reviewing or approving and no agent is starting or mid-turn. Runs
+    waiting for a human and idle chats do not count.
+  \item See what it does, and turn it off again:
+\begin{lstlisting}
+agern auto-upgrade status
+sudo agern auto-upgrade off
+\end{lstlisting}
+\end{enumerate}
+
+If the factory stays busy for 24 hours (\texttt{AGERN\_UPGRADE\_MAX\_WAIT\_HOURS}), the timer gives up
+on that version with a warning in the journal; \cmd{sudo agern upgrade} installs it whenever it
+suits you. Details:
+\repodoc{INSTALL-LINUX.md\#8-upgrades-rollback-and-automatic-upgrades}{\texttt{INSTALL-LINUX.md}, section~8}.
+
+\whatyouhave
+You know which version runs, how to upgrade by hand or automatically, from releases or from
+\texttt{main}, and how to roll back. Next, protect your data: chapter~\ref{ch:backup}.

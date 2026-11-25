@@ -1,0 +1,62 @@
+\chapter{Keeping an eye on things}\label{ch:watch}
+
+\emph{You want to know what all the agents are doing, follow a colleague's work, and not run into
+your Claude usage limit by surprise.}
+
+\section{The active counter and the Agents page}\label{sec:agents-page}
+
+\begin{enumerate}
+  \item Look at the top bar: the counter \ui{N active} shows how many agents are working right now,
+    across all projects you can see. Choose it, or \ui{Agents}, to open the Agents page.
+  \item The Agents page (\ui{On the floor}, figure~\ref{fig:agents}) shows the runs in flight as
+    cards at the top, and a table of every agent: what it is (chat or pipeline stage), its project
+    and issue, its owner, what it is doing at this moment, its model, cost and running time.
+  \item Filter with \ui{everyone} or \ui{mine}, and tick \ui{include ended} to see finished agents too.
+  \item Choose a run card to open the run page, or an agent to watch its transcript.
+\end{enumerate}
+
+\screenshot{18-agents-desktop}{The Agents page: runs in flight and every agent you can see.}{agents}
+
+\section{Watch someone else's session}\label{sec:observe}
+
+Everybody who can read a repository can watch its agents, read-only.
+
+\begin{enumerate}
+  \item On a project page, choose another person's agent in the agents \& runs pane, for example
+    bob's chat.
+  \item The chat pane shows that session live. There is no prompt: only
+    the owner can write to their agents (figure~\ref{fig:observing}).
+\end{enumerate}
+
+\screenshot{14-observing-desktop}{Observing bob's chat: live, but read-only.}{observing}
+
+\section{Your Claude usage}\label{sec:usage}
+
+Claude limits how much you can use in a five-hour window and in a week. Agern shows how close you
+are, for your own account only.
+
+\begin{enumerate}
+  \item Look at the usage indicator in the top bar, left of the active counter. It shows the window
+    closest to its limit, for example \ui{5h 42\%}. From 80~\% it turns amber and says \ui{high}
+    (figure~\ref{fig:usage-high}); at the limit it turns red and says when it resets
+    (figure~\ref{fig:usage-limit}).
+  \item Choose it to open the \ui{Usage} block in \ui{Settings}, under \ui{Models \& cost}
+    (figure~\ref{fig:settings-models} in chapter~\ref{ch:accounts}): every window with its reset time,
+    and what you spent through Agern today and this month.
+  \item If you are often near the limit, choose cheaper models there (section~\ref{sec:models}).
+\end{enumerate}
+
+Claude reports these numbers while one of your agents runs; they are not refreshed in between.
+When the limit is reached, your agents cannot go on: a run stops with an error that you can retry
+once the limit has reset (section~\ref{sec:retry}), and a release pauses and resumes by itself
+(chapter~\ref{ch:releases}).
+
+\screenshot[0.6\linewidth]{46-usage-high-desktop}{The usage indicator at 86~\% of the five-hour window.}{usage-high}
+
+\screenshot[0.6\linewidth]{47-usage-limit-desktop}{The usage indicator when the limit is reached.}{usage-limit}
+
+\whatyouhave
+You can see every agent at work, follow your colleagues' sessions, and know how much of your
+Claude usage is left. That completes the daily use of Agern.
+Upcoming: using Agern from Claude on your own computer is planned and not yet available.
+Next, keep Agern itself healthy: chapter~\ref{ch:upgrade}.

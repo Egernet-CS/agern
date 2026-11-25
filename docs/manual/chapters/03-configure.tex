@@ -1,0 +1,145 @@
+\chapter{Configure}\label{ch:configure}
+
+\emph{You want Agern reachable under its proper address, ideally over HTTPS, protected by a
+firewall, and open to the other people on your team.} This chapter covers the few settings a new
+installation really touches. Every setting is described in
+\repodoc{ARCHITECTURE.md\#3-configuration-environment-variables}{\texttt{ARCHITECTURE.md}, section~3};
+appendix~\ref{app:config} lists the ones you are likely to need.
+
+After every change to \file{/etc/agern/agern.env}, restart Agern so that it reads the file again:
+\begin{lstlisting}
+sudo agern restart
+\end{lstlisting}
+
+\section{The public URL}\label{sec:public-url}
+
+\envvar{FACTORY_PUBLIC_URL} is the one address under which people use Agern. The browser sends
+it as the \emph{origin} of every request, and Agern refuses changes and live connections that come
+from any other origin. This protects you from other web pages that try to act in your name.
+
+\begin{enumerate}
+  \item Decide on the address people will type, for example \url{http://agern.example.com:8080}
+    on your LAN, or \url{https://agern.example.com} behind a reverse proxy (next section).
+  \item Set it, without a trailing slash, and restart:
+\begin{lstlisting}[style=conf]
+FACTORY_PUBLIC_URL=https://agern.example.com
+\end{lstlisting}
+  \item Open exactly that address. If you use another one (the IP address, \texttt{localhost}, a
+    different port), pages may load, but signing in or anything else that changes data fails with
+    \msg{Origin not allowed}.
+\end{enumerate}
+
+\section{HTTPS behind a reverse proxy}\label{sec:https}
+
+Plain HTTP works on a trusted LAN: the second factor is a code from an app, which does not need
+HTTPS. For HTTPS, put a reverse proxy such as Caddy or nginx on the same machine in front of
+Agern.
+
+\begin{enumerate}
+  \item Make Agern listen only on the loopback address, so that it is reachable only through the
+    proxy, and set the HTTPS address as public URL. An \texttt{https://} URL also makes the session
+    cookie \texttt{Secure}:
+\begin{lstlisting}[style=conf]
+FACTORY_HOST=127.0.0.1
+FACTORY_PUBLIC_URL=https://agern.example.com
+\end{lstlisting}
+  \item Configure the proxy to forward everything to \texttt{127.0.0.1:8080}. It must pass
+    WebSockets (Agern streams agents live over \texttt{/api/ws/\ldots}) and should send the header
+    \texttt{X-Forwarded-For}. Caddy does both by default; for a LAN name, \texttt{tls internal}
+    makes Caddy use its own certificate authority (\file{/etc/caddy/Caddyfile}):
+\begin{lstlisting}[style=conf]
+agern.example.com {
+    tls internal
+    reverse_proxy 127.0.0.1:8080
+}
+\end{lstlisting}
+    With nginx, add WebSocket upgrades and
+    \texttt{proxy\_set\_header X-Forwarded-For \$proxy\_add\_x\_forwarded\_for;}.
+  \item Restart Agern and the proxy, then open \url{https://agern.example.com}.
+\end{enumerate}
+
+The forwarded header is more than logging: it is how Agern tells requests through the proxy from
+requests made on the machine itself, which matters for automatic upgrades
+(chapter~\ref{ch:upgrade}). Details:
+\repodoc{INSTALL-LINUX.md\#7-network-firewall-and-tls}{\texttt{INSTALL-LINUX.md}, section~7}.
+
+\section{The firewall}\label{sec:firewall}
+
+Agern is made for a trusted network. Do not expose it to the internet.
+
+\begin{enumerate}
+  \item Allow SSH and Agern's port only from your LAN (here \texttt{192.0.2.0/24}; use port 443
+    instead of 8080 behind an HTTPS proxy):
+\begin{lstlisting}
+sudo apt install ufw
+sudo ufw default deny incoming
+sudo ufw allow from 192.0.2.0/24 to any port 22 proto tcp
+sudo ufw allow from 192.0.2.0/24 to any port 8080 proto tcp
+sudo ufw enable
+\end{lstlisting}
+\end{enumerate}
+
+\section{The essential settings}\label{sec:essential-settings}
+
+Most installations change nothing beyond chapter~\ref{ch:install} and the address above. These
+are the settings worth knowing about; their defaults suit a small team:
+
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.42\linewidth}>{\raggedright\arraybackslash}X@{}}
+  \toprule
+  Variable (default) & What it decides\\
+  \midrule
+  \envvar{FACTORY_HOST} (\texttt{0.0.0.0}), \envvar{FACTORY_PORT} (\texttt{8080}) & Where Agern listens.\\
+  \envvar{FACTORY_MAX_AGENTS_PER_USER} (\texttt{8}) & How many agents one person may run at once.\\
+  \envvar{FACTORY_STAGE_TIMEOUT_MINUTES} (\texttt{60}) & The longest a single pipeline stage may take before the run fails.\\
+  \envvar{FACTORY_CHAT_IDLE_MINUTES} (\texttt{30}) & After how long an idle chat's process is stopped; your next message resumes it.\\
+  \bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Adding users}\label{sec:users}
+
+Agern has no user database of its own to manage: whoever can sign in with an account of the
+machine (\texttt{os}) or of your directory (\texttt{ldap}) can use it. What a person then sees is
+decided by their own GitHub token.
+
+\begin{enumerate}
+  \item \textbf{Accounts on this machine} (\texttt{FACTORY\_AUTH=os}): create one per person with
+    \cmd{sudo adduser <name>}, with a password they use nowhere else. The \texttt{shadow} group
+    decision of section~\ref{sec:first-admin} applies.
+  \item \textbf{Or a directory} (\texttt{FACTORY\_AUTH=ldap}): set \envvar{FACTORY_LDAP_URL} and
+    either a DN template or search-then-bind, for example:
+\begin{lstlisting}[style=conf]
+FACTORY_AUTH=ldap
+FACTORY_LDAP_URL=ldaps://ldap.example.com:636
+FACTORY_LDAP_USER_DN_TEMPLATE=uid={0},ou=people,dc=example,dc=com
+\end{lstlisting}
+    For search-then-bind, see the \texttt{FACTORY\_LDAP\_\ldots} lines in
+    \file{/etc/agern/agern.env}. \texttt{FACTORY\_AUTH=os,ldap} tries both, in that order.
+  \item \textbf{Admins}: add the user name to \envvar{FACTORY_ADMINS} and restart. Admins see the
+    \ui{Admin} page, approve sandboxes and can stop or cancel anybody's agents, but never drive
+    them.
+  \item Each new person signs in, enrols an authenticator and saves their recovery codes, exactly
+    as in section~\ref{sec:first-login}, then connects their own accounts
+    (chapter~\ref{ch:accounts}).
+\end{enumerate}
+
+The \ui{Admin} page lists everybody who has signed in, whether they have a GitHub token and a
+Claude credential, and their two-factor state (figure~\ref{fig:admin-users}). Someone who lost
+their phone and their recovery codes, or locked themselves out with five wrong codes, needs an
+admin:
+
+\begin{enumerate}
+  \item Confirm the person's identity outside Agern.
+  \item On the \ui{Admin} page, choose \ui{Reset 2FA} in their row and confirm
+    (figure~\ref{fig:admin-reset}). They enrol a new authenticator at their next sign-in.
+\end{enumerate}
+
+\screenshot[0.85\linewidth]{45-admin-users-desktop}{The users on the Admin page, with their credentials and two-factor state.}{admin-users}
+
+\screenshot{22-admin-reset-2fa-desktop}{Resetting a user's two-factor setup.}{admin-reset}
+
+\whatyouhave
+Agern answers under its public address, over HTTPS if you chose to, only your LAN can reach it,
+and your colleagues can sign in. Next, connect your GitHub and Claude accounts so that you see
+projects and can start agents: chapter~\ref{ch:accounts}.
