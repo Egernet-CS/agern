@@ -1769,6 +1769,12 @@ html.app-locked #root {
   margin: 5px 0 0;
   font-size: 0.9rem;
 }
+/* The hint of "Update and merge": its own row under the title and the actions. */
+.rh-update-hint {
+  grid-column: 1 / -1;
+  margin: 0;
+  text-align: right;
+}
 .rh-actions {
   grid-column: 2;
   grid-row: 2 / span 2;
@@ -1835,6 +1841,49 @@ html.app-locked #root {
   color: var(--text);
   font-size: 0.86rem;
   overflow-wrap: anywhere;
+}
+/* Update rounds ("Update and merge") above the rounds strip. */
+.run-updates {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 14px 0 0;
+}
+.run-update {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 10px 14px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r);
+  background: var(--surface);
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.run-update p {
+  margin: 0;
+}
+.run-update-h {
+  margin: 0;
+  font-size: 0.92rem;
+  font-weight: 600;
+}
+.run-update-status--resolved {
+  color: var(--pass);
+}
+.run-update-status--failed {
+  color: var(--fail);
+}
+.run-update-status--running {
+  color: var(--changes);
+}
+.run-update-list {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+.run-update .notice {
+  align-self: stretch;
 }
 .rounds {
   display: flex;
@@ -2715,6 +2764,9 @@ html.app-locked #root {
     grid-column: 1;
     grid-row: auto;
     justify-content: flex-start;
+  }
+  .rh-update-hint {
+    text-align: left;
   }
   .rh-title h1 {
     font-size: 1.25rem;

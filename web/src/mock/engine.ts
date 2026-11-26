@@ -18,6 +18,7 @@ import type {
   RetryMode,
   RetryOptions,
   Run,
+  RunUpdate,
   PendingSandbox,
   RunSandbox,
   RunningSandbox,
@@ -36,7 +37,7 @@ import type {
   Verdict,
   Workspace,
 } from '../api/types';
-import { approverScript, builderScript, chatReplies, reviewerScript, sandboxBuilderScript, seededChat, specScript, type Step } from './scripts';
+import { approverScript, builderScript, chatReplies, reviewerScript, sandboxBuilderScript, seededChat, specScript, updateBuilderScript, type Step } from './scripts';
 
 export const ORG = 'Egernet-CS';
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -692,6 +693,8 @@ type Plan = {
   liveFrom: (role: StageRole, round: number) => boolean;
   /** The UI reviewers attach no screenshots, so the server's warning "UI change reviewed without screenshots" shows. */
   noScreenshots?: boolean;
+  /** The approved merge is refused because the target moved: a migration clash or a merge conflict ("Update and merge"). */
+  refuseMerge?: 'migration' | 'conflict';
 };
 
 /** Like the backend's warning (docs/ARCHITECTURE.md §6 "Screenshots") for the mock diff of a UI change. */
@@ -780,7 +783,11 @@ function runStage(r: Run, role: StageRole, round: number, plan: Plan, startMs: n
     const prev = r.stages.filter((x) => x.round === round - 1 && x.verdict === 'CHANGES').flatMap((x) => x.findings.map((f) => f.detail));
     const sb = r.sandbox;
     const def = sb?.state === 'approved' ? db.sandboxFiles.get(r.repo)?.definition : null;
-    steps = def ? sandboxBuilderScript(round, def.image, def.setup, def.services.map((x) => x.name), def.platforms) : builderScript(round, prev);
+    const upd = r.updates?.find((u) => u.round === round);
+    steps = upd
+      ? updateBuilderScript(upd.target, upd.migrations.length ? 'migration' : 'conflict')
+      : def ? sandboxBuilderScript(round, def.image, def.setup, def.services.map((x) => x.name), def.platforms) : builderScript(round, prev);
+    if (upd) steps = [{ kind: 'system', level: 'info', text: `Update round ${upd.number}: merged \`${upd.target}\` (${upd.incomingCount} commits)${upd.conflicts.length ? `; conflicts in ${upd.conflicts.map((c) => `\`${c}\``).join(', ')}` : ''}`, ms: 50 }, ...steps];
     // Like the backend: the builder's transcript starts with the run's sandbox decision.
     if (sb && sb.state !== 'disabled') steps = [{ kind: 'system', level: sb.state === 'approved' ? 'info' : 'warn', text: `Sandbox: ${sb.reason}`, ms: 50 }, ...steps];
     if (def && !db.runningSandboxes.has(r.id)) {
@@ -791,7 +798,7 @@ function runStage(r: Run, role: StageRole, round: number, plan: Plan, startMs: n
       if (sb && def.platforms.length) sb.platformsUsed = ['default', ...def.platforms.map((x) => x.name)];
       feed({ type: 'sandboxes', runId: r.id, change: 'created' });
     }
-    summary = round > 0 ? 'Addressed review findings; tests green.' : 'Implemented the spec; 9 tests added, all green.';
+    summary = upd ? `Merged ${upd.target} and resolved the ${upd.migrations.length ? 'migration clash' : 'conflict'}; tests green.` : round > 0 ? 'Addressed review findings; tests green.' : 'Implemented the spec; 9 tests added, all green.';
   } else if (role === 'approver') {
     verdict = plan.approver;
     steps = approverScript(plan.approver, `${r.issueTitle} (#${r.issueNumber})`);
@@ -888,10 +895,114 @@ function pipeline(r: Run, plan: Plan, owner: User, startMs: number) {
     runStage(r, 'approver', round, plan, t, owner, (t2, stage) => {
       if (fail()) return;
       if (stage.verdict === 'ESCALATE') r.error = `The approver escalated: ${stage.summary}`;
+      if (stage.verdict === 'APPROVE' && plan.refuseMerge) return refuseMerge(r, plan.refuseMerge, iso(t2 + 1500));
       setRunStatus(r, stage.verdict === 'APPROVE' ? 'merged' : 'needs_human', iso(t2 + 1500));
     });
   };
   spec();
+}
+
+// ---------------------------------------------------------------- update and merge (docs/ARCHITECTURE.md §6 "Retrying a run")
+
+const targetOf = (r: Run) => r.baseBranch ?? 'main';
+const updatable = (r: Run) =>
+  r.status === 'needs_human' && (r.failureKind === 'migration_conflict' || r.failureKind === 'merge_conflict') && !!r.branch && !!r.prNumber &&
+  (r.updateRounds ?? 0) < (r.maxUpdateRounds ?? 0);
+
+/** Like the server's summary line of an update round. */
+function updateSummary(u: RunUpdate): string {
+  const n = (k: number, one: string) => `${k} ${one}${k === 1 ? '' : 's'}`;
+  const parts: string[] = [];
+  if (u.mergeStatus === 'up_to_date') parts.push(`already up to date with \`${u.target}\``);
+  else if (u.mergeStatus) parts.push(`merged \`${u.target}\` (${n(u.incomingCount, 'commit')})`);
+  if (u.conflicts.length) parts.push(n(u.conflicts.length, 'conflicted file'));
+  if (u.migrations.length) parts.push(n(u.migrations.length, 'migration problem'));
+  if (u.commits.length) parts.push(`builder added ${n(u.commits.length, 'commit')}`);
+  return `Update round ${u.number} of ${u.maxRounds}${u.trigger === 'release' ? ' (automatic)' : ''}${parts.length ? `: ${parts.join('; ')}` : ''} — ${u.status}`;
+}
+
+function syncUpdateFields(r: Run) {
+  r.updateAvailable = updatable(r);
+  for (const u of r.updates ?? []) u.summary = updateSummary(u);
+}
+
+/** The approved merge is refused because the target moved, as the server words it. */
+function refuseMerge(r: Run, kind: 'migration' | 'conflict', ts: string) {
+  const t = targetOf(r);
+  r.maxUpdateRounds ??= 2;
+  r.updateRounds ??= 0;
+  const used = r.updateRounds;
+  const max = r.maxUpdateRounds;
+  const ending = used < max
+    ? `Use "Update and merge" to have Agern merge \`${t}\` into the branch and let the builder ${kind === 'migration' ? 'renumber the migration' : 'resolve the conflicts'} (update round ${used + 1} of ${max}), or ${kind === 'migration' ? 'fix the migration on the pull request\'s branch' : 'resolve them on the pull request\'s branch'} and approve again.`
+    : `The limit of ${max} update round(s) is reached: ${kind === 'migration' ? 'fix the migration' : 'resolve the conflicts'} on the pull request's branch and approve again, or build the issue again from the current \`${t}\` (in a release: Retry).`;
+  r.failureKind = kind === 'migration' ? 'migration_conflict' : 'merge_conflict';
+  r.failedStep = kind === 'migration' ? null : 'merge';
+  r.error = kind === 'migration'
+    ? `Database migration conflict with \`${t}\`: \`src/main/resources/db/migration/V7__saved_carts.sql\` has the same version (7) as \`src/main/resources/db/migration/V7__gift_cards.sql\`. Pull request #${r.prNumber} was not merged. Migrations already on \`${t}\` must stay unchanged, and a new migration needs a version above all of them. ${ending}`
+    : `Merging pull request #${r.prNumber} failed: Pull Request has merge conflicts. The branch conflicts with \`${t}\` or is behind it. ${ending}`;
+  dropSandbox(r.id);
+  // The status first: whether the run can be updated depends on it (and a release reads it when its run ends).
+  r.status = 'needs_human';
+  syncUpdateFields(r);
+  setRunStatus(r, 'needs_human', ts);
+}
+
+/** Like the server's "Update and merge": same checks and codes; the round always resolves in the mock. */
+export function updateRun(r: Run, by: User, trigger: RunUpdate['trigger'] = 'owner', instantAt?: number): Run {
+  if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner of this run can update and merge it');
+  if (!by.claudeCredentialKind) throw new MockError(422, 'claude_credential_required', 'Register a Claude credential in Settings first');
+  if (!updatable(r)) throw new MockError(409, 'retry_mode_unavailable', 'Cannot update and merge this run');
+  if (r.conversation.review === 'running') throw new MockError(409, 'review_in_progress', 'The changes from the conversation are being reviewed; update when the reviews are in');
+  const adv = r.conversation.sessionId ? db.sessions.get(r.conversation.sessionId) : undefined;
+  if (adv && (adv.status === 'running' || adv.status === 'starting')) throw new MockError(409, 'agent_busy', 'The agent is still answering; wait for it or interrupt it');
+  const kind = r.failureKind === 'migration_conflict' ? 'migration' : 'conflict';
+  const round = Math.max(...r.stages.map((x) => x.round)) + 1;
+  const t = targetOf(r);
+  r.updateRounds = (r.updateRounds ?? 0) + 1;
+  const u: RunUpdate = {
+    number: r.updateRounds, round, maxRounds: r.maxUpdateRounds ?? 2, trigger, target: t, reason: r.error, status: 'running',
+    mergeStatus: kind === 'conflict' ? 'conflict' : 'merged', targetSha: '7c1e0a94b2d3f5e6a7b8c9d0e1f2a3b4c5d6e7f8', incomingCount: 3,
+    incoming: ['Gift cards at checkout (#71)', 'Fix VAT rounding on invoices (#70)', 'Bump Kotlin to 2.1 (#69)'],
+    conflicts: kind === 'conflict' ? ['src/main/kotlin/shop/cart/CartService.kt'] : [],
+    migrations: kind === 'migration' ? ['`src/main/resources/db/migration/V7__saved_carts.sql` has the same version (7) as `src/main/resources/db/migration/V7__gift_cards.sql`'] : [],
+    commits: [], error: null, startedAt: iso(Date.now()), endedAt: null, summary: '',
+  };
+  r.updates = [...(r.updates ?? []), u];
+  r.error = null;
+  r.failureKind = null;
+  r.failedStep = null;
+  r.round = round;
+  if (adv) setStatus(adv, 'idle', iso(Date.now()));
+  for (const role of ['builder', ...reviewers, 'approver'] as StageRole[]) pendingStage(r, role, round);
+  syncUpdateFields(r);
+  // instantAt: a seeded round from the past, played at once.
+  const plan: Plan = { changes: {}, approver: 'APPROVE', liveFrom: () => instantAt === undefined };
+  const t0 = instantAt ?? Date.now();
+  u.startedAt = iso(t0);
+  setRunStatus(r, 'building', iso(t0));
+  runStage(r, 'builder', round, plan, t0, by, (t1) => {
+    if (r.status === 'cancelled') return;
+    u.commits = [kind === 'migration' ? 'c41d2e9 Renumber the saved-carts migration to V8' : '9b0e7a1 Merge ' + t + ' into the run branch'];
+    u.status = 'resolved';
+    u.endedAt = iso(t1);
+    syncUpdateFields(r);
+    setRunStatus(r, 'reviewing', iso(t1));
+    let pending = reviewers.length;
+    for (const role of reviewers) {
+      runStage(r, role, round, plan, t1, by, (t2) => {
+        if (--pending > 0 || r.status === 'cancelled') return;
+        setRunStatus(r, 'approving', iso(t2));
+        runStage(r, 'approver', round, plan, t2 + 400, by, (t3) => {
+          if (r.status === 'cancelled') return;
+          r.status = 'merged';
+          syncUpdateFields(r);
+          setRunStatus(r, 'merged', iso(t3 + 1500));
+        });
+      });
+    }
+  });
+  return r;
 }
 
 // ---------------------------------------------------------------- sandboxes (docs/ARCHITECTURE.md §5 "Sandboxes")
@@ -1694,6 +1805,15 @@ function advanceRelease(r: Release) {
       changed = true;
       continue;
     }
+    const previous = it.retryMode === 'update' && it.runId ? db.runs.get(it.runId) : undefined;
+    if (previous) {
+      // "Update and merge" in the issue's turn, on the same run.
+      Object.assign(it, { state: 'running', note: null, retryMode: null });
+      updateRun(previous, owner);
+      changed = true;
+      started = true;
+      break;
+    }
     const run = startRun(r.repo, it.number, owner, null, { changes: {} }, Date.now(), r);
     it.state = 'running';
     it.runId = run.id;
@@ -1812,6 +1932,10 @@ function releaseRunEnded(run: Run) {
   if (!r || !it || r.status === 'cancelled') return;
   it.prNumber = run.prNumber;
   it.prUrl = run.prUrl;
+  Object.assign(it, {
+    updateAvailable: updatable(run), updateRounds: run.updateRounds ?? 0, maxUpdateRounds: run.maxUpdateRounds ?? 0,
+    updateSummary: run.updates?.length ? updateSummary(run.updates[run.updates.length - 1]) : null,
+  });
   if (run.status === 'merged') {
     it.state = 'merged';
     it.note = null;
@@ -1892,6 +2016,7 @@ export function retryOptionsFor(run: Run | undefined): RetryOptions {
     return {
       runId: '', recommended: 'start_over', reason: 'The issue has no run to continue from.', step: null, commits: null, releaseId: null,
       options: [
+        { mode: 'update', available: false, detail: 'The issue has no run.' },
         { mode: 'step', available: false, detail: 'The issue has no run.' },
         { mode: 'continue', available: false, detail: 'The issue has no run.' },
         { mode: 'start_over', available: true, detail: 'A new run from scratch.' },
@@ -1901,13 +2026,22 @@ export function retryOptionsFor(run: Run | undefined): RetryOptions {
   const blocked = /no commits/i.test(run.error ?? '') || run.stages.every((s) => s.role !== 'builder' || s.status !== 'done' && s.status !== 'failed');
   const commits = blocked ? 0 : 2;
   const canContinue = commits > 0 && ['failed', 'cancelled', 'needs_human'].includes(run.status);
-  const recommended: RetryMode = !canContinue || run.status === 'cancelled' ? 'start_over' : 'continue';
-  const reason = recommended === 'continue'
+  const update = updatable(run);
+  const recommended: RetryMode = update ? 'update' : !canContinue || run.status === 'cancelled' ? 'start_over' : 'continue';
+  const reason = update
+    ? `The work is finished; only the merge into \`${targetOf(run)}\` was refused: ${(run.error ?? '').split('\n')[0].slice(0, 157)}`
+    : recommended === 'continue'
     ? `The run failed after ${commits} commits${run.error ? ` (${run.error.split('\n')[0].slice(0, 120)})` : ''}; continue from them.`
     : run.status === 'cancelled' && canContinue ? `The run was cancelled; its branch has ${commits} commits if you want to continue.` : "The run's branch has no commits of its own.";
   return {
     runId: run.id, recommended, reason, step: null, commits, releaseId: run.releaseId,
     options: [
+      {
+        mode: 'update', available: update,
+        detail: update
+          ? `Agern merges \`${targetOf(run)}\` into branch ${run.branch} on this run, the builder resolves the conflict, the reviewers and the approver run again, and the pull request is merged (update round ${(run.updateRounds ?? 0) + 1} of ${run.maxUpdateRounds}); no new spec or build.`
+          : 'Only when a finished run could not be merged because of a migration or merge conflict with its target branch.',
+      },
       { mode: 'step', available: false, detail: 'Only when the builder finished and a later step (push, pull request, merge) failed.' },
       { mode: 'continue', available: canContinue, detail: canContinue ? `A new run starts from branch ${run.branch} (${commits} commits), reuses the spec and finishes the work.` : "Only when the run's branch has commits of its own." },
       { mode: 'start_over', available: true, detail: 'A new run on a new branch from scratch; the old branch is left as it is.' },
@@ -1925,6 +2059,13 @@ function checkMode(opts: RetryOptions, mode: RetryMode | undefined): RetryMode {
 export function retryRun(r: Run, mode: RetryMode | undefined, by: User): Run {
   if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner of this run can retry it');
   if (r.releaseId) throw new MockError(409, 'release_run', "This run builds an issue of a release; retry the issue on the release's page");
+  if (r.status === 'needs_human') {
+    const opts = retryOptionsFor(r);
+    if (mode !== 'update')
+      throw new MockError(409, 'run_not_retryable', `Run is ${r.status}; only failed or cancelled runs can be retried, or updated and merged`);
+    checkMode(opts, 'update');
+    return updateRun(r, by);
+  }
   if (r.status !== 'failed' && r.status !== 'cancelled') throw new MockError(409, 'run_not_retryable', `Run is ${r.status}; only failed or cancelled runs can be retried`);
   const m = checkMode(retryOptionsFor(r), mode);
   const next = startRun(r.repo, r.issueNumber, by);
@@ -1939,6 +2080,16 @@ export function retryReleaseIssue(r: Release, n: number, by: User, mode?: RetryM
   const held = r.issues.find((i) => i.number === n);
   const oldRun = held?.runId ? db.runs.get(held.runId) : undefined;
   const m = held ? checkMode(retryOptionsFor(oldRun), mode) : 'start_over';
+  if (m === 'update' && held && oldRun) {
+    if (r.status === 'released') notEditable(r);
+    guardRelease(r, by, 'owner');
+    if (held.state !== 'held') throw new MockError(409, 'release_issue_not_held', `Issue #${n} is ${held.state}; only held or skipped issues can be retried`);
+    if (r.status === 'ready') Object.assign(r, { status: 'building', readyAt: null });
+    Object.assign(held, { state: 'waiting', note: `Retry: updates run ${oldRun.id} with \`${targetOf(oldRun)}\` and merges it`, retryMode: 'update' });
+    touchRelease(r);
+    advanceRelease(r);
+    return r;
+  }
   const result = retryReleaseIssueOver(r, n, by);
   const now = r.issues.find((i) => i.number === n);
   const newRun = now?.runId ? db.runs.get(now.runId) : undefined;
@@ -2159,7 +2310,6 @@ function seed() {
   const never = () => false;
   startRun('web-shop', 47, alice, null, { changes: {}, liveFrom: never }, Date.now() - 3 * 86400_000);
   startRun('design-system', 12, alice, null, { changes: {}, liveFrom: never, noScreenshots: true }, Date.now() - 5 * 86400_000);
-  startRun('shop-workspace', 5, alice, null, { changes: {}, liveFrom: never }, Date.now() - 2 * 86400_000);
   const failed = startRun('web-shop', 44, bob, null, { changes: {}, liveFrom: never }, Date.now() - 86400_000);
   for (const st of failed.stages.slice(2)) {
     if (st.sessionId) db.sessions.delete(st.sessionId);
@@ -2179,6 +2329,11 @@ function seed() {
 
   // Waiting for a human (alice owns it).
   startRun('billing-service', 17, alice, null, { changes: {}, approver: 'ESCALATE', liveFrom: never }, Date.now() - 40 * 60_000);
+  // Finished, but its migration clashes with one that landed on main meanwhile: "Update and merge" is offered.
+  startRun('data-pipeline', 3, alice, null, { changes: {}, liveFrom: never, refuseMerge: 'migration' }, Date.now() - 30 * 60_000);
+  // Updated once after a merge conflict, then merged (history).
+  const updated = startRun('shop-workspace', 5, alice, null, { changes: {}, liveFrom: never, refuseMerge: 'conflict' }, Date.now() - 2 * 86400_000);
+  updateRun(updated, alice, 'owner', Date.now() - 2 * 86400_000 + 3_600_000);
 
   // Chats.
   const chat = createChat('web-shop', alice, Date.now() - 50 * 60_000);
@@ -2224,7 +2379,11 @@ function seed() {
     it.note = it.state === 'held' ? run.error : null;
   };
   seededRun(53, { liveFrom: never }, 50);
-  seededRun(60, { approver: 'ESCALATE', liveFrom: never }, 35);
+  // Held: its migration clashes with release/1.3 (an update round is offered next to Retry and Remove).
+  seededRun(60, { liveFrom: never, refuseMerge: 'migration' }, 35);
+  const held60 = building.issues.find((i) => i.number === 60)!;
+  const run60 = db.runs.get(held60.runId!)!;
+  Object.assign(held60, { prNumber: run60.prNumber, prUrl: run60.prUrl, updateAvailable: updatable(run60), updateRounds: 0, maxUpdateRounds: 2 });
   seededRun(58, { liveFrom: (role) => role !== 'spec-writer' && role !== 'builder' }, 3);
 
   // Releasing (step 3): finished releases with their runs, in every state of the release pull request.

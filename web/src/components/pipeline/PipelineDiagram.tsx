@@ -2,7 +2,7 @@ import { useEffect, useId, useRef, useState, type KeyboardEvent } from 'react';
 import type { Run } from '../../api/types';
 import { between } from '../../lib/format';
 import { useNow } from '../../lib/useNow';
-import { humanSelectable, isFollowUp, roundName, type NodeId, type NodeView } from './model';
+import { humanSelectable, isFollowUp, roundName, updateOf, type NodeId, type NodeView } from './model';
 
 type Box = { x: number; y: number; w: number; h: number };
 type Layout = { w: number; h: number; boxes: Record<NodeId, Box>; orient: 'h' | 'v' };
@@ -275,7 +275,7 @@ export function PipelineDiagram({ run, nodes, selected, onSelect }: { run: Run; 
         </g>
         {L.orient === 'h' && (
           <text className="pe-label pe-label--round" x={L.boxes.builder.x + L.boxes.builder.w / 2 + 16} y={418}>
-            {run.round === 0 ? 'build' : isFollowUp(run.round, run) ? roundName(run.round, run) : `fix round ${run.round} of ${run.maxRounds}`}
+            {run.round === 0 ? 'build' : isFollowUp(run.round, run) || updateOf(run.round, run) ? roundName(run.round, run) : `fix round ${run.round} of ${run.maxRounds}`}
           </text>
         )}
         {order.map((id) => (
