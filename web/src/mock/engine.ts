@@ -2458,7 +2458,9 @@ function seed() {
   startRun('data-pipeline', 3, alice, null, { changes: {}, liveFrom: never, refuseMerge: 'migration' }, Date.now() - 30 * 60_000);
   // Updated once after a merge conflict, then merged (history).
   const updated = startRun('shop-workspace', 5, alice, null, { changes: {}, liveFrom: never, refuseMerge: 'conflict' }, Date.now() - 2 * 86400_000);
-  updateRun(updated, alice, 'owner', Date.now() - 2 * 86400_000 + 3_600_000);
+  // History from two days ago, when alice had a Claude credential: seeded the same in every scenario (in 'fresh'
+  // and 'noclaude' she has none today, and updateRun would refuse and break loading the mock).
+  updateRun(updated, { ...alice, claudeCredentialKind: alice.claudeCredentialKind ?? 'oauth_token' }, 'owner', Date.now() - 2 * 86400_000 + 3_600_000);
 
   // Chats.
   const chat = createChat('web-shop', alice, Date.now() - 50 * 60_000);
