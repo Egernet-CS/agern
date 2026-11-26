@@ -12,6 +12,8 @@ import type {
   IssueKind,
   PreferenceOverrides,
   Project,
+  ProjectSettings,
+  MergePolicy,
   Release,
   ReleaseChecks,
   ReleaseMode,
@@ -37,7 +39,8 @@ import type {
   Verdict,
   Workspace,
 } from '../api/types';
-import { approverScript, builderScript, chatReplies, reviewerScript, sandboxBuilderScript, seededChat, specScript, updateBuilderScript, type Step } from './scripts';
+import { runLeftNeedsHuman, runSandboxVmFor, sandboxVmBuilderSteps } from './sandboxVm';
+import { approverScript, builderScript, chatReplies, reviewSandboxSteps, reviewerScript, sandboxBuilderScript, seededChat, specScript, updateBuilderScript, type Step } from './scripts';
 
 export const ORG = 'Egernet-CS';
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -48,7 +51,7 @@ export const uid = () =>
 
 // ---------------------------------------------------------------- users & scenario
 
-const scenario = (() => {
+export const scenario = (() => {
   const q = new URLSearchParams(location.search).get('mock');
   try {
     if (q) sessionStorage.setItem('agern-mock', q);
@@ -153,7 +156,7 @@ export const db = {
   /** FACTORY_SANDBOX is not off (scenario `nosandbox`: switched off). */
   sandboxEnabled: scenario !== 'nosandbox',
   /** Sandboxes that exist right now, by run id (created when an approved run's builder starts, removed after review). */
-  runningSandboxes: new Map<string, { createdAt: string; builderSessionId: string; containers: { platform: string; image: string; createdAt: string }[] }>(),
+  runningSandboxes: new Map<string, { createdAt: string; builderSessionId: string; containers: { platform: string; image: string; createdAt: string; kind: 'build' | 'review' }[] }>(),
   players: new Map<string, Player>(),
   settings: {
     agentsMayInstallSoftware: false,
@@ -401,7 +404,7 @@ function play(
     });
   };
   const system = (st: Extract<Step, { kind: 'system' }>, gap: number) =>
-    p.after(gap, (ts) => emit(sid, 'system', { level: st.level, text: st.text, ...(st.sandbox ? { sandbox: st.sandbox } : {}) }, ts));
+    p.after(gap, (ts) => emit(sid, 'system', { level: st.level, text: st.text, ...(st.sandbox ? { sandbox: st.sandbox } : {}), ...(st.sandboxVm ? { sandboxVm: st.sandboxVm } : {}) }, ts));
   for (const step of steps) {
     if (step.kind === 'pause') p.after(step.ms, () => {});
     else if (step.kind === 'system') system(step, step.ms ?? 300);
@@ -735,8 +738,10 @@ function findRun(idOrPrefix: string) {
 }
 
 function setRunStatus(r: Run, status: Run['status'], ts: string) {
+  const left = r.status === 'needs_human' && status !== 'needs_human';
   r.status = status;
-  if (['merged', 'failed', 'cancelled'].includes(status)) {
+  if (left) runLeftNeedsHuman(r);
+  if (['merged', 'failed', 'cancelled', 'ready'].includes(status)) {
     r.endedAt = ts;
     const issue = db.issues[r.repo]?.find((i) => i.number === r.issueNumber);
     if (issue) {
@@ -788,12 +793,14 @@ function runStage(r: Run, role: StageRole, round: number, plan: Plan, startMs: n
       ? updateBuilderScript(upd.target, upd.migrations.length ? 'migration' : 'conflict')
       : def ? sandboxBuilderScript(round, def.image, def.setup, def.services.map((x) => x.name), def.platforms) : builderScript(round, prev);
     if (upd) steps = [{ kind: 'system', level: 'info', text: `Update round ${upd.number}: merged \`${upd.target}\` (${upd.incomingCount} commits)${upd.conflicts.length ? `; conflicts in ${upd.conflicts.map((c) => `\`${c}\``).join(', ')}` : ''}`, ms: 50 }, ...steps];
+    // Like the backend: after committing, a builder with an approved sandbox VM deploys there and checks it (first build only).
+    if (round === 0) steps = [...steps, ...sandboxVmBuilderSteps(r)];
     // Like the backend: the builder's transcript starts with the run's sandbox decision.
     if (sb && sb.state !== 'disabled') steps = [{ kind: 'system', level: sb.state === 'approved' ? 'info' : 'warn', text: `Sandbox: ${sb.reason}`, ms: 50 }, ...steps];
     if (def && !db.runningSandboxes.has(r.id)) {
       const at = iso(Math.min(Date.now(), p.endMs + 4000));
       // Like the backend: one container per image used — the default one, then each platform the builder tests on.
-      const containers = [{ platform: 'default', image: def.image, createdAt: at }, ...def.platforms.map((x) => ({ platform: x.name, image: x.image, createdAt: at }))];
+      const containers = [{ platform: 'default', image: def.image, createdAt: at, kind: 'build' as const }, ...def.platforms.map((x) => ({ platform: x.name, image: x.image, createdAt: at, kind: 'build' as const }))];
       db.runningSandboxes.set(r.id, { createdAt: at, builderSessionId: s.id, containers });
       if (sb && def.platforms.length) sb.platformsUsed = ['default', ...def.platforms.map((x) => x.name)];
       feed({ type: 'sandboxes', runId: r.id, change: 'created' });
@@ -815,6 +822,12 @@ function runStage(r: Run, role: StageRole, round: number, plan: Plan, startMs: n
         ? [{ severity: 'info', file: null, detail: 'Consider a toast when carts are merged on login.' }]
         : [];
     steps = reviewerScript(role, verdict, summary);
+    // Like the backend: an approved run's ux reviewer starts the app in the read-only review sandbox.
+    const reviewDef = r.sandbox?.state === 'approved' ? db.sandboxFiles.get(r.repo)?.definition : null;
+    if (role === 'ux' && reviewDef && r.sandbox) {
+      steps = [...reviewSandboxSteps(reviewDef.image, reviewDef.setup), ...steps];
+      r.sandbox.reviewUsed = true;
+    }
     if (live) steps = [{ kind: 'pause', ms: reviewerMs[role] * 1500 }, ...steps];
     const captions = plan.noScreenshots ? [] : screenshotCaptions[role]?.(round) ?? [];
     if (plan.noScreenshots && (role === 'ux' || role === 'ui-design'))
@@ -894,9 +907,18 @@ function pipeline(r: Run, plan: Plan, owner: User, startMs: number) {
     setRunStatus(r, 'approving', iso(t));
     runStage(r, 'approver', round, plan, t, owner, (t2, stage) => {
       if (fail()) return;
+      // Like the server: what the verdict does follows the policy stored on the run (ARCHITECTURE §6 "Merge policy").
+      if (r.mergePolicy === 'github') {
+        r.error = null;
+        setRunStatus(r, 'ready', iso(t2 + 1500));
+        return;
+      }
       if (stage.verdict === 'ESCALATE') r.error = `The approver escalated: ${stage.summary}`;
-      if (stage.verdict === 'APPROVE' && plan.refuseMerge) return refuseMerge(r, plan.refuseMerge, iso(t2 + 1500));
-      setRunStatus(r, stage.verdict === 'APPROVE' ? 'merged' : 'needs_human', iso(t2 + 1500));
+      else if (r.mergePolicy === 'owner_approves') {
+        r.error = `The approver recommends merging: ${stage.summary} This project requires the run owner's approval before every merge.`;
+      }
+      if (stage.verdict === 'APPROVE' && r.mergePolicy !== 'owner_approves' && plan.refuseMerge) return refuseMerge(r, plan.refuseMerge, iso(t2 + 1500));
+      setRunStatus(r, stage.verdict === 'APPROVE' && r.mergePolicy !== 'owner_approves' ? 'merged' : 'needs_human', iso(t2 + 1500));
     });
   };
   spec();
@@ -1091,6 +1113,40 @@ export function setProjectIconFromRepository(repo: string, rawPath: string) {
   replaceProjectIcon(repo, url);
 }
 
+const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+const TEAM_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/;
+
+/** The project's merge policy now (ARCHITECTURE §6 "Merge policy"). */
+export function policyOf(repo: string): MergePolicy {
+  return db.projects.find((x) => x.name === repo)?.settings.mergePolicy ?? 'automatic';
+}
+
+/** Validates and stores the project's settings like the server; the caller checked admin and visibility. */
+export function setProjectSettings(repo: string, body: Partial<ProjectSettings>) {
+  const p = db.projects.find((x) => x.name === repo);
+  if (!p) throw new MockError(404, 'not_found', `No repository ${repo} in ${ORG}.`);
+  if (!body.mergePolicy || !['automatic', 'owner_approves', 'github'].includes(body.mergePolicy)) {
+    throw new MockError(400, 'bad_request', 'mergePolicy must be one of automatic, owner_approves, github');
+  }
+  const list = (raw: string[] | undefined, re: RegExp, what: string, field: string) => {
+    const out: string[] = [];
+    for (const entry of raw ?? []) {
+      const e = entry.trim().replace(/^@/, '').trim();
+      if (!e) continue;
+      if (!re.test(e)) throw new MockError(400, 'bad_request', `${field}: '${e.slice(0, 100)}' is not a valid ${what}`);
+      if (!out.some((x) => x.toLowerCase() === e.toLowerCase())) out.push(e);
+    }
+    if (out.length > 15) throw new MockError(400, 'bad_request', `${field}: at most 15 entries`);
+    return out;
+  };
+  p.settings = {
+    mergePolicy: body.mergePolicy,
+    reviewers: list(body.reviewers, LOGIN_RE, 'GitHub login', 'reviewers'),
+    teamReviewers: list(body.teamReviewers, TEAM_RE, 'team slug', 'teamReviewers'),
+  };
+  for (const r of db.releases.values()) if (r.repo === repo) touchRelease(r);
+}
+
 export function deleteProjectIcon(repo: string) {
   replaceProjectIcon(repo, null);
 }
@@ -1210,9 +1266,14 @@ function makeRun(repo: string, issue: Issue, owner: User, createdMs: number, sta
     endedAt: null,
     stages: [],
     sandbox: runSandboxFor(repo),
+    sandboxVm: runSandboxVmFor(repo),
     releaseId: release?.id ?? null,
     baseBranch: release ? `release/${release.name}` : null,
     conversation: { sessionId: null, review: 'none', followUpFrom: null },
+    // The policy in force now, fixed for the run; a release run merges into its release branch as `automatic`.
+    mergePolicy: release ? 'automatic' : policyOf(repo),
+    mergedOnGitHub: false,
+    mergedBy: null,
   };
   for (const role of ['spec-writer', 'builder', ...reviewers, 'approver'] as StageRole[]) pendingStage(r, role, 0);
   db.runs.set(r.id, r);
@@ -1305,7 +1366,7 @@ export function startRun(repo: string, issueNumber: number, owner: User, started
   const target = release ? null : workspaceTarget(repo, issue, owner);
   if (issue.activeRunId) throw new MockError(409, 'active_run_exists', `Issue #${issueNumber} already has an active run`);
   const r = makeRun(repo, issue, owner, createdMs, startedBy, release);
-  if (target) Object.assign(r, { targetRepo: target.repository, targetDirectory: target.directory, baseBranch: target.branch, sandbox: runSandboxFor(target.repository) });
+  if (target) Object.assign(r, { targetRepo: target.repository, targetDirectory: target.directory, baseBranch: target.branch, sandbox: runSandboxFor(target.repository), sandboxVm: runSandboxVmFor(target.repository) });
   touchRun(r, iso(createdMs));
   const full: Plan = {
     changes: { code: ['Merge logic duplicates quantity handling from `CheckoutService`; extract a **shared helper**.'], security: ['Cart routes accept any cart id; ownership is not checked (**IDOR**).', 'Log line prints the full cart including email.'] },
@@ -1320,6 +1381,9 @@ export function startRun(repo: string, issueNumber: number, owner: User, started
 
 export function approveRun(r: Run, by: User) {
   if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner can approve this run.');
+  if (r.mergePolicy === 'github') {
+    throw new MockError(409, 'merge_on_github', `This project merges on GitHub: Agern does not merge. Review and merge pull request ${r.prUrl ?? '(none)'} on GitHub.`);
+  }
   if (r.status !== 'needs_human') throw new MockError(409, 'conflict', 'Run is not waiting for a human.');
   const adv = r.conversation.sessionId ? db.sessions.get(r.conversation.sessionId) : undefined;
   if (r.conversation.review === 'running') throw new MockError(409, 'review_in_progress', 'Changes from the conversation are being reviewed; wait for the reviews.');
@@ -1328,6 +1392,19 @@ export function approveRun(r: Run, by: User) {
   if (adv) setStatus(adv, 'done', iso(Date.now()));
   r.error = null;
   setRunStatus(r, 'merged', iso(Date.now()));
+}
+
+/** "Merge anyway" (docs/ARCHITECTURE.md §6 "Checks before a merge"): owner only, bound to the checks' head commit. */
+export function mergeAnywayRun(r: Run, by: User, headSha: string) {
+  if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner of this run can merge it.');
+  const c = r.checks;
+  if ((r.status !== 'needs_human' && r.status !== 'waiting_for_checks') || !r.prNumber || !c || !['failed', 'pending', 'awaiting', 'unknown'].includes(c.state))
+    throw new MockError(409, 'run_not_overridable', 'Only a run whose checks blocked its merge can be merged anyway.');
+  if (c.sha !== headSha) throw new MockError(409, 'checks_changed', 'The checks changed since you looked. Look at them again before merging.');
+  const now = iso(Date.now());
+  r.checks = { ...c, waitingSince: null, deadline: null, overriddenBy: by.username, overriddenAt: now };
+  r.error = null;
+  setRunStatus(r, 'merged', now);
 }
 
 export function cancelRun(r: Run) {
@@ -1445,6 +1522,7 @@ const RELEASE_NAME_RULE =
 
 /** Strictly increasing `updatedAt`, like the server's touch. */
 function touchRelease(r: Release) {
+  r.mergePolicy = policyOf(r.repo);
   const now = Date.now();
   r.updatedAt = iso(Math.max(now, Date.parse(r.updatedAt) + 1));
   feed({ type: 'release', repo: r.repo, release: r });
@@ -1488,6 +1566,7 @@ export function createRelease(
 ): Release {
   const { name, description } = validRelease(repo, body.name, body.description ?? '');
   const mode = validMode(body.mode);
+  if (mode === 'automatic') requireAutomaticAllowed(repo);
   const r: Release = {
     id: uid(),
     repo,
@@ -1517,6 +1596,7 @@ export function createRelease(
     releasedBy: null,
     mergeCommit: null,
     mode,
+    mergePolicy: policyOf(repo),
     releasedAutomatically: false,
     checks: null,
     repositories: [],
@@ -1573,6 +1653,7 @@ export function setReleaseMode(r: Release, rawMode: string, by: User) {
   if (r.status === 'released') notEditable(r);
   if (r.status === 'cancelled') throw new MockError(409, 'release_closed', 'The release is cancelled');
   if (r.status !== 'planning') guardRelease(r, by, mode === 'automatic' ? 'owner' : 'ownerOrAdmin');
+  if (mode === 'automatic') requireAutomaticAllowed(r.repo);
   if (r.mode === mode) return r;
   r.mode = mode;
   touchRelease(r);
@@ -1854,6 +1935,7 @@ function evaluateRelease(r: Release) {
     const checks = releaseChecks.get(`${r.repo}:${r.branch}`) ?? { state: 'none', detail: 'No checks' };
     r.checks = { ...checks, sha: `${r.name.length}f3a9c1e7b2d4${r.prNumber}`.slice(0, 40) };
   } else r.mergeState = 'unknown';
+  r.syncNeeded = !r.repositories.length && !!r.branch && (r.mergeState === 'conflict' || (r.behindBy ?? 0) > 0 || !!r.migrationConflict);
   r.notice = null;
   touchRelease(r);
   // Automatic release: the same merge as an approval by the owner, once complete, clean and green; blockers wait.
@@ -1883,10 +1965,52 @@ export function checkRelease(r: Release, by: User) {
   return r;
 }
 
+/**
+ * "Bring up to date" (owner or admin). The mock has no agents for it: it records a finished sync at once and the
+ * release merges cleanly afterwards.
+ */
+export function syncRelease(r: Release, by: User) {
+  if (r.status === 'planning' || r.status === 'scheduled') throw conflictOf(r);
+  guardRelease(r, by, 'ownerOrAdmin');
+  if (r.status !== 'ready') throw conflictOf(r);
+  if (r.repositories.length)
+    throw new MockError(409, 'release_sync_unsupported', `Bringing a release of several repositories up to date is not supported yet; merge the base branch into \`${r.branch}\` in each repository by hand.`);
+  if (r.sync?.state === 'running')
+    throw new MockError(409, 'release_sync_running', `Release "${r.name}" is already being brought up to date (run ${r.sync.runId}).`);
+  if (!r.syncNeeded)
+    throw new MockError(409, 'release_up_to_date', `\`${r.branch}\` is not behind \`main\` and has no conflicts. Use "Check again" if that changed.`);
+  const now = new Date().toISOString();
+  r.sync = {
+    runId: uid(),
+    state: 'done',
+    by: { username: by.username, displayName: by.displayName },
+    startedAt: now,
+    endedAt: now,
+    pushedSha: Array.from({ length: 40 }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join(''),
+    error: null,
+  };
+  conflictingReleases.delete(`${r.repo}:${r.branch}`);
+  r.mergeState = 'clean';
+  r.behindBy = 0;
+  r.migrationConflict = false;
+  r.syncNeeded = false;
+  touchRelease(r);
+  return r;
+}
+
 /** Owner-only approval: merges the release pull request (rebase, or a merge commit if it cannot be rebased), closes the issues, deletes the branch. */
+function requireAutomaticAllowed(repo: string) {
+  if (policyOf(repo) !== 'automatic') {
+    throw new MockError(409, 'release_mode_not_allowed', 'This project requires a human approval; its releases cannot be released automatically.');
+  }
+}
+
 export function approveRelease(r: Release, by: User) {
   if (r.status === 'planning' || r.status === 'scheduled') throw conflictOf(r);
   guardRelease(r, by, 'owner');
+  if (policyOf(r.repo) === 'github') {
+    throw new MockError(409, 'merge_on_github', 'This project merges on GitHub: Agern does not merge. Review and merge the release pull request on GitHub.');
+  }
   if (r.status !== 'ready') throw conflictOf(r);
   const held = r.issues.filter((i) => i.state === 'held');
   if (held.length)
@@ -2159,6 +2283,7 @@ function seed() {
     activeAgents: 0,
     activeRuns: 0,
     iconUrl: null,
+    settings: { mergePolicy: 'automatic', reviewers: [], teamReviewers: [] },
   });
   db.projects = [
     proj('web-shop', 'Storefront and checkout for egernet.dk', 'Kotlin', 9, 4),

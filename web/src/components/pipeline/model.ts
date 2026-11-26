@@ -85,7 +85,11 @@ export function buildNodes(run: Run, sessions: Map<string, AgentSession>): Recor
   const nodes = {} as Record<NodeId, NodeView>;
   const base = (id: NodeId): NodeView => ({ id, title: ROLE_TITLE[id], sub: null, model: null, state: 'pending', verdict: null, tone: null, stage: null, startedAt: null, endedAt: null, note: null, round: null });
 
-  nodes.issue = { ...base('issue'), title: `#${run.issueNumber}`, sub: run.issueTitle, state: 'done', note: run.issueKind, startedAt: run.createdAt };
+  const sync = run.kind === 'sync';
+  // A sync run belongs to no issue: its first node is the release branch it brings up to date.
+  nodes.issue = sync
+    ? { ...base('issue'), title: 'sync', sub: run.issueTitle, state: 'done', note: run.baseBranch, startedAt: run.createdAt }
+    : { ...base('issue'), title: `#${run.issueNumber}`, sub: run.issueTitle, state: 'done', note: run.issueKind, startedAt: run.createdAt };
 
   // Run.round counts fix rounds: 0 is the initial build, 1..maxRounds are fix rounds.
   const currentRound = Math.max(run.round, latestStage(run, 'builder')?.round ?? 0);
@@ -136,15 +140,48 @@ export function buildNodes(run: Run, sessions: Map<string, AgentSession>): Recor
     round: currentRound,
   };
 
-  nodes.merge = { ...base('merge'), title: run.targetRepo && run.baseBranch ? `merge to ${run.baseBranch}` : run.baseBranch ? 'merge to release' : ROLE_TITLE.merge, state: run.status === 'merged' ? 'done' : TERMINAL_FAIL.includes(run.status) ? 'skipped' : 'pending', sub: run.prNumber ? `PR #${run.prNumber}` : null, tone: run.status === 'merged' ? 'pass' : null, verdict: run.status === 'merged' ? 'MERGED' : null, endedAt: run.status === 'merged' ? run.endedAt : null };
+  // Merge policy (ARCHITECTURE §6 "Merge policy"): `github` runs are merged on GitHub by the team, never by Agern.
+  const onGitHub = run.mergePolicy === 'github';
+  const mergedOnGitHub = run.status === 'merged' && !!run.mergedOnGitHub;
+  const prSub = run.prNumber ? `PR #${run.prNumber}` : null;
+  nodes.merge = {
+    ...base('merge'),
+    title: run.targetRepo && run.baseBranch ? `merge to ${run.baseBranch}` : run.baseBranch ? 'merge to release' : onGitHub ? 'merge on GitHub' : ROLE_TITLE.merge,
+    state: run.status === 'merged' ? 'done' : TERMINAL_FAIL.includes(run.status) ? 'skipped' : 'pending',
+    sub: mergedOnGitHub ? 'merged on GitHub' : run.status === 'ready' ? `${prSub ?? 'PR'} · waiting on GitHub` : prSub,
+    tone: run.status === 'merged' ? 'pass' : null,
+    verdict: run.status === 'merged' ? 'MERGED' : null,
+    endedAt: run.status === 'merged' ? run.endedAt : null,
+  };
+  // Checks before the merge (docs/ARCHITECTURE.md §6 "Checks before a merge").
+  if (run.status === 'waiting_for_checks') {
+    nodes.merge = { ...nodes.merge, state: 'running', sub: 'waiting for checks' };
+  } else if (run.status === 'needs_human' && run.failureKind === 'checks') {
+    nodes.merge = { ...nodes.merge, state: 'failed', tone: 'fail', sub: 'checks not passed' };
+  } else if (run.status === 'merged' && run.checks?.overriddenBy) {
+    nodes.merge = { ...nodes.merge, note: 'despite checks' };
+  }
   const approver = latestStage(run, 'approver');
   const review = run.conversation.review;
   const waitingSub = review === 'running' ? 'reviewing changes' : review === 'required' ? 'changes not reviewed' : 'waiting for owner';
-  const approvedByHuman = run.status === 'merged' && (approver?.verdict === 'ESCALATE' || approver?.status === 'skipped');
+  // Under `owner_approves` every merge is the owner's, also after an approver APPROVE; a merge on GitHub is nobody's in Agern.
+  // A sync run has no approver and nothing for a human to approve: it never merges into the default branch.
+  const approvedByHuman =
+    !sync && run.status === 'merged' && !mergedOnGitHub && (run.mergePolicy === 'owner_approves' || approver?.verdict === 'ESCALATE' || approver?.status === 'skipped');
+  if (sync) {
+    const pushed = !!run.syncPushedSha;
+    nodes.merge = {
+      ...nodes.merge,
+      title: `push ${run.baseBranch ?? 'release branch'}`,
+      sub: run.status === 'merged' ? (pushed ? 'up to date' : 'already up to date') : pushed ? `pushed ${run.syncPushedSha!.slice(0, 7)}` : null,
+      verdict: run.status === 'merged' ? 'UP TO DATE' : null,
+      note: null,
+    };
+  }
   nodes.human = {
     ...base('human'),
-    state: run.status === 'needs_human' ? 'running' : approvedByHuman ? 'done' : TERMINAL_FAIL.includes(run.status) || run.status === 'merged' ? 'skipped' : 'pending',
-    sub: run.status === 'needs_human' ? waitingSub : approvedByHuman ? 'approved by owner' : run.status === 'merged' ? 'not needed' : '/factory approve',
+    state: run.status === 'needs_human' ? 'running' : approvedByHuman ? 'done' : sync || TERMINAL_FAIL.includes(run.status) || run.status === 'merged' || run.status === 'ready' ? 'skipped' : 'pending',
+    sub: run.status === 'needs_human' ? waitingSub : approvedByHuman ? 'approved by owner' : sync || run.status === 'merged' || run.status === 'ready' ? 'not needed' : onGitHub ? 'review on GitHub' : '/factory approve',
     tone: run.status === 'needs_human' ? 'escalate' : approvedByHuman ? 'pass' : null,
     verdict: run.status === 'needs_human' ? 'WAITING' : approvedByHuman ? 'APPROVED' : null,
   };

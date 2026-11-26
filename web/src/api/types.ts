@@ -48,6 +48,23 @@ export type Project = {
    * Filled by `GET /api/projects/{repo}` only (always null in the project list).
    */
   workspace?: Workspace | null;
+  /** Settings an admin sets (ARCHITECTURE §6 "Merge policy"); the defaults without a stored row. */
+  settings: ProjectSettings;
+};
+
+/**
+ * How a project's runs reach the default branch (ARCHITECTURE §6 "Merge policy"): `automatic` = the approver agent may
+ * merge; `owner_approves` = every merge waits for the run owner; `github` = Agern never merges, the team merges on GitHub.
+ */
+export type MergePolicy = 'automatic' | 'owner_approves' | 'github';
+export const MERGE_POLICIES: MergePolicy[] = ['automatic', 'owner_approves', 'github'];
+
+export type ProjectSettings = {
+  mergePolicy: MergePolicy;
+  /** GitHub logins requested as reviewers (policy `github` only). */
+  reviewers: string[];
+  /** Team slugs of the organisation requested as reviewers (policy `github` only). */
+  teamReviewers: string[];
 };
 
 /** A member repository of a workspace, as the caller sees it. */
@@ -264,11 +281,37 @@ export type Release = {
   releasedAutomatically: boolean;
   /** The checks on the release pull request, as last read; null until it has one. */
   checks: ReleaseChecks | null;
+  /** The project's current merge policy: `github` refuses Agern's approval; anything but `automatic` refuses automatic mode. */
+  mergePolicy?: MergePolicy;
   /**
    * Empty unless the release spans several repositories: then member repositories in merge order (untouched last),
    * followed by the project repository (`directory` null). The fields above describe the project repository's PR.
    */
   repositories: ReleaseRepo[];
+  /** Commits on `targetBranch` that are not on the release branch, as last compared; null = not known. */
+  behindBy?: number | null;
+  /** The last evaluation found migrations of the release branch that collide with `targetBranch`'s. */
+  migrationConflict?: boolean;
+  /** "Bring up to date" is offered: ready, one repository, and a conflict, a branch behind or a migration conflict. */
+  syncNeeded?: boolean;
+  /** The release's latest run that brought it up to date, or null. */
+  sync?: ReleaseSync | null;
+};
+
+/**
+ * `running` (queued, building, reviewing), `done` (merged), `failed` (failed or cancelled, nothing pushed) or
+ * `unreviewed` (failed or cancelled after its merge was pushed).
+ */
+export type ReleaseSyncState = 'running' | 'done' | 'failed' | 'unreviewed';
+
+export type ReleaseSync = {
+  runId: string;
+  state: ReleaseSyncState;
+  by: Owner;
+  startedAt: string;
+  endedAt?: string | null;
+  pushedSha?: string | null;
+  error?: string | null;
 };
 
 /** Building or paused: at most one per project. */
@@ -458,10 +501,14 @@ export type RunStatus =
   | 'building'
   | 'reviewing'
   | 'approving'
+  /** Approved; merges by itself once the checks on the pull request's head commit pass (docs/ARCHITECTURE.md §6). */
+  | 'waiting_for_checks'
   | 'merged'
   | 'needs_human'
   | 'failed'
-  | 'cancelled';
+  | 'cancelled'
+  /** Passed every reviewer under policy `github`: the pull request waits on GitHub (terminal; followed until merged or closed). */
+  | 'ready';
 
 export type Run = {
   id: string;
@@ -504,8 +551,22 @@ export type Run = {
   /** A workspace run: the member repository and directory it changes (its `baseBranch` is the member's); null otherwise. */
   targetRepo?: string | null;
   targetDirectory?: string | null;
+  /** The project's merge policy when the run started; never changes. */
+  mergePolicy?: MergePolicy;
+  /** The pull request was merged on GitHub, outside Agern. */
+  mergedOnGitHub?: boolean;
+  /** Who merged it on GitHub, when GitHub reports it. */
+  mergedBy?: string | null;
+  /** The checks on the pull request's head commit as last evaluated before a merge; null until the first evaluation. */
+  checks?: RunChecks | null;
   /** Set while the run waits for the network before trying again; it keeps its status meanwhile. */
   waiting?: RunWait | null;
+  /** `issue`, or `sync` for a run that brings a release up to date (it belongs to no issue: `issueNumber` is 0). */
+  kind?: RunKind;
+  /** A sync run: the commit it last pushed to its release branch. */
+  syncPushedSha?: string | null;
+  /** The run's sandbox VM decision and its human preview (docs/SANDBOX-VMS.md); null for sync runs and older runs. */
+  sandboxVm?: RunSandboxVm | null;
   /** Update rounds ("Update and merge") started on the run, and its limit. */
   updateRounds?: number;
   maxUpdateRounds?: number;
@@ -544,9 +605,40 @@ export type RunUpdate = {
   summary: string;
 };
 
+
+export type RunKind = 'issue' | 'sync';
+
+/** A run that brings a release up to date (docs/ARCHITECTURE.md §6 "Bringing a release up to date"). */
+export const isSyncRun = (r: Pick<Run, 'kind'>) => r.kind === 'sync';
+
+/** How lists name a run: `#<issue>`, or `sync` for a run that belongs to no issue (never `#0`). */
+export const runRef = (r: { kind?: RunKind; issueNumber: number }) => (r.kind === 'sync' || r.issueNumber === 0 ? 'sync' : `#${r.issueNumber}`);
+
+/** One check that has not passed. Name and URL come from GitHub (untrusted); `url` is only ever an `https://` URL. */
+export type RunCheckItem = { name: string; state: 'failed' | 'pending'; conclusion: string | null; url: string | null };
+
+/** The checks a run's merge was decided on (docs/ARCHITECTURE.md §6 "Checks before a merge"). */
+export type RunChecks = {
+  state: 'awaiting' | 'pending' | 'passed' | 'failed' | 'none' | 'unknown';
+  /** The head commit they were read for. */
+  sha: string;
+  detail: string;
+  /** At most 50. */
+  items: RunCheckItem[];
+  /** Set only while `waiting_for_checks`. */
+  waitingSince: string | null;
+  deadline: string | null;
+  /** Set when the owner merged anyway. */
+  overriddenBy: string | null;
+  overriddenAt: string | null;
+};
+
+/** Checks states that block a merge (and that the owner may merge anyway). */
+export const BLOCKING_CHECK_STATES: RunChecks['state'][] = ['failed', 'pending', 'awaiting', 'unknown'];
+
 export type FailureKind =
   | 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other'
-  | 'submodule_commit_missing' | 'migration_conflict' | 'merge_conflict';
+  | 'submodule_commit_missing' | 'checks' | 'migration_conflict' | 'merge_conflict';
 export type FailedStep = 'push' | 'pull_request' | 'merge';
 
 /**
@@ -590,6 +682,8 @@ export type RunSandbox = {
   platforms: string[];
   /** Where the builder ran commands: `default` and platform names, in first-use order (only when there are platforms). */
   platformsUsed: string[];
+  /** The ux and ui-design reviewers ran the app in a read-only review sandbox at least once (absent for older runs). */
+  reviewUsed?: boolean;
 };
 
 /** A sidecar's readiness check: run inside the service until it exits 0, for at most `timeoutSeconds`. */
@@ -638,6 +732,166 @@ export type SandboxStatus = {
   approvers: Owner[];
 };
 
+/** A target of a valid `.agern/deploy.yml` (docs/DEPLOY.md). */
+export type DeployTarget = {
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+  /** e.g. `ssh-ed25519`. */
+  hostKeyType: string;
+  /** OpenSSH style, `SHA256:…`. */
+  hostKeyFingerprint: string;
+  description: string | null;
+};
+
+export type DeployApproval = { sha256: string; content: string; approvedBy: Owner; approvedAt: string };
+
+/** The project's deploy key pair: only the public half ever leaves the server. */
+export type DeployKey = { publicKey: string; fingerprint: string; createdBy: Owner; createdAt: string };
+
+/** `GET /api/projects/{repo}/deploy`: the deploy targets on the default branch, their approval and the project's key. */
+export type DeployStatus = {
+  repo: string;
+  /** FACTORY_DEPLOY is not off. Files can be approved and keys generated either way. */
+  enabled: boolean;
+  /** `fake`: commands only pretend to run (development). */
+  mode: 'ssh' | 'fake' | 'off';
+  path: string;
+  branch: string;
+  /** `pending`: valid, but this exact content is not approved. */
+  state: 'none' | 'invalid' | 'pending' | 'approved';
+  sha256: string | null;
+  content: string | null;
+  errors: string[];
+  /** The targets of a valid file (pending or approved); empty otherwise. */
+  targets: DeployTarget[];
+  approval: DeployApproval | null;
+  approvers: Owner[];
+  key: DeployKey | null;
+};
+
+/** `POST /api/projects/{repo}/deploy/targets/{name}/check`: connects, verifies the host key, authenticates, disconnects. */
+export type DeployCheck = {
+  target: string;
+  ok: boolean;
+  /** Where it stopped: `ok`, or the step that failed. */
+  stage: 'connect' | 'host_key' | 'auth' | 'ok';
+  message: string;
+  durationMs: number;
+};
+
+/**
+ * A run's sandbox VM decision (docs/SANDBOX-VMS.md), fixed when it starts, plus what happened with the VM since.
+ * `disabled` = FACTORY_SANDBOX_VM is off; `none` = no `.agern/sandbox-vm.yml`; `invalid`; `unapproved`; `approved`.
+ */
+export type RunSandboxVmState = 'disabled' | 'none' | 'invalid' | 'unapproved' | 'approved';
+export type RunSandboxVm = {
+  state: RunSandboxVmState;
+  reason: string;
+  sha256: string | null;
+  /** The VM's label, host, SSH user and URL (`approved` only). */
+  name: string | null;
+  host: string | null;
+  user: string | null;
+  url: string | null;
+  /** The builder deployed to the VM at least once. */
+  used: boolean;
+  /** How long a human preview holds the VM (FACTORY_SANDBOX_VM_PREVIEW_MINUTES). */
+  previewMinutes: number;
+  /** The latest human preview of the run; null when nobody started one. */
+  preview: SandboxVmPreview | null;
+};
+
+export type SandboxVmPreviewState = 'deploying' | 'ready' | 'failed' | 'released';
+
+/** A human preview of a run on its sandbox VM (`POST /api/runs/{id}/sandbox-vm/preview`). */
+export type SandboxVmPreview = {
+  state: SandboxVmPreviewState;
+  /** The commit deployed (or being deployed). */
+  sha: string | null;
+  url: string | null;
+  startedBy: Owner | null;
+  startedAt: string | null;
+  /** `ready`: until when the preview holds the VM. */
+  expiresAt: string | null;
+  /** `released` / `failed`: when the preview ended. */
+  endedAt: string | null;
+  /** `released` because the preview time ran out. */
+  expired: boolean;
+  /** `failed`: `upload`, `checkout`, `setup`, `ready` or `connect`. */
+  failedStep: string | null;
+  error: string | null;
+  /** `failed`: the tail of the failed step's output (at most 20,000 characters). */
+  output: string | null;
+};
+
+/** The VM of a valid `.agern/sandbox-vm.yml`. */
+export type SandboxVm = {
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+  hostKeyType: string;
+  /** OpenSSH style, `SHA256:…`. */
+  hostKeyFingerprint: string;
+  description: string | null;
+  url: string | null;
+  checkout: string;
+  setup: string | null;
+  ready: SandboxReady | null;
+  reset: string | null;
+};
+
+/** Who holds a sandbox VM now. `runId`, `repo` and `issueNumber` are withheld (`visible` false) from viewers who cannot see the holder's project. */
+export type SandboxVmLease = {
+  /** `build` (a run's builder) or `preview` (a human). */
+  kind: 'build' | 'preview';
+  state: 'held' | 'resetting';
+  since: string;
+  expiresAt: string | null;
+  visible: boolean;
+  runId: string | null;
+  repo: string | null;
+  issueNumber: number | null;
+};
+
+/** `GET /api/projects/{repo}/sandbox-vm`: the definition on the default branch, its approval, the key and the lease. */
+export type SandboxVmStatus = {
+  repo: string;
+  /** FACTORY_SANDBOX_VM is not off. Definitions can be approved either way. */
+  enabled: boolean;
+  /** `fake`: commands only pretend to run (development). */
+  mode: 'ssh' | 'fake' | 'off';
+  path: string;
+  branch: string;
+  /** `pending`: valid, but this exact content is not approved. */
+  state: 'none' | 'invalid' | 'pending' | 'approved';
+  sha256: string | null;
+  content: string | null;
+  errors: string[];
+  vm: SandboxVm | null;
+  approval: SandboxApproval | null;
+  approvers: Owner[];
+  /** The project's deploy key (shared with deploy targets); null when it has none. */
+  key: DeployKey | null;
+  /** The VM's lease (keyed by host and port, so possibly held by another project's run); null when free. */
+  lease: SandboxVmLease | null;
+  previewMinutes: number;
+};
+
+/** `POST /api/projects/{repo}/sandbox-vm/check`: how far a connection got, and the readiness check. */
+export type SandboxVmCheck = {
+  ok: boolean;
+  /** `ok`, or the step that failed. */
+  stage: 'connect' | 'host_key' | 'auth' | 'ready' | 'ok';
+  message: string;
+  durationMs: number;
+  /** Stage `ready`: the readiness command's exit code and output tail. */
+  exitCode: number | null;
+  output: string | null;
+};
+
 /** A sandbox that exists right now (`GET /api/admin/sandboxes`). */
 export type RunningSandbox = {
   runId: string;
@@ -667,7 +921,8 @@ export type RunningSandbox = {
   memoryTotal: string;
 };
 
-export type SandboxContainer = { platform: string; image: string; createdAt: string };
+/** `build`: the default image or a platform of the build sandbox; `review`: the review sandbox's container (platform `default`). */
+export type SandboxContainer = { platform: string; image: string; createdAt: string; kind: 'build' | 'review' };
 
 /** Admin overview of the sandbox runtime: its limits and the sandboxes that exist (oldest first). */
 export type SandboxOverview = {
@@ -700,6 +955,49 @@ export type SandboxLog = {
   outputTruncated: boolean;
   /** Where it ran: null when the definition has no platforms, else `default` or the platform's name. */
   platform?: string | null;
+  /** Ran in the read-only review sandbox of the ux and ui-design reviewers. */
+  review?: boolean;
+};
+
+/** On `system` events of deploy commands and copies in a chat: what ran on which target, and its full output. */
+export type DeployLog = {
+  kind: 'exec' | 'copy';
+  target: string;
+  host: string;
+  port: number;
+  user: string;
+  command?: string;
+  path?: string;
+  dest?: string;
+  bytes?: number;
+  /** null: no exit status (a copy, a connection failure, a signal). */
+  exitCode: number | null;
+  timedOut: boolean;
+  durationMs: number;
+  output: string;
+  outputTruncated: boolean;
+  /** Why the operation failed before or instead of an exit status (connect, host key, authentication, transfer). */
+  error: string | null;
+};
+
+/** On `system` events of a run's builder: one step of a sandbox VM deploy, a command, or a reset (docs/SANDBOX-VMS.md). */
+export type SandboxVmLog = {
+  kind: 'deploy' | 'exec' | 'reset';
+  /** The deploy step; null for `exec` and `reset`. */
+  step: 'upload' | 'checkout' | 'setup' | 'ready' | null;
+  vm: string;
+  host: string;
+  port: number;
+  user: string;
+  command: string | null;
+  sha: string | null;
+  /** null: no exit status (an upload, a connection failure, a signal). */
+  exitCode: number | null;
+  timedOut: boolean;
+  durationMs: number;
+  output: string;
+  outputTruncated: boolean;
+  error: string | null;
 };
 
 export type EventType = 'user' | 'claude' | 'system' | 'status' | 'images' | 'checkout';
@@ -753,7 +1051,7 @@ export type ClientConfig = {
 };
 
 export type UserPayload = { text: string; username: string; attachments?: Attachment[] };
-export type SystemPayload = { level: 'info' | 'warn' | 'error'; text: string; messageId?: string; sandbox?: SandboxLog };
+export type SystemPayload = { level: 'info' | 'warn' | 'error'; text: string; messageId?: string; sandbox?: SandboxLog; deploy?: DeployLog; sandboxVm?: SandboxVmLog };
 export type StatusPayload = { status: SessionStatus };
 
 export type Settings = {
@@ -835,8 +1133,50 @@ export type FeedFrame =
   /** Private to the receiving user: their own Claude usage changed; reload `GET /api/me/usage`. */
   | { type: 'usage' };
 
+/** `GET /api/github/status` (docs/ARCHITECTURE.md §6 "GitHub status"): whether GitHub works for this Agern. */
+export type GitHubVerdictState = 'working' | 'degraded' | 'down';
+export type GitHubCallCounts = { calls: number; serverErrors: number; network: number; rateLimited: number; auth: number };
+export type GitHubRateLimit = { limit: number; remaining: number; resetAt: string; observedAt: string };
+export type GitHubErrorClass = 'server_error' | 'network' | 'rate_limited' | 'auth';
+export type GitHubKindStatus = {
+  kind: string;
+  label: string;
+  last15m: GitHubCallCounts;
+  last24h: GitHubCallCounts;
+  lastError: { at: string; class: GitHubErrorClass; status: number | null; requestId: string | null; message: string } | null;
+};
+export type GitHubOfficialStatus = {
+  state: 'ok' | 'unreachable' | 'disabled';
+  /** null unless state = ok. */
+  indicator: 'none' | 'minor' | 'major' | 'critical' | 'unknown' | null;
+  description: string | null;
+  /** Non-operational components only; `relevant`: one Agern depends on. */
+  components: { name: string; status: string; relevant: boolean }[];
+  incidents: { title: string; status: string; impact: string | null; updatedAt: string | null; url: string | null }[];
+  /** When the cached answer (or failure) was obtained. */
+  fetchedAt: string | null;
+  /** Only for unreachable. */
+  error: string | null;
+};
+export type GitHubStatus = {
+  verdict: { state: GitHubVerdictState; reason: string };
+  generatedAt: string;
+  official: GitHubOfficialStatus;
+  /** Empty with `brief`. */
+  kinds: GitHubKindStatus[];
+  /** null with `brief`. */
+  rateLimits: {
+    /** null: the caller has no GitHub token. */
+    own: { rest: GitHubRateLimit | null; graphql: GitHubRateLimit | null } | null;
+    /** Other tokens with a current REST observation. */
+    otherTokens: number;
+    /** The lowest remaining/limit among them (REST). */
+    lowestOther: GitHubRateLimit | null;
+  } | null;
+};
+
 /** Agents are working on these runs. */
-export const WORKING_RUN_STATUSES: RunStatus[] = ['queued', 'spec', 'building', 'reviewing', 'approving'];
+export const WORKING_RUN_STATUSES: RunStatus[] = ['queued', 'spec', 'building', 'reviewing', 'approving', 'waiting_for_checks'];
 /** Not finished: what `GET /api/runs?active=true` returns (working + needs_human). */
 export const ACTIVE_RUN_STATUSES: RunStatus[] = [...WORKING_RUN_STATUSES, 'needs_human'];
 

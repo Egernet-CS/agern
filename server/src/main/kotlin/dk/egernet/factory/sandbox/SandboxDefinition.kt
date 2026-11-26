@@ -113,13 +113,7 @@ object SandboxDefinitions {
         if (content.toByteArray(Charsets.UTF_8).size > MAX_BYTES) {
             return ParsedDefinition.Invalid(hash, listOf("$SANDBOX_FILE is larger than ${MAX_BYTES / 1024} KiB"))
         }
-        val root = try {
-            yaml.parseToYamlNode(content)
-        } catch (e: YamlException) {
-            return ParsedDefinition.Invalid(hash, listOf("Not valid YAML: ${e.message} (line ${e.line}, column ${e.column})"))
-        } catch (e: Exception) {
-            return ParsedDefinition.Invalid(hash, listOf("Not valid YAML: ${e.message ?: e.javaClass.simpleName}"))
-        }
+        val root = parseYaml(content).getOrElse { return ParsedDefinition.Invalid(hash, listOf(it.message!!)) }
         val errors = mutableListOf<String>()
         val top = root as? YamlMap ?: return ParsedDefinition.Invalid(hash, listOf("The file must be a mapping with at least `image:`"))
         unknownKeys(top, TOP_KEYS, "", errors)
@@ -262,6 +256,18 @@ object SandboxDefinitions {
         )
     }
 
+    /**
+     * The YAML tree of [content], or a failure whose message says why it is not valid YAML (with line and column). Shared
+     * with the other parsers of files under `.agern/`, so anchors and duplicate keys are treated the same everywhere.
+     */
+    internal fun parseYaml(content: String): Result<YamlNode> = try {
+        Result.success(yaml.parseToYamlNode(content))
+    } catch (e: YamlException) {
+        Result.failure(IllegalArgumentException("Not valid YAML: ${e.message} (line ${e.line}, column ${e.column})"))
+    } catch (e: Exception) {
+        Result.failure(IllegalArgumentException("Not valid YAML: ${e.message ?: e.javaClass.simpleName}"))
+    }
+
     /** The registry host (and port) of a fully qualified reference, or null when the reference names none. */
     fun registryOf(image: String): String? {
         val first = image.substringBefore('/')
@@ -333,13 +339,13 @@ object SandboxDefinitions {
         return SandboxReady(command, timeout)
     }
 
-    private fun unknownKeys(m: YamlMap, allowed: List<String>, prefix: String, errors: MutableList<String>) {
+    internal fun unknownKeys(m: YamlMap, allowed: List<String>, prefix: String, errors: MutableList<String>) {
         for (k in m.entries.keys) {
             if (k.content !in allowed) errors += "$prefix${k.content}: unknown key (allowed here: ${allowed.joinToString(", ")})"
         }
     }
 
-    private fun scalar(node: YamlNode, path: String, errors: MutableList<String>): String? {
+    internal fun scalar(node: YamlNode, path: String, errors: MutableList<String>): String? {
         val s = node as? YamlScalar
         if (s == null) {
             errors += "$path: must be a single value, not a ${if (node is YamlMap) "mapping" else if (node is YamlList) "list" else "null"}"

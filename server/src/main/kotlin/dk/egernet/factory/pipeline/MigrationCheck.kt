@@ -226,9 +226,17 @@ object MigrationCheck {
         return Plan(renumber, nextFree, restore)
     }
 
-    /** Why the release branch [branch] is not merged into [target]: the release's notice and the approval refusal. */
-    fun releaseReason(target: String, branch: String, problems: List<String>): String =
-        "Database migration conflict with `$target`: ${listed(problems)}. The release is not merged. Fix the migrations on " +
-            "`$branch` (merge `$target` into it; a new migration needs a version above every migration on `$target`, and " +
-            "existing ones must stay unchanged), then use \"Check again\"."
+    /**
+     * Why the release branch [branch] is not merged into [target]: the release's notice and the approval refusal. With
+     * [releaseName] (a single-repository release) it points at "Bring up to date" (docs/ARCHITECTURE.md §6 "Bringing a
+     * release up to date").
+     */
+    fun releaseReason(target: String, branch: String, problems: List<String>, releaseName: String? = null): String =
+        "Database migration conflict with `$target`: ${listed(problems)}. The release is not merged. A new migration needs " +
+            "a version above every migration on `$target`, and existing ones must stay unchanged. " + if (releaseName != null) {
+            "Use \"Bring up to date\" on the release page (or `/factory release sync $releaseName`), or fix the migrations on " +
+                "`$branch` and use \"Check again\"."
+        } else {
+            "Fix the migrations on `$branch` (merge `$target` into it), then use \"Check again\"."
+        }
 }

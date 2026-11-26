@@ -1,11 +1,14 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, ApiError, isReleaseFinished, isReleaseOpen, isRunWorking, isSessionActive, type AgentSession, type CheckoutInfo, type Issue, type IssueKind, type Release, type ReleaseMode, type Run, type Workspace } from '../api';
+import { api, ApiError, isReleaseFinished, isReleaseOpen, isRunWorking, isSessionActive, runRef, type AgentSession, type CheckoutInfo, type Issue, type IssueKind, type MergePolicy, type Release, type ReleaseMode, type Run, type Workspace } from '../api';
 import { ChatView } from '../components/chat/ChatView';
 import { IssueImagesDialog } from '../components/images/IssueImagesDialog';
 import { REVIEWERS, roundName } from '../components/pipeline/model';
+import { deploySummary } from '../components/deploy/DeployBits';
 import { sandboxSummary } from '../components/sandbox/SandboxBits';
+import { sandboxVmSummary } from '../components/sandboxvm/SandboxVmBits';
 import { ProjectIconControl } from '../components/ui/ProjectIconControl';
+import { MergePolicyControl } from '../components/ui/MergePolicyControl';
 import { Dialog, Empty, ErrorBox, KindBadge, Loading, Notice, ProjectIcon, ReleaseStatusPill, RoleBadge, RunStatusPill, SessionStatusPill } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
@@ -121,6 +124,14 @@ export function ProjectPage() {
           )}
           {p && <a href={p.htmlUrl} target="_blank" rel="noreferrer">GitHub ↗</a>}
         </div>
+        {p?.settings && (
+          <MergePolicyControl
+            repo={repo}
+            settings={p.settings}
+            isAdmin={me.isAdmin}
+            onChanged={(np) => project.setData((old) => ({ ...np, workspace: old?.workspace ?? np.workspace }))}
+          />
+        )}
         {iconError && (
           <div className="ph-alert" role="alert">
             <span>{iconError}</span>
@@ -161,6 +172,7 @@ export function ProjectPage() {
             loading={!runsBase.data || !sessionsBase.data}
             releases={releases}
             workspace={p?.workspace ?? null}
+            mergePolicy={p?.settings?.mergePolicy ?? 'automatic'}
             onSelectChat={selectSession}
             onCloseChat={setClosing}
             currentId={closedNotice ? null : current?.id ?? null}
@@ -802,7 +814,7 @@ function ReleaseHistory({ repo, releases }: { repo: string; releases: Release[] 
 }
 
 /** Creates a release; the new release shows through the shared live list (once, even though its feed frame follows). */
-function NewReleaseDialog({ repo, open, onClose }: { repo: string; open: boolean; onClose: () => void }) {
+function NewReleaseDialog({ repo, open, onClose, humanRequired }: { repo: string; open: boolean; onClose: () => void; humanRequired: boolean }) {
   const { noteReleases } = useFeed();
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -852,13 +864,21 @@ function NewReleaseDialog({ repo, open, onClose }: { repo: string; open: boolean
               Manual approval <span className="muted small">— it waits until whoever starts it approves the release.</span>
             </span>
           </label>
-          <label>
-            <input type="radio" name="release-mode" value="automatic" checked={mode === 'automatic'} onChange={() => setMode('automatic')} />
+          <label className={humanRequired ? 'is-disabled' : ''}>
+            <input
+              type="radio"
+              name="release-mode"
+              value="automatic"
+              checked={mode === 'automatic'}
+              onChange={() => setMode('automatic')}
+              disabled={humanRequired}
+            />
             <span>
               Release automatically{' '}
               <span className="muted small">
-                — once everything is built, merges cleanly and all checks on the release pull request have passed, Agern merges it with the
-                owner&apos;s GitHub token.
+                {humanRequired
+                  ? '— this project requires a human approval.'
+                  : '— once everything is built, merges cleanly and all checks on the release pull request have passed, Agern merges it with the owner’s GitHub token.'}
               </span>
             </span>
           </label>
@@ -1026,6 +1046,79 @@ function SandboxSection({ repo }: { repo: string }) {
   );
 }
 
+/** The project's deploy targets in one row: state pill and one line, linking to the Deploy page (docs/DEPLOY.md). */
+function DeploySection({ repo }: { repo: string }) {
+  const reconnects = useFeedReconnects();
+  const q = useAsync(() => api.deployStatus(repo), [repo, reconnects]);
+  const s = q.data && deploySummary(q.data);
+  return (
+    <>
+      <div className="panel-head">
+        <h2>Deploy</h2>
+      </div>
+      {q.loading && !q.data && <Loading />}
+      {q.error && !q.data && (
+        <p className="form-error pad" role="alert">
+          Could not read the deploy targets: {q.error.message}{' '}
+          <button type="button" className="btn btn--ghost btn--sm" onClick={q.reload}>Retry</button>
+        </p>
+      )}
+      {q.data && s && (
+        <ul className="run-list">
+          <li>
+            <Link to={`/p/${repo}/deploy`} className={`run-row dpl-row sbx-row--${s.tone}`}>
+              <div className="rr-top">
+                <span className="rr-title mono">{q.data.path}</span>
+              </div>
+              <div className="rr-bot">
+                <span className={`pill pill--${s.tone}`}>
+                  <span className="pill-dot" aria-hidden />
+                  {s.label}
+                </span>
+                <span className="rr-line">{s.line}</span>
+              </div>
+            </Link>
+          </li>
+        </ul>
+      )}
+    </>
+  );
+}
+
+/**
+ * The project's sandbox VM in one row: state pill and one line, linking to its page (docs/SANDBOX-VMS.md). Hidden when the
+ * project has no `.agern/sandbox-vm.yml`, and when it cannot be read (the page says why).
+ */
+function SandboxVmSection({ repo }: { repo: string }) {
+  const reconnects = useFeedReconnects();
+  const q = useAsync(() => api.getSandboxVm(repo), [repo, reconnects]);
+  if (!q.data || q.data.state === 'none') return null;
+  const s = sandboxVmSummary(q.data);
+  return (
+    <>
+      <div className="panel-head">
+        <h2>Sandbox VM</h2>
+      </div>
+      <ul className="run-list">
+        <li>
+          <Link to={`/p/${repo}/sandbox-vm`} className={`run-row svm-row svm-row--${s.tone}`}>
+            <div className="rr-top">
+              <span className="rr-title mono">{q.data.path}</span>
+            </div>
+            <div className="rr-bot">
+              <span className={`pill pill--${s.tone}`}>
+                <span className="pill-dot" aria-hidden />
+                {s.label}
+              </span>
+              <span className="rr-line">{s.line}</span>
+            </div>
+          </Link>
+        </li>
+      </ul>
+    </>
+  );
+}
+
 export function runStageLine(r: Run): string {
   const running = r.stages.filter((s) => s.status === 'running').map((s) => s.role);
   if (r.status === 'reviewing') {
@@ -1045,6 +1138,7 @@ function ActivityPanel({
   loading,
   releases,
   workspace,
+  mergePolicy,
   onSelectChat,
   onCloseChat,
   currentId,
@@ -1056,6 +1150,8 @@ function ActivityPanel({
   releases: { releases: Release[]; loading: boolean; error: Error | undefined; reload: () => void };
   /** The project's workspace definition; null for a project that is one repository. */
   workspace: Workspace | null;
+  /** The project's merge policy: anything but `automatic` refuses automatic releases. */
+  mergePolicy: MergePolicy;
   onSelectChat: (id: string) => void;
   onCloseChat: (s: AgentSession) => void;
   currentId: string | null;
@@ -1148,9 +1244,11 @@ function ActivityPanel({
         ))}
       </ul>
       <ReleaseHistory repo={repo} releases={historyOf(releases.releases)} />
-      <NewReleaseDialog repo={repo} open={creatingRelease} onClose={() => setCreatingRelease(false)} />
+      <NewReleaseDialog repo={repo} open={creatingRelease} onClose={() => setCreatingRelease(false)} humanRequired={mergePolicy !== 'automatic'} />
       {/* A workspace's sandboxes belong to its member projects (a submodule workspace's own runs use its own). */}
       {ownSandbox && <SandboxSection repo={repo} />}
+      <DeploySection repo={repo} />
+      <SandboxVmSection repo={repo} />
       <div className="panel-head">
         <h2>Runs</h2>
       </div>
@@ -1160,11 +1258,11 @@ function ActivityPanel({
           <li key={r.id}>
             <Link to={`/p/${repo}/runs/${r.id}`} className={`run-row run-row--${r.status}`}>
               <div className="rr-top">
-                <span className="mono">#{r.issueNumber}</span>
+                <span className="mono">{runRef(r)}</span>
                 <span className="rr-title">{r.issueTitle}</span>
               </div>
               <div className="rr-bot">
-                <RunStatusPill status={r.status} />
+                <RunStatusPill status={r.status} kind={r.kind} />
                 <span className="rr-line">{runStageLine(r)}</span>
               </div>
               <div className="rr-meta">{r.owner.username} · {timeAgo(r.updatedAt)}</div>

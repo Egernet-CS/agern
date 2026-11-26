@@ -98,6 +98,15 @@ tests `FACTORY_2FA=off` is accepted when `dev` is the only provider.
     Put `fake:sandbox` in the issue body to make the builder call `factory_sandbox_info` and
     `factory_sandbox_exec` (`echo built in the sandbox && ls`) through MCP and report both answers.
 
+    A chat message containing `fake:deploy` makes the chat agent call `factory_deploy_targets` and then
+    `factory_deploy_exec` with the command `echo deployed` on the first target it lists, and report both answers
+    (needs an approved `.agern/deploy.yml` and a key, see `FACTORY_DEPLOY=fake` below).
+
+    Put `fake:sandbox-vm` in the issue body to make the builder, after its commit, call
+    `factory_sandbox_vm_deploy` and then `factory_sandbox_vm_exec` with `echo checked on the vm`, and append
+    "Sandbox VM deploy: …" and "Sandbox VM exec: …" to its result (needs an approved `.agern/sandbox-vm.yml` and
+    a key, see `FACTORY_SANDBOX_VM=fake` below).
+
     Images: in fake-GitHub mode Settings offers the provider "Fake (development)" (keys starting with
     `fake-image-`, model `fake-image-1`; it draws PNGs, and `fake:refuse` / `fake:quota` in a prompt fail).
     A chat message containing `fake:image` (or `fake:image=<n>`, plus `#<issue>` as the issue hint) makes
@@ -127,6 +136,45 @@ tests `FACTORY_2FA=off` is accepted when `dev` is the only provider.
 
   then approve it as an admin on `/p/demo-app/sandbox` and start a run with `fake:sandbox` in the issue body.
   The end-to-end suite (`web/e2e/server.mjs`) runs with this mode.
+* `FACTORY_DEPLOY=fake` (only together with `FACTORY_DEV_FAKE_GITHUB`): deploy targets (docs/DEPLOY.md) with a
+  transport that connects nowhere and pretends to run commands (`echo …`, `sleep N`, `exit N`, `true`, `false`;
+  anything else prints `[fake deploy user@host] would run: …`; a copy reports the file's size). Hosts starting with
+  `unreachable`, `badkey` or `noauth` fail at connect, host key or authentication, so every outcome of the page's
+  Check can be seen. Put the file where the fake GitHub serves it, e.g.
+
+  ```sh
+  mkdir -p "$FACTORY_DATA_DIR/fake-github/demo-app/.agern"
+  cat > "$FACTORY_DATA_DIR/fake-github/demo-app/.agern/deploy.yml" <<'YML'
+  targets:
+    kiosk:
+      host: kiosk.example.net
+      user: deploy
+      hostKey: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDW6AIaLf5ZHdROZLicqXQeFlHaQ/EKBnlmRsrguFOLw
+  YML
+  ```
+
+  then, as an admin on `/p/demo-app/deploy`, generate the key and approve the file, and send `fake:deploy` in a chat.
+  The end-to-end suite runs with this mode too.
+* `FACTORY_SANDBOX_VM=fake` (only together with `FACTORY_DEV_FAKE_GITHUB`): sandbox VMs (docs/SANDBOX-VMS.md)
+  with the same fake transport as `FACTORY_DEPLOY=fake` (the leading `export …` line of a definition command is
+  ignored). For example:
+
+  ```sh
+  cat > "$FACTORY_DATA_DIR/fake-github/demo-app/.agern/sandbox-vm.yml" <<'YML'
+  host: sandbox.example.net
+  user: agern
+  hostKey: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDW6AIaLf5ZHdROZLicqXQeFlHaQ/EKBnlmRsrguFOLw
+  url: http://sandbox.example.net/
+  checkout: echo unpacking
+  setup: echo restarting
+  ready:
+    command: "true"
+  reset: echo resetting
+  YML
+  ```
+
+  then, as an admin, generate the key (Deploy or Sandbox VM page) and approve the file on `/p/demo-app/sandbox-vm`,
+  and start a run with `fake:sandbox-vm` in the issue body. The end-to-end suite runs with this mode too.
 
 With both, the whole product — chat, runs with live stages, needs-human approval — works locally for
 UI development at zero cost.
@@ -175,6 +223,8 @@ src/main/kotlin/dk/egernet/factory/
   pipeline/Orchestrator.kt                the run state machine
   mcp/                                    MCP endpoint (JSON-RPC over HTTP) and per-process tokens
   sandbox/                                .agern/sandbox.yml parsing, SandboxRuntime (rootless Podman CLI), per-run SandboxManager
+  deploy/                                 .agern/deploy.yml parsing, project keys, SSH transport (Apache MINA SSHD), DeployManager
+  sandboxvm/                              .agern/sandbox-vm.yml parsing, approvals, leases, deploy procedure, preview, MCP tools
 src/main/resources/prompts/               system prompts per role (chat, spec-writer, builder, reviewers, approver)
 src/test/resources/fake-claude            the CLI stub described above
 ```
@@ -195,3 +245,7 @@ src/test/resources/fake-claude            the CLI stub described above
 * Sandboxes are not a security boundary yet: the agent runs on the host as the user that owns the
   rootless containers. They are never privileged, get no added capabilities and no credentials of the
   run's owner, and only the run's worktree is mounted (at `/workspace`).
+* Deploy keys (docs/DEPLOY.md) exist only encrypted in the database and, during one connection, in the server's
+  memory; agents get MCP tools, never the key, and only in project chats. Host keys are pinned, with no fallback.
+* Sandbox VMs (docs/SANDBOX-VMS.md) use the same key and transport; only a run's builder gets their tools, and every
+  operation re-checks the approval.

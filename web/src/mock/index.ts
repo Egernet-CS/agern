@@ -1,8 +1,13 @@
 // Mock implementation of the Api interface. Enabled with VITE_MOCK=1 (npm run dev:mock).
 // Scenarios via ?mock=default|fresh|noclaude|observer|loggedout|nosandbox|usage-none|usage-high|usage-limit (remembered per tab;
 // nosandbox: FACTORY_SANDBOX=off; usage-*: alice's Claude usage without data, at 86 % or at a reached limit).
+// GitHub status: ?mock=github-degraded (several 5xx on issues and releases while GitHub's own page says all is well) and
+// ?mock=github-down (only network errors, githubstatus.com unreachable); any other scenario: GitHub is working.
 import { ApiError, type Api, type Channel } from '../api/api';
+import * as deploy from './deploy';
+import { githubStatus } from './githubStatus';
 import * as images from './images';
+import * as sandboxVm from './sandboxVm';
 
 /**
  * A light-theme sketch of a shop page with an open cart drawer (demo content, 320×200), used for every mock
@@ -46,14 +51,17 @@ import {
   retryRun,
   approveRelease,
   checkRelease,
+  syncRelease,
   setReleaseMode,
   approveRun,
+  mergeAnywayRun,
   approveSandbox,
   cancelRun,
   reviewRun,
   talkToRun,
   revokeSandboxApproval,
   setProjectIcon,
+  setProjectSettings,
   setProjectIconFromRepository,
   deleteProjectIcon,
   pendingSandboxes,
@@ -77,6 +85,7 @@ import {
 } from './engine';
 
 images.seedRunImage();
+sandboxVm.seedSandboxVmPreview();
 
 /** Mock rule: any 6 digits except 000000, or a recovery code like abcd-1234 (login only). */
 function secondFactor(u: User, code: string, allowRecovery: boolean) {
@@ -242,6 +251,7 @@ const byNewest = <T extends { createdAt: string }>(a: T, b: T) => b.createdAt.lo
 
 export const mockApi: Api = {
   health: () => ok(() => ({ status: 'ok' as const, version: '0.1.0-mock', name: 'agern' })),
+  githubStatus: (opts) => ok(() => githubStatus(me(), !!opts?.brief)),
   providers: () => ok(() => ({ providers: ['os', 'ldap', 'dev'], org: ORG, twoFactor: true })),
   login: (username, password) =>
     ok((): LoginStep => {
@@ -401,6 +411,13 @@ export const mockApi: Api = {
       setProjectIconFromRepository(repo, path);
       return project(repo);
     }),
+  setProjectSettings: (repo, settings) =>
+    ok(() => {
+      needAdmin();
+      project(repo);
+      setProjectSettings(repo, settings);
+      return project(repo);
+    }),
   deleteProjectIcon: (repo) =>
     ok(() => {
       needAdmin();
@@ -435,6 +452,19 @@ export const mockApi: Api = {
       return i;
     }),
 
+  deployStatus: (repo) => ok(() => deploy.deployStatus(repo, project(repo).defaultBranch)),
+  approveDeploy: (repo, sha256) => ok(() => (project(repo), deploy.approveDeploy(repo, sha256, me()))),
+  revokeDeployApproval: (repo) => ok(() => (project(repo), deploy.revokeDeployApproval(repo, me()))),
+  generateDeployKey: (repo) => ok(() => (project(repo), deploy.generateDeployKey(repo, me()))),
+  rotateDeployKey: (repo) => ok(() => (project(repo), deploy.rotateDeployKey(repo, me()))),
+  checkDeployTarget: (repo, target) => ok(() => (project(repo), deploy.checkDeployTarget(repo, target, me()))),
+  getSandboxVm: (repo) => ok(() => sandboxVm.getSandboxVm(repo, project(repo).defaultBranch)),
+  approveSandboxVm: (repo, sha256) => ok(() => (project(repo), sandboxVm.approveSandboxVm(repo, sha256, me()))),
+  revokeSandboxVm: (repo) => ok(() => (project(repo), sandboxVm.revokeSandboxVm(repo, me()))),
+  checkSandboxVm: (repo) => ok(() => (project(repo), sandboxVm.checkSandboxVm(repo, me()))),
+  releaseSandboxVmLease: (repo) => ok(() => (project(repo), sandboxVm.releaseSandboxVmLease(repo, me()))),
+  startSandboxVmPreview: (runId) => ok(() => (needGithub(), sandboxVm.startSandboxVmPreview(run(runId), me()))),
+  releaseSandboxVmPreview: (runId) => ok(() => (needGithub(), sandboxVm.releaseSandboxVmPreview(run(runId), me()))),
   sandboxStatus: (repo) => ok(() => sandboxStatus(repo, project(repo).defaultBranch)),
   approveSandbox: (repo, sha256) => ok(() => (project(repo), approveSandbox(repo, sha256, me()))),
   revokeSandboxApproval: (repo) => ok(() => (project(repo), revokeSandboxApproval(repo, me()))),
@@ -505,6 +535,7 @@ export const mockApi: Api = {
     }),
   approveRelease: (id) => ok(() => withRelease(id, (r) => approveRelease(r, me()))),
   checkRelease: (id) => ok(() => withRelease(id, (r) => checkRelease(r, me()))),
+  syncRelease: (id) => ok(() => withRelease(id, (r) => syncRelease(r, me()))),
   setReleaseMode: (id, mode) => ok(() => withRelease(id, (r) => setReleaseMode(r, mode, me()))),
 
   projectRuns: (repo) => ok(() => (project(repo), [...db.runs.values()].filter((r) => r.repo === repo).sort(byNewest))),
@@ -530,6 +561,12 @@ export const mockApi: Api = {
     ok(() => {
       const r = run(id);
       approveRun(r, me());
+      return r;
+    }),
+  mergeAnywayRun: (id, headSha) =>
+    ok(() => {
+      const r = run(id);
+      mergeAnywayRun(r, me(), headSha);
       return r;
     }),
   runRetryOptions: (id) => ok(() => retryOptionsFor(run(id))),

@@ -45,6 +45,11 @@ data class Config(
     val networkRetryDelaysMs: List<Long> = listOf(1L, 2L, 5L, 10L, 15L).map { it * 60_000L },
     val githubApiUrl: String = "https://api.github.com",
     val fakeGithub: Boolean = false,
+    /**
+     * FACTORY_GITHUB_STATUS_URL: GitHub's official status summary shown on the GitHub status page (docs/ARCHITECTURE.md
+     * §6 "GitHub status"); null switches it off. [fromEnv] defaults it to githubstatus.com for github.com only.
+     */
+    val githubStatusUrl: String? = null,
     val pamService: String? = null,
     val agentPath: String = defaultAgentPath(),
     /** FACTORY_ATTACHMENT_MAX_MB: largest single chat attachment. */
@@ -61,11 +66,21 @@ data class Config(
     val imageLimits: ImageLimits = ImageLimits(),
     /** FACTORY_SANDBOX*: per-run build/test sandboxes (docs/ARCHITECTURE.md §5 "Sandboxes"). */
     val sandbox: SandboxConfig = SandboxConfig(),
+    /** FACTORY_DEPLOY*: per-project SSH deploy targets (docs/DEPLOY.md, docs/ARCHITECTURE.md §5 "Deploy targets"). */
+    val deploy: DeployConfig = DeployConfig(),
+    /** FACTORY_SANDBOX_VM*: per-project sandbox VMs (docs/SANDBOX-VMS.md, docs/ARCHITECTURE.md §5 "Sandbox VMs"). */
+    val sandboxVm: SandboxVmConfig = SandboxVmConfig(),
     /**
-     * FACTORY_RELEASE_CHECKS_SETTLE_SECONDS: how long a release pull request's head commit must have had no checks at
-     * all before "no checks" counts as green for an automatic release (CI registers its checks some seconds after a push).
+     * FACTORY_RELEASE_CHECKS_SETTLE_SECONDS: how long a pull request's head commit must have had no checks at all before
+     * "no checks" counts as green, for an automatic release and before a run is merged (CI registers its checks some
+     * seconds after a push).
      */
     val releaseChecksSettleSeconds: Long = 120,
+    /**
+     * FACTORY_RUN_CHECKS_WAIT_MINUTES: how long an approved run waits in `waiting_for_checks` for the checks on its pull
+     * request's head commit before it goes to needs_human (docs/ARCHITECTURE.md §6 "Checks before a merge").
+     */
+    val runChecksWaitMinutes: Long = 60,
     /** How long `POST /mcp` waits for a call before it answers as an event stream (not configurable; tests shorten it). */
     val mcpStreamAfterMs: Long = 5_000,
     /** How often a streamed MCP answer sends a progress notification or keep-alive while the call runs. */
@@ -78,9 +93,10 @@ data class Config(
 
     /**
      * The MCP tool-call and idle timeouts given to every agent (`MCP_TOOL_TIMEOUT`, `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`):
-     * longer than any call can take (no call outlives the stage; the first sandbox call adds creation and setup).
+     * longer than any call can take (no call outlives the stage; the first sandbox call adds creation and setup; a deploy
+     * command or copy adds its connection; so does a sandbox VM command or deploy).
      */
-    val mcpToolTimeoutMs: Long get() = maxOf(stageTimeoutMs, sandbox.execTimeoutMs) + 60_000
+    val mcpToolTimeoutMs: Long get() = maxOf(stageTimeoutMs, sandbox.execTimeoutMs, deploy.execTimeoutMs, sandboxVm.execTimeoutMs) + 60_000
     /** Agents reach the MCP endpoint over loopback, never through the public URL. */
     val mcpUrl: String get() = "http://127.0.0.1:$port/mcp"
     val publicOrigin: String get() = originOf(publicUrl)
@@ -110,8 +126,9 @@ data class Config(
         "Config(host=$host, port=$port, dbUrl=$dbUrl, dbUser=$dbUser, githubOrg=$githubOrg, auth=$authProviders, " +
             "admins=$admins, dataDir=$dataDir, webDir=$webDir, claudeBin=$claudeBin, codexBin=$codexBin, publicUrl=$publicUrl, " +
             "maxAgentsPerUser=$maxAgentsPerUser, chatIdleMinutes=$chatIdleMinutes, stageTimeoutMs=$stageTimeoutMs, networkRetryMaxMs=$networkRetryMaxMs, maxUpdateRounds=$maxUpdateRounds, fakeGithub=$fakeGithub, " +
+            "githubStatusUrl=${githubStatusUrl ?: "off"}, " +
             "attachments=${attachmentMaxCount}x${attachmentMaxBytes shr 20}MB/${attachmentMaxMessageBytes shr 20}MB, " +
-            "screenshots=${screenshotMaxCount}x${screenshotMaxBytes shr 20}MB, images=$imageLimits, sandbox=$sandbox)"
+            "screenshots=${screenshotMaxCount}x${screenshotMaxBytes shr 20}MB, images=$imageLimits, sandbox=$sandbox, deploy=$deploy, sandboxVm=$sandboxVm)"
 
     companion object {
         fun defaultAgentPath(): String =
@@ -144,6 +161,10 @@ data class Config(
             if (fakeGithub) require("dev" in auth) { "FACTORY_DEV_FAKE_GITHUB requires 'dev' in FACTORY_AUTH" }
             val sandbox = SandboxConfig.fromEnv(::get)
             if (sandbox.mode == "fake") require(fakeGithub) { "FACTORY_SANDBOX=fake is a development mode and requires FACTORY_DEV_FAKE_GITHUB" }
+            val deploy = DeployConfig.fromEnv(::get)
+            if (deploy.mode == "fake") require(fakeGithub) { "FACTORY_DEPLOY=fake is a development mode and requires FACTORY_DEV_FAKE_GITHUB" }
+            val sandboxVm = SandboxVmConfig.fromEnv(::get)
+            if (sandboxVm.mode == "fake") require(fakeGithub) { "FACTORY_SANDBOX_VM=fake is a development mode and requires FACTORY_DEV_FAKE_GITHUB" }
 
             return Config(
                 port = get("FACTORY_PORT")?.toInt() ?: 8080,
@@ -163,6 +184,10 @@ data class Config(
                     userFilter = get("FACTORY_LDAP_USER_FILTER") ?: "(uid={0})",
                     bindDn = get("FACTORY_LDAP_BIND_DN"),
                     bindPassword = get("FACTORY_LDAP_BIND_PASSWORD"),
+                    // DNs contain commas, so several groups are separated by ';'.
+                    requiredGroups = (get("FACTORY_LDAP_REQUIRED_GROUP") ?: "").split(';').map { it.trim() }.filter { it.isNotEmpty() },
+                    groupMemberAttribute = get("FACTORY_LDAP_GROUP_MEMBER_ATTRIBUTE") ?: "member",
+                    groupMemberValue = (get("FACTORY_LDAP_GROUP_MEMBER_VALUE") ?: "dn").lowercase(),
                 ),
                 devUsers = devUsers,
                 dataDir = Paths.get(get("FACTORY_DATA_DIR") ?: "./data").toAbsolutePath().normalize(),
@@ -189,6 +214,7 @@ data class Config(
                 } ?: 2,
                 githubApiUrl = get("FACTORY_GITHUB_API_URL") ?: "https://api.github.com",
                 fakeGithub = fakeGithub,
+                githubStatusUrl = githubStatusUrl(env["FACTORY_GITHUB_STATUS_URL"], get("FACTORY_GITHUB_API_URL") ?: "https://api.github.com", fakeGithub),
                 pamService = get("FACTORY_PAM_SERVICE"),
                 agentPath = get("FACTORY_AGENT_PATH") ?: defaultAgentPath(),
                 attachmentMaxBytes = mb(get("FACTORY_ATTACHMENT_MAX_MB"), "FACTORY_ATTACHMENT_MAX_MB", 20),
@@ -207,15 +233,36 @@ data class Config(
                     maxEdge = intIn(get("FACTORY_IMAGE_MAX_EDGE"), "FACTORY_IMAGE_MAX_EDGE", 2048, 256..4096),
                 ),
                 sandbox = sandbox,
+                deploy = deploy,
+                sandboxVm = sandboxVm,
                 releaseChecksSettleSeconds = get("FACTORY_RELEASE_CHECKS_SETTLE_SECONDS")?.let { v ->
                     (v.toLongOrNull() ?: throw IllegalArgumentException("FACTORY_RELEASE_CHECKS_SETTLE_SECONDS must be a whole number of seconds"))
                         .also { require(it in 0..3600) { "FACTORY_RELEASE_CHECKS_SETTLE_SECONDS must be between 0 and 3600" } }
                 } ?: 120,
+                runChecksWaitMinutes = get("FACTORY_RUN_CHECKS_WAIT_MINUTES")?.let { v ->
+                    (v.toLongOrNull() ?: throw IllegalArgumentException("FACTORY_RUN_CHECKS_WAIT_MINUTES must be a whole number of minutes"))
+                        .also { require(it in 1..1440) { "FACTORY_RUN_CHECKS_WAIT_MINUTES must be between 1 and 1440" } }
+                } ?: 60,
             ).also {
                 require(it.attachmentMaxMessageBytes >= it.attachmentMaxBytes) {
                     "FACTORY_ATTACHMENT_MAX_MESSAGE_MB must be at least FACTORY_ATTACHMENT_MAX_MB"
                 }
             }
+        }
+
+        /**
+         * FACTORY_GITHUB_STATUS_URL: unset → githubstatus.com for github.com without the fake GitHub, else off; `off` or
+         * empty → off; anything else must be an http(s) URL.
+         */
+        fun githubStatusUrl(raw: String?, apiUrl: String, fakeGithub: Boolean): String? {
+            if (raw == null) return if (apiUrl == "https://api.github.com" && !fakeGithub) "https://www.githubstatus.com/api/v2/summary.json" else null
+            val v = raw.trim()
+            if (v.isEmpty() || v.equals("off", ignoreCase = true)) return null
+            val uri = runCatching { java.net.URI(v) }.getOrNull()
+            require(uri != null && uri.scheme?.lowercase() in setOf("http", "https") && !uri.host.isNullOrEmpty()) {
+                "FACTORY_GITHUB_STATUS_URL must be an http:// or https:// URL, or 'off'"
+            }
+            return v
         }
 
         private fun intIn(v: String?, name: String, default: Int, range: IntRange): Int {
@@ -287,8 +334,15 @@ data class LdapConfig(
     val userFilter: String = "(uid={0})",
     val bindDn: String? = null,
     val bindPassword: String? = null,
+    /** Group DNs, any one of which must list the user (FACTORY_LDAP_REQUIRED_GROUP); empty = no group check. */
+    val requiredGroups: List<String> = emptyList(),
+    /** Attribute of the group entry that lists members (FACTORY_LDAP_GROUP_MEMBER_ATTRIBUTE). */
+    val groupMemberAttribute: String = "member",
+    /** `dn` (the member attribute holds user DNs) or `uid` (it holds login names) (FACTORY_LDAP_GROUP_MEMBER_VALUE). */
+    val groupMemberValue: String = "dn",
 ) {
-    override fun toString() = "LdapConfig(url=$url, userDnTemplate=$userDnTemplate, baseDn=$baseDn, bindDn=$bindDn)"
+    override fun toString() = "LdapConfig(url=$url, userDnTemplate=$userDnTemplate, baseDn=$baseDn, bindDn=$bindDn, " +
+        "requiredGroups=$requiredGroups, groupMemberAttribute=$groupMemberAttribute, groupMemberValue=$groupMemberValue)"
 }
 
 /** Sandbox settings (docs/ARCHITECTURE.md §3, §5 "Sandboxes"). */
@@ -396,6 +450,72 @@ data class SandboxConfig(
             bytes > 0 && bytes % (1L shl 20) == 0L -> "${bytes shr 20}m"
             bytes > 0 && bytes % (1L shl 10) == 0L -> "${bytes shr 10}k"
             else -> bytes.toString()
+        }
+    }
+}
+
+/** Deploy target settings (docs/ARCHITECTURE.md §3, docs/DEPLOY.md). */
+data class DeployConfig(
+    /**
+     * `ssh` (default: the tools exist, nothing happens until an admin generates a key and approves a file), `off` (no
+     * deploy tools) or `fake` (connects nowhere, only pretends; development and end-to-end tests with
+     * FACTORY_DEV_FAKE_GITHUB).
+     */
+    val mode: String = "ssh",
+    /** FACTORY_DEPLOY_EXEC_TIMEOUT_MINUTES: default and maximum for one command or copy. */
+    val execTimeoutMs: Long = 30 * 60_000L,
+    /** FACTORY_DEPLOY_MAX_COPY_MB: the largest file `factory_deploy_copy` sends. */
+    val maxCopyBytes: Long = 512L shl 20,
+) {
+    val enabled: Boolean get() = mode != "off"
+
+    override fun toString() = if (!enabled) "off" else "DeployConfig(mode=$mode, execTimeoutMs=$execTimeoutMs, maxCopyMB=${maxCopyBytes shr 20})"
+
+    companion object {
+        fun fromEnv(get: (String) -> String?): DeployConfig {
+            val mode = (get("FACTORY_DEPLOY") ?: "ssh").lowercase()
+            require(mode in setOf("ssh", "off", "fake")) { "FACTORY_DEPLOY must be 'ssh' or 'off' ('fake' in development)" }
+            val minutes = get("FACTORY_DEPLOY_EXEC_TIMEOUT_MINUTES")?.let {
+                it.toLongOrNull() ?: throw IllegalArgumentException("FACTORY_DEPLOY_EXEC_TIMEOUT_MINUTES must be a whole number of minutes")
+            } ?: 30
+            require(minutes in 1..24 * 60) { "FACTORY_DEPLOY_EXEC_TIMEOUT_MINUTES must be between 1 and 1440" }
+            val mb = get("FACTORY_DEPLOY_MAX_COPY_MB")?.let {
+                it.toLongOrNull() ?: throw IllegalArgumentException("FACTORY_DEPLOY_MAX_COPY_MB must be a whole number of megabytes")
+            } ?: 512
+            require(mb in 1..10_240) { "FACTORY_DEPLOY_MAX_COPY_MB must be between 1 and 10240" }
+            return DeployConfig(mode, minutes * 60_000L, mb shl 20)
+        }
+    }
+}
+
+/** Sandbox VM settings (docs/ARCHITECTURE.md §3, docs/SANDBOX-VMS.md). The upload limit is [DeployConfig.maxCopyBytes]. */
+data class SandboxVmConfig(
+    /**
+     * `ssh` (default: nothing happens until an admin approves a project's `.agern/sandbox-vm.yml`), `off` (no tools, no
+     * previews) or `fake` (connects nowhere, only pretends; development and end-to-end tests with FACTORY_DEV_FAKE_GITHUB).
+     */
+    val mode: String = "ssh",
+    /** FACTORY_SANDBOX_VM_EXEC_TIMEOUT_MINUTES: default and maximum for one command, and for one whole deploy. */
+    val execTimeoutMs: Long = 30 * 60_000L,
+    /** FACTORY_SANDBOX_VM_PREVIEW_MINUTES: how long a human preview holds the VM. */
+    val previewMs: Long = 120 * 60_000L,
+) {
+    val enabled: Boolean get() = mode != "off"
+
+    override fun toString() = if (!enabled) "off" else "SandboxVmConfig(mode=$mode, execTimeoutMs=$execTimeoutMs, previewMinutes=${previewMs / 60_000})"
+
+    companion object {
+        fun fromEnv(get: (String) -> String?): SandboxVmConfig {
+            val mode = (get("FACTORY_SANDBOX_VM") ?: "ssh").lowercase()
+            require(mode in setOf("ssh", "off", "fake")) { "FACTORY_SANDBOX_VM must be 'ssh' or 'off' ('fake' in development)" }
+            fun minutes(name: String, default: Long, range: LongRange): Long {
+                val v = get(name)?.let { it.trim().toLongOrNull() ?: throw IllegalArgumentException("$name must be a whole number of minutes") } ?: default
+                require(v in range) { "$name must be between ${range.first} and ${range.last}" }
+                return v
+            }
+            val exec = minutes("FACTORY_SANDBOX_VM_EXEC_TIMEOUT_MINUTES", 30, 1L..24 * 60)
+            val preview = minutes("FACTORY_SANDBOX_VM_PREVIEW_MINUTES", 120, 5L..24 * 60)
+            return SandboxVmConfig(mode, exec * 60_000L, preview * 60_000L)
         }
     }
 }

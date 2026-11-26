@@ -104,6 +104,7 @@ function openSocket<T>(path: string, handlers: ChannelHandlers<T>): Channel {
 
 export const httpApi: Api = {
   health: () => get('/api/health'),
+  githubStatus: (opts) => get('/api/github/status' + (opts?.brief ? '?brief=1' : '')),
   providers: () => get('/api/auth/providers'),
   login: (username, password) => post('/api/auth/login', { username, password }),
   totp: (code) => post('/api/auth/totp', { code }),
@@ -135,6 +136,7 @@ export const httpApi: Api = {
   setProjectIcon: (repo, file) => upload(`/api/projects/${enc(repo)}/icon`, file, { method: 'PUT' }),
   setProjectIconFromRepository: (repo, path) => post(`/api/projects/${enc(repo)}/icon/from-repository`, { path }),
   deleteProjectIcon: (repo) => del(`/api/projects/${enc(repo)}/icon`),
+  setProjectSettings: (repo, settings) => put(`/api/projects/${enc(repo)}/settings`, settings),
   issues: (repo, state = 'open') => get(`/api/projects/${enc(repo)}/issues?state=${state}`),
   issue: (repo, n) => get(`/api/projects/${enc(repo)}/issues/${n}`),
   createIssue: (repo, body) => post(`/api/projects/${enc(repo)}/issues`, body),
@@ -155,6 +157,7 @@ export const httpApi: Api = {
   releaseIssueRetryOptions: (id, issueNumber) => get(`/api/releases/${enc(id)}/issues/${issueNumber}/retry`),
   approveRelease: (id) => post(`/api/releases/${enc(id)}/approve`),
   checkRelease: (id) => post(`/api/releases/${enc(id)}/check`),
+  syncRelease: (id) => post(`/api/releases/${enc(id)}/sync`),
   setReleaseMode: (id, mode) => put(`/api/releases/${enc(id)}/mode`, { mode }),
   scheduleRelease: (id, startAt) => put(`/api/releases/${enc(id)}/schedule`, { startAt }),
   cancelReleaseSchedule: (id) => del(`/api/releases/${enc(id)}/schedule`),
@@ -165,6 +168,21 @@ export const httpApi: Api = {
   sandboxes: () => get('/api/admin/sandboxes'),
   pendingSandboxes: () => get('/api/admin/sandboxes/pending'),
   stopSandbox: (runId) => del(`/api/admin/sandboxes/${enc(runId)}`),
+
+  deployStatus: (repo) => get(`/api/projects/${enc(repo)}/deploy`),
+  approveDeploy: (repo, sha256) => post(`/api/projects/${enc(repo)}/deploy/approval`, { sha256 }),
+  revokeDeployApproval: (repo) => del(`/api/projects/${enc(repo)}/deploy/approval`),
+  generateDeployKey: (repo) => post(`/api/projects/${enc(repo)}/deploy/key`),
+  rotateDeployKey: (repo) => post(`/api/projects/${enc(repo)}/deploy/key/rotate`),
+  checkDeployTarget: (repo, target) => post(`/api/projects/${enc(repo)}/deploy/targets/${enc(target)}/check`),
+
+  getSandboxVm: (repo) => get(`/api/projects/${enc(repo)}/sandbox-vm`),
+  approveSandboxVm: (repo, sha256) => post(`/api/projects/${enc(repo)}/sandbox-vm/approval`, { sha256 }),
+  revokeSandboxVm: (repo) => del(`/api/projects/${enc(repo)}/sandbox-vm/approval`),
+  checkSandboxVm: (repo) => post(`/api/projects/${enc(repo)}/sandbox-vm/check`),
+  releaseSandboxVmLease: (repo) => del(`/api/projects/${enc(repo)}/sandbox-vm/lease`),
+  startSandboxVmPreview: (runId) => post(`/api/runs/${enc(runId)}/sandbox-vm/preview`),
+  releaseSandboxVmPreview: (runId) => del(`/api/runs/${enc(runId)}/sandbox-vm/preview`),
 
   projectRuns: (repo) => get(`/api/projects/${enc(repo)}/runs`),
   startRun: (repo, issueNumber) => post(`/api/projects/${enc(repo)}/runs`, { issueNumber }),
@@ -178,6 +196,7 @@ export const httpApi: Api = {
   },
   run: (id) => get(`/api/runs/${enc(id)}`),
   approveRun: (id) => post(`/api/runs/${enc(id)}/approve`),
+  mergeAnywayRun: (id, headSha) => post(`/api/runs/${enc(id)}/merge-anyway`, { headSha }),
   cancelRun: (id) => post(`/api/runs/${enc(id)}/cancel`),
   retryRunNow: (id) => post(`/api/runs/${enc(id)}/network/retry`),
   giveUpRun: (id) => post(`/api/runs/${enc(id)}/network/give-up`),

@@ -146,7 +146,8 @@ data class StageAgentRequest(
     val role: String,
     val model: String,
     val runId: UUID,
-    val issueNumber: Int,
+    /** The run's issue; null for a run that belongs to no issue (a sync run). */
+    val issueNumber: Int?,
     val parentSessionId: UUID?,
     val workDir: Path,
     val systemPrompt: String,
@@ -155,8 +156,10 @@ data class StageAgentRequest(
     val disallowedTools: List<String> = emptyList(),
     val resumeClaudeSessionId: String? = null,
     val title: String? = null,
-    /** MCP tools on top of [McpRegistry.STAGE_TOOLS] (the builder's sandbox tools). */
+    /** MCP tools on top of [McpRegistry.STAGE_TOOLS] (e.g. the sandbox tools). */
     val extraTools: Set<String> = emptySet(),
+    /** Which sandbox the sandbox tools in [extraTools] address. */
+    val sandboxScope: dk.egernet.factory.mcp.SandboxScope = dk.egernet.factory.mcp.SandboxScope.BUILD,
     /** `system` events (level, text) put at the top of the stage's transcript, e.g. whether the run has a sandbox. */
     val notes: List<Pair<String, String>> = emptyList(),
     /** The member repositories of a workspace run, recorded on the session (docs/ARCHITECTURE.md §4 "Visibility"). */
@@ -223,6 +226,8 @@ class AgentManager(
     private val preferences: dk.egernet.factory.db.PreferenceStore,
     private val usageStore: dk.egernet.factory.db.ClaudeUsageStore,
     private val workspaceDefs: dk.egernet.factory.workspace.WorkspaceService? = null,
+    /** MCP tools a (non-advisor) chat gets on top of [McpRegistry.CHAT_TOOLS]: the deploy tools when they are switched on. */
+    private val chatExtraTools: Set<String> = emptySet(),
 ) {
     private val log = LoggerFactory.getLogger(AgentManager::class.java)
 
@@ -624,7 +629,7 @@ class AgentManager(
             // The attachment files are a cache of the database: put back what a cleaned data dir lost.
             if (!advisor) withContext(Dispatchers.IO) { attachments.materialiseSession(sessionId) }
             val mayInstall = settings.get().agentsMayInstallSoftware
-            val granted = if (advisor) McpRegistry.STAGE_TOOLS else McpRegistry.CHAT_TOOLS
+            val granted = if (advisor) McpRegistry.STAGE_TOOLS else McpRegistry.CHAT_TOOLS + chatExtraTools
             val tools = if (mayInstall) granted - "factory_request_software" else granted
             token = mcp.issue(McpGrant(sessionId, owner.id, s.repo, launch?.runId, tools))
             val spec = LaunchSpec(
@@ -1041,7 +1046,7 @@ class AgentManager(
                 ?: return finishStage(s, null, "Run owner has no Claude credential", credentialRejected = true)
             val mayInstall = settings.get().agentsMayInstallSoftware
             val tools = (if (mayInstall) McpRegistry.STAGE_TOOLS - "factory_request_software" else McpRegistry.STAGE_TOOLS) + req.extraTools
-            token = mcp.issue(McpGrant(s.id, req.owner.id, req.repo, req.runId, tools))
+            token = mcp.issue(McpGrant(s.id, req.owner.id, req.repo, req.runId, tools, sandboxScope = req.sandboxScope))
             val identity = AgentIdentity(req.owner.username, req.owner.displayName, req.owner.githubLogin, access.githubToken(req.owner), cred)
             val steerable = req.role in STEERABLE_ROLES
             val spec = LaunchSpec(

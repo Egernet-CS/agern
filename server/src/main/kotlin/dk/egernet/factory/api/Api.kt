@@ -10,6 +10,7 @@ import dk.egernet.factory.FeedFrame
 import dk.egernet.factory.LoginStepDto
 import dk.egernet.factory.PIPELINE_ROLES
 import dk.egernet.factory.ProjectIcons
+import dk.egernet.factory.ProjectSettingsReq
 import dk.egernet.factory.RunStatus
 import dk.egernet.factory.Services
 import dk.egernet.factory.SettingsDto
@@ -124,6 +125,7 @@ private suspend fun ApplicationCall.retryReq(): dk.egernet.factory.RetryReq {
 }
 @Serializable data class CreateSessionReq(val model: String? = null)
 @Serializable data class TalkReq(val text: String = "")
+@Serializable data class MergeAnywayReq(val headSha: String = "")
 @Serializable data class InputReq(val text: String = "", val attachmentIds: List<String> = emptyList())
 @Serializable data class ResolveReq(val status: String, val note: String? = null)
 @Serializable data class ApproveSandboxReq(val sha256: String)
@@ -266,6 +268,13 @@ fun Application.installApi(s: Services) {
                         withContext(Dispatchers.IO) { s.images.catalogue() },
                     ),
                 )
+            }
+            // GitHub as Agern sees it (docs/ARCHITECTURE.md §6 "GitHub status"): any logged-in user, no token needed.
+            // brief=1 (the shell's banner) skips the caller's rate-limit lookup and the per-kind table.
+            get("/github/status") {
+                val u = call.requireUser(s)
+                val brief = call.request.queryParameters["brief"]?.trim()?.lowercase() in setOf("1", "true")
+                call.respond(withContext(Dispatchers.IO) { s.githubStatus.status(u, brief) })
             }
             authRoutes(s)
             meRoutes(s)
@@ -599,6 +608,36 @@ private fun Route.projectRoutes(s: Services) {
         call.respond(s.sandboxes.approve(u, repo, req.sha256))
     }
     delete("/projects/{repo}/sandbox/approval") { call.respond(s.sandboxes.revoke(call.requireUser(s), repoParam())) }
+    // Deploy targets, their approval and the project's key (docs/DEPLOY.md, docs/ARCHITECTURE.md §8).
+    get("/projects/{repo}/deploy") { call.respond(s.deploys.status(call.requireUser(s), repoParam())) }
+    post("/projects/{repo}/deploy/approval") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        val req = call.receive<ApproveSandboxReq>()
+        if (!Regex("^[0-9a-fA-F]{64}$").matches(req.sha256.trim())) throw badRequest("sha256 must be 64 hex digits")
+        call.respond(s.deploys.approve(u, repo, req.sha256))
+    }
+    delete("/projects/{repo}/deploy/approval") { call.respond(s.deploys.revoke(call.requireUser(s), repoParam())) }
+    post("/projects/{repo}/deploy/key") { call.respond(s.deploys.generateKey(call.requireUser(s), repoParam())) }
+    post("/projects/{repo}/deploy/key/rotate") { call.respond(s.deploys.rotateKey(call.requireUser(s), repoParam())) }
+    post("/projects/{repo}/deploy/targets/{name}/check") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        val name = call.parameters["name"].orEmpty()
+        call.respond(s.deploys.check(u, repo, name))
+    }
+    // The sandbox VM, its approval, check and lease (docs/SANDBOX-VMS.md, docs/ARCHITECTURE.md §8).
+    get("/projects/{repo}/sandbox-vm") { call.respond(s.sandboxVms.status(call.requireUser(s), repoParam())) }
+    post("/projects/{repo}/sandbox-vm/approval") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        val req = call.receive<ApproveSandboxReq>()
+        if (!Regex("^[0-9a-fA-F]{64}$").matches(req.sha256.trim())) throw badRequest("sha256 must be 64 hex digits")
+        call.respond(s.sandboxVms.approve(u, repo, req.sha256))
+    }
+    delete("/projects/{repo}/sandbox-vm/approval") { call.respond(s.sandboxVms.revoke(call.requireUser(s), repoParam())) }
+    post("/projects/{repo}/sandbox-vm/check") { call.respond(s.sandboxVms.check(call.requireUser(s), repoParam())) }
+    delete("/projects/{repo}/sandbox-vm/lease") { call.respond(s.sandboxVms.forceRelease(call.requireUser(s), repoParam())) }
     // Project icons (docs/ARCHITECTURE.md §8 "Project icons"): admins set them, everyone who sees the repo sees them.
     put("/projects/{repo}/icon") {
         val u = call.requireAdmin(s)
@@ -618,6 +657,13 @@ private fun Route.projectRoutes(s: Services) {
         val repo = repoParam()
         val req = call.receive<IconFromRepositoryReq>()
         call.respond(s.factory.setProjectIconFromRepository(u, repo, req.path))
+    }
+    // Project settings (docs/ARCHITECTURE.md §6 "Merge policy"): admins set them, everyone who sees the repo sees them.
+    put("/projects/{repo}/settings") {
+        val u = call.requireAdmin(s)
+        val repo = repoParam()
+        val req = call.receive<ProjectSettingsReq>()
+        call.respond(s.factory.setProjectSettings(u, repo, req))
     }
     delete("/projects/{repo}/icon") {
         val u = call.requireAdmin(s)
@@ -664,6 +710,16 @@ private fun Route.runRoutes(s: Services) {
         call.respondStoredFile(bytes, m.mediaType, "inline", name)
     }
     post("/runs/{id}/approve") { call.respond(s.factory.approveRun(call.requireUser(s), uuidParam("id"))) }
+    // "Try it on the sandbox VM" (docs/SANDBOX-VMS.md "Preview"): the run's owner or an admin.
+    post("/runs/{id}/sandbox-vm/preview") { call.respond(s.runs.toDto(s.sandboxVms.startPreview(call.requireUser(s), uuidParam("id")))) }
+    delete("/runs/{id}/sandbox-vm/preview") { call.respond(s.runs.toDto(s.sandboxVms.releasePreview(call.requireUser(s), uuidParam("id")))) }
+    // "Merge anyway" despite checks that have not passed (docs/ARCHITECTURE.md §6 "Checks before a merge"): owner only.
+    post("/runs/{id}/merge-anyway") {
+        val u = call.requireUser(s)
+        val id = uuidParam("id")
+        val req = call.receive<MergeAnywayReq>()
+        call.respond(s.factory.mergeAnywayRun(u, id, req.headSha))
+    }
     post("/runs/{id}/cancel") { call.respond(s.factory.cancelRun(call.requireUser(s), uuidParam("id"))) }
     // A run waiting for the network (docs/ARCHITECTURE.md §6 "Transient failures").
     post("/runs/{id}/network/retry") { call.respond(s.factory.retryRunNow(call.requireUser(s), uuidParam("id"))) }
@@ -691,7 +747,11 @@ private fun Route.runRoutes(s: Services) {
  * repository [u] cannot read are left out.
  */
 private suspend fun Services.releaseDto(u: dk.egernet.factory.db.UserRecord, r: dk.egernet.factory.db.ReleaseRecord): dk.egernet.factory.ReleaseDto =
-    r.toDto().let { d -> if (d.repositories.isEmpty()) d else withContext(Dispatchers.IO) { d.forViewer { access.canSee(u, it) } } }
+    withPolicy(r.toDto()).let { d -> if (d.repositories.isEmpty()) d else withContext(Dispatchers.IO) { d.forViewer { access.canSee(u, it) } } }
+
+/** [d] with its project's current merge policy (docs/ARCHITECTURE.md §6 "Merge policy"). */
+private suspend fun Services.withPolicy(d: dk.egernet.factory.ReleaseDto): dk.egernet.factory.ReleaseDto =
+    d.copy(mergePolicy = withContext(Dispatchers.IO) { projectSettings.get(d.repo).mergePolicy })
 
 private fun Route.releaseRoutes(s: Services) {
     get("/projects/{repo}/releases") {
@@ -772,6 +832,10 @@ private fun Route.releaseRoutes(s: Services) {
     post("/releases/{id}/check") {
         val u = call.requireUser(s)
         call.respond(s.releaseDto(u, s.releases.check(u, uuidParam("id"))))
+    }
+    post("/releases/{id}/sync") {
+        val u = call.requireUser(s)
+        call.respond(s.releaseDto(u, s.releases.sync(u, uuidParam("id")).release))
     }
     get("/releases/{id}/issues/{number}/retry") {
         val u = call.requireUser(s)
@@ -1142,8 +1206,9 @@ private fun Route.wsRoutes(s: Services) {
                     // Per subscriber: a member repository they cannot read keeps its pull request details to itself.
                     is FeedItem.Release -> FeedFrame(
                         type = "release", repo = item.repo,
-                        release = if (item.release.repositories.isEmpty()) item.release
-                            else withContext(Dispatchers.IO) { item.release.forViewer { s.access.canSee(u, it) } },
+                        release = s.withPolicy(item.release).let { d ->
+                            if (d.repositories.isEmpty()) d else withContext(Dispatchers.IO) { d.forViewer { s.access.canSee(u, it) } }
+                        },
                     )
                     is FeedItem.ReleaseDeleted -> FeedFrame(type = "release_deleted", repo = item.repo, releaseId = item.releaseId)
                     is FeedItem.SandboxApproval -> FeedFrame(type = "sandbox_approval", repo = item.repo, approval = item.approval)

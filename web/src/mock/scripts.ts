@@ -1,9 +1,9 @@
 // Canned agent transcripts for the mock backend. Each script is a list of steps that the
 // engine either plays live (with streamed partials) or materialises instantly as history.
-import type { SandboxLog, SandboxPlatform } from '../api/types';
+import type { SandboxLog, SandboxPlatform, SandboxVmLog } from '../api/types';
 
 /** A `system` event; with `sandbox` the full log of a sandbox command (docs/ARCHITECTURE.md §8 "Event"). */
-export type SystemStep = { kind: 'system'; level: 'info' | 'warn' | 'error'; text: string; sandbox?: SandboxLog; ms?: number };
+export type SystemStep = { kind: 'system'; level: 'info' | 'warn' | 'error'; text: string; sandbox?: SandboxLog; sandboxVm?: SandboxVmLog; ms?: number };
 
 export type Step =
   | { kind: 'think'; text: string }
@@ -96,13 +96,14 @@ const EXEC = 'mcp__factory__factory_sandbox_exec';
 /** A finished sandbox command: its full log (system event) and the JSON the agent gets back (the tail). */
 function sandboxExec(
   command: string, exitCode: number, output: string, durationMs: number, extraLogs: SystemStep[] = [], kind: SandboxLog['kind'] = 'exec', platform: string | null = null,
+  review = false,
 ): Step {
   const what = kind === 'setup' ? 'setup script' : `\`${command.split('\n')[0].slice(0, 200)}\``;
   const log: SystemStep = {
     kind: 'system',
     level: exitCode === 0 ? 'info' : 'warn',
-    text: `Sandbox${platform ? ` [${platform}]` : ''} ${what}: exit ${exitCode} in ${(durationMs / 1000).toFixed(1)} s`,
-    sandbox: { kind, command, exitCode, timedOut: false, durationMs, output, outputTruncated: false, platform },
+    text: `${review ? 'Review sandbox' : 'Sandbox'}${platform ? ` [${platform}]` : ''} ${what}: exit ${exitCode} in ${(durationMs / 1000).toFixed(1)} s`,
+    sandbox: { kind, command, exitCode, timedOut: false, durationMs, output, outputTruncated: false, platform, ...(review ? { review: true } : {}) },
   };
   const tail = output.slice(-20_000);
   return {
@@ -213,6 +214,25 @@ export function reviewerScript(role: string, verdict: 'PASS' | 'CHANGES', summar
     tool('Read', { file_path: `src/main/kotlin/shop/cart/${f.files[0]}` }, '   1→package shop.cart\n   2→\n   3→import shop.auth.UserId\n   …', 700),
     tool('Grep', { pattern: 'CartId\\(', path: 'src/main' }, 'src/main/kotlin/shop/cart/CartRoutes.kt:42\nsrc/main/kotlin/shop/cart/CartRoutes.kt:57\nsrc/main/kotlin/shop/cart/CartService.kt:19', 500),
     { kind: 'text', text: `Checked ${f.look}.\n\n**Verdict: ${verdict}** — ${summary}` },
+  ];
+}
+
+/**
+ * What a ux reviewer of a run with an approved sandbox does first (like the backend): starts the app detached in the
+ * shared, read-only review sandbox and waits until it answers.
+ */
+export function reviewSandboxSteps(image: string, setup: string | null): Step[] {
+  const created: SystemStep[] = [
+    { kind: 'system', level: 'info', text: `Creating the review sandbox: image ${image}, services postgres …` },
+    ...(setup
+      ? [{ kind: 'system' as const, level: 'info' as const, text: 'Review sandbox setup script: exit 0 in 39.8 s', sandbox: { kind: 'setup' as const, command: setup, exitCode: 0, timedOut: false, durationMs: 39_800, output: aptOutput, outputTruncated: false, platform: null, review: true } }]
+      : []),
+    { kind: 'system', level: 'info', text: `Review sandbox ready in 44.1 s: ${image}, 2 CPUs, 4g memory, /workspace read-only, output in .agern-run/review.` },
+  ];
+  const start = 'cp -a /workspace /tmp/app && cd /tmp/app && (nohup ./gradlew run > /tmp/app.log 2>&1 < /dev/null &) && for i in $(seq 90); do curl -fsS http://127.0.0.1:8081/ >/dev/null && break; sleep 1; done; tail -3 /tmp/app.log';
+  return [
+    { kind: 'think', text: 'The run has a read-only review sandbox. Start the shop there and take the screenshots inside it.' },
+    sandboxExec(start, 0, '> Task :run\nShop listening on http://0.0.0.0:8081\nConnected to postgres:5432\n', 58_300, created, 'exec', null, true),
   ];
 }
 
