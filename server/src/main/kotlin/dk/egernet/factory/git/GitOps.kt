@@ -9,6 +9,11 @@ import java.util.concurrent.TimeUnit
 
 class GitException(message: String) : RuntimeException(message)
 
+/** [BaseMerge.status] values (the same words as `run_updates.merge_status`). */
+const val UPDATE_UP_TO_DATE = "up_to_date"
+const val UPDATE_MERGED = "merged"
+const val UPDATE_CONFLICT = "conflict"
+
 /** One entry of `git worktree list`: its path as git reports it and its branch (null when detached). */
 data class WorktreeInfo(val path: Path, val branch: String?)
 
@@ -42,6 +47,24 @@ data class CheckoutState(
     val branch: String?, val defaultBranch: String, val head: String, val behind: Int, val ahead: Int,
     val status: String, val reason: String?, val updatedFrom: String?, val newCommits: Int = 0,
 )
+
+/**
+ * [GitOps.mergeBase]: what merging the target branch into a run's worktree did. [status] is `up_to_date` (the branch
+ * already contains [targetSha]), `merged` (a clean merge, committed) or `conflict` (the worktree is left mid-merge
+ * with [conflicts]). [headBefore]: HEAD before; [head]: HEAD after (the merge commit, or [headBefore] when nothing was
+ * committed). [incomingCount]: commits of the target the branch did not have; [incoming]: the subjects of the first-parent
+ * ones, newest first (at most 50).
+ */
+data class BaseMerge(
+    val status: String, val targetSha: String, val headBefore: String, val head: String, val incomingCount: Int,
+    val incoming: List<String>, val conflicts: List<String>,
+)
+
+/**
+ * [GitOps.mergeState]: whether a merge is still in progress ([merging]), the paths still unmerged, whether tracked files
+ * have uncommitted changes ([dirty]), whether the target commit is contained in HEAD, and HEAD.
+ */
+data class MergeState(val merging: Boolean, val unmerged: List<String>, val dirty: Boolean, val containsTarget: Boolean, val head: String)
 
 /** Git operations the server performs itself (the agents run git on their own). */
 interface GitOps {
@@ -156,6 +179,20 @@ interface GitOps {
      * (HEAD and local branches) to the bundle [file]. Throws [GitException] when git fails.
      */
     fun bundleSubmodule(dir: Path, sub: String, file: Path, home: Path) {}
+    /**
+     * Merges [baseBranch] as it is on GitHub (fetched first; the local branch in fake-GitHub mode) into the branch checked
+     * out in [worktree] with a real merge (`git merge`, never a rebase or reset), committed as [id] when it is clean; a
+     * conflict leaves the worktree mid-merge ([BaseMerge]). Throws [GitException] when the worktree has uncommitted
+     * changes to tracked files, or when git fails otherwise (a failed merge without conflicts is aborted first).
+     */
+    fun mergeBase(id: AgentIdentity, worktree: Path, baseBranch: String, home: Path): BaseMerge =
+        throw GitException("Merging a base branch is not supported")
+    /** The state of [worktree] after a merge of [targetSha] ([MergeState]). Throws [GitException] when git fails. */
+    fun mergeState(worktree: Path, targetSha: String, home: Path): MergeState = throw GitException("Not supported")
+    /** Aborts a merge in progress in [worktree] and resets it hard to [sha] (a commit it already has). Never throws. */
+    fun restore(worktree: Path, sha: String, home: Path) {}
+    /** `<short sha> <subject>` of the first-parent commits from [from] (exclusive) to HEAD of [worktree], oldest first, at most [max]. */
+    fun commitSubjects(worktree: Path, from: String, home: Path, max: Int): List<String> = emptyList()
 }
 
 /**
@@ -547,6 +584,67 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
     override fun bundleSubmodule(dir: Path, sub: String, file: Path, home: Path) {
         Files.createDirectories(file.parent)
         git(dir.resolve(sub), home, null, "bundle", "create", "-q", file.toString(), "HEAD", "--branches", "--not", "--remotes", timeoutSec = 300)
+    }
+
+    override fun mergeBase(id: AgentIdentity, worktree: Path, baseBranch: String, home: Path): BaseMerge {
+        require(baseBranch.isNotBlank() && !baseBranch.startsWith("-")) { "Invalid branch name" }
+        if (git(worktree, home, null, "status", "--porcelain", "--untracked-files=no", timeoutSec = 120).isNotBlank()) {
+            throw GitException("the run's worktree has uncommitted changes")
+        }
+        val ref = if (localOnly) "refs/heads/$baseBranch" else {
+            git(worktree, home, id, "fetch", "--no-tags", "origin", "+refs/heads/$baseBranch:refs/remotes/origin/$baseBranch")
+            "refs/remotes/origin/$baseBranch"
+        }
+        val targetSha = git(worktree, home, null, "rev-parse", "--verify", "$ref^{commit}", timeoutSec = 60).trim()
+        val before = git(worktree, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim()
+        val count = git(worktree, home, null, "rev-list", "--count", "HEAD..$targetSha", timeoutSec = 120).trim().toIntOrNull() ?: 0
+        if (count == 0) return BaseMerge(UPDATE_UP_TO_DATE, targetSha, before, before, 0, emptyList(), emptyList())
+        val incoming = git(worktree, home, null, "log", "--first-parent", "-n", "50", "--format=%s", "HEAD..$targetSha", timeoutSec = 120)
+            .lines().filter { it.isNotBlank() }
+        // A real merge (no rebase, no reset): the later push is a fast-forward of the remote branch. Hooks are off.
+        val (code, out) = gitStatus(worktree, home, id, "-c", "core.hooksPath=/dev/null", "merge", "--no-edit", targetSha)
+        if (code == 0) {
+            val head = git(worktree, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim()
+            return BaseMerge(UPDATE_MERGED, targetSha, before, head, count, incoming, emptyList())
+        }
+        val conflicts = unmergedPaths(worktree, home)
+        if (conflicts.isEmpty()) {
+            gitStatus(worktree, home, null, "merge", "--abort", timeoutSec = 60)
+            throw GitException("git merge failed: ${out.takeLast(1000).trim()}")
+        }
+        return BaseMerge(UPDATE_CONFLICT, targetSha, before, before, count, incoming, conflicts)
+    }
+
+    private fun unmergedPaths(worktree: Path, home: Path): List<String> =
+        git(worktree, home, null, "diff", "--name-only", "--diff-filter=U", "-z", timeoutSec = 120).split('\u0000').filter { it.isNotEmpty() }.distinct()
+
+    override fun mergeState(worktree: Path, targetSha: String, home: Path): MergeState {
+        require(!targetSha.startsWith("-")) { "Invalid commit" }
+        val merging = gitStatus(worktree, home, null, "rev-parse", "-q", "--verify", "MERGE_HEAD", timeoutSec = 60).first == 0
+        val unmerged = unmergedPaths(worktree, home)
+        val dirty = git(worktree, home, null, "status", "--porcelain", "--untracked-files=no", timeoutSec = 120).isNotBlank()
+        val contains = gitStatus(worktree, home, null, "merge-base", "--is-ancestor", targetSha, "HEAD", timeoutSec = 60).first == 0
+        val head = git(worktree, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim()
+        return MergeState(merging, unmerged, dirty, contains, head)
+    }
+
+    override fun restore(worktree: Path, sha: String, home: Path) {
+        try {
+            if (sha.isBlank() || sha.startsWith("-")) return
+            if (gitStatus(worktree, home, null, "rev-parse", "-q", "--verify", "MERGE_HEAD", timeoutSec = 60).first == 0) {
+                gitStatus(worktree, home, null, "merge", "--abort", timeoutSec = 60)
+            }
+            val (code, out) = gitStatus(worktree, home, null, "reset", "-q", "--hard", sha, timeoutSec = 120)
+            if (code != 0) log.warn("Resetting {} to {} failed: {}", worktree, sha, out.takeLast(300).trim())
+        } catch (e: Exception) {
+            log.warn("Restoring {} to {} failed: {}", worktree, sha, e.message)
+        }
+    }
+
+    override fun commitSubjects(worktree: Path, from: String, home: Path, max: Int): List<String> {
+        require(!from.startsWith("-")) { "Invalid commit" }
+        return git(worktree, home, null, "log", "--first-parent", "-n", max.toString(), "--format=%h %s", "$from..HEAD", timeoutSec = 120)
+            .lines().filter { it.isNotBlank() }.reversed()
     }
 
     override fun syncCheckout(id: AgentIdentity?, mainDir: Path, defaultBranch: String, home: Path, fetch: Boolean): CheckoutState? {

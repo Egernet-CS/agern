@@ -314,6 +314,37 @@ class FakeGitOps : GitOps {
     /** What [unpushedSubmodules] answers for every checkout. */
     @Volatile var unpushed: List<dk.egernet.factory.git.UnpushedSubmodule> = emptyList()
     override fun unpushedSubmodules(dir: Path, home: Path) = unpushed
+    /**
+     * What [mergeBase] answers for (worktree, base branch); a thrown exception is thrown by it. Default: a clean merge of
+     * one commit, HEAD moving from [headSha] to a merge commit (and [headSha] following it).
+     */
+    @Volatile var baseMerge: (Path, String) -> dk.egernet.factory.git.BaseMerge = { _, _ ->
+        val before = headSha
+        val after = "merge-of-$before".take(40)
+        headSha = after
+        dk.egernet.factory.git.BaseMerge(dk.egernet.factory.git.UPDATE_MERGED, "target-sha-0000000000000000000000000000", before, after, 1,
+            listOf("Merged elsewhere (#99)"), emptyList())
+    }
+    /** Every [mergeBase], as `"<base branch>"`. */
+    val baseMerges = CopyOnWriteArrayList<String>()
+    override fun mergeBase(id: AgentIdentity, worktree: Path, baseBranch: String, home: Path): dk.egernet.factory.git.BaseMerge {
+        baseMerges += baseBranch
+        return baseMerge(worktree, baseBranch)
+    }
+    /** What [mergeState] answers (default: a finished merge at [headSha] that contains the target). */
+    @Volatile var mergeStateAnswer: (Path, String) -> dk.egernet.factory.git.MergeState = { _, _ ->
+        dk.egernet.factory.git.MergeState(false, emptyList(), false, true, headSha)
+    }
+    override fun mergeState(worktree: Path, targetSha: String, home: Path) = mergeStateAnswer(worktree, targetSha)
+    /** Every [restore], as `"<sha>"`; it sets [headSha] back to that commit. */
+    val restores = CopyOnWriteArrayList<String>()
+    override fun restore(worktree: Path, sha: String, home: Path) {
+        restores += sha
+        headSha = sha
+    }
+    /** What [commitSubjects] answers. */
+    @Volatile var subjects: List<String> = listOf("abc1234 Resolve the merge")
+    override fun commitSubjects(worktree: Path, from: String, home: Path, max: Int) = subjects.take(max)
     override fun removeWorktree(mainDir: Path, worktree: Path, home: Path, keepUnpushed: Boolean) {
         if (!deleteWorktrees) return
         worktree.toFile().deleteRecursively()

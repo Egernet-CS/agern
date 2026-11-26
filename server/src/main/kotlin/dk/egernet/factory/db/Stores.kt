@@ -12,6 +12,7 @@ import dk.egernet.factory.SoftwareRequestDto
 import dk.egernet.factory.StageDto
 import dk.egernet.factory.UserDto
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.JsonElement
 import java.sql.ResultSet
 import java.time.Instant
@@ -400,7 +401,80 @@ data class RunRecord(
     val contextRepos: List<String> = emptyList(),
     /** Set while the run sleeps before retrying an operation that failed for lack of network. */
     val wait: RunWait? = null,
+    /** Update rounds started on the run, and its limit ("Update and merge", docs/ARCHITECTURE.md §6 "Retrying a run"). */
+    val updateRounds: Int = 0,
+    val maxUpdateRounds: Int = 0,
+) {
+    /** Whether the owner can start an update round now ([updatable]). */
+    val updateAvailable: Boolean get() = updatable(status, failureKind, branch, prNumber, updateRounds, maxUpdateRounds)
+}
+
+/**
+ * The one rule for "Update and merge": a run that needs a human because its merge was refused for a conflict with its
+ * target ([dk.egernet.factory.FailureKind.UPDATABLE]), with a branch and a pull request, and update rounds left.
+ */
+fun updatable(status: String?, failureKind: String?, branch: String?, prNumber: Int?, updateRounds: Int, maxUpdateRounds: Int): Boolean =
+    status == RunStatus.NEEDS_HUMAN && failureKind in dk.egernet.factory.FailureKind.UPDATABLE && branch != null && prNumber != null &&
+        updateRounds < maxUpdateRounds
+
+/** One row of `run_updates`: an update round of a run (see [dk.egernet.factory.RunUpdateDto]). */
+data class RunUpdateRecord(
+    val id: UUID, val runId: UUID, val number: Int, val round: Int, val maxRounds: Int, val trigger: String, val target: String,
+    val reason: String?, val status: String, val mergeStatus: String?, val targetSha: String?, val headBefore: String?,
+    val headAfter: String?, val incomingCount: Int, val incoming: List<String>, val conflicts: List<String>,
+    val migrations: List<String>, val commits: List<String>, val error: String?, val startedAt: Instant, val endedAt: Instant?,
+) {
+    /** E.g. "Update round 1 of 2 (automatic): merged `release/1.0` (3 commits); 2 conflicted files; builder added 1 commit — resolved". */
+    val summary: String get() {
+        fun n(k: Int, one: String, many: String = one + "s") = "$k ${if (k == 1) one else many}"
+        val parts = mutableListOf<String>()
+        when (mergeStatus) {
+            UpdateMerge.UP_TO_DATE -> parts += "already up to date with `$target`"
+            UpdateMerge.MERGED, UpdateMerge.CONFLICT -> parts += "merged `$target` (${n(incomingCount, "commit")})"
+        }
+        if (conflicts.isNotEmpty()) parts += n(conflicts.size, "conflicted file")
+        if (migrations.isNotEmpty()) parts += n(migrations.size, "migration problem")
+        if (commits.isNotEmpty()) parts += "builder added ${n(commits.size, "commit")}"
+        val head = "Update round $number of $maxRounds" + if (trigger == UpdateTrigger.RELEASE) " (automatic)" else ""
+        return head + (if (parts.isEmpty()) "" else ": " + parts.joinToString("; ")) + " — $status"
+    }
+
+    fun toDto() = dk.egernet.factory.RunUpdateDto(
+        number, round, maxRounds, trigger, target, reason, status, mergeStatus, targetSha, incomingCount, incoming, conflicts,
+        migrations, commits, error, startedAt.iso(), endedAt?.iso(), summary,
+    )
+}
+
+/** [RunUpdateRecord.trigger]. */
+object UpdateTrigger { const val OWNER = "owner"; const val RELEASE = "release" }
+
+/** [RunUpdateRecord.mergeStatus]. */
+object UpdateMerge { const val UP_TO_DATE = "up_to_date"; const val MERGED = "merged"; const val CONFLICT = "conflict" }
+
+/** [RunUpdateRecord.status]. */
+object UpdateStatus {
+    const val RUNNING = "running"; const val RESOLVED = "resolved"; const val FAILED = "failed"; const val CANCELLED = "cancelled"
+}
+
+private val stringListSer = ListSerializer(String.serializer())
+
+private fun jsonList(list: List<String>) = JsonbParam(AppJson.encodeToString(stringListSer, list))
+
+private fun ResultSet.stringList(col: String): List<String> =
+    getString(col)?.let { runCatching { AppJson.decodeFromString(stringListSer, it) }.getOrNull() }.orEmpty()
+
+/** A `run_updates` row selected with [RUN_UPDATE_COLUMNS]. */
+internal fun mapRunUpdate(rs: ResultSet) = RunUpdateRecord(
+    rs.uuid("id"), rs.uuid("run_id"), rs.getInt("number"), rs.getInt("round"), rs.getInt("max_rounds"), rs.getString("trigger"),
+    rs.getString("target"), rs.getString("reason"), rs.getString("status"), rs.getString("merge_status"), rs.getString("target_sha"),
+    rs.getString("head_before"), rs.getString("head_after"), rs.getInt("incoming_count"), rs.stringList("incoming_text"),
+    rs.stringList("conflicts_text"), rs.stringList("migrations_text"), rs.stringList("commits_text"), rs.getString("error"),
+    rs.instant("started_at"), rs.instantOrNull("ended_at"),
 )
+
+/** The columns of `run_updates u` for [mapRunUpdate] (JSON lists as text). */
+internal const val RUN_UPDATE_COLUMNS = "u.*, u.incoming::text AS incoming_text, u.conflicts::text AS conflicts_text, " +
+    "u.migrations::text AS migrations_text, u.commits::text AS commits_text"
 
 /** A run's network wait (docs/ARCHITECTURE.md §6 "Transient failures"): see [dk.egernet.factory.RunWaitDto]. */
 data class RunWait(val reason: String, val since: Instant, val nextAt: Instant, val attempts: Int, val detail: String)
@@ -435,7 +509,7 @@ class RunStore(private val db: Db) {
         rs.uuidOrNull("continues_run_id"), rs.getString("spec"), rs.getString("builder_summary"),
         rs.getString("failure_kind"), rs.getString("failed_step"),
         rs.getString("target_repo"), rs.getString("target_dir"), splitRepos(rs.getString("context_repos")),
-        rs.runWait(),
+        rs.runWait(), rs.getInt("update_rounds"), rs.getInt("max_update_rounds"),
     )
 
     private fun mapStage(rs: ResultSet) = StageRecord(
@@ -453,6 +527,7 @@ class RunStore(private val db: Db) {
         repo: String, issueNumber: Int, issueTitle: String, issueKind: String, maxRounds: Int, ownerId: UUID, startedBy: UUID?,
         releaseId: UUID? = null, baseBranch: String? = null, continuesRunId: UUID? = null, spec: String? = null,
         targetRepo: String? = null, targetDir: String? = null, contextRepos: List<String> = emptyList(),
+        maxUpdateRounds: Int = 2,
     ): RunRecord? {
         val id = UUID.randomUUID()
         val inserted = db.tx { c ->
@@ -464,11 +539,11 @@ class RunStore(private val db: Db) {
             if (active > 0) return@tx false
             c.prepare(
                 """INSERT INTO runs(id, repo, issue_number, issue_title, issue_kind, status, max_rounds, owner_id, started_by_session_id,
-                     release_id, base_branch, continues_run_id, spec, target_repo, target_dir, context_repos)
-                   VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     release_id, base_branch, continues_run_id, spec, target_repo, target_dir, context_repos, max_update_rounds)
+                   VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 arrayOf<Any?>(
                     id, repo, issueNumber, issueTitle, issueKind, maxRounds, ownerId, startedBy, releaseId, baseBranch, continuesRunId, spec,
-                    targetRepo, targetDir, joinRepos(contextRepos),
+                    targetRepo, targetDir, joinRepos(contextRepos), maxUpdateRounds,
                 ),
             ).use { it.executeUpdate() }
             true
@@ -497,6 +572,55 @@ class RunStore(private val db: Db) {
             arrayOf<Any?>(id),
         ).use { it.executeUpdate() } == 1
     }
+
+    /**
+     * An update round starts ("Update and merge"): an updatable `needs_human` run ([RunRecord.updateAvailable]) becomes
+     * `building` in round [round], with one more update round counted and its error and failure cleared. One
+     * conditional update, so of two concurrent starts only one wins (false for the other).
+     */
+    fun startUpdate(id: UUID, round: Int): Boolean = db.update(
+        """UPDATE runs SET status = 'building', round = ?, update_rounds = update_rounds + 1, error = NULL, failure_kind = NULL,
+             failed_step = NULL, updated_at = now()
+           WHERE id = ? AND status = 'needs_human' AND failure_kind IN ('migration_conflict', 'merge_conflict')
+             AND branch IS NOT NULL AND pr_number IS NOT NULL AND update_rounds < max_update_rounds""",
+        round, id,
+    ) == 1
+
+    fun createUpdate(runId: UUID, number: Int, round: Int, maxRounds: Int, trigger: String, target: String, reason: String?): UUID {
+        val id = UUID.randomUUID()
+        db.update(
+            "INSERT INTO run_updates(id, run_id, number, round, max_rounds, trigger, target, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            id, runId, number, round, maxRounds, trigger, target, reason,
+        )
+        return id
+    }
+
+    /** What the merge of the target did ([dk.egernet.factory.git.BaseMerge]) and the migration problems found before it. */
+    fun recordUpdateMerge(
+        id: UUID, mergeStatus: String, targetSha: String, headBefore: String, incomingCount: Int, incoming: List<String>,
+        conflicts: List<String>, migrations: List<String>,
+    ) = db.update(
+        """UPDATE run_updates SET merge_status = ?, target_sha = ?, head_before = ?, incoming_count = ?, incoming = ?, conflicts = ?,
+             migrations = ? WHERE id = ?""",
+        mergeStatus, targetSha, headBefore, incomingCount, jsonList(incoming.take(50)), jsonList(conflicts), jsonList(migrations), id,
+    )
+
+    /** The branch after the builder: its head and the builder's commits. */
+    fun recordUpdateBuilder(id: UUID, headAfter: String, commits: List<String>) = db.update(
+        "UPDATE run_updates SET head_after = ?, commits = ? WHERE id = ?", headAfter, jsonList(commits), id,
+    )
+
+    /** A `running` update becomes [status] (`resolved`, `failed` or `cancelled`); false when it was not running any more. */
+    fun finishUpdate(id: UUID, status: String, error: String? = null): Boolean = db.update(
+        "UPDATE run_updates SET status = ?, error = ?, ended_at = now() WHERE id = ? AND status = 'running'", status, error?.take(4000), id,
+    ) == 1
+
+    fun update(id: UUID): RunUpdateRecord? =
+        db.queryOne("SELECT $RUN_UPDATE_COLUMNS FROM run_updates u WHERE u.id = ?", id, map = ::mapRunUpdate)
+
+    /** The run's update rounds, oldest first. */
+    fun updates(runId: UUID): List<RunUpdateRecord> =
+        db.query("SELECT $RUN_UPDATE_COLUMNS FROM run_updates u WHERE u.run_id = ? ORDER BY u.number", runId, map = ::mapRunUpdate)
 
     /** The newest run that continues [id], if any. */
     fun continuedBy(id: UUID): UUID? = db.queryOne(
@@ -692,6 +816,8 @@ class RunStore(private val db: Db) {
             waiting = r.wait?.takeIf { r.status in WAITABLE_STATUSES }?.toDto(),
             warnings = stageRows.filter { it.warning != null }.groupBy { it.round }.toSortedMap()
                 .map { (round, list) -> dk.egernet.factory.RunWarningDto(round, list.map { it.role }, list.first().warning!!) },
+            updateRounds = r.updateRounds, maxUpdateRounds = r.maxUpdateRounds, updateAvailable = r.updateAvailable,
+            updates = updates(r.id).map { it.toDto() },
         )
     }
 
@@ -704,6 +830,10 @@ class RunStore(private val db: Db) {
             setFailure(id, dk.egernet.factory.FailureKind.RESTART, null)
             closeOpenStages(id)
         }
+        // An update round is not resumed after a restart: its run failed above, and its row ends with it.
+        db.update(
+            "UPDATE run_updates SET status = 'failed', error = 'Interrupted by a server restart', ended_at = now() WHERE status = 'running'",
+        )
         return ids
     }
 

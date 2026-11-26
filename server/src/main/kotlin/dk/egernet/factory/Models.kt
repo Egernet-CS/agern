@@ -142,6 +142,11 @@ data class ReleaseIssueDto(
     val targetRepo: String? = null, val targetDir: String? = null,
     /** The linked run's network wait while the issue is `running` and its run waits for the network. */
     val waiting: RunWaitDto? = null,
+    /** From the linked run: whether "Update and merge" can start now, its update rounds and limit, the latest update's summary. */
+    val updateAvailable: Boolean = false,
+    val updateRounds: Int = 0,
+    val maxUpdateRounds: Int = 0,
+    val updateSummary: String? = null,
 )
 
 /**
@@ -326,6 +331,45 @@ data class RunDto(
     val targetDirectory: String? = null,
     /** Set while the run sleeps before retrying an operation that failed for lack of network; null otherwise. */
     val waiting: RunWaitDto? = null,
+    /** Update rounds started on the run, and its limit (docs/ARCHITECTURE.md §6 "Retrying a run", "Update and merge"). */
+    val updateRounds: Int = 0,
+    val maxUpdateRounds: Int = 0,
+    /** True when the owner can start an update round now ("Update and merge"). */
+    val updateAvailable: Boolean = false,
+    /** The run's update rounds, oldest first. */
+    val updates: List<RunUpdateDto> = emptyList(),
+)
+
+/**
+ * One update round of a run ("Update and merge"): Agern merged [target] into the run's branch, the builder resolved what
+ * conflicted, and the reviewers and the approver ran again. Texts from the repository ([incoming], [conflicts],
+ * [migrations], [commits]) are untrusted data.
+ */
+@Serializable
+data class RunUpdateDto(
+    val number: Int, val round: Int, val maxRounds: Int,
+    /** `owner` or `release` (automatic, in a building release). */
+    val trigger: String,
+    val target: String,
+    /** The merge refusal that caused the update. */
+    val reason: String? = null,
+    /** `running`, `resolved` (pushed; review and merge follow), `failed` or `cancelled`. */
+    val status: String,
+    /** `up_to_date`, `merged` or `conflict`; null before the merge. */
+    val mergeStatus: String? = null,
+    val targetSha: String? = null,
+    val incomingCount: Int = 0,
+    /** Subjects of the commits that came in (first parent, at most 50). */
+    val incoming: List<String> = emptyList(),
+    val conflicts: List<String> = emptyList(),
+    val migrations: List<String> = emptyList(),
+    /** The builder's commits, `<short sha> <subject>`, oldest first. */
+    val commits: List<String> = emptyList(),
+    val error: String? = null,
+    val startedAt: String,
+    val endedAt: String? = null,
+    /** One line for people, composed by the server. */
+    val summary: String,
 )
 
 /** Ways to retry a failed run (docs/ARCHITECTURE.md §6 "Retrying a run"). */
@@ -336,9 +380,14 @@ object RetryMode {
     const val CONTINUE = "continue"
     /** A new run from scratch (the behaviour before retry modes existed; the default when a client sends none). */
     const val START_OVER = "start_over"
+    /**
+     * "Update and merge": a finished run whose merge was refused because its target moved gets an update round on the
+     * same run (merge the target in, the builder resolves it, review, approve, merge).
+     */
+    const val UPDATE = "update"
     /** Whatever the server recommends for the run. Only accepted in requests. */
     const val RECOMMENDED = "recommended"
-    val ALL = listOf(STEP, CONTINUE, START_OVER)
+    val ALL = listOf(UPDATE, STEP, CONTINUE, START_OVER)
 }
 
 /** Why a run failed, recorded when it fails. */
@@ -351,6 +400,10 @@ object FailureKind {
     const val STEP = "step"
     /** The merge was refused: a submodule pointer names a commit its remote does not have (the run needs a human). */
     const val SUBMODULE_COMMIT_MISSING = "submodule_commit_missing"
+    /** The merge was refused: the run's migrations collide with its target's (the run needs a human; "Update and merge"). */
+    const val MIGRATION_CONFLICT = "migration_conflict"
+    /** The merge was refused: the pull request conflicts with its target or is behind it ("Update and merge"). */
+    const val MERGE_CONFLICT = "merge_conflict"
     const val OTHER = "other"
 
     /**
@@ -359,6 +412,9 @@ object FailureKind {
      * off); see [dk.egernet.factory.pipeline.Transient] and docs/ARCHITECTURE.md §6 "Transient failures".
      */
     val INTERRUPTED = setOf(TIME_LIMIT, USAGE_LIMIT, RESTART, API_UNREACHABLE)
+
+    /** Refusals of the merge that an update round can resolve. */
+    val UPDATABLE = setOf(MIGRATION_CONFLICT, MERGE_CONFLICT)
 
     private val API_UNREACHABLE_RE = Regex(
         "(?i)can'?t reach the api|unable to connect to (the )?api|api error: (connection|network)|connection error|" +

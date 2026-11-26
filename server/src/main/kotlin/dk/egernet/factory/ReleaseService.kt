@@ -315,6 +315,7 @@ class ReleaseService(
         return builder.retryOptions(id, number) ?: dk.egernet.factory.RetryOptionsDto(
             runId = "", recommended = dk.egernet.factory.RetryMode.START_OVER, reason = "The issue has no run to continue from.",
             options = listOf(
+                dk.egernet.factory.RetryOptionDto(dk.egernet.factory.RetryMode.UPDATE, false, "The issue has no run."),
                 dk.egernet.factory.RetryOptionDto(dk.egernet.factory.RetryMode.STEP, false, "The issue has no run."),
                 dk.egernet.factory.RetryOptionDto(dk.egernet.factory.RetryMode.CONTINUE, false, "The issue has no run."),
                 dk.egernet.factory.RetryOptionDto(dk.egernet.factory.RetryMode.START_OVER, true, "A new run from scratch."),
