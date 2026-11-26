@@ -211,7 +211,7 @@ class SandboxManager(
                 null, repo, worktree,
             )
             is ParsedDefinition.Valid -> {
-                // A workspace run's sandbox is approved per member repository (docs/ARCHITECTURE.md ง6 "Workspace runs").
+                // A workspace run's sandbox is approved per member repository (docs/ARCHITECTURE.md ยง6 "Workspace runs").
                 val approval = withContext(Dispatchers.IO) { approvals.get(definitionRepo) }
                 val def = parsed.definition
                 if (approval != null && approval.sha256 == parsed.sha256) {
