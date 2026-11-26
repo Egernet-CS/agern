@@ -1789,7 +1789,7 @@ html.app-locked #root {
 }
 /* A run (or a release's running issue) waiting for the network (docs/ARCHITECTURE.md §6 "Transient failures"). */
 .notice--wait {
-  border-color: rgba(143, 180, 255, 0.4);
+  border-color: color-mix(in srgb, var(--changes) 40%, transparent);
   background: linear-gradient(90deg, var(--changes-wash), var(--surface) 60%);
 }
 .network-wait {

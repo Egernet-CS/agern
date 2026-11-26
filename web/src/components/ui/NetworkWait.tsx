@@ -26,7 +26,7 @@ export function NetworkWaitBanner({
   return (
     <div className="notice notice--wait network-wait" role="status">
       <div className="notice-text">
-        <strong>Waiting for the network</strong>
+        <strong>Waiting for the network</strong>{' '}
         since {dateTime(wait.since)} ({timeAgo(wait.since, now)}). <span className="network-wait-detail">{wait.detail}</span>{' '}
         Next try at {shortClock(wait.nextAttemptAt, now)} (attempt {wait.attempt + 1}).
       </div>
