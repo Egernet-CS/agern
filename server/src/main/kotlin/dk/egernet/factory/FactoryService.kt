@@ -286,6 +286,15 @@ class FactoryService(
         return runs.toDto(orchestrator.approve(user, runId))
     }
 
+    /**
+     * "Merge anyway" (docs/ARCHITECTURE.md §6 "Checks before a merge"): the owner merges although the checks on
+     * [headSha] have not passed. Web only: there is deliberately no MCP tool, MCP argument or chat command for it.
+     */
+    suspend fun mergeAnywayRun(user: UserRecord, runId: UUID, headSha: String): RunDto {
+        visibleRun(user, runId)
+        return runs.toDto(orchestrator.mergeAnyway(user, runId, headSha))
+    }
+
     /** The owner's message for the agent of a run that needs a human (docs/ARCHITECTURE.md §6 "Conversation at needs human"). */
     suspend fun talkToRun(user: UserRecord, runId: UUID, text: String): TalkAcceptedDto {
         visibleRun(user, runId)
@@ -301,6 +310,18 @@ class FactoryService(
     suspend fun cancelRun(user: UserRecord, runId: UUID): RunDto {
         visibleRun(user, runId)
         return runs.toDto(orchestrator.cancel(user, runId))
+    }
+
+    /** "Retry now" for a run waiting for the network (docs/ARCHITECTURE.md §6 "Transient failures"); owner or admin. */
+    suspend fun retryRunNow(user: UserRecord, runId: UUID): RunDto {
+        visibleRun(user, runId)
+        return runs.toDto(orchestrator.retryNow(user, runId))
+    }
+
+    /** "Give up" for a run waiting for the network: it fails now; owner or admin. Returns it once it has failed. */
+    suspend fun giveUpRun(user: UserRecord, runId: UUID): RunDto {
+        visibleRun(user, runId)
+        return runs.toDto(orchestrator.giveUp(user, runId))
     }
 
     /** How a run can be retried (docs/ARCHITECTURE.md §6 "Retrying a run"); anyone who can see it may ask. */
@@ -397,8 +418,7 @@ class FactoryService(
                             candidates.joinToString("\n") { "• ${it.id}  #${it.issueNumber} ${it.issueTitle}" }
                     }
                 }
-                val r = approveRun(owner, id)
-                "Run ${r.id}: ${r.status}" + (r.error?.let { " — $it" } ?: "")
+                approvedRunReply(approveRun(owner, id))
             }
             "cancel" -> {
                 val id = parts.getOrNull(1)?.let { parseUuid(it) } ?: return "Usage: /factory cancel <runId>"
@@ -499,6 +519,15 @@ class FactoryService(
             val nums = tokens.flatMap { it.split(',') }.map { it.trim() }.filter { it.isNotEmpty() }
                 .map { t -> t.removePrefix("#").toIntOrNull()?.takeIf { it > 0 } ?: return null }
             return nums.ifEmpty { null }
+        }
+
+        /** The reply to a run's approval (`/factory approve`, `factory_approve_run`). */
+        fun approvedRunReply(r: RunDto): String {
+            val c = r.checks
+            if (r.status == RunStatus.WAITING_FOR_CHECKS && c != null) {
+                return "Run ${r.id} is waiting for checks on `${c.sha.take(7)}` (${c.detail}); it merges by itself when they pass."
+            }
+            return "Run ${r.id}: ${r.status}" + (r.error?.let { " — $it" } ?: "")
         }
 
         /** The reply to an approval (`/factory release approve`, `factory_approve_release`). */

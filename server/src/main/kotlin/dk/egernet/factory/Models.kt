@@ -168,10 +168,24 @@ data class ReleaseIssueDto(
     val retryMode: String? = null,
     /** The member repository and directory its linked run targets; null without a run or for the project repository. */
     val targetRepo: String? = null, val targetDir: String? = null,
+    /** The linked run's network wait while the issue is `running` and its run waits for the network. */
+    val waiting: RunWaitDto? = null,
 )
 
-/** Why a release is paused; [resumeAt] is set only for an automatic resume after a usage limit. */
-@Serializable data class ReleasePauseDto(val reason: String, val note: String?, val resumeAt: String?)
+/**
+ * Why a release is paused; [resumeAt] is set for an automatic resume (after a usage limit, or the next try for reason
+ * `network`). [since] and [attempt]: the start of the current network streak and its failed starts (reason `network`).
+ */
+@Serializable data class ReleasePauseDto(
+    val reason: String, val note: String?, val resumeAt: String?, val since: String? = null, val attempt: Int? = null,
+)
+
+/**
+ * A run that lost the network and waits before trying again (docs/ARCHITECTURE.md §6 "Transient failures"); ISO instants.
+ * [attempt]: failed attempts of the current streak so far (≥ 1); [detail]: what failed.
+ */
+@Serializable
+data class RunWaitDto(val reason: String, val since: String, val nextAttemptAt: String, val attempt: Int, val detail: String)
 
 @Serializable
 data class ReleaseDto(
@@ -346,7 +360,31 @@ data class RunDto(
     val mergedOnGitHub: Boolean = false,
     /** The GitHub login that merged the pull request on GitHub; null when unknown or merged by Agern. */
     val mergedBy: String? = null,
+    /** The checks on the pull request's head commit as last evaluated before a merge; null until the first evaluation. */
+    val checks: RunChecksDto? = null,
+    /** Set while the run sleeps before retrying an operation that failed for lack of network; null otherwise. */
+    val waiting: RunWaitDto? = null,
 )
+
+/**
+ * The checks a run's merge was decided on (docs/ARCHITECTURE.md §6 "Checks before a merge"). [state] is a
+ * [ReleaseChecksState]; [items] are the checks that have not passed (at most [MAX_ITEMS]); [waitingSince] and [deadline]
+ * are set only while the run is `waiting_for_checks`; [overriddenBy] / [overriddenAt] when the owner merged anyway.
+ * Names, details and URLs come from GitHub and are untrusted; [RunCheckItemDto.url] is only ever an `https://` URL.
+ */
+@Serializable
+data class RunChecksDto(
+    val state: String, val sha: String, val detail: String, val items: List<RunCheckItemDto> = emptyList(),
+    val waitingSince: String? = null, val deadline: String? = null,
+    val overriddenBy: String? = null, val overriddenAt: String? = null,
+) {
+    companion object {
+        const val MAX_ITEMS = 50
+    }
+}
+
+/** One check that has not passed: [state] `failed` (with its [conclusion]) or `pending`. */
+@Serializable data class RunCheckItemDto(val name: String, val state: String, val conclusion: String? = null, val url: String? = null)
 
 /** Ways to retry a failed run (docs/ARCHITECTURE.md §6 "Retrying a run"). */
 object RetryMode {
@@ -371,11 +409,17 @@ object FailureKind {
     const val STEP = "step"
     /** The merge was refused: a submodule pointer names a commit its remote does not have (the run needs a human). */
     const val SUBMODULE_COMMIT_MISSING = "submodule_commit_missing"
+    /**
+     * The merge was not made because the checks on the pull request's head commit failed, did not finish within the
+     * time limit or could not be read (docs/ARCHITECTURE.md §6 "Checks before a merge").
+     */
+    const val CHECKS = "checks"
     const val OTHER = "other"
 
     /**
      * Failures that come from the environment rather than the work. Continuing is recommended for them when the branch
-     * has commits; issue #57 (pause and retry transient failures automatically) can build on this set.
+     * has commits. A run only fails with [API_UNREACHABLE] after it waited for the network and gave up (or waiting is
+     * off); see [dk.egernet.factory.pipeline.Transient] and docs/ARCHITECTURE.md §6 "Transient failures".
      */
     val INTERRUPTED = setOf(TIME_LIMIT, USAGE_LIMIT, RESTART, API_UNREACHABLE)
 
@@ -704,7 +748,12 @@ object RunStatus {
     const val NEEDS_HUMAN = "needs_human"; const val FAILED = "failed"; const val CANCELLED = "cancelled"
     /** Passed every reviewer under [MergePolicy.GITHUB]: the pull request waits on GitHub; Agern follows it. */
     const val READY = "ready"
-    val ACTIVE = setOf(QUEUED, SPEC, BUILDING, REVIEWING, APPROVING, NEEDS_HUMAN)
+    /**
+     * Approved, but the checks on the pull request's head commit have not passed yet: merges by itself when they do
+     * (docs/ARCHITECTURE.md §6 "Checks before a merge"). Survives a restart, like [NEEDS_HUMAN].
+     */
+    const val WAITING_FOR_CHECKS = "waiting_for_checks"
+    val ACTIVE = setOf(QUEUED, SPEC, BUILDING, REVIEWING, APPROVING, WAITING_FOR_CHECKS, NEEDS_HUMAN)
     val TERMINAL = setOf(MERGED, FAILED, CANCELLED, READY)
     val ALL = ACTIVE + TERMINAL
 }
@@ -770,6 +819,8 @@ object ReleaseIssueState {
 /** Why a release is paused. */
 object PauseReason {
     const val MANUAL = "manual"; const val USAGE_LIMIT = "usage_limit"; const val CREDENTIALS = "credentials"
+    /** The next issue could not start because GitHub or the Claude API could not be reached; it resumes by itself. */
+    const val NETWORK = "network"
 }
 
 object SessionStatus {

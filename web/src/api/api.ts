@@ -123,6 +123,11 @@ export interface Api {
   pauseRelease(id: string): Promise<Release>;
   /** Owner only; 409 `release_not_paused`, 422 `claude_credential_required`. */
   resumeRelease(id: string): Promise<Release>;
+  /**
+   * Owner or admin; 409 `release_not_waiting_for_network` unless paused with reason `network`. Holds the issue that could
+   * not start and goes on with the next one.
+   */
+  giveUpReleaseNetwork(id: string): Promise<Release>;
   /** Owner or admin; 409 `release_not_building`. Stops the running issue; what was merged stays on the branch. */
   cancelRelease(id: string): Promise<Release>;
   /**
@@ -181,7 +186,16 @@ export interface Api {
   runs(filter?: { active?: boolean; status?: RunStatus[] }): Promise<Run[]>;
   run(id: string): Promise<Run>;
   approveRun(id: string): Promise<Run>;
+  /**
+   * Owner only: merges although the checks on `headSha` have not passed (docs/ARCHITECTURE.md §6 "Checks before a
+   * merge"). 409 `run_not_overridable` / `checks_changed` / `review_required` / `review_in_progress` / `agent_busy`.
+   */
+  mergeAnywayRun(id: string, headSha: string): Promise<Run>;
   cancelRun(id: string): Promise<Run>;
+  /** "Retry now" for a run waiting for the network. Owner or admin (403); 409 `run_not_waiting_for_network`. */
+  retryRunNow(id: string): Promise<Run>;
+  /** "Give up" for a run waiting for the network: it fails now. Owner or admin (403); 409 `run_not_waiting_for_network`. */
+  giveUpRun(id: string): Promise<Run>;
   /**
    * Owner only (403 for everyone else, admins included): a message to the run's advisor while it needs a human. 409
    * `run_not_waiting` / `review_in_progress` / `agent_busy` / `too_many_agents` / `run_worktree_missing`, 422

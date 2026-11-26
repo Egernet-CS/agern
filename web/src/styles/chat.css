@@ -899,6 +899,7 @@
   display: block;
   max-width: 220px;
   max-height: 160px;
+  height: auto;
   object-fit: contain;
 }
 .t-att-figure figcaption {

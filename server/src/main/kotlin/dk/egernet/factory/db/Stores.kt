@@ -403,7 +403,36 @@ data class RunRecord(
     /** The pull request was merged on GitHub, outside Agern; [mergedBy] is who merged it, when GitHub reports it. */
     val mergedOnGitHub: Boolean = false,
     val mergedBy: String? = null,
-)
+    /** JSON of [dk.egernet.factory.RunChecksDto] (without the waiting times): the checks last evaluated before a merge. */
+    val checksJson: String? = null,
+    /** While `waiting_for_checks`: since when, and when it stops waiting (docs/ARCHITECTURE.md §6 "Checks before a merge"). */
+    val checksWaitingSince: Instant? = null,
+    val checksDeadline: Instant? = null,
+    /** Who approved the merge that waits for its checks: a username, or null for the approver agent. */
+    val mergeApprovedBy: String? = null,
+    /** Set while the run sleeps before retrying an operation that failed for lack of network. */
+    val wait: RunWait? = null,
+) {
+    /** [checksJson] decoded; null when there is none (or it cannot be read). */
+    val checks: dk.egernet.factory.RunChecksDto?
+        get() = checksJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunChecksDto.serializer(), it) }.getOrNull() }
+}
+
+/** A run's network wait (docs/ARCHITECTURE.md §6 "Transient failures"): see [dk.egernet.factory.RunWaitDto]. */
+data class RunWait(val reason: String, val since: Instant, val nextAt: Instant, val attempts: Int, val detail: String)
+
+/** The wait columns of `runs` (aliased with [prefix]) as a [RunWait], or null when there is none. */
+internal fun ResultSet.runWait(prefix: String = ""): RunWait? {
+    val reason = getString("${prefix}wait_reason") ?: return null
+    val since = instantOrNull("${prefix}wait_since") ?: return null
+    val next = instantOrNull("${prefix}wait_next_at") ?: return null
+    return RunWait(reason, since, next, getInt("${prefix}wait_attempts"), getString("${prefix}wait_detail") ?: "")
+}
+
+/** Statuses in which a run can be waiting for the network. */
+internal val WAITABLE_STATUSES = setOf(RunStatus.QUEUED, RunStatus.SPEC, RunStatus.BUILDING, RunStatus.REVIEWING, RunStatus.APPROVING)
+
+internal fun RunWait.toDto() = dk.egernet.factory.RunWaitDto(reason, since.iso(), nextAt.iso(), attempts, detail.ifBlank { "The network could not be reached" })
 
 class RunStore(private val db: Db) {
     private val screenshots = ScreenshotStore(db)
@@ -423,6 +452,8 @@ class RunStore(private val db: Db) {
         rs.getString("failure_kind"), rs.getString("failed_step"),
         rs.getString("target_repo"), rs.getString("target_dir"), splitRepos(rs.getString("context_repos")),
         rs.getString("merge_policy"), rs.getBoolean("merged_on_github"), rs.getString("merged_by"),
+        rs.getString("checks"), rs.instantOrNull("checks_waiting_since"), rs.instantOrNull("checks_deadline"),
+        rs.getString("merge_approved_by"), rs.runWait(),
     )
 
     private fun mapStage(rs: ResultSet) = StageRecord(
@@ -446,7 +477,7 @@ class RunStore(private val db: Db) {
         val inserted = db.tx { c ->
             c.prepare("SELECT pg_advisory_xact_lock(hashtext(?))", arrayOf<Any?>("$repo#$issueNumber")).use { it.executeQuery().close() }
             val active = c.prepare(
-                "SELECT count(*) FROM runs WHERE repo = ? AND issue_number = ? AND status IN ('queued','spec','building','reviewing','approving','needs_human')",
+                "SELECT count(*) FROM runs WHERE repo = ? AND issue_number = ? AND status IN ('queued','spec','building','reviewing','approving','waiting_for_checks','needs_human')",
                 arrayOf<Any?>(repo, issueNumber),
             ).use { ps -> ps.executeQuery().use { rs -> rs.next(); rs.getInt(1) } }
             if (active > 0) return@tx false
@@ -475,7 +506,7 @@ class RunStore(private val db: Db) {
         val run = get(id) ?: return@tx false
         c.prepare("SELECT pg_advisory_xact_lock(hashtext(?))", arrayOf<Any?>("${run.repo}#${run.issueNumber}")).use { it.executeQuery().close() }
         val active = c.prepare(
-            "SELECT count(*) FROM runs WHERE repo = ? AND issue_number = ? AND id <> ? AND status IN ('queued','spec','building','reviewing','approving','needs_human')",
+            "SELECT count(*) FROM runs WHERE repo = ? AND issue_number = ? AND id <> ? AND status IN ('queued','spec','building','reviewing','approving','waiting_for_checks','needs_human')",
             arrayOf<Any?>(run.repo, run.issueNumber, id),
         ).use { ps -> ps.executeQuery().use { rs -> rs.next(); rs.getInt(1) } }
         if (active > 0) return@tx false
@@ -507,7 +538,7 @@ class RunStore(private val db: Db) {
         val where = mutableListOf<String>()
         val params = mutableListOf<Any?>()
         if (repo != null) { where += "r.repo = ?"; params += repo }
-        if (activeOnly) where += "r.status IN ('queued','spec','building','reviewing','approving','needs_human')"
+        if (activeOnly) where += "r.status IN ('queued','spec','building','reviewing','approving','waiting_for_checks','needs_human')"
         if (statuses != null) {
             if (statuses.isEmpty()) return emptyList()
             where += "r.status IN (" + statuses.joinToString(",") { "?" } + ")"
@@ -519,13 +550,13 @@ class RunStore(private val db: Db) {
     }
 
     fun activeRunFor(repo: String, issueNumber: Int): UUID? = db.queryOne(
-        "SELECT id FROM runs WHERE repo = ? AND issue_number = ? AND status IN ('queued','spec','building','reviewing','approving','needs_human') ORDER BY created_at DESC LIMIT 1",
+        "SELECT id FROM runs WHERE repo = ? AND issue_number = ? AND status IN ('queued','spec','building','reviewing','approving','waiting_for_checks','needs_human') ORDER BY created_at DESC LIMIT 1",
         repo, issueNumber,
     ) { it.uuid("id") }
 
     /** Active runs (including `needs_human`) of a release. */
     fun activeByRelease(releaseId: UUID): List<RunRecord> = db.query(
-        "$select WHERE r.release_id = ? AND r.status IN ('queued','spec','building','reviewing','approving','needs_human') ORDER BY r.created_at",
+        "$select WHERE r.release_id = ? AND r.status IN ('queued','spec','building','reviewing','approving','waiting_for_checks','needs_human') ORDER BY r.created_at",
         releaseId, map = ::map,
     )
 
@@ -540,25 +571,42 @@ class RunStore(private val db: Db) {
     ) { it.getInt("pr_number") }
 
     fun activeRunsByIssue(repo: String): Map<Int, UUID> = db.query(
-        "SELECT issue_number, id FROM runs WHERE repo = ? AND status IN ('queued','spec','building','reviewing','approving','needs_human')",
+        "SELECT issue_number, id FROM runs WHERE repo = ? AND status IN ('queued','spec','building','reviewing','approving','waiting_for_checks','needs_human')",
         repo,
     ) { it.getInt("issue_number") to it.uuid("id") }.toMap()
 
     fun countActiveByRepo(): Map<String, Int> = db.query(
-        "SELECT repo, count(*) AS n FROM runs WHERE status IN ('queued','spec','building','reviewing','approving','needs_human') GROUP BY repo",
+        "SELECT repo, count(*) AS n FROM runs WHERE status IN ('queued','spec','building','reviewing','approving','waiting_for_checks','needs_human') GROUP BY repo",
     ) { it.getString("repo") to it.getInt("n") }.toMap()
 
     /**
-     * Runs a restart would fail (see [failUnfinishedAfterRestart]): every active status except `needs_human`,
-     * which survives a restart.
+     * Runs a restart would fail (see [failUnfinishedAfterRestart]): every active status except `needs_human` and
+     * `waiting_for_checks`, which survive a restart.
      */
     fun countInProgress(): Int =
         db.queryOne("SELECT count(*) AS n FROM runs WHERE status IN ('queued','spec','building','reviewing','approving')") { it.getInt("n") } ?: 0
 
-    fun setStatus(id: UUID, status: String, error: String? = null, clearError: Boolean = false) = db.update(
-        """UPDATE runs SET status = ?, error = CASE WHEN ? THEN NULL ELSE COALESCE(?, error) END, updated_at = now(),
-           ended_at = CASE WHEN ? THEN now() ELSE ended_at END WHERE id = ?""",
-        status, clearError, error, status in RunStatus.TERMINAL, id,
+    /** A terminal or `needs_human` status also ends a network wait. */
+    fun setStatus(id: UUID, status: String, error: String? = null, clearError: Boolean = false): Int {
+        val n = db.update(
+            """UPDATE runs SET status = ?, error = CASE WHEN ? THEN NULL ELSE COALESCE(?, error) END, updated_at = now(),
+               ended_at = CASE WHEN ? THEN now() ELSE ended_at END WHERE id = ?""",
+            status, clearError, error, status in RunStatus.TERMINAL, id,
+        )
+        if (status !in WAITABLE_STATUSES) clearWait(id)
+        return n
+    }
+
+    /** The run sleeps for the network until [nextAt]; [attempts] failed since [since] (docs/ARCHITECTURE.md §6 "Transient failures"). */
+    fun setWait(id: UUID, since: Instant, nextAt: Instant, attempts: Int, detail: String) = db.update(
+        """UPDATE runs SET wait_reason = 'network', wait_since = ?, wait_next_at = ?, wait_attempts = ?, wait_detail = ?, updated_at = now()
+           WHERE id = ?""",
+        since, nextAt, attempts, detail.take(500), id,
+    )
+
+    fun clearWait(id: UUID) = db.update(
+        """UPDATE runs SET wait_reason = NULL, wait_since = NULL, wait_next_at = NULL, wait_attempts = 0, wait_detail = NULL
+           WHERE id = ? AND wait_reason IS NOT NULL""", id,
     )
 
     /**
@@ -608,6 +656,46 @@ class RunStore(private val db: Db) {
         "UPDATE runs SET sandbox = ?, updated_at = now() WHERE id = ?",
         JsonbParam(AppJson.encodeToString(dk.egernet.factory.RunSandboxDto.serializer(), info)), id,
     )
+
+    /** Records the checks last evaluated before a merge (the waiting times live in their own columns). */
+    fun setChecks(id: UUID, checks: dk.egernet.factory.RunChecksDto) = db.update(
+        "UPDATE runs SET checks = ?, updated_at = now() WHERE id = ?",
+        JsonbParam(AppJson.encodeToString(dk.egernet.factory.RunChecksDto.serializer(), checks.copy(waitingSince = null, deadline = null))), id,
+    )
+
+    /**
+     * When Agern first saw [sha] as the head of the run's pull request: recorded as [now] the first time (a new head
+     * starts again), so the settle period survives restarts. [force] records [now] even for the same head (a push).
+     */
+    fun headSeenAt(id: UUID, sha: String, now: Instant, force: Boolean = false): Instant {
+        db.update(
+            """UPDATE runs SET checks_head_sha = ?, checks_head_seen_at = ? WHERE id = ?
+               AND (? OR checks_head_sha IS DISTINCT FROM ? OR checks_head_seen_at IS NULL)""",
+            sha, now, id, force, sha,
+        )
+        return db.queryOne("SELECT checks_head_seen_at FROM runs WHERE id = ?", id) { it.instantOrNull("checks_head_seen_at") } ?: now
+    }
+
+    /** Who approved the merge (null: the approver agent); kept for the merge comment after a wait or a restart. */
+    fun setMergeApprovedBy(id: UUID, username: String?) =
+        db.update("UPDATE runs SET merge_approved_by = ? WHERE id = ?", username, id)
+
+    /**
+     * The run starts waiting for its checks: status `waiting_for_checks` (error cleared), since [since] until [deadline].
+     * False when the run is not `approving` (or already waiting) any more, e.g. cancelled meanwhile.
+     */
+    fun startWaitingForChecks(id: UUID, since: Instant, deadline: Instant): Boolean = db.update(
+        """UPDATE runs SET status = 'waiting_for_checks', error = NULL, checks_waiting_since = ?, checks_deadline = ?, updated_at = now()
+           WHERE id = ? AND status IN ('approving','waiting_for_checks')""",
+        since, deadline, id,
+    ) == 1
+
+    /** The waiting times are cleared once the run stops waiting. */
+    fun clearChecksWait(id: UUID) =
+        db.update("UPDATE runs SET checks_waiting_since = NULL, checks_deadline = NULL WHERE id = ?", id)
+
+    /** Runs in `waiting_for_checks` (resumed after a restart). */
+    fun waitingForChecks(): List<RunRecord> = db.query("$select WHERE r.status = 'waiting_for_checks' ORDER BY r.created_at", map = ::map)
 
     fun setRound(id: UUID, round: Int) = db.update("UPDATE runs SET round = ?, updated_at = now() WHERE id = ?", round, id)
     fun setContextRepos(id: UUID, repos: List<String>) =
@@ -695,15 +783,24 @@ class RunStore(private val db: Db) {
             failureKind = r.failureKind, failedStep = r.failedStep,
             targetRepo = r.targetRepo, targetDirectory = r.targetDir,
             mergePolicy = r.mergePolicy, mergedOnGitHub = r.mergedOnGitHub, mergedBy = r.mergedBy,
+            checks = r.checks?.let { c ->
+                if (r.status == RunStatus.WAITING_FOR_CHECKS) c.copy(waitingSince = r.checksWaitingSince?.iso(), deadline = r.checksDeadline?.iso())
+                else c.copy(waitingSince = null, deadline = null)
+            },
+            waiting = r.wait?.takeIf { r.status in WAITABLE_STATUSES }?.toDto(),
             warnings = stageRows.filter { it.warning != null }.groupBy { it.round }.toSortedMap()
                 .map { (round, list) -> dk.egernet.factory.RunWarningDto(round, list.map { it.role }, list.first().warning!!) },
         )
     }
 
-    /** v1: runs cannot survive a restart. needs_human runs have no process and stay as they are. */
+    /**
+     * v1: runs cannot survive a restart. needs_human runs have no process and stay as they are; runs waiting for checks
+     * are resumed ([dk.egernet.factory.pipeline.Orchestrator.resumeChecksWaits]).
+     */
     fun failUnfinishedAfterRestart(): List<UUID> {
         val ids = db.query("SELECT id FROM runs WHERE status IN ('queued','spec','building','reviewing','approving')") { it.uuid("id") }
         for (id in ids) {
+            // setStatus ends a network wait too: a waiting run is interrupted by a restart like any other.
             setStatus(id, RunStatus.FAILED, "Server restarted while the run was in progress; retry it to continue or start over.")
             setFailure(id, dk.egernet.factory.FailureKind.RESTART, null)
             closeOpenStages(id)

@@ -264,6 +264,7 @@ class MergePolicyTest {
         assertEquals(RunStatus.NEEDS_HUMAN, waiting.status)
         assertTrue(comments().any { it.startsWith("**Agern: needs a human.**") && it.endsWith("Agern does not merge it.") }, comments().toString())
         assertEquals("merge_on_github", code { s.orchestrator.approve(alice, waiting.id) }.code)
+        assertEquals("merge_on_github", code { s.orchestrator.mergeAnyway(alice, waiting.id, "abc") }.code)
         // A step retry of a merge is refused too.
         s.runs.setFailure(waiting.id, null, FailedStep.MERGE)
         assertEquals("merge_on_github", code { s.orchestrator.retryStep(alice, s.runs.get(waiting.id)!!) }.code)
@@ -279,10 +280,15 @@ class MergePolicyTest {
         policy(MergePolicy.OWNER_APPROVES)
         script()
         val oRun = finished(start(issue = 2))
-        val merge = s.orchestrator.javaClass.getDeclaredMethod("merge", RunRecord::class.java, UserRecord::class.java, String::class.java)
-        merge.isAccessible = true
-        merge.invoke(s.orchestrator, s.runs.get(gRun.id)!!, alice, "alice")
-        merge.invoke(s.orchestrator, s.runs.get(oRun.id)!!, alice, null)
+        // One evaluation before a merge, as the approval step, approve and a merge retry run it (approved by whom is on the run).
+        val mergeStep = s.orchestrator.javaClass.getDeclaredMethod(
+            "mergeStep", java.util.UUID::class.java, Boolean::class.javaPrimitiveType, Boolean::class.javaPrimitiveType,
+        )
+        mergeStep.isAccessible = true
+        s.runs.setMergeApprovedBy(gRun.id, "alice")
+        mergeStep.invoke(s.orchestrator, gRun.id, false, false)
+        s.runs.setMergeApprovedBy(oRun.id, null)
+        mergeStep.invoke(s.orchestrator, oRun.id, false, false)
         assertTrue(merges().isEmpty(), gh.actions.toString())
         assertEquals("Not merged: this run's merge policy (github) does not allow it.", s.runs.get(gRun.id)!!.error)
         assertEquals("Not merged: this run's merge policy (owner_approves) does not allow it.", s.runs.get(oRun.id)!!.error)

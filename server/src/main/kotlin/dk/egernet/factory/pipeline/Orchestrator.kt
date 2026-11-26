@@ -43,11 +43,19 @@ import dk.egernet.factory.db.UserStore
 import dk.egernet.factory.forbidden
 import dk.egernet.factory.github.Access
 import dk.egernet.factory.github.GhIssue
+import dk.egernet.factory.github.ChecksSummary
 import dk.egernet.factory.github.GitHubClient
+import dk.egernet.factory.github.GitHubException
+import dk.egernet.factory.ReleaseChecksState
+import dk.egernet.factory.RunCheckItemDto
+import dk.egernet.factory.RunChecksDto
+import dk.egernet.factory.db.iso
 import dk.egernet.factory.issueKindFromLabels
 import dk.egernet.factory.notFound
 import dk.egernet.factory.unprocessable
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -66,6 +74,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import org.slf4j.LoggerFactory
 import java.nio.file.Path
+import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -87,13 +96,16 @@ object Schemas {
  * A stage (or the run's set-up, or a step after the builder) failed; carries what the stage agent reported about usage
  * limits and credentials, the [FailureKind] and, for a mechanical step after the builder, the [FailedStep].
  */
-private class StageFailed(
+internal class StageFailed(
     message: String,
     val usageLimit: UsageLimit? = null,
     val credentialRejected: Boolean = false,
     val kind: String = FailureKind.OTHER,
     val step: String? = null,
-) : RuntimeException(message)
+    cause: Throwable? = null,
+    /** The run waited for the network and gave up (or reached the limit): never retried again ([Transient]). */
+    val gaveUp: Boolean = false,
+) : RuntimeException(message, cause)
 
 /**
  * How a release run ended, for the release builder (docs/ARCHITECTURE.md §6 "Releases"): [run] as it is now,
@@ -129,6 +141,8 @@ class Orchestrator(
     private val releaseStore: dk.egernet.factory.db.ReleaseStore? = null,
     /** The projects' settings: the merge policy a run snapshots and the reviewers of policy `github`; null = defaults. */
     private val projectSettings: dk.egernet.factory.db.ProjectSettingsStore? = null,
+    /** Time source of the checks before a merge (settle period, wait limit); tests use a controllable clock. */
+    private val clock: java.time.Clock = java.time.Clock.systemUTC(),
 ) {
     private val log = LoggerFactory.getLogger(Orchestrator::class.java)
     private val jobs = ConcurrentHashMap<UUID, Job>()
@@ -145,6 +159,21 @@ class Orchestrator(
     /** The settings of project [repo] as stored now (defaults without a row). */
     private fun settingsOf(repo: String): dk.egernet.factory.ProjectSettingsDto =
         projectSettings?.get(repo) ?: dk.egernet.factory.ProjectSettingsDto()
+
+    /**
+     * How long a pull request's head commit must have had no checks before "no checks" counts as green before a merge
+     * (FACTORY_RELEASE_CHECKS_SETTLE_SECONDS; tests change it).
+     */
+    @Volatile var checksSettleSeconds = cfg.releaseChecksSettleSeconds
+
+    /** Pause between evaluations of the checks while a run is `waiting_for_checks` (tests shorten it). */
+    @Volatile var checksPollMillis = 30_000L
+
+    /** How long a run waits for its checks before it needs a human (FACTORY_RUN_CHECKS_WAIT_MINUTES; tests shorten it). */
+    @Volatile var checksWaitLimit: java.time.Duration = java.time.Duration.ofMinutes(cfg.runChecksWaitMinutes)
+
+    /** The database keeps microseconds: compare at that precision, or a rounded-up "seen" lies after "now". */
+    private fun now(): java.time.Instant = clock.instant().truncatedTo(java.time.temporal.ChronoUnit.MICROS)
 
     /**
      * Called when a release run settles: at the end of its pipeline (not when its coroutine is cancelled), after
@@ -165,6 +194,190 @@ class Orchestrator(
     fun publish(runId: UUID) {
         runs.touch(runId)
         runs.get(runId)?.let { bus.emitFeed(FeedItem.Run(runs.toDto(it), it.contextRepos)) }
+    }
+
+    // ------------------------------------------------------------ waiting for the network (docs/ARCHITECTURE.md §6 "Transient failures")
+
+    /** How a sleeping wait ends early: "Retry now" ([giveUpBy] null) or "Give up" by [giveUpBy]. */
+    private class WakeUp(val giveUpBy: String?)
+
+    /** One sleep before the next attempt, shared by every operation of the run that fails meanwhile. */
+    private class Sleep(val nextAt: Instant) {
+        val signal = CompletableDeferred<WakeUp>()
+    }
+
+    /**
+     * A run's current streak of transient failures: when it began, how many attempts failed, the sleep in progress (if
+     * any) and who gave up. Lives only while the run's pipeline does (removed in [execute]).
+     */
+    private class NetWait {
+        val lock = Mutex()
+        var since: Instant? = null
+        var attempts = 0
+        var sleep: Sleep? = null
+        var gaveUpBy: String? = null
+    }
+
+    private val netWaits = ConcurrentHashMap<UUID, NetWait>()
+
+    /**
+     * Called with the release id when a release run starts or stops waiting for the network, so the release is
+     * published. The receiver must not block or call back into the orchestrator inline.
+     */
+    @Volatile var onReleaseRunWaitChanged: ((UUID) -> Unit)? = null
+
+    private fun waitChanged(runId: UUID) {
+        publish(runId)
+        val releaseId = runs.get(runId)?.releaseId ?: return
+        try {
+            onReleaseRunWaitChanged?.invoke(releaseId)
+        } catch (e: Exception) {
+            log.warn("Release callback for the network wait of run {} failed: {}", runId, Transient.describe(e))
+        }
+    }
+
+    /** A failure as the run's wait shows it: a [StageFailed]'s own sentence, else the exception named with its class. */
+    private fun describeFailure(e: Throwable): String = (e as? StageFailed)?.message ?: Transient.describe(e)
+
+    /**
+     * After an operation of run [runId] failed transiently ([original], described by [detail]): waits until its next
+     * attempt is due, "Retry now" is pressed, or the run is cancelled; joins the sleep in progress if there is one (not
+     * counted as another attempt). Throws instead when waiting is off ([original] itself), when the owner gave up, or when
+     * the wait would start after [Config.networkRetryMaxMs] (a [StageFailed] with [StageFailed.gaveUp]). [sessionId]:
+     * the stage agent whose transcript is told.
+     */
+    private suspend fun awaitNetwork(runId: UUID, detail: String, sessionId: UUID?, original: Exception) {
+        if (cfg.networkRetryMaxMs <= 0) throw original
+        val w = netWaits.computeIfAbsent(runId) { NetWait() }
+        val text = detail.trim().ifEmpty { Transient.describe(original) }.take(500)
+        var started = false
+        val sleep: Sleep
+        val attempt: Int
+        w.lock.withLock {
+            w.gaveUpBy?.let { throw gaveUp(original, it, w.attempts) }
+            val current = w.sleep
+            if (current != null) {
+                sleep = current
+            } else {
+                val now = Instant.now()
+                val since = w.since ?: now
+                val n = w.attempts + 1
+                if (!now.isBefore(since.plusMillis(cfg.networkRetryMaxMs))) {
+                    throw waitEnded(original, "Gave up after waiting for the network for ${humanDuration(now.toEpochMilli() - since.toEpochMilli())} ($n attempts).")
+                }
+                val delays = cfg.networkRetryDelaysMs.ifEmpty { listOf(60_000L) }
+                val s = Sleep(now.plusMillis(delays[minOf(n, delays.size) - 1]))
+                w.since = since
+                w.attempts = n
+                w.sleep = s
+                runs.setWait(runId, since, s.nextAt, n, text)
+                sleep = s
+                started = true
+            }
+            attempt = w.attempts
+        }
+        if (started) {
+            log.info("Run {} waits for the network until {} (attempt {}): {}", runId, sleep.nextAt, attempt, text)
+            waitChanged(runId)
+        }
+        sessionId?.let {
+            bestEffort {
+                agents.systemEvent(
+                    it, "warn",
+                    "Lost the connection: ${text.trimEnd('.')}. Waiting for the network; next try at ${WAIT_TIME.format(sleep.nextAt)} (attempt ${attempt + 1}).",
+                )
+            }
+        }
+        val wake = withTimeoutOrNull(java.time.Duration.between(Instant.now(), sleep.nextAt).toMillis().coerceAtLeast(1)) { sleep.signal.await() }
+        var ended = false
+        w.lock.withLock {
+            if (wake?.giveUpBy != null && w.gaveUpBy == null) w.gaveUpBy = wake.giveUpBy
+            if (w.sleep === sleep) {
+                w.sleep = null
+                runs.clearWait(runId)
+                ended = true
+            }
+        }
+        if (ended) waitChanged(runId)
+        w.gaveUpBy?.let { throw gaveUp(original, it, w.attempts) }
+    }
+
+    /** The streak of transient failures ends with the first success of a retried operation (unless a sleep is in progress). */
+    private suspend fun endStreak(runId: UUID) {
+        val w = netWaits[runId] ?: return
+        w.lock.withLock {
+            if (w.sleep == null) {
+                w.since = null
+                w.attempts = 0
+            }
+        }
+    }
+
+    private fun gaveUp(original: Exception, username: String, attempts: Int) =
+        waitEnded(original, "Gave up waiting for the network (by @$username, after $attempts attempt${if (attempts == 1) "" else "s"}).")
+
+    /**
+     * The failure a run ends with when it stops waiting: [original]'s reason with [suffix], kind `api_unreachable` (or
+     * the failed step of a push or pull request), never retried again.
+     */
+    private fun waitEnded(original: Exception, suffix: String): StageFailed {
+        val step = (original as? StageFailed)?.takeIf { it.kind == FailureKind.STEP }
+        return StageFailed(
+            "${describeFailure(original).trimEnd()} $suffix", kind = step?.kind ?: FailureKind.API_UNREACHABLE, step = step?.step,
+            cause = original, gaveUp = true,
+        )
+    }
+
+    /**
+     * Runs [block] and, while it fails transiently ([Transient.isTransient]), waits for the network ([awaitNetwork]) and
+     * runs it again, with [beforeRetry] first. The first success after a retry ends the run's streak.
+     */
+    private suspend fun <T> withNetworkRetry(runId: UUID, beforeRetry: suspend () -> Unit = {}, block: suspend () -> T): T {
+        var retried = false
+        while (true) {
+            try {
+                if (retried) beforeRetry()
+                val value = block()
+                if (retried) endStreak(runId)
+                return value
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (!Transient.isTransient(e)) throw e
+                awaitNetwork(runId, describeFailure(e), null, e)
+                retried = true
+            }
+        }
+    }
+
+    /** The sleep run [runId] is in, or 404/403/409 (owner or admin, as [cancel]). */
+    private suspend fun pendingSleep(user: UserRecord, runId: UUID): Pair<NetWait, Sleep> {
+        val run = runs.get(runId) ?: throw notFound("Run not found")
+        if (run.ownerId != user.id && !user.isAdmin) throw forbidden("Only the owner or an admin can do this for this run")
+        val w = netWaits[runId]
+        val sleep = w?.lock?.withLock { w.sleep }
+        if (w == null || sleep == null || run.status !in RunStatus.ACTIVE || run.status == RunStatus.NEEDS_HUMAN) {
+            throw conflict("The run is not waiting for the network", "run_not_waiting_for_network")
+        }
+        return w to sleep
+    }
+
+    /** "Retry now": the waiting run tries its operation again at once. Owner or admin. */
+    suspend fun retryNow(user: UserRecord, runId: UUID): RunRecord {
+        val (w, sleep) = pendingSleep(user, runId)
+        if (!sleep.signal.complete(WakeUp(null))) throw conflict("The run is not waiting for the network", "run_not_waiting_for_network")
+        // Until the sleeping pipeline has ended the wait, so the answer no longer shows it.
+        withTimeoutOrNull(5_000) { while (w.lock.withLock { w.sleep === sleep }) kotlinx.coroutines.delay(10) }
+        return runs.get(runId)!!
+    }
+
+    /** "Give up": the waiting run fails now, as it would have without waiting. Owner or admin. Returns it once failed. */
+    suspend fun giveUp(user: UserRecord, runId: UUID): RunRecord {
+        val (_, sleep) = pendingSleep(user, runId)
+        if (!sleep.signal.complete(WakeUp(user.username))) throw conflict("The run is not waiting for the network", "run_not_waiting_for_network")
+        log.info("Run {}: {} gave up waiting for the network", runId, user.username)
+        jobs[runId]?.join()
+        return runs.get(runId)!!
     }
 
     // ------------------------------------------------------------ commands (ownership enforced here)
@@ -390,10 +603,8 @@ class Orchestrator(
             val approverApproved = run.mergePolicy == MergePolicy.AUTOMATIC &&
                 runs.stages(run.id).lastOrNull { it.role == "approver" }?.verdict == "APPROVE"
             launchJob(run.id) {
-                withContext(Dispatchers.IO) { merge(runs.get(run.id)!!, owner, approvedBy = if (approverApproved) null else owner.username) }
-                runs.get(run.id)?.takeIf { it.status == RunStatus.MERGED }?.advisorSessionId?.let { agents.endAdvisor(it) }
-                publish(run.id)
-                settled(run.id)
+                mergeWithChecks(run.id, approvedBy = if (approverApproved) null else owner.username)
+                finishMerge(run.id)
             }
             return runs.get(run.id)!!
         }
@@ -411,8 +622,10 @@ class Orchestrator(
     }
 
     /**
-     * Owner only, only in needs_human: squash-merge the PR and close the issue. Never for a run of policy `github`
-     * (409 `merge_on_github`, whatever its status; docs/ARCHITECTURE.md §6 "Merge policy").
+     * Owner only, only in needs_human: squash-merge the PR and close the issue once the checks on its head commit allow
+     * it (docs/ARCHITECTURE.md §6 "Checks before a merge"). The first evaluation happens before this answers: the run is
+     * then merged, needs a human again, or is `waiting_for_checks` with a job that merges it when they pass. Never for a
+     * run of policy `github` (409 `merge_on_github`, whatever its status; docs/ARCHITECTURE.md §6 "Merge policy").
      */
     suspend fun approve(user: UserRecord, runId: UUID): RunRecord {
         val run = runs.get(runId) ?: throw notFound("Run not found")
@@ -422,11 +635,65 @@ class Orchestrator(
         if (run.prNumber == null) throw conflict("Run has no pull request to merge")
         startMerging(runId)
         publish(runId)
-        withContext(Dispatchers.IO) { merge(runs.get(runId)!!, user, approvedBy = user.username) }
-        runs.get(runId)?.takeIf { it.status == RunStatus.MERGED }?.advisorSessionId?.let { agents.endAdvisor(it) }
-        publish(runId)
-        settled(runId)
+        runs.setMergeApprovedBy(runId, user.username)
+        val step = withContext(Dispatchers.IO) { mergeStep(runId) }
+        if (step is MergeStep.Wait && startWaiting(runId)) {
+            launchJob(runId) {
+                waitForChecks(runId)
+                finishMerge(runId)
+            }
+            return runs.get(runId)!!
+        }
+        finishMerge(runId)
         return runs.get(runId)!!
+    }
+
+    /**
+     * The owner merges the run's pull request although its checks have not passed ("Merge anyway", web only: no MCP tool
+     * or chat command reaches this). Bound to [headSha], the commit whose checks the owner saw; recorded on the run, the
+     * pull request and the issue. From `waiting_for_checks` the waiting job is stopped first; from `needs_human` the
+     * conversation gate of an approval applies.
+     */
+    suspend fun mergeAnyway(user: UserRecord, runId: UUID, headSha: String): RunRecord {
+        val run = runs.get(runId) ?: throw notFound("Run not found")
+        if (run.ownerId != user.id) throw forbidden("Only the owner of this run can merge it")
+        if (run.mergePolicy == MergePolicy.GITHUB) throw mergeOnGitHub(run)
+        if (headSha.isBlank()) throw badRequest("headSha must not be empty")
+        requireOverridable(run, headSha)
+        if (run.status == RunStatus.WAITING_FOR_CHECKS) {
+            jobs[runId]?.let { it.cancel(); it.join() }
+            val after = runs.get(runId)!!
+            if (after.status == RunStatus.MERGED) return after
+            requireOverridable(after, headSha)
+            if (after.status == RunStatus.WAITING_FOR_CHECKS) {
+                runs.setStatus(runId, RunStatus.APPROVING, clearError = true)
+                runs.clearChecksWait(runId)
+            } else {
+                startMerging(runId)
+            }
+        } else {
+            startMerging(runId)
+        }
+        publish(runId)
+        withContext(Dispatchers.IO) { mergeOverridden(runId, user, headSha) }
+        finishMerge(runId)
+        return runs.get(runId)!!
+    }
+
+    /** 409 unless [run] may be merged anyway for [headSha]: its recorded checks block the merge and are for that commit. */
+    private fun requireOverridable(run: RunRecord, headSha: String) {
+        val c = run.checks
+        if (run.status != RunStatus.NEEDS_HUMAN && run.status != RunStatus.WAITING_FOR_CHECKS || run.prNumber == null ||
+            c == null || c.state !in BLOCKING_CHECKS
+        ) {
+            throw conflict("Run ${run.id} cannot be merged anyway: only a run whose checks blocked its merge can", "run_not_overridable")
+        }
+        if (c.sha != headSha) {
+            throw conflict(
+                "The checks changed since you looked: they are now for commit `${c.sha.take(7)}`. Look at them again before merging.",
+                "checks_changed",
+            )
+        }
     }
 
     /**
@@ -661,7 +928,10 @@ class Orchestrator(
             val ctx = runContext(start, owner)
             val home = workspaces.home(owner.username)
             val head = withContext(Dispatchers.IO) { workspaces.git.head(ctx.worktree, home) }
-            withContext(Dispatchers.IO) { workspaces.git.push(id, ctx.worktree, ctx.branch, home) }
+            withContext(Dispatchers.IO) {
+                workspaces.git.push(id, ctx.worktree, ctx.branch, home)
+                runs.headSeenAt(runId, head, now())
+            }
             val round = (runs.stages(runId).maxOfOrNull { it.round } ?: 0) + 1
             val eff = preferences.effective(owner.id)
             REVIEWER_ROLES.forEach { runs.createStage(runId, it, round, eff.model(it)) }
@@ -887,11 +1157,13 @@ class Orchestrator(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            log.warn("Run {} failed: {}", runId, e.message)
-            val reason = e.message ?: e.javaClass.simpleName
             val sf = e as? StageFailed
+            // The log names the exception's class; the run's error keeps a message people can read, and is the class
+            // name (never "null") for an exception without one, e.g. java.net.ConnectException from HttpClient.
+            log.warn("Run {} failed: {}", runId, Transient.describe(e))
+            val reason = sf?.message ?: e.message?.takeIf { it.isNotBlank() } ?: Transient.describe(e)
             val kind = sf?.kind?.takeIf { it != FailureKind.OTHER }
-                ?: if (e is java.io.IOException || FailureKind.looksUnreachable(reason)) FailureKind.API_UNREACHABLE else FailureKind.OTHER
+                ?: if (Transient.isTransient(e) || FailureKind.looksUnreachable(reason)) FailureKind.API_UNREACHABLE else FailureKind.OTHER
             runs.setFailure(runId, kind, sf?.step)
             // Clean up first, so a run shown as ended has left nothing behind: the sandbox (it bind-mounts the worktree),
             // then the worktree.
@@ -902,6 +1174,7 @@ class Orchestrator(
             settled(runId, sf?.usageLimit, sf?.credentialRejected == true)
             return
         } finally {
+            netWaits.remove(runId)
             // Safety net; normally released already (end of the build/review loop, failure, cancel) — and always before
             // settled(), so the next run of a release finds the slot free.
             withContext(NonCancellable) { sandboxes.release(runId) }
@@ -968,37 +1241,15 @@ class Orchestrator(
         val resuming = step != null
         val previous = if (resuming) null else run.continuesRunId?.let { runs.get(it) }
 
-        // Workspace: owner's clone + a worktree on the run branch.
-        val repoInfo = withContext(Dispatchers.IO) { client.getRepo(org, run.repo) } ?: throw StageFailed("Repository not accessible")
-        val issue = withContext(Dispatchers.IO) { client.getIssue(org, run.repo, run.issueNumber) } ?: throw StageFailed("Issue not found")
-        val comments = withContext(Dispatchers.IO) { runCatching { client.listComments(org, run.repo, run.issueNumber) }.getOrDefault(emptyList()) }
-        // A release run starts from and merges into its release branch; a single run uses the default branch.
-        val target = run.baseBranch ?: repoInfo.defaultBranch
+        // Workspace: owner's clone + a worktree on the run branch. Retried as a whole when the network fails, after
+        // removing what the failed attempt checked out (docs/ARCHITECTURE.md §6 "Transient failures").
         val releaseName = run.baseBranch?.takeIf { run.releaseId != null }?.removePrefix("release/")
-        val branch = if (resuming) run.branch ?: throw StageFailed("The run has no branch to retry") else runBranch(run.issueNumber, issue.title, releaseName, run.id)
-        // A step retry re-creates the worktree on its own branch; a continuation starts at the tip of the earlier run's branch.
-        val startFrom = if (resuming) branch else previous?.branch
         // The agents' working directory; for a workspace run the change is in the target member's worktree inside it.
         val root = workspaces.runDir(owner.username, run.repo, run.id)
         val home = workspaces.home(owner.username)
-        val setUp = withContext(Dispatchers.IO) {
-            if (run.targetRepo != null) setUpWorkspace(run, owner, id, repoInfo.defaultBranch, target, branch, startFrom)
-            else {
-                val main = workspaces.ensureMain(id, run.repo)
-                val base = workspaces.withRepoLock(owner.username, run.repo) {
-                    // Leftovers of runs that have ended (e.g. after a crash) never block a new run; live runs keep theirs.
-                    workspaces.reapRunWorktrees(owner.username, run.repo) { it != run.id && keepWorktree(it) }
-                    try {
-                        workspaces.git.createWorktree(id, main, root, branch, target, home, startFrom)
-                    } catch (e: dk.egernet.factory.git.GitException) {
-                        if (startFrom == null) throw e
-                        throw StageFailed("Could not start from branch $startFrom: ${e.message}")
-                    }
-                }
-                val subs = workspaces.git.updateSubmodules(id, root, home)?.let { listOf(run.repo to it) }.orEmpty()
-                WorkspaceSetUp(root, base, parentBlock(owner, run.repo), subs)
-            }
-        }
+        val (repoInfo, issue, comments, branch, target, setUp) = withNetworkRetry(
+            runId, beforeRetry = { withContext(Dispatchers.IO) { cleanupWorktree(runId, merged = false) } },
+        ) { setUpRun(run, owner, id, client, resuming, previous, releaseName, root, home) }
         val worktree = setUp.worktree
         val baseRef = setUp.baseRef
         if (!resuming) runs.setBranch(run.id, branch)
@@ -1072,8 +1323,10 @@ class Orchestrator(
             spec = specRes.resultText?.trim().takeUnless { it.isNullOrEmpty() } ?: throw StageFailed("spec-writer produced no spec")
             runs.setSpec(run.id, spec)
             finishStage(run.id, "spec-writer", 0, null, firstParagraph(spec), emptyList())
-            withContext(Dispatchers.IO) {
-                client.comment(org, run.repo, run.issueNumber, "**Agern: spec ready** (run `${run.id}`)\n\n$spec")
+            withNetworkRetry(run.id) {
+                withContext(Dispatchers.IO) {
+                    client.comment(org, run.repo, run.issueNumber, "**Agern: spec ready** (run `${run.id}`)\n\n$spec")
+                }
             }
         }
 
@@ -1133,11 +1386,14 @@ class Orchestrator(
             }
 
             withContext(Dispatchers.IO) {
-                try {
-                    workspaces.git.push(id, worktree, branch, workspaces.home(owner.username))
-                } catch (e: Exception) {
-                    throw StageFailed("Pushing branch $branch failed: ${e.message}", kind = FailureKind.STEP, step = FailedStep.PUSH)
+                withNetworkRetry(run.id) {
+                    try {
+                        workspaces.git.push(id, worktree, branch, workspaces.home(owner.username))
+                    } catch (e: Exception) {
+                        throw StageFailed("Pushing branch $branch failed: ${e.message}", kind = FailureKind.STEP, step = FailedStep.PUSH, cause = e)
+                    }
                 }
+                recordPushedHead(run.id, worktree, home)
                 run = runs.get(run.id)!!
                 if (run.prNumber == null) {
                     // A release run's pull request must not close the issue: that happens when the release is merged.
@@ -1157,14 +1413,19 @@ class Orchestrator(
                             (prev?.error?.let { ", which stopped: ${it.lineSequence().first().take(300)}" } ?: "") +
                             ". Its commits are part of this pull request.\n\n"
                     }.orEmpty()
-                    val pr = try {
-                        client.findOpenPull(org, prRepo(run), branch) ?: client.createPull(
-                            org, prRepo(run), branch, target, prTitle(run, issue.title),
-                            "$lead\n\nBuilt by Agern run `${run.id}` for @${owner.githubLogin ?: owner.username}.\n\n" + continues + earlier +
-                                "<details><summary>Spec</summary>\n\n$spec\n\n</details>",
-                        )
-                    } catch (e: Exception) {
-                        throw StageFailed("Opening the pull request for $branch failed: ${e.message}", kind = FailureKind.STEP, step = FailedStep.PULL_REQUEST)
+                    val pr = withNetworkRetry(run.id) {
+                        try {
+                            client.findOpenPull(org, prRepo(run), branch) ?: client.createPull(
+                                org, prRepo(run), branch, target, prTitle(run, issue.title),
+                                "$lead\n\nBuilt by Agern run `${run.id}` for @${owner.githubLogin ?: owner.username}.\n\n" + continues + earlier +
+                                    "<details><summary>Spec</summary>\n\n$spec\n\n</details>",
+                            )
+                        } catch (e: Exception) {
+                            throw StageFailed(
+                                "Opening the pull request for $branch failed: ${e.message ?: e.javaClass.simpleName}",
+                                kind = FailureKind.STEP, step = FailedStep.PULL_REQUEST, cause = e,
+                            )
+                        }
                     }
                     runs.setPr(run.id, pr.number, pr.htmlUrl)
                     bestEffort { client.comment(org, run.repo, run.issueNumber, "**Agern:** pull request ${pr.htmlUrl} is open; reviews are running.") }
@@ -1233,7 +1494,7 @@ class Orchestrator(
             )
             MergePolicy.GITHUB -> withContext(Dispatchers.IO) { readyForGitHub(runs.get(run.id)!!, owner, v) }
             else -> if (v.verdict == "APPROVE") {
-                withContext(Dispatchers.IO) { merge(runs.get(run.id)!!, owner, approvedBy = null) }
+                mergeWithChecks(run.id, approvedBy = null, waitForNetwork = true)
                 publish(run.id)
             } else {
                 needsHuman(runs.get(run.id)!!, owner, "The approver escalated: ${v.summary}")
@@ -1278,6 +1539,47 @@ class Orchestrator(
         publish(run.id)
     }
 
+    /** What a run's set-up read and checked out (see [setUpRun]). */
+    private data class RunSetUp(
+        val repoInfo: dk.egernet.factory.github.GhRepo, val issue: GhIssue, val comments: List<dk.egernet.factory.github.GhComment>,
+        val branch: String, val target: String, val checkout: WorkspaceSetUp,
+    )
+
+    /**
+     * The set-up of a run: the repository and issue from GitHub, the owner's clone and the run's worktree on its branch
+     * (or the workspace checkout). One unit for the network retry: a failed attempt's checkout is removed before the next.
+     */
+    private suspend fun setUpRun(
+        run: RunRecord, owner: UserRecord, id: AgentIdentity, client: GitHubClient, resuming: Boolean, previous: RunRecord?,
+        releaseName: String?, root: Path, home: Path,
+    ): RunSetUp = withContext(Dispatchers.IO) {
+        val repoInfo = client.getRepo(org, run.repo) ?: throw StageFailed("Repository not accessible")
+        val issue = client.getIssue(org, run.repo, run.issueNumber) ?: throw StageFailed("Issue not found")
+        val comments = runCatching { client.listComments(org, run.repo, run.issueNumber) }.getOrDefault(emptyList())
+        // A release run starts from and merges into its release branch; a single run uses the default branch.
+        val target = run.baseBranch ?: repoInfo.defaultBranch
+        val branch = if (resuming) run.branch ?: throw StageFailed("The run has no branch to retry") else runBranch(run.issueNumber, issue.title, releaseName, run.id)
+        // A step retry re-creates the worktree on its own branch; a continuation starts at the tip of the earlier run's branch.
+        val startFrom = if (resuming) branch else previous?.branch
+        val checkout = if (run.targetRepo != null) setUpWorkspace(run, owner, id, repoInfo.defaultBranch, target, branch, startFrom)
+        else {
+            val main = workspaces.ensureMain(id, run.repo)
+            val base = workspaces.withRepoLock(owner.username, run.repo) {
+                // Leftovers of runs that have ended (e.g. after a crash) never block a new run; live runs keep theirs.
+                workspaces.reapRunWorktrees(owner.username, run.repo) { it != run.id && keepWorktree(it) }
+                try {
+                    workspaces.git.createWorktree(id, main, root, branch, target, home, startFrom)
+                } catch (e: dk.egernet.factory.git.GitException) {
+                    if (startFrom == null) throw e
+                    throw StageFailed("Could not start from branch $startFrom: ${e.message}", cause = e)
+                }
+            }
+            val subs = workspaces.git.updateSubmodules(id, root, home)?.let { listOf(run.repo to it) }.orEmpty()
+            WorkspaceSetUp(root, base, parentBlock(owner, run.repo), subs)
+        }
+        RunSetUp(repoInfo, issue, comments, branch, target, checkout)
+    }
+
     /** The result of a run's checkout: the change's [worktree], its [baseRef], the workspace [block] and submodule errors. */
     private data class WorkspaceSetUp(val worktree: Path, val baseRef: String, val block: String, val submoduleErrors: List<Pair<String, String>>)
 
@@ -1305,7 +1607,7 @@ class Orchestrator(
         val state = try {
             workspaceDefs.lookup(owner, run.repo, strict = true)
         } catch (e: Exception) {
-            throw StageFailed("Reading the workspace definition failed: ${e.message}")
+            throw StageFailed("Reading the workspace definition failed: ${e.message}", cause = e)
         }
         val declared = state?.takeIf { it.valid }?.members?.firstOrNull { it.directory == tDir && it.repository == tRepo } ?: throw StageFailed(gone)
         val resolved = workspaceDefs.resolve(owner, state)
@@ -1325,8 +1627,8 @@ class Orchestrator(
                     id, run.repo, run.id, defaultBranch, target, branch, startFrom, others.filter { o -> wc.checkedOut.any { it.directory == o.directory } },
                 )
             } catch (e: Exception) {
-                if (startFrom != null) throw StageFailed("Could not start from branch $startFrom in member `$tDir`: ${e.message}")
-                throw StageFailed("Member `$tDir` ($tRepo) could not be checked out: ${e.message}")
+                if (startFrom != null) throw StageFailed("Could not start from branch $startFrom in member `$tDir`: ${e.message}", cause = e)
+                throw StageFailed("Member `$tDir` ($tRepo) could not be checked out: ${e.message}", cause = e)
             }
         }
         runs.setContextRepos(run.id, co.members.map { it.repository })
@@ -1409,7 +1711,15 @@ class Orchestrator(
                     "`$targetBranch` (not into `$defaultBranch`), and the issue stays open until the release is merged.\n"
     }
 
-    /** Runs one stage's agent and marks the stage running/failed. The caller records the outcome on success. */
+    /**
+     * Runs one stage's agent and marks the stage running/failed. The caller records the outcome on success.
+     *
+     * An agent that lost the Claude API ([Transient.isTransient]) does not fail the stage: the run waits for the
+     * network ([awaitNetwork]) and the stage runs again in a new session of the same stage row, resuming the failed
+     * attempt's Claude conversation with [CONTINUE_PROMPT] when it reported one, else with the original prompt. A resume
+     * that fails without ever starting is followed by one fresh attempt with the original prompt
+     * (docs/ARCHITECTURE.md §6 "Transient failures").
+     */
     private suspend fun stage(
         runId: UUID, role: String, round: Int, owner: UserRecord, ctx: RunContext, prompt: String,
         schema: String? = null, disallowed: List<String> = emptyList(),
@@ -1417,21 +1727,61 @@ class Orchestrator(
         extraTools: Set<String> = emptySet(), notes: List<Pair<String, String>> = emptyList(),
     ): StageAgentResult {
         val st = stageRecord(runId, role, round)
-        val s = settings.get()
-        val res = agents.runStageAgent(
-            StageAgentRequest(
-                // The model recorded on the stage when it was created, so Stage.model is what actually ran.
-                owner = owner, repo = ctx.repo, role = role, model = st.model, runId = runId,
-                issueNumber = ctx.issue.number, parentSessionId = parent, workDir = ctx.root,
-                systemPrompt = prompts.system(role, ctx.repo, s.agentsMayInstallSoftware, workspace = if (ctx.memberDir != null) "" else null),
-                prompt = prompt, contextRepos = ctx.contextRepos,
-                jsonSchema = schema, disallowedTools = disallowed, resumeClaudeSessionId = resume,
-                title = "$role · #${ctx.issue.number}" + if (round > 0) " · round $round" else "",
-                extraTools = extraTools, notes = notes,
-            ),
-        ) { session ->
-            runs.startStage(st.id, session.id, session.model)
-            publish(runId)
+        var attemptPrompt = prompt
+        var attemptResume = resume
+        var attemptParent = parent
+        var resumedRetry = false
+        var retried = false
+        var res: StageAgentResult
+        while (true) {
+            val s = settings.get()
+            res = agents.runStageAgent(
+                StageAgentRequest(
+                    // The model recorded on the stage when it was created, so Stage.model is what actually ran.
+                    owner = owner, repo = ctx.repo, role = role, model = st.model, runId = runId,
+                    issueNumber = ctx.issue.number, parentSessionId = attemptParent, workDir = ctx.root,
+                    systemPrompt = prompts.system(role, ctx.repo, s.agentsMayInstallSoftware, workspace = if (ctx.memberDir != null) "" else null),
+                    prompt = attemptPrompt, contextRepos = ctx.contextRepos,
+                    jsonSchema = schema, disallowedTools = disallowed, resumeClaudeSessionId = attemptResume,
+                    title = "$role · #${ctx.issue.number}" + if (round > 0) " · round $round" else "",
+                    extraTools = extraTools, notes = notes,
+                ),
+            ) { session ->
+                runs.startStage(st.id, session.id, session.model)
+                publish(runId)
+            }
+            if (res.ok) {
+                if (retried) endStreak(runId)
+                return res
+            }
+            if (Transient.isTransient(res)) {
+                // The stage stays `running` while the run waits; it fails only if the run gives up.
+                val error = res.error.orEmpty()
+                awaitNetwork(runId, error, res.session.id, StageFailed("$role failed: $error", kind = FailureKind.API_UNREACHABLE))
+                attemptParent = res.session.id
+                val claude = res.claudeSessionId
+                if (claude != null) {
+                    attemptPrompt = CONTINUE_PROMPT
+                    attemptResume = claude
+                    resumedRetry = true
+                } else {
+                    attemptPrompt = prompt
+                    attemptResume = resume
+                    resumedRetry = false
+                }
+                retried = true
+                continue
+            }
+            if (resumedRetry && !res.started && res.result == null) {
+                // The resumed conversation could not be started at all: run the stage once more, fresh.
+                log.info("Run {}: resuming the {} conversation failed without starting; running the stage again", runId, role)
+                attemptParent = res.session.id
+                attemptPrompt = prompt
+                attemptResume = resume
+                resumedRetry = false
+                continue
+            }
+            break
         }
         if (!res.ok) {
             runs.finishStage(st.id, "failed", null, res.error, emptyList())
@@ -1482,41 +1832,370 @@ class Orchestrator(
         publish(run.id)
     }
 
+    // ------------------------------------------------------------ checks before a merge (docs/ARCHITECTURE.md §6)
+
+    /** What one evaluation before a merge ended in: [Done] (merged or needs a human) or [Wait] for the checks. */
+    private sealed interface MergeStep {
+        object Done : MergeStep
+        object Wait : MergeStep
+    }
+
+    /** The checks on one head commit as evaluated before a merge; [refusal]: GitHub refused the read (401/403/404). */
+    private data class Evaluated(val summary: ChecksSummary, val refusal: String? = null)
+
     /**
-     * Squash-merges the PR and closes the issue; a release run's issue stays open until the release is merged.
-     * On failure, or when its database migrations collide with the target's, the run goes (back) to needs_human.
+     * Merges the run's pull request once the checks on its head commit allow it, approved by [approvedBy] (null: the
+     * approver agent). Suspends while the run is `waiting_for_checks`; returns when it is merged or needs a human.
+     * [waitForNetwork] (the pipeline's own merge): a first evaluation or merge that fails for lack of network waits for it
+     * and tries again (docs/ARCHITECTURE.md §6 "Transient failures").
      */
-    private fun merge(run: RunRecord, owner: UserRecord, approvedBy: String?) {
-        // Defence in depth (docs/ARCHITECTURE.md §6 "Merge policy"): the run's policy decides, whoever called.
-        if (run.mergePolicy == MergePolicy.GITHUB || (run.mergePolicy == MergePolicy.OWNER_APPROVES && approvedBy == null)) {
-            log.error("Run {}: refusing to merge under merge policy {} (approved by {})", run.id, run.mergePolicy, approvedBy)
-            needsHuman(run, owner, "Not merged: this run's merge policy (${run.mergePolicy}) does not allow it.")
-            return
+    private suspend fun mergeWithChecks(runId: UUID, approvedBy: String?, waitForNetwork: Boolean = false) {
+        runs.setMergeApprovedBy(runId, approvedBy)
+        val step = if (waitForNetwork && cfg.networkRetryMaxMs > 0) mergeStepWaitingForNetwork(runId)
+        else withContext(Dispatchers.IO) { mergeStep(runId) }
+        if (step is MergeStep.Wait && startWaiting(runId)) waitForChecks(runId)
+    }
+
+    /**
+     * [mergeStep], but reading the pull request or merging it while the network is down waits for the network and
+     * evaluates again. A retry that finds the pull request merged (the failed merge request went through) continues as
+     * merged. Giving up, or reaching the limit, ends as any failed merge: the run needs a human, merge as its failed step.
+     */
+    private suspend fun mergeStepWaitingForNetwork(runId: UUID): MergeStep {
+        var retried = false
+        while (true) {
+            try {
+                val step = withContext(Dispatchers.IO) { mergeStep(runId, rethrowTransient = true, mergedMeanwhile = retried) }
+                if (retried) endStreak(runId)
+                return step
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (!Transient.isTransient(e)) throw e
+                try {
+                    awaitNetwork(runId, describeFailure(e), null, e)
+                } catch (gaveUp: StageFailed) {
+                    withContext(Dispatchers.IO) {
+                        val run = runs.get(runId)!!
+                        mergeFailed(run, owner(run), run.prNumber ?: 0, gaveUp.message ?: Transient.describe(e))
+                    }
+                    return MergeStep.Done
+                }
+                retried = true
+            }
         }
+    }
+
+    /** The run waits for its checks from now on, until the wait limit; false when it is no longer approving. */
+    private fun startWaiting(runId: UUID): Boolean {
+        val since = now()
+        val ok = runs.startWaitingForChecks(runId, since, since.plus(checksWaitLimit))
+        publish(runId)
+        return ok
+    }
+
+    /**
+     * The waiting job of a run in `waiting_for_checks`: evaluates again every [checksPollMillis] until the run is merged
+     * or needs a human, or the deadline passes. [evaluateFirst]: evaluate before the first pause (after a restart).
+     */
+    private suspend fun waitForChecks(runId: UUID, evaluateFirst: Boolean = false) {
+        try {
+            if (evaluateFirst && withContext(Dispatchers.IO) { mergeStep(runId) } == MergeStep.Done) return
+            while (true) {
+                val run = runs.get(runId) ?: return
+                if (run.status != RunStatus.WAITING_FOR_CHECKS) return
+                val deadline = run.checksDeadline ?: (run.checksWaitingSince ?: now()).plus(checksWaitLimit)
+                val left = java.time.Duration.between(clock.instant(), deadline).toMillis()
+                if (left <= 0) {
+                    withContext(Dispatchers.IO) { checksTimedOut(run) }
+                    return
+                }
+                kotlinx.coroutines.delay(minOf(checksPollMillis, left).coerceAtLeast(1))
+                if (withContext(Dispatchers.IO) { mergeStep(runId) } == MergeStep.Done) return
+            }
+        } finally {
+            withContext(NonCancellable) {
+                if (runs.get(runId)?.status != RunStatus.WAITING_FOR_CHECKS) runs.clearChecksWait(runId)
+            }
+        }
+    }
+
+    /** After a merge attempt has ended (merged or needs a human): the advisor ends on a merge; the release is told. */
+    private fun finishMerge(runId: UUID) {
+        val run = runs.get(runId) ?: return
+        // Still waiting (the job goes on, e.g. a merge anyway stopped it): a release must never see this as settled.
+        if (run.status == RunStatus.WAITING_FOR_CHECKS) return
+        if (run.status == RunStatus.MERGED) run.advisorSessionId?.let { agents.endAdvisor(it) }
+        publish(runId)
+        settled(runId)
+    }
+
+    /**
+     * At server start: the runs that were `waiting_for_checks` go on waiting, each in its own job, with their original
+     * deadline. Returns their ids.
+     */
+    fun resumeChecksWaits(): List<UUID> {
+        val waiting = runs.waitingForChecks()
+        for (r in waiting) {
+            launchJob(r.id) {
+                waitForChecks(r.id, evaluateFirst = true)
+                finishMerge(r.id)
+            }
+        }
+        if (waiting.isNotEmpty()) log.info("Resumed waiting for checks of {} run(s) after restart", waiting.size)
+        return waiting.map { it.id }
+    }
+
+    /**
+     * One evaluation before a merge, with the run owner's token: the database migration and submodule guards, the pull
+     * request's current head, the checks on it, then a merge pinned to that head, a needs-human outcome, or [MergeStep.Wait].
+     * Never merges another commit than the one whose checks were evaluated. Blocking. [rethrowTransient]: a pull request
+     * read or merge that fails for lack of network throws instead; [mergedMeanwhile]: a pull request found merged
+     * counts as merged by this run (a retry after such a failure).
+     */
+    private fun mergeStep(runId: UUID, rethrowTransient: Boolean = false, mergedMeanwhile: Boolean = false): MergeStep {
+        val run = runs.get(runId) ?: return MergeStep.Done
+        val owner = owner(run)
+        // Defence in depth (docs/ARCHITECTURE.md §6 "Merge policy"): the run's policy decides, whoever called.
+        if (policyRefuses(run, owner, run.mergeApprovedBy)) return MergeStep.Done
         val client = gh(owner)
-        val pr = run.prNumber ?: run { needsHuman(run, owner, "There is no pull request to merge."); return }
+        val pr = run.prNumber ?: run { needsHuman(run, owner, "There is no pull request to merge."); return MergeStep.Done }
+        if (!guardsPass(run, owner, client, pr)) return MergeStep.Done
+        for (attempt in 1..MAX_HEAD_MOVES) {
+            val info = try {
+                client.getPull(org, prRepo(run), pr)
+            } catch (e: Exception) {
+                if (rethrowTransient && Transient.isTransient(e)) throw e
+                // Transient (5xx, network): wait and read again at the next poll.
+                log.info("Run {}: reading pull request {} failed, evaluating again later: {}", run.id, pr, e.message)
+                val sha = runs.get(runId)?.checks?.sha.orEmpty()
+                recordChecks(runId, ChecksSummary(ReleaseChecksState.UNKNOWN, "Could not read the pull request: ${e.message}".take(500)), sha)
+                return MergeStep.Wait
+            }
+            if (mergedMeanwhile && info != null && info.merged) {
+                log.info("Run {}: pull request {} was merged by the request whose answer was lost", run.id, pr)
+                afterMerge(run, client, pr, approvalText(runId))
+                return MergeStep.Done
+            }
+            if (info == null || info.state != "open") {
+                val why = when {
+                    info == null -> "not found"
+                    info.merged -> "merged"
+                    else -> "closed"
+                }
+                runs.setFailure(run.id, null, FailedStep.MERGE)
+                needsHuman(run, owner, "Pull request ${prRef(run, pr)} is no longer open on GitHub ($why), so Agern did not merge it.")
+                return MergeStep.Done
+            }
+            val sha = info.head.sha
+            val ev = evaluateChecks(run, client, sha)
+            val checks = recordChecks(runId, ev.summary, sha)
+            when {
+                ev.summary.state in ReleaseChecksState.GREEN -> {
+                    try {
+                        client.squashMerge(org, prRepo(run), pr, prTitle(run, run.issueTitle), expectedHeadSha = sha)
+                    } catch (e: GitHubException) {
+                        if (e.status == 409) {
+                            // The head moved since it was read: evaluate the new head, never merge it unseen.
+                            log.info("Run {}: the head of {} moved past {} (attempt {}), evaluating again", run.id, pr, sha.take(7), attempt)
+                            continue
+                        }
+                        if (rethrowTransient && Transient.isTransient(e)) throw e
+                        mergeFailed(run, owner, pr, e)
+                        return MergeStep.Done
+                    } catch (e: Exception) {
+                        if (rethrowTransient && Transient.isTransient(e)) throw e
+                        mergeFailed(run, owner, pr, e)
+                        return MergeStep.Done
+                    }
+                    afterMerge(run, client, pr, approvalText(runId))
+                    return MergeStep.Done
+                }
+                ev.summary.state == ReleaseChecksState.FAILED -> {
+                    checksFailed(run, owner, client, pr, ev.summary, checks)
+                    return MergeStep.Done
+                }
+                ev.refusal != null -> {
+                    runs.setFailure(run.id, FailureKind.CHECKS, FailedStep.MERGE)
+                    needsHuman(
+                        run, owner,
+                        "Could not read the checks of ${prRef(run, pr)}: ${ev.refusal}. The run owner's GitHub token needs read " +
+                            "access to commit statuses, checks and Actions.",
+                    )
+                    return MergeStep.Done
+                }
+                // pending, awaiting, or a read that failed for a transient reason
+                else -> return MergeStep.Wait
+            }
+        }
+        return MergeStep.Wait
+    }
+
+    /**
+     * The run's merge policy forbids this merge (docs/ARCHITECTURE.md §6 "Merge policy"): never under `github`, and under
+     * `owner_approves` only when a person approved it ([approvedBy] not null). Sends the run to needs_human. Blocking.
+     */
+    private fun policyRefuses(run: RunRecord, owner: UserRecord, approvedBy: String?): Boolean {
+        if (run.mergePolicy != MergePolicy.GITHUB && (run.mergePolicy != MergePolicy.OWNER_APPROVES || approvedBy != null)) return false
+        log.error("Run {}: refusing to merge under merge policy {} (approved by {})", run.id, run.mergePolicy, approvedBy)
+        needsHuman(run, owner, "Not merged: this run's merge policy (${run.mergePolicy}) does not allow it.")
+        return true
+    }
+
+    /** The migration and submodule guards before every merge; false when one sent the run to needs_human. Blocking. */
+    private fun guardsPass(run: RunRecord, owner: UserRecord, client: GitHubClient, pr: Int): Boolean {
         migrationConflict(run, owner, client, pr)?.let { reason ->
             // Not a failed step: merging again cannot help until the branch's migrations change.
             runs.setFailure(run.id, null, null)
             needsHuman(run, owner, reason)
-            return
+            return false
         }
         submoduleProblem(run, owner, client, pr)?.let { p ->
             // A failed merge step: once the submodule commit is pushed, a retry of the merge (or an approval) checks again.
             runs.setFailure(run.id, if (p.code == SubmoduleCheck.MISSING) FailureKind.SUBMODULE_COMMIT_MISSING else FailureKind.STEP, FailedStep.MERGE)
             needsHuman(run, owner, p.text)
-            return
+            return false
         }
-        try {
-            client.squashMerge(org, prRepo(run), pr, prTitle(run, run.issueTitle))
+        return true
+    }
+
+    /**
+     * The checks on [sha] of the run's pull request, with the rules of releases ([ChecksSummary.read]): "no checks" is
+     * `awaiting` until the head has been known for [checksSettleSeconds]. Blocking; never throws.
+     */
+    private fun evaluateChecks(run: RunRecord, client: GitHubClient, sha: String): Evaluated {
+        val now = now()
+        val seen = runs.headSeenAt(run.id, sha, now)
+        val summary = try {
+            ChecksSummary.read(client, org, prRepo(run), sha) { e ->
+                log.info("Run {}: workflow runs of {} could not be read, judging statuses and check runs only: {}", run.id, sha.take(7), e.message)
+            }
+        } catch (e: GitHubException) {
+            val msg = e.message ?: "GitHub answered ${e.status}"
+            return Evaluated(
+                ChecksSummary(ReleaseChecksState.UNKNOWN, "Could not read the checks: $msg".take(500)),
+                refusal = msg.takeIf { e.status == 401 || e.status == 403 || e.status == 404 },
+            )
         } catch (e: Exception) {
-            // A retry of the run can retry the merge (docs/ARCHITECTURE.md §6 "Retrying a run"); so can the owner's approval.
-            runs.setFailure(run.id, null, FailedStep.MERGE)
-            needsHuman(run, owner, "Merging pull request ${prRef(run, pr)} failed: ${e.message}")
+            return Evaluated(ChecksSummary(ReleaseChecksState.UNKNOWN, "Could not read the checks: ${e.message ?: e.javaClass.simpleName}".take(500)))
+        }
+        val settled = seen.plusSeconds(checksSettleSeconds)
+        if (summary.state == ReleaseChecksState.NONE && now.isBefore(settled)) {
+            return Evaluated(
+                ChecksSummary(
+                    ReleaseChecksState.AWAITING,
+                    "No checks yet; waiting for them to appear until ${settled.truncatedTo(java.time.temporal.ChronoUnit.SECONDS)} " +
+                        "(after that, no checks counts as green)",
+                ),
+            )
+        }
+        return Evaluated(summary)
+    }
+
+    /** Stores [summary] for [sha] on the run and publishes it when its state, commit or detail changed. Returns it. */
+    private fun recordChecks(runId: UUID, summary: ChecksSummary, sha: String): RunChecksDto {
+        val items = (summary.failing.map { RunCheckItemDto(it.name.take(200), "failed", it.conclusion, safeUrl(it.url)) } +
+            summary.pending.map { RunCheckItemDto(it.name.take(200), "pending", null, safeUrl(it.url)) }).take(RunChecksDto.MAX_ITEMS)
+        val dto = RunChecksDto(summary.state, sha, summary.detail, items)
+        val before = runs.get(runId)?.checks
+        if (before == null || before.state != dto.state || before.sha != dto.sha || before.detail != dto.detail ||
+            before.items != dto.items || before.overriddenBy != null
+        ) {
+            runs.setChecks(runId, dto)
+            publish(runId)
+        }
+        return dto
+    }
+
+    /** The failed checks of [checks] as Markdown: each name (a link when GitHub gave an https URL) and its conclusion. */
+    private fun failedList(summary: ChecksSummary): String = summary.failing.joinToString(", ") { item ->
+        val name = mdText(item.name)
+        val label = safeUrl(item.url)?.let { "[$name]($it)" } ?: name
+        label + (item.conclusion?.let { " (${mdText(it)})" } ?: "")
+    }
+
+    /** Failed checks: no merge; needs a human, with the checks named on the issue and on the pull request. Blocking. */
+    private fun checksFailed(run: RunRecord, owner: UserRecord, client: GitHubClient, pr: Int, summary: ChecksSummary, checks: RunChecksDto) {
+        val incomplete = summary.failing.any { it.conclusion in ChecksSummary.INCOMPLETE_CONCLUSIONS }
+        val reason = "Checks failed on `${checks.sha.take(7)}` of ${prRef(run, pr)}, so Agern did not merge it: ${failedList(summary)}. " +
+            if (incomplete) {
+                "Some checks did not run to completion (for example a startup failure or a cancellation on GitHub's side). " +
+                    "Re-run them on GitHub, then approve again."
+            } else {
+                "Push a fix to the branch or re-run the checks, then approve again; the run owner can also merge anyway on the run page."
+            }
+        runs.setFailure(run.id, FailureKind.CHECKS, FailedStep.MERGE)
+        needsHuman(run, owner, reason)
+        bestEffort { client.comment(org, prRepo(run), pr, "**Agern: not merged.** $reason") }
+    }
+
+    /** The wait limit passed while the checks were still pending (or awaited). Blocking. */
+    private fun checksTimedOut(run: RunRecord) {
+        val owner = owner(run)
+        val c = runs.get(run.id)?.checks
+        val pr = run.prNumber ?: return
+        val limit = checksWaitLimit.toMinutes().let { if (it >= 1) "$it minute${if (it == 1L) "" else "s"}" else "${checksWaitLimit.seconds} second${if (checksWaitLimit.seconds == 1L) "" else "s"}" }
+        runs.setFailure(run.id, FailureKind.CHECKS, FailedStep.MERGE)
+        needsHuman(
+            run, owner,
+            "Checks on `${c?.sha?.take(7).orEmpty()}` of ${prRef(run, pr)} did not finish within $limit (${mdText(c?.detail ?: "no result")}). " +
+                "Approve again to wait again, or merge anyway on the run page.",
+        )
+    }
+
+    private fun mergeFailed(run: RunRecord, owner: UserRecord, pr: Int, e: Exception) =
+        mergeFailed(run, owner, pr, e.message ?: Transient.describe(e))
+
+    /** A failed squash merge: the run needs a human, with the merge as its failed step. */
+    private fun mergeFailed(run: RunRecord, owner: UserRecord, pr: Int, why: String) {
+        // A retry of the run can retry the merge (docs/ARCHITECTURE.md §6 "Retrying a run"); so can the owner's approval.
+        runs.setFailure(run.id, null, FailedStep.MERGE)
+        needsHuman(run, owner, "Merging pull request ${prRef(run, pr)} failed: $why")
+    }
+
+    /** Who approved the merge, for the merged comment on the issue. */
+    private fun approvalText(runId: UUID): String =
+        runs.get(runId)?.mergeApprovedBy?.let { " (approved by @$it)" } ?: " (approved by the approver agent)"
+
+    /**
+     * "Merge anyway": the guards, then a squash merge pinned to [headSha] without evaluating the checks, recorded on the
+     * run, the pull request and the issue. A head that moved since the owner confirmed is not merged. Blocking.
+     */
+    private fun mergeOverridden(runId: UUID, user: UserRecord, headSha: String) {
+        val run = runs.get(runId) ?: return
+        val owner = owner(run)
+        val client = gh(owner)
+        if (policyRefuses(run, owner, user.username)) return
+        val pr = run.prNumber ?: run { needsHuman(run, owner, "There is no pull request to merge."); return }
+        if (!guardsPass(run, owner, client, pr)) return
+        val checks = run.checks
+        val detail = mdText(checks?.detail ?: "checks not passed")
+        try {
+            client.squashMerge(org, prRepo(run), pr, prTitle(run, run.issueTitle), expectedHeadSha = headSha)
+        } catch (e: GitHubException) {
+            if (e.status == 409) {
+                runs.setFailure(run.id, FailureKind.CHECKS, FailedStep.MERGE)
+                needsHuman(run, owner, "The pull request's head changed since you confirmed; approve again to evaluate the new commit.")
+            } else {
+                mergeFailed(run, owner, pr, e)
+            }
+            return
+        } catch (e: Exception) {
+            mergeFailed(run, owner, pr, e)
             return
         }
+        checks?.let { runs.setChecks(run.id, it.copy(overriddenBy = user.username, overriddenAt = now().iso())) }
+        log.info("Run {}: merged by {} despite checks on {} ({})", run.id, user.username, headSha.take(7), checks?.detail)
+        bestEffort {
+            client.comment(org, prRepo(run), pr,
+                "**Agern:** @${user.username} merged this pull request although its checks had not passed on `${headSha.take(7)}` ($detail).")
+        }
+        afterMerge(run, client, pr, " (approved by @${user.username}, despite checks: $detail)")
+    }
+
+    /** After the pull request [pr] is squash-merged: comments, the issue, the worktree, the pointer bump, `merged`. Blocking. */
+    private fun afterMerge(run: RunRecord, client: GitHubClient, pr: Int, approval: String) {
         bestEffort { client.removeLabel(org, run.repo, run.issueNumber, "needs-human") }
-        val approval = approvedBy?.let { " (approved by @$it)" } ?: " (approved by the approver agent)"
         if (run.releaseId != null && run.baseBranch != null && run.targetRepo != null) {
             bestEffort {
                 client.comment(org, run.repo, run.issueNumber,
@@ -1626,6 +2305,13 @@ class Orchestrator(
             if (merged && run.targetRepo != null && run.releaseId == null) bumpPointerSafely(run, client, pr, autoMerge = false)
         }
         publish(run.id)
+    }
+
+    /** Records the worktree HEAD Agern just pushed as the head first seen now (the checks' settle period counts from it). */
+    private fun recordPushedHead(runId: UUID, worktree: Path, home: Path) {
+        runCatching { workspaces.git.head(worktree, home) }
+            .onSuccess { runs.headSeenAt(runId, it, now()) }
+            .onFailure { log.info("Run {}: could not read the pushed HEAD: {}", runId, it.message) }
     }
 
     /**
@@ -2046,6 +2732,38 @@ class Orchestrator(
 
     companion object {
         val READ_ONLY_TOOLS = listOf("Edit", "Write", "NotebookEdit")
+
+        /** Checks states that block a merge and that the owner may merge anyway. */
+        val BLOCKING_CHECKS = setOf(
+            ReleaseChecksState.FAILED, ReleaseChecksState.PENDING, ReleaseChecksState.AWAITING, ReleaseChecksState.UNKNOWN,
+        )
+
+        /** How often a merge follows a moving head (409) within one evaluation before it waits for the next poll. */
+        private const val MAX_HEAD_MOVES = 3
+
+        /** [s] as literal Markdown text (check names and details come from GitHub). */
+        fun mdText(s: String): String = s.replace(Regex("""[\\`*_{}\[\]()<>#!|~@]""")) { "\\" + it.value }
+
+        /** [url] when it is safe to link to (`https://`, no spaces or Markdown-breaking characters), else null. */
+        fun safeUrl(url: String?): String? =
+            url?.takeIf { it.startsWith("https://") && it.length <= 2000 && it.none { c -> c.isWhitespace() || c in "<>\"()[]`" } }
+
+        /** The prompt of a stage resumed after the Claude API was unreachable (docs/ARCHITECTURE.md §6 "Transient failures"). */
+        const val CONTINUE_PROMPT = "Message from Agern: the connection to the Claude API was lost while you were working and is " +
+            "available again. Continue the task from where you stopped; your working directory is as you left it. End with " +
+            "the final answer the task asks for."
+
+        private val WAIT_TIME = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm 'UTC'").withZone(java.time.ZoneOffset.UTC)
+
+        /** [ms] for people: `3 s`, `12 min`, `2 h 5 min`. */
+        fun humanDuration(ms: Long): String {
+            val s = maxOf(0L, ms) / 1000
+            return when {
+                s < 60 -> "$s s"
+                s < 3600 -> "${s / 60} min"
+                else -> "${s / 3600} h" + (if ((s % 3600) / 60 > 0) " ${(s % 3600) / 60} min" else "")
+            }
+        }
 
         fun modelFor(s: dk.egernet.factory.SettingsDto, role: String): String =
             s.pipelineModels[role] ?: dk.egernet.factory.DEFAULT_PIPELINE_MODELS[role] ?: "sonnet"

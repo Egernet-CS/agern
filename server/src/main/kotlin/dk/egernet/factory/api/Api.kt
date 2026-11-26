@@ -125,6 +125,7 @@ private suspend fun ApplicationCall.retryReq(): dk.egernet.factory.RetryReq {
 }
 @Serializable data class CreateSessionReq(val model: String? = null)
 @Serializable data class TalkReq(val text: String = "")
+@Serializable data class MergeAnywayReq(val headSha: String = "")
 @Serializable data class InputReq(val text: String = "", val attachmentIds: List<String> = emptyList())
 @Serializable data class ResolveReq(val status: String, val note: String? = null)
 @Serializable data class ApproveSandboxReq(val sha256: String)
@@ -672,7 +673,17 @@ private fun Route.runRoutes(s: Services) {
         call.respondStoredFile(bytes, m.mediaType, "inline", name)
     }
     post("/runs/{id}/approve") { call.respond(s.factory.approveRun(call.requireUser(s), uuidParam("id"))) }
+    // "Merge anyway" despite checks that have not passed (docs/ARCHITECTURE.md §6 "Checks before a merge"): owner only.
+    post("/runs/{id}/merge-anyway") {
+        val u = call.requireUser(s)
+        val id = uuidParam("id")
+        val req = call.receive<MergeAnywayReq>()
+        call.respond(s.factory.mergeAnywayRun(u, id, req.headSha))
+    }
     post("/runs/{id}/cancel") { call.respond(s.factory.cancelRun(call.requireUser(s), uuidParam("id"))) }
+    // A run waiting for the network (docs/ARCHITECTURE.md §6 "Transient failures").
+    post("/runs/{id}/network/retry") { call.respond(s.factory.retryRunNow(call.requireUser(s), uuidParam("id"))) }
+    post("/runs/{id}/network/give-up") { call.respond(s.factory.giveUpRun(call.requireUser(s), uuidParam("id"))) }
     // The conversation while a run needs a human (docs/ARCHITECTURE.md §6 "Conversation at needs human").
     post("/runs/{id}/conversation") {
         val u = call.requireUser(s)
@@ -757,6 +768,10 @@ private fun Route.releaseRoutes(s: Services) {
     post("/releases/{id}/resume") {
         val u = call.requireUser(s)
         call.respond(s.releaseDto(u, s.releases.resume(u, uuidParam("id"))))
+    }
+    post("/releases/{id}/network/give-up") {
+        val u = call.requireUser(s)
+        call.respond(s.releaseDto(u, s.releases.giveUpNetwork(u, uuidParam("id"))))
     }
     post("/releases/{id}/cancel") {
         val u = call.requireUser(s)

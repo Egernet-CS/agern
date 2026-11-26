@@ -30,6 +30,8 @@ data class ReleaseIssueRecord(
     val retryMode: String? = null,
     /** The member repository and directory [runId] targets; null without a run or for the project repository. */
     val targetRepo: String? = null, val targetDir: String? = null,
+    /** The network wait of [runId] (with the run's status), if it has one. */
+    val runWait: RunWait? = null, val runStatus: String? = null,
 )
 
 /**
@@ -75,6 +77,8 @@ data class ReleaseRecord(
     val prMergedAt: Instant? = null,
     /** The project repository's `release/<name>` was deleted by a cancel or delete. */
     val branchDeleted: Boolean = false,
+    /** The first failed start of the current network streak (docs/ARCHITECTURE.md §6 "Transient failures"), and how many. */
+    val networkSince: Instant? = null, val networkAttempts: Int = 0,
 ) {
     val automatic: Boolean get() = mode == ReleaseMode.AUTOMATIC
 
@@ -114,11 +118,20 @@ data class ReleaseRecord(
         id.toString(), repo, name, description, status, OwnerDto(createdByUsername, createdByDisplayName),
         createdAt.iso(), updatedAt.iso(),
         issues.map {
-            ReleaseIssueDto(it.number, it.title, it.kind, it.state, it.runId?.toString(), it.note, it.prNumber, it.prUrl, it.retryMode, it.targetRepo, it.targetDir)
+            ReleaseIssueDto(
+                it.number, it.title, it.kind, it.state, it.runId?.toString(), it.note, it.prNumber, it.prUrl, it.retryMode, it.targetRepo, it.targetDir,
+                waiting = it.runWait?.takeIf { _ -> it.state == ReleaseIssueState.RUNNING && it.runStatus in WAITABLE_STATUSES }?.toDto(),
+            )
         },
         owner = if (ownerId != null && ownerUsername != null) OwnerDto(ownerUsername, ownerDisplayName ?: ownerUsername) else null,
         branch = branch, startedAt = startedAt?.iso(), endedAt = endedAt?.iso(),
-        pause = if (status == ReleaseStatus.PAUSED && pauseReason != null) ReleasePauseDto(pauseReason, pauseNote, resumeAt?.iso()) else null,
+        pause = if (status == ReleaseStatus.PAUSED && pauseReason != null) {
+            val network = pauseReason == dk.egernet.factory.PauseReason.NETWORK
+            ReleasePauseDto(
+                pauseReason, pauseNote, resumeAt?.iso(),
+                since = networkSince?.takeIf { network }?.iso(), attempt = networkAttempts.takeIf { network && it > 0 },
+            )
+        } else null,
         scheduledAt = scheduledAt?.iso(),
         waitingFor = if (waitingForId != null && waitingForName != null) IssueReleaseDto(waitingForId.toString(), waitingForName) else null,
         startFailure = if (startFailedAt != null && startFailedReason != null) {
@@ -231,6 +244,7 @@ class ReleaseStore(private val db: Db) {
         checksState = rs.getString("checks_state"), checksSha = rs.getString("checks_sha"), checksDetail = rs.getString("checks_detail"),
         checksFailureSha = rs.getString("checks_failure_sha"), autoMergeFailedSha = rs.getString("auto_merge_failed_sha"),
         prMergedAt = rs.instantOrNull("pr_merged_at"), branchDeleted = rs.getBoolean("branch_deleted"),
+        networkSince = rs.instantOrNull("network_since"), networkAttempts = rs.getInt("network_attempts"),
     )
 
     private fun mapRepo(rs: ResultSet) = ReleaseRepoRecord(
@@ -256,13 +270,14 @@ class ReleaseStore(private val db: Db) {
         rs.getString("state"), rs.uuidOrNull("run_id"), rs.getString("note"),
         rs.intOrNull("pr_number"), rs.getString("pr_url"), rs.getString("retry_mode"),
         rs.getString("target_repo"), rs.getString("target_dir"),
+        rs.runWait(), rs.getString("run_status"),
     )
 
     private fun issuesOf(ids: List<UUID>): Map<UUID, List<ReleaseIssueRecord>> {
         if (ids.isEmpty()) return emptyMap()
         return db.query(
             "SELECT ri.release_id, ri.issue_number, ri.issue_title, ri.issue_kind, ri.state, ri.run_id, ri.note, ri.retry_mode, ru.pr_number, ru.pr_url, " +
-                "ru.target_repo, ru.target_dir " +
+                "ru.target_repo, ru.target_dir, ru.status AS run_status, ru.wait_reason, ru.wait_since, ru.wait_next_at, ru.wait_attempts, ru.wait_detail " +
                 "FROM release_issues ri LEFT JOIN runs ru ON ru.id = ri.run_id WHERE ri.release_id IN (" +
                 ids.joinToString(",") { "?" } + ") ORDER BY ri.position, ri.added_at",
             *ids.toTypedArray(),
@@ -367,9 +382,20 @@ class ReleaseStore(private val db: Db) {
 
     /** `building`, `paused` or `ready` → `cancelled`. False otherwise. */
     fun cancel(id: UUID): Boolean = db.update(
-        """UPDATE releases SET status = 'cancelled', ended_at = now(), pause_reason = NULL, pause_note = NULL, resume_at = NULL
+        """UPDATE releases SET status = 'cancelled', ended_at = now(), pause_reason = NULL, pause_note = NULL, resume_at = NULL,
+             network_since = NULL, network_attempts = 0
            WHERE id = ? AND status IN ('building', 'paused', 'ready')""", id,
     ) == 1
+
+    /** A start failed transiently: the network streak began at [since] and has [attempts] failed starts. */
+    fun noteNetworkFailure(id: UUID, since: Instant, attempts: Int) = db.update(
+        "UPDATE releases SET network_since = ?, network_attempts = ? WHERE id = ?", since, attempts, id,
+    )
+
+    /** The network streak ends (a run started, an issue was skipped or held). */
+    fun clearNetwork(id: UUID) = db.update(
+        "UPDATE releases SET network_since = NULL, network_attempts = 0 WHERE id = ? AND (network_since IS NOT NULL OR network_attempts <> 0)", id,
+    )
 
     // ------------------------------------------------------------ releasing (docs/ARCHITECTURE.md §6 "Releasing")
 

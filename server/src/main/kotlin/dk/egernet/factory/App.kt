@@ -148,7 +148,7 @@ class Services(
     val modePolicy: dk.egernet.factory.pipeline.ReleaseModePolicy = releaseModePolicy
         ?: dk.egernet.factory.pipeline.ReleaseModePolicy { repo -> projectSettings.get(repo).mergePolicy == MergePolicy.AUTOMATIC }
     val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes, screenshotStore,
-        sessions, events, images, workspaceDefs, releaseStore, projectSettings)
+        sessions, events, images, workspaceDefs, releaseStore, projectSettings, clock)
     val screenshots = dk.egernet.factory.agent.Screenshots(cfg, screenshotStore, runs, workspaces, publishRun = { orchestrator.publish(it) })
     val releaseLocks = dk.egernet.factory.pipeline.ReleaseLocks()
     val releaseMerger = dk.egernet.factory.pipeline.ReleaseMerger(
@@ -185,6 +185,7 @@ class Services(
         agents.advisorLaunch = { session, owner -> orchestrator.advisorLaunch(session, owner) }
         agents.afterAdvisorTurn = { session -> session.runId?.let { orchestrator.reconcile(it) } }
         orchestrator.onReleaseRunSettled = releaseBuilder::onRunSettled
+        orchestrator.onReleaseRunWaitChanged = { id -> scope.launch { releaseBuilder.publish(id) } }
         images.publishRun = { orchestrator.publish(it) }
         agents.onChatInput = { sessionId -> images.newTurn(sessionId) }
         agents.onChatClosed = { sessionId -> images.removeSession(sessionId) }
@@ -197,7 +198,8 @@ class Services(
      */
     fun recoverAfterRestart() {
         val failed = runs.failUnfinishedAfterRestart()
-        // Runs at needs_human survive: an interrupted follow-up review must be started again, and no stage stays open.
+        // Runs at needs_human (and waiting_for_checks) survive: an interrupted follow-up review must be started again, and
+        // no stage stays open.
         runs.recoverConversationsAfterRestart()
         if (failed.isNotEmpty()) LoggerFactory.getLogger("dk.egernet.factory").warn("Marked {} unfinished run(s) as failed after restart", failed.size)
         // Order matters: first the sandboxes of runs that are no longer active (their containers bind-mount the worktrees),
@@ -213,6 +215,8 @@ class Services(
             .getOrDefault(emptyList())
         if (reaped.isNotEmpty()) LoggerFactory.getLogger("dk.egernet.factory").info("Removed {} worktree(s) of ended runs", reaped.size)
         releaseBuilder.recoverAfterRestart()
+        // Runs that were waiting for the checks on their pull request go on waiting, with their original deadline.
+        orchestrator.resumeChecksWaits()
         sessions.recoverAfterRestart()
         webSessions.purgeExpired()
         mcpTokens.purgeRevokedBefore(clock.instant().minus(java.time.Duration.ofDays(30)))

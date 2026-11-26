@@ -172,6 +172,20 @@ export type ReleaseIssue = {
   targetRepo: string | null;
   /** That member's directory in the workspace; null like `targetRepo`. */
   targetDir: string | null;
+  /** While the issue is `running` and its run waits for the network: that run's wait. */
+  waiting?: RunWait | null;
+};
+
+/**
+ * A run that lost the network (GitHub or the Claude API) and waits before it tries again (docs/ARCHITECTURE.md §6
+ * "Transient failures"). `attempt`: failed attempts so far (≥ 1); `detail`: what failed. Instants are ISO-8601.
+ */
+export type RunWait = {
+  reason: 'network';
+  since: string;
+  nextAttemptAt: string;
+  attempt: number;
+  detail: string;
 };
 
 /** The state of one repository's release pull request in a multi-repository release. */
@@ -203,7 +217,7 @@ export type ReleaseRepo = {
   accessible: boolean;
 };
 
-export type ReleasePauseReason = 'manual' | 'usage_limit' | 'credentials';
+export type ReleasePauseReason = 'manual' | 'usage_limit' | 'credentials' | 'network';
 
 /** A named plan of issues for one project (docs/ARCHITECTURE.md §6 "Releases"). */
 export type Release = {
@@ -225,7 +239,14 @@ export type Release = {
   startedAt: string | null;
   endedAt: string | null;
   /** Set while `paused`. */
-  pause: { reason: ReleasePauseReason; note: string | null; resumeAt: string | null } | null;
+  pause: {
+    reason: ReleasePauseReason;
+    note: string | null;
+    resumeAt: string | null;
+    /** Reason `network`: when the current streak of failed starts began, and how many failed. */
+    since?: string | null;
+    attempt?: number | null;
+  } | null;
   /** ISO instant of the scheduled start; set exactly while `scheduled`. */
   scheduledAt: string | null;
   /** The release this one waits behind: only while `scheduled` and its time has come. */
@@ -450,6 +471,8 @@ export type RunStatus =
   | 'building'
   | 'reviewing'
   | 'approving'
+  /** Approved; merges by itself once the checks on the pull request's head commit pass (docs/ARCHITECTURE.md §6). */
+  | 'waiting_for_checks'
   | 'merged'
   | 'needs_human'
   | 'failed'
@@ -504,9 +527,35 @@ export type Run = {
   mergedOnGitHub?: boolean;
   /** Who merged it on GitHub, when GitHub reports it. */
   mergedBy?: string | null;
+  /** The checks on the pull request's head commit as last evaluated before a merge; null until the first evaluation. */
+  checks?: RunChecks | null;
+  /** Set while the run waits for the network before trying again; it keeps its status meanwhile. */
+  waiting?: RunWait | null;
 };
 
-export type FailureKind = 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | 'submodule_commit_missing';
+/** One check that has not passed. Name and URL come from GitHub (untrusted); `url` is only ever an `https://` URL. */
+export type RunCheckItem = { name: string; state: 'failed' | 'pending'; conclusion: string | null; url: string | null };
+
+/** The checks a run's merge was decided on (docs/ARCHITECTURE.md §6 "Checks before a merge"). */
+export type RunChecks = {
+  state: 'awaiting' | 'pending' | 'passed' | 'failed' | 'none' | 'unknown';
+  /** The head commit they were read for. */
+  sha: string;
+  detail: string;
+  /** At most 50. */
+  items: RunCheckItem[];
+  /** Set only while `waiting_for_checks`. */
+  waitingSince: string | null;
+  deadline: string | null;
+  /** Set when the owner merged anyway. */
+  overriddenBy: string | null;
+  overriddenAt: string | null;
+};
+
+/** Checks states that block a merge (and that the owner may merge anyway). */
+export const BLOCKING_CHECK_STATES: RunChecks['state'][] = ['failed', 'pending', 'awaiting', 'unknown'];
+
+export type FailureKind = 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | 'submodule_commit_missing' | 'checks';
 export type FailedStep = 'push' | 'pull_request' | 'merge';
 
 /** `step`: retry the failed step on the same run; `continue`: a new run from its commits; `start_over`: from scratch. */
@@ -793,7 +842,7 @@ export type FeedFrame =
   | { type: 'usage' };
 
 /** Agents are working on these runs. */
-export const WORKING_RUN_STATUSES: RunStatus[] = ['queued', 'spec', 'building', 'reviewing', 'approving'];
+export const WORKING_RUN_STATUSES: RunStatus[] = ['queued', 'spec', 'building', 'reviewing', 'approving', 'waiting_for_checks'];
 /** Not finished: what `GET /api/runs?active=true` returns (working + needs_human). */
 export const ACTIVE_RUN_STATUSES: RunStatus[] = [...WORKING_RUN_STATUSES, 'needs_human'];
 

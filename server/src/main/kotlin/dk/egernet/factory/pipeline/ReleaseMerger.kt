@@ -168,7 +168,7 @@ class ReleaseMerger(
             try {
                 tick()
             } catch (e: Exception) {
-                log.warn("Periodic release re-evaluation failed: {}", e.message)
+                log.warn("Periodic release re-evaluation failed: {}", Transient.describe(e))
             }
         }
     }
@@ -185,7 +185,9 @@ class ReleaseMerger(
                 }
                 if (before?.copy(updatedAt = Instant.EPOCH) != after?.copy(updatedAt = Instant.EPOCH)) publish(id)
             } catch (e: Exception) {
-                log.warn("Release {} could not be re-evaluated: {}", id, e.message)
+                // A lost network is expected to pass: one line. Anything else gets its stack trace.
+                if (Transient.isTransient(e)) log.warn("Release {} could not be re-evaluated: {}", id, Transient.describe(e))
+                else log.warn("Release {} could not be re-evaluated: {}", id, Transient.describe(e), e)
             }
         }
     }
@@ -473,7 +475,8 @@ class ReleaseMerger(
         }
 
     /**
-     * Reads and stores the checks on head commit [sha]; a read GitHub refuses is `unknown` with the reason. No checks
+     * Reads and stores the checks on head commit [sha] ([ChecksSummary.read], the rules runs use too); a read GitHub
+     * refuses is `unknown` with the reason. No checks
      * on a head first seen less than [checksSettleSeconds] ago is `awaiting` (CI registers its checks some seconds after
      * a push, so "none" right after opening the pull request or a new commit means nothing yet), not `none`.
      */
@@ -482,7 +485,11 @@ class ReleaseMerger(
         val now = clock.instant().truncatedTo(java.time.temporal.ChronoUnit.MICROS)
         val seen = io { store.headSeenAt(r.id, sha, now, r.memberRepo) }
         var summary = try {
-            io { ChecksSummary.of(client.combinedStatus(org, r.repo, sha), client.checkRuns(org, r.repo, sha)) }
+            io {
+                ChecksSummary.read(client, org, r.repo, sha) { e ->
+                    log.info("Release {}: workflow runs of {} could not be read, judging statuses and check runs only: {}", r.id, sha, e.message)
+                }
+            }
         } catch (e: GitHubException) {
             ChecksSummary(ReleaseChecksState.UNKNOWN, "Could not read the checks: ${e.message}".take(500))
         }

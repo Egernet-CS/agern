@@ -330,6 +330,8 @@ fun testConfig(dataDir: Path, twoFactor: Boolean = true, devUsers: Map<String, S
     dataDir = dataDir,
     twoFactorRequired = twoFactor,
     chatIdleMinutes = 30,
+    // Waiting for the network is off in tests, so failures keep their meaning; tests of the wait switch it on.
+    networkRetryMaxMs = 0,
 )
 
 /** A clock whose instant the test sets and advances. */
@@ -373,6 +375,13 @@ class TestWorld(
         releaseStarter = releaseStarter, sandboxRuntime = if (sandbox) sandboxRuntime else null, imageProviders = imageProviders,
         onBackgroundFailure = { backgroundFailures += it },
     )
+
+    init {
+        // The fake GitHub has no checks: without this, every run would wait out the settle period before it merges.
+        // Tests of the checks before a merge set their own values; release tests set the release merger's period.
+        services.orchestrator.checksSettleSeconds = 0
+        services.orchestrator.checksPollMillis = 50
+    }
 
     /** Puts `.agern/sandbox.yml` on the default branch (GitHub API and git alike); null removes it. */
     fun sandboxFile(content: String?, repo: String = "demo-app") {

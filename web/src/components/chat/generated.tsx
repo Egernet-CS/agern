@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type FormEv
 import { api, type GeneratedImage, type ImagesPayload } from '../../api';
 import { bytes } from '../../lib/format';
 import { Dialog } from '../ui/ui';
+import { fitWidth } from './model';
 
 // ---------------------------------------------------------------- the images of a session (one load per session)
 
@@ -132,6 +133,8 @@ function Tile({ sessionId, img, n, issueHint, me, onOpen }: { sessionId: string;
   const [err, setErr] = useState<string | null>(null);
   const mine = img.origin === 'chat' && !!me && img.owner.username === me;
   const sel = img.selection;
+  // Reserve the tile's box before the image loads, so the transcript does not shift.
+  const fitted = fitWidth(img.width, img.height);
   const act = async (fn: () => Promise<void>) => {
     setBusy(true);
     setErr(null);
@@ -146,7 +149,11 @@ function Tile({ sessionId, img, n, issueHint, me, onOpen }: { sessionId: string;
   return (
     <figure className="t-att-figure t-gen-tile">
       <button type="button" className="t-att-img" onClick={onOpen} aria-label={`Open image ${img.purpose} ${n}`}>
-        <img src={api.imageUrl(img.id)} alt={img.purpose} loading="lazy" />
+        {fitted != null ? (
+          <img src={api.imageUrl(img.id)} alt={img.purpose} loading="lazy" width={img.width} height={img.height} style={{ width: fitted }} />
+        ) : (
+          <img src={api.imageUrl(img.id)} alt={img.purpose} loading="lazy" />
+        )}
       </button>
       <figcaption>
         {img.width}×{img.height} · {bytes(img.size)}

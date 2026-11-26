@@ -39,8 +39,8 @@ claude setup-token
 
 \section{Your GitHub token}\label{sec:github-token}
 
-The token decides which repositories you see, and your agents push branches and open pull
-requests with it. GitHub enforces the access; Agern never widens it.
+The token decides which repositories you see, and your agents push branches, open and merge
+pull requests and comment with it. GitHub enforces the access; Agern never widens it.
 
 \begin{enumerate}
   \item On GitHub, under \emph{Settings $\rightarrow$ Developer settings $\rightarrow$ Personal access
@@ -57,6 +57,14 @@ requests with it. GitHub enforces the access; Agern never widens it.
     for a classic token, its scopes. If a classic token lacks \texttt{repo}, a warning asks you to
     create one with the \texttt{repo} and \texttt{read:org} scopes.
 \end{enumerate}
+
+\begin{note}[More permissions you may need]
+If runs change files under \file{.github/workflows/}, also grant the \texttt{workflow} scope
+(classic) or \textbf{Workflows}: read \& write (fine-grained); GitHub refuses such a push
+otherwise. An agent can do everything the token allows, so grant it only the repositories Agern
+should work on. Scopes, automatic merging and how to restrict it:
+\securitydoc{the README's section ``Security: read this first''}.
+\end{note}
 
 \screenshot[0.8\linewidth]{26-settings-github-desktop}{The GitHub card with a registered classic token and its scopes.}{settings-github}
 

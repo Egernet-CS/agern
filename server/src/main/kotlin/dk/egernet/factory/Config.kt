@@ -31,6 +31,13 @@ data class Config(
     val chatIdleMinutes: Long = 30,
     /** FACTORY_STAGE_TIMEOUT_MINUTES: wall-clock limit for one pipeline stage agent. */
     val stageTimeoutMs: Long = 60 * 60_000L,
+    /**
+     * FACTORY_NETWORK_RETRY_HOURS: how long a run or a release start waits for the network (GitHub, the Claude API)
+     * before it fails or holds (docs/ARCHITECTURE.md §6 "Transient failures"); 0 switches waiting off.
+     */
+    val networkRetryMaxMs: Long = 24 * 3_600_000L,
+    /** Delays before the 2nd, 3rd, … attempt after a transient failure; the last repeats (not configurable; tests shorten it). */
+    val networkRetryDelaysMs: List<Long> = listOf(1L, 2L, 5L, 10L, 15L).map { it * 60_000L },
     val githubApiUrl: String = "https://api.github.com",
     val fakeGithub: Boolean = false,
     val pamService: String? = null,
@@ -50,10 +57,16 @@ data class Config(
     /** FACTORY_SANDBOX*: per-run build/test sandboxes (docs/ARCHITECTURE.md §5 "Sandboxes"). */
     val sandbox: SandboxConfig = SandboxConfig(),
     /**
-     * FACTORY_RELEASE_CHECKS_SETTLE_SECONDS: how long a release pull request's head commit must have had no checks at
-     * all before "no checks" counts as green for an automatic release (CI registers its checks some seconds after a push).
+     * FACTORY_RELEASE_CHECKS_SETTLE_SECONDS: how long a pull request's head commit must have had no checks at all before
+     * "no checks" counts as green, for an automatic release and before a run is merged (CI registers its checks some
+     * seconds after a push).
      */
     val releaseChecksSettleSeconds: Long = 120,
+    /**
+     * FACTORY_RUN_CHECKS_WAIT_MINUTES: how long an approved run waits in `waiting_for_checks` for the checks on its pull
+     * request's head commit before it goes to needs_human (docs/ARCHITECTURE.md §6 "Checks before a merge").
+     */
+    val runChecksWaitMinutes: Long = 60,
     /** How long `POST /mcp` waits for a call before it answers as an event stream (not configurable; tests shorten it). */
     val mcpStreamAfterMs: Long = 5_000,
     /** How often a streamed MCP answer sends a progress notification or keep-alive while the call runs. */
@@ -97,7 +110,7 @@ data class Config(
     override fun toString(): String =
         "Config(host=$host, port=$port, dbUrl=$dbUrl, dbUser=$dbUser, githubOrg=$githubOrg, auth=$authProviders, " +
             "admins=$admins, dataDir=$dataDir, webDir=$webDir, claudeBin=$claudeBin, codexBin=$codexBin, publicUrl=$publicUrl, " +
-            "maxAgentsPerUser=$maxAgentsPerUser, chatIdleMinutes=$chatIdleMinutes, stageTimeoutMs=$stageTimeoutMs, fakeGithub=$fakeGithub, " +
+            "maxAgentsPerUser=$maxAgentsPerUser, chatIdleMinutes=$chatIdleMinutes, stageTimeoutMs=$stageTimeoutMs, networkRetryMaxMs=$networkRetryMaxMs, fakeGithub=$fakeGithub, " +
             "attachments=${attachmentMaxCount}x${attachmentMaxBytes shr 20}MB/${attachmentMaxMessageBytes shr 20}MB, " +
             "screenshots=${screenshotMaxCount}x${screenshotMaxBytes shr 20}MB, images=$imageLimits, sandbox=$sandbox)"
 
@@ -166,6 +179,10 @@ data class Config(
                     ?.also { require(it in 1..24 * 60) { "FACTORY_STAGE_TIMEOUT_MINUTES must be between 1 and 1440" } }
                     ?: (get("FACTORY_STAGE_TIMEOUT_MINUTES")?.let { throw IllegalArgumentException("FACTORY_STAGE_TIMEOUT_MINUTES must be a whole number of minutes") })
                     ?: 60) * 60_000L,
+                networkRetryMaxMs = (get("FACTORY_NETWORK_RETRY_HOURS")?.toLongOrNull()
+                    ?.also { require(it in 0..168) { "FACTORY_NETWORK_RETRY_HOURS must be between 0 and 168" } }
+                    ?: (get("FACTORY_NETWORK_RETRY_HOURS")?.let { throw IllegalArgumentException("FACTORY_NETWORK_RETRY_HOURS must be a whole number of hours") })
+                    ?: 24) * 3_600_000L,
                 githubApiUrl = get("FACTORY_GITHUB_API_URL") ?: "https://api.github.com",
                 fakeGithub = fakeGithub,
                 pamService = get("FACTORY_PAM_SERVICE"),
@@ -190,6 +207,10 @@ data class Config(
                     (v.toLongOrNull() ?: throw IllegalArgumentException("FACTORY_RELEASE_CHECKS_SETTLE_SECONDS must be a whole number of seconds"))
                         .also { require(it in 0..3600) { "FACTORY_RELEASE_CHECKS_SETTLE_SECONDS must be between 0 and 3600" } }
                 } ?: 120,
+                runChecksWaitMinutes = get("FACTORY_RUN_CHECKS_WAIT_MINUTES")?.let { v ->
+                    (v.toLongOrNull() ?: throw IllegalArgumentException("FACTORY_RUN_CHECKS_WAIT_MINUTES must be a whole number of minutes"))
+                        .also { require(it in 1..1440) { "FACTORY_RUN_CHECKS_WAIT_MINUTES must be between 1 and 1440" } }
+                } ?: 60,
             ).also {
                 require(it.attachmentMaxMessageBytes >= it.attachmentMaxBytes) {
                     "FACTORY_ATTACHMENT_MAX_MESSAGE_MB must be at least FACTORY_ATTACHMENT_MAX_MB"
