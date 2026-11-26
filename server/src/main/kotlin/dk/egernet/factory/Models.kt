@@ -425,6 +425,8 @@ data class RunSandboxDto(
     val platforms: List<String> = emptyList(),
     /** Where the builder ran commands: `default` and platform names, in first-use order (only when there are platforms). */
     val platformsUsed: List<String> = emptyList(),
+    /** A review sandbox of the run was created at least once (the ux and ui-design reviewers ran the app in it). */
+    val reviewUsed: Boolean = false,
 )
 
 /** A sidecar's readiness check (`ready:`). */
@@ -492,18 +494,21 @@ data class RunningSandboxDto(
     val createdAt: String,
     /** Per-container limits it runs with. */
     val cpus: Double, val memory: String,
-    /** The containers that run commands right now (the default image and/or platforms), each taking one slot. */
+    /** The containers that run commands right now (the default image, platforms, the review sandbox), each taking one slot. */
     val containers: List<SandboxContainerDto> = emptyList(),
     /** The definition's platforms (whether or not they exist right now). */
     val platforms: List<String> = emptyList(),
     /** Slots of FACTORY_SANDBOX_MAX_CONCURRENT this run holds: one per entry of [containers]. */
     val slots: Int = 0,
-    /** The memory all of the run's containers may use together: [memory] × (command containers + services). */
+    /** The memory all of the run's containers may use together: [memory] × (command containers + services, of both sandboxes). */
     val memoryTotal: String = memory,
 )
 
-/** One container of a run's sandbox that runs commands: `default` (the top-level image) or a platform. */
-@Serializable data class SandboxContainerDto(val platform: String, val image: String, val createdAt: String)
+/**
+ * One container of a run that runs commands: `default` (the top-level image) or a platform of the build sandbox ([kind]
+ * `build`), or the review sandbox's container ([kind] `review`, [platform] `default`).
+ */
+@Serializable data class SandboxContainerDto(val platform: String, val image: String, val createdAt: String, val kind: String = "build")
 
 @Serializable
 data class SandboxServerLimitsDto(
