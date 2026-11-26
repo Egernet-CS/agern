@@ -76,6 +76,10 @@ Behaviour
         the 10 s read timeout of mcp_call, so the answer has to come as a stream) and report it ("Sandbox exec: ...")
     - "fake:sandbox-background" makes the builder start "sleep long" with factory_sandbox_exec {background: true}, then
         call factory_sandbox_wait with the handle, and report both ("Sandbox start: ..." / "Sandbox wait: ...")
+    - "fake:sandbox-vm" makes the builder, after its commit, call the MCP tools factory_sandbox_vm_deploy (no arguments)
+        and then factory_sandbox_vm_exec (command "echo checked on the vm") and append "Sandbox VM deploy: <answer>" and
+        "Sandbox VM exec: <answer>" to its result, each marked " (error)" when the tool answered with an error (it does
+        not trigger "fake:sandbox")
     - "fake:screenshots" makes the ux and ui-design reviewers, before answering, write a small PNG into their working
         directory, attach it through the MCP tool factory_attach_screenshot with the caption
         "Fake <role> screenshot (<build | fix round N>)", delete the file and append "Attached 1 screenshot." (or the
@@ -375,6 +379,19 @@ def fake_deploy():
     answer, exec_error = mcp_tool_roundtrip("factory_deploy_exec", {"target": name, "command": "echo deployed"}, 3)
     return "Deploy targets%s: %s\nDeploy exec%s: %s" % (
         " (error)" if targets_error else "", targets, " (error)" if exec_error else "", answer)
+
+
+def fake_sandbox_vm():
+    """fake:sandbox-vm: factory_sandbox_vm_deploy, then factory_sandbox_vm_exec "echo checked on the vm".
+    Returns the lines for the builder's result."""
+    try:
+        mcp_init()
+    except Exception as e:  # noqa
+        return "Sandbox VM MCP calls failed: %s" % e
+    deployed, deploy_error = mcp_tool_roundtrip("factory_sandbox_vm_deploy", {}, 20)
+    answer, exec_error = mcp_tool_roundtrip("factory_sandbox_vm_exec", {"command": "echo checked on the vm"}, 21)
+    return "Sandbox VM deploy%s: %s\nSandbox VM exec%s: %s" % (
+        " (error)" if deploy_error else "", deployed, " (error)" if exec_error else "", answer)
 
 
 def generate_fake_image(text, req_id=2):
@@ -742,7 +759,7 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
             except Exception as e:  # noqa
                 sandbox_report = "\nSandbox MCP calls failed: %s" % e
             checkpoint()
-        elif "fake:sandbox" in prompt and mcp_config:
+        elif re.search(r"fake:sandbox(?![\w-])", prompt) and mcp_config:
             try:
                 mcp_call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake-claude", "version": "0"}}, 1)
                 info, _ = mcp_tool_roundtrip("factory_sandbox_info", {}, 2)
@@ -781,6 +798,9 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
             if os.path.isfile(os.path.join(d, "assets", "fake-icon.png")):
                 subprocess.run(["git", "add", os.path.join("assets", "fake-icon.png")], check=False, cwd=d)
             subprocess.run(["git", "commit", "-q", "-m", "Fake build commit"], check=False, cwd=d)
+        if "fake:sandbox-vm" in prompt and mcp_config:
+            sandbox_report += "\n" + fake_sandbox_vm()
+            checkpoint()
         if "fake:stop-builder" in prompt and "Do not redo that work" not in prompt:
             text = "API Error: Can't reach the API server - check your internet or DNS (fake)"
             stream_text(text)

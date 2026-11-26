@@ -3,6 +3,7 @@ import { cost, duration, modelLabel } from '../../lib/format';
 import { useNow } from '../../lib/useNow';
 import { DeployLogBlock } from '../deploy/DeployLog';
 import { SandboxLogBlock } from '../sandbox/SandboxLog';
+import { SandboxVmLogBlock } from '../sandboxvm/SandboxVmLog';
 import { MessageAttachments } from './attachments';
 import { GeneratedImages } from './generated';
 import { Markdown } from './Markdown';
@@ -151,6 +152,7 @@ const TranscriptItem = memo(function TranscriptItem({ item, me, sessionId }: { i
     case 'system':
       if (item.sandbox) return <SandboxLogBlock log={item.sandbox} />;
       if (item.deploy) return <DeployLogBlock log={item.deploy} />;
+      if (item.sandboxVm) return <SandboxVmLogBlock log={item.sandboxVm} />;
       return (
         <div className={`t-system t-system--${item.level}`} role={item.level === 'error' ? 'alert' : undefined}>
           <span className="t-elbow" aria-hidden>※</span>

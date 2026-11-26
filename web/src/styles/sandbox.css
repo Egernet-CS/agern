@@ -572,3 +572,204 @@
 .dpl-check--fail {
   color: #ffc0c0;
 }
+
+/* ------------------------------------------------------------------ sandbox VMs (docs/SANDBOX-VMS.md) */
+
+/* A sandbox VM step or command in a builder's transcript: the deploy block's look with a "sandbox VM" chip. */
+.t-svm-chip {
+  color: var(--amber-hi);
+  border-color: rgba(255, 196, 92, 0.35);
+}
+.t-svm-vm {
+  font-family: var(--font-mono);
+  color: var(--text-2);
+}
+
+/* run page: the VM line below the sandbox line */
+.run-svm {
+  grid-column: 1;
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin: 4px 0 0;
+  font-size: 0.86rem;
+  color: var(--text-2);
+}
+.run-svm-k {
+  font: 500 0.66rem/1 var(--font-mono);
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+.run-svm-name {
+  color: var(--pass);
+  overflow-wrap: anywhere;
+}
+.run-svm-why {
+  color: var(--text-3);
+}
+.run-svm--off .run-svm-why {
+  color: var(--text-2);
+}
+.run-svm-used {
+  color: var(--pass);
+}
+.run-svm-link {
+  font-size: 0.8rem;
+}
+
+/* run page: the preview panel */
+.svm-pv {
+  margin: 0 0 16px;
+  padding: 12px 16px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--text-3);
+  border-radius: var(--r);
+  background: rgba(255, 255, 255, 0.015);
+}
+.svm-pv--ready {
+  border-left-color: var(--pass);
+}
+.svm-pv--deploying {
+  border-left-color: var(--amber);
+}
+.svm-pv--failed {
+  border-left-color: var(--fail);
+  background: var(--fail-wash);
+}
+.svm-pv-h {
+  margin: 0 0 6px;
+  font: 500 0.7rem/1.4 var(--font-mono);
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+.svm-pv-text {
+  margin: 0 0 8px;
+  max-width: 80ch;
+  overflow-wrap: anywhere;
+}
+.svm-pv-fail {
+  color: #ffc0c0;
+}
+.svm-pv-busy {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.svm-pv-spin {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid var(--amber);
+  border-right-color: transparent;
+  animation: svm-spin 0.9s linear infinite;
+}
+@keyframes svm-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .svm-pv-spin {
+    animation: none;
+  }
+}
+.svm-pv-open {
+  font-weight: 600;
+  margin-right: 10px;
+}
+.svm-pv-open:focus-visible,
+.run-svm-link:focus-visible,
+.svm-row:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+  border-radius: 4px;
+}
+.svm-pv-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+.svm-pv-ended {
+  margin: 8px 0 0;
+}
+.svm-pv-err {
+  margin: 8px 0 0;
+}
+.svm-pv-output {
+  margin: 0 0 8px;
+}
+.svm-pv-output summary {
+  cursor: pointer;
+  font-size: 0.86rem;
+  color: var(--text-2);
+}
+.svm-pv-output summary:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+  border-radius: 4px;
+}
+.svm-pv-output[open] summary {
+  margin-bottom: 6px;
+}
+
+/* project activity pane: the VM row (its own modifiers; not the sandbox row's) */
+.svm-row--pass {
+  border-color: rgba(90, 214, 160, 0.25);
+}
+.svm-row--escalate {
+  border-color: rgba(255, 120, 174, 0.4);
+}
+.svm-row--fail {
+  border-color: rgba(255, 100, 100, 0.35);
+}
+
+/* the project's sandbox VM page (pages/SandboxVm.tsx) */
+.svm-cmd {
+  display: contents;
+}
+.svm-cmd pre {
+  margin-top: 4px;
+}
+.svm-check {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-top: 14px;
+}
+.svm-check-result p {
+  margin: 8px 0 0;
+}
+.svm-lease {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+}
+.svm-lease-text {
+  margin: 0;
+}
+.svm-setup-list {
+  margin: 8px 0 0;
+  padding-left: 20px;
+  display: grid;
+  gap: 6px;
+  font-size: 0.9rem;
+  color: var(--text-2);
+}
+.svm-dialog-cmds {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.svm-dialog-cmds pre {
+  margin: 2px 0 0;
+}

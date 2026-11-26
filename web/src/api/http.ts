@@ -176,6 +176,14 @@ export const httpApi: Api = {
   rotateDeployKey: (repo) => post(`/api/projects/${enc(repo)}/deploy/key/rotate`),
   checkDeployTarget: (repo, target) => post(`/api/projects/${enc(repo)}/deploy/targets/${enc(target)}/check`),
 
+  getSandboxVm: (repo) => get(`/api/projects/${enc(repo)}/sandbox-vm`),
+  approveSandboxVm: (repo, sha256) => post(`/api/projects/${enc(repo)}/sandbox-vm/approval`, { sha256 }),
+  revokeSandboxVm: (repo) => del(`/api/projects/${enc(repo)}/sandbox-vm/approval`),
+  checkSandboxVm: (repo) => post(`/api/projects/${enc(repo)}/sandbox-vm/check`),
+  releaseSandboxVmLease: (repo) => del(`/api/projects/${enc(repo)}/sandbox-vm/lease`),
+  startSandboxVmPreview: (runId) => post(`/api/runs/${enc(runId)}/sandbox-vm/preview`),
+  releaseSandboxVmPreview: (runId) => del(`/api/runs/${enc(runId)}/sandbox-vm/preview`),
+
   projectRuns: (repo) => get(`/api/projects/${enc(repo)}/runs`),
   startRun: (repo, issueNumber) => post(`/api/projects/${enc(repo)}/runs`, { issueNumber }),
   createMemberLabels: (repo) => post(`/api/projects/${enc(repo)}/workspace/labels`, {}),

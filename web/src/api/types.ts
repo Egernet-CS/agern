@@ -559,6 +559,8 @@ export type Run = {
   kind?: RunKind;
   /** A sync run: the commit it last pushed to its release branch. */
   syncPushedSha?: string | null;
+  /** The run's sandbox VM decision and its human preview (docs/SANDBOX-VMS.md); null for sync runs and older runs. */
+  sandboxVm?: RunSandboxVm | null;
 };
 
 export type RunKind = 'issue' | 'sync';
@@ -731,6 +733,117 @@ export type DeployCheck = {
   durationMs: number;
 };
 
+/**
+ * A run's sandbox VM decision (docs/SANDBOX-VMS.md), fixed when it starts, plus what happened with the VM since.
+ * `disabled` = FACTORY_SANDBOX_VM is off; `none` = no `.agern/sandbox-vm.yml`; `invalid`; `unapproved`; `approved`.
+ */
+export type RunSandboxVmState = 'disabled' | 'none' | 'invalid' | 'unapproved' | 'approved';
+export type RunSandboxVm = {
+  state: RunSandboxVmState;
+  reason: string;
+  sha256: string | null;
+  /** The VM's label, host, SSH user and URL (`approved` only). */
+  name: string | null;
+  host: string | null;
+  user: string | null;
+  url: string | null;
+  /** The builder deployed to the VM at least once. */
+  used: boolean;
+  /** How long a human preview holds the VM (FACTORY_SANDBOX_VM_PREVIEW_MINUTES). */
+  previewMinutes: number;
+  /** The latest human preview of the run; null when nobody started one. */
+  preview: SandboxVmPreview | null;
+};
+
+export type SandboxVmPreviewState = 'deploying' | 'ready' | 'failed' | 'released';
+
+/** A human preview of a run on its sandbox VM (`POST /api/runs/{id}/sandbox-vm/preview`). */
+export type SandboxVmPreview = {
+  state: SandboxVmPreviewState;
+  /** The commit deployed (or being deployed). */
+  sha: string | null;
+  url: string | null;
+  startedBy: Owner | null;
+  startedAt: string | null;
+  /** `ready`: until when the preview holds the VM. */
+  expiresAt: string | null;
+  /** `released` / `failed`: when the preview ended. */
+  endedAt: string | null;
+  /** `released` because the preview time ran out. */
+  expired: boolean;
+  /** `failed`: `upload`, `checkout`, `setup`, `ready` or `connect`. */
+  failedStep: string | null;
+  error: string | null;
+  /** `failed`: the tail of the failed step's output (at most 20,000 characters). */
+  output: string | null;
+};
+
+/** The VM of a valid `.agern/sandbox-vm.yml`. */
+export type SandboxVm = {
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+  hostKeyType: string;
+  /** OpenSSH style, `SHA256:…`. */
+  hostKeyFingerprint: string;
+  description: string | null;
+  url: string | null;
+  checkout: string;
+  setup: string | null;
+  ready: SandboxReady | null;
+  reset: string | null;
+};
+
+/** Who holds a sandbox VM now. `runId`, `repo` and `issueNumber` are withheld (`visible` false) from viewers who cannot see the holder's project. */
+export type SandboxVmLease = {
+  /** `build` (a run's builder) or `preview` (a human). */
+  kind: 'build' | 'preview';
+  state: 'held' | 'resetting';
+  since: string;
+  expiresAt: string | null;
+  visible: boolean;
+  runId: string | null;
+  repo: string | null;
+  issueNumber: number | null;
+};
+
+/** `GET /api/projects/{repo}/sandbox-vm`: the definition on the default branch, its approval, the key and the lease. */
+export type SandboxVmStatus = {
+  repo: string;
+  /** FACTORY_SANDBOX_VM is not off. Definitions can be approved either way. */
+  enabled: boolean;
+  /** `fake`: commands only pretend to run (development). */
+  mode: 'ssh' | 'fake' | 'off';
+  path: string;
+  branch: string;
+  /** `pending`: valid, but this exact content is not approved. */
+  state: 'none' | 'invalid' | 'pending' | 'approved';
+  sha256: string | null;
+  content: string | null;
+  errors: string[];
+  vm: SandboxVm | null;
+  approval: SandboxApproval | null;
+  approvers: Owner[];
+  /** The project's deploy key (shared with deploy targets); null when it has none. */
+  key: DeployKey | null;
+  /** The VM's lease (keyed by host and port, so possibly held by another project's run); null when free. */
+  lease: SandboxVmLease | null;
+  previewMinutes: number;
+};
+
+/** `POST /api/projects/{repo}/sandbox-vm/check`: how far a connection got, and the readiness check. */
+export type SandboxVmCheck = {
+  ok: boolean;
+  /** `ok`, or the step that failed. */
+  stage: 'connect' | 'host_key' | 'auth' | 'ready' | 'ok';
+  message: string;
+  durationMs: number;
+  /** Stage `ready`: the readiness command's exit code and output tail. */
+  exitCode: number | null;
+  output: string | null;
+};
+
 /** A sandbox that exists right now (`GET /api/admin/sandboxes`). */
 export type RunningSandbox = {
   runId: string;
@@ -819,6 +932,26 @@ export type DeployLog = {
   error: string | null;
 };
 
+/** On `system` events of a run's builder: one step of a sandbox VM deploy, a command, or a reset (docs/SANDBOX-VMS.md). */
+export type SandboxVmLog = {
+  kind: 'deploy' | 'exec' | 'reset';
+  /** The deploy step; null for `exec` and `reset`. */
+  step: 'upload' | 'checkout' | 'setup' | 'ready' | null;
+  vm: string;
+  host: string;
+  port: number;
+  user: string;
+  command: string | null;
+  sha: string | null;
+  /** null: no exit status (an upload, a connection failure, a signal). */
+  exitCode: number | null;
+  timedOut: boolean;
+  durationMs: number;
+  output: string;
+  outputTruncated: boolean;
+  error: string | null;
+};
+
 export type EventType = 'user' | 'claude' | 'system' | 'status' | 'images' | 'checkout';
 
 /**
@@ -870,7 +1003,7 @@ export type ClientConfig = {
 };
 
 export type UserPayload = { text: string; username: string; attachments?: Attachment[] };
-export type SystemPayload = { level: 'info' | 'warn' | 'error'; text: string; messageId?: string; sandbox?: SandboxLog; deploy?: DeployLog };
+export type SystemPayload = { level: 'info' | 'warn' | 'error'; text: string; messageId?: string; sandbox?: SandboxLog; deploy?: DeployLog; sandboxVm?: SandboxVmLog };
 export type StatusPayload = { status: SessionStatus };
 
 export type Settings = {

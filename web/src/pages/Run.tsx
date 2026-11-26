@@ -3,6 +3,8 @@ import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { api, ApiError, BLOCKING_CHECK_STATES, isRunActive, isRunWorking, isSyncRun, runRef, type AgentSession, type GeneratedImage, type Run, type RunCheckItem, type Screenshot, type StageRole } from '../api';
 import { ChatView } from '../components/chat/ChatView';
 import { RunSandboxLine } from '../components/sandbox/SandboxBits';
+import { RunSandboxVmLine } from '../components/sandboxvm/SandboxVmBits';
+import { SandboxVmPreviewPanel } from '../components/sandboxvm/SandboxVmPreview';
 import { Markdown } from '../components/chat/Markdown';
 import { approverEscalation, buildNodes, humanSelectable, isFollowUp, latestStage, REVIEWERS, ROLE_BLURB, roundName, rounds, stagesFor, type NodeId } from '../components/pipeline/model';
 import { Prompt } from '../components/chat/Prompt';
@@ -187,6 +189,7 @@ export function RunPage() {
           <div><dt>started</dt><dd>{timeAgo(run.createdAt, now)}</dd></div>
         </dl>
         <RunSandboxLine run={run} />
+        <RunSandboxVmLine run={run} />
         {run.status === 'merged' && checks?.overriddenBy && (
           <p className="muted small run-override">Merged by {checks.overriddenBy} despite checks: {checks.detail}</p>
         )}
@@ -268,6 +271,7 @@ export function RunPage() {
         </div>
       )}
       {err && <p className="form-error" role="alert">{err}</p>}
+      <SandboxVmPreviewPanel run={run} canAct={isOwner || me.isAdmin} onRun={(r) => runQ.setData(() => r)} />
       {run.status === 'waiting_for_checks' && checks && <WaitingForChecks checks={checks} />}
       {(run.warnings ?? []).map((w) => {
         // "<title>: <detail>" — the title in bold, the detail as a sentence.
