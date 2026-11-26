@@ -9,7 +9,7 @@ function seconds(ms: number) {
 }
 
 /**
- * A sandbox command (or the setup script) in a builder's transcript: collapsed to one line with exit code and duration;
+ * A sandbox command (or the setup script) in a builder's or UI reviewer's transcript: collapsed to one line with exit code and duration;
  * opened, the end of its output in the terminal style, with "Show all" for long output. Nothing of the output is
  * rendered while collapsed, so long logs cost nothing until someone looks.
  */
@@ -29,7 +29,15 @@ export function SandboxLogBlock({ log }: { log: SandboxLog }) {
           {open ? '▾' : '▸'}
         </span>
         <span className="t-sbx-cmd">
-          <span className="sr-only">{setup ? 'Sandbox setup script' : 'Sandbox command'}{log.platform ? ` on platform ${log.platform}` : ''}: </span>
+          <span className="sr-only">
+            {log.review ? 'Review sandbox' : 'Sandbox'} {setup ? 'setup script' : 'command'}
+            {log.platform ? ` on platform ${log.platform}` : ''}:{' '}
+          </span>
+          {log.review && (
+            <span className="sbx-plat t-sbx-plat t-sbx-review" aria-hidden title="Ran in the read-only review sandbox">
+              review
+            </span>
+          )}
           {log.platform && (
             <span className="sbx-plat t-sbx-plat" aria-hidden title={`Ran on platform ${log.platform}`}>
               {log.platform}

@@ -103,6 +103,25 @@ test('a run with an approved sandbox shows its image and the commands it ran', a
   await expect(setup.locator('.t-sbx-out')).toContainText(`installing the toolchain ${tag}`);
 });
 
+test('the ux and ui-design reviewers run the app in a read-only review sandbox, shown on the run page', async ({ page }) => {
+  await login(page, 'alice');
+  const runId = await startRun(page, `Review sandbox ${tag}`, 'Look at it in the review sandbox. fake:review-sandbox');
+  await page.goto(`${BASE()}/p/demo-app/runs/${runId}`);
+  await expect(page.locator('.rh-title .pill')).toHaveText('merged', { timeout: 45_000 });
+  const review = page.locator('.run-sbx .run-sbx-review');
+  await expect(review).toHaveText('review sandbox ✓');
+  await expect(review).toHaveAttribute('title', 'The ux and ui-design reviewers ran the app in a read-only review sandbox');
+
+  await node(page, 'ux').click();
+  const log = page.locator('.stage-detail .chat-log');
+  const cmd = log.locator('.t-sbx', { hasText: 'echo reviewed in the sandbox && ls' });
+  await expect(cmd).toContainText('exit 0');
+  await expect(cmd.locator('.t-sbx-review')).toHaveText('review');
+  await cmd.getByRole('button', { name: /Review sandbox command: .*echo reviewed in the sandbox/ }).click();
+  await expect(cmd.locator('.t-sbx-out')).toContainText('reviewed in the sandbox');
+  await expect(cmd.locator('.t-sbx-out')).toContainText('README.md');
+});
+
 test('a changed definition shows the diff and needs a new approval', async ({ page }) => {
   definition(v2);
   await login(page, 'alice');

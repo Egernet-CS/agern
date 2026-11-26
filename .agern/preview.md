@@ -27,6 +27,9 @@ Wait until `http://127.0.0.1:$PORT/` answers (a few seconds), then take screensh
   A workspace project (several repositories side by side) is `/p/shop-workspace`: its members are in
   the "agents & runs" pane, its issues show their member, and issue #5 has a merged workspace run.
   As `observer` (bob) the member `ios` is marked "no access".
+- Sandboxes: `web-shop` has an approved sandbox. Its merged run of issue #47 shows "review sandbox ✓"
+  in the run page's sandbox line; the `ux` stage's transcript has a command block with the `review`
+  chip (the app started in the read-only review sandbox).
 - The app is a single-page app: with Chromium's `--screenshot`, pass `--virtual-time-budget=8000`,
   or the page is captured before it renders. With Playwright, wait for `networkidle` and a selector.
 - There is one (dark) theme. Check narrow layouts at 390 px width.

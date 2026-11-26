@@ -543,6 +543,8 @@ export type RunSandbox = {
   platforms: string[];
   /** Where the builder ran commands: `default` and platform names, in first-use order (only when there are platforms). */
   platformsUsed: string[];
+  /** The ux and ui-design reviewers ran the app in a read-only review sandbox at least once (absent for older runs). */
+  reviewUsed?: boolean;
 };
 
 /** A sidecar's readiness check: run inside the service until it exits 0, for at most `timeoutSeconds`. */
@@ -620,7 +622,8 @@ export type RunningSandbox = {
   memoryTotal: string;
 };
 
-export type SandboxContainer = { platform: string; image: string; createdAt: string };
+/** `build`: the default image or a platform of the build sandbox; `review`: the review sandbox's container (platform `default`). */
+export type SandboxContainer = { platform: string; image: string; createdAt: string; kind: 'build' | 'review' };
 
 /** Admin overview of the sandbox runtime: its limits and the sandboxes that exist (oldest first). */
 export type SandboxOverview = {
@@ -653,6 +656,8 @@ export type SandboxLog = {
   outputTruncated: boolean;
   /** Where it ran: null when the definition has no platforms, else `default` or the platform's name. */
   platform?: string | null;
+  /** Ran in the read-only review sandbox of the ux and ui-design reviewers. */
+  review?: boolean;
 };
 
 export type EventType = 'user' | 'claude' | 'system' | 'status' | 'images' | 'checkout';
