@@ -220,32 +220,66 @@ fun resolveSubmoduleUrl(parentUrl: String, url: String): String {
 
 /**
  * Runs the git CLI with an environment built from scratch (auth via `GIT_CONFIG_*` env only).
- * With [localOnly] (fake GitHub dev mode) a clone is replaced by `git init` and pushes are skipped.
+ * With [localOnly] (fake GitHub dev mode) a clone is replaced by `git init` and pushes are skipped. Without it, every
+ * `clone`, `fetch` and `push` is reported to [health] (docs/ARCHITECTURE.md §6 "GitHub status").
  */
-class CliGitOps(private val path: String, private val gitHost: String, private val localOnly: Boolean = false) : GitOps {
+class CliGitOps(
+    private val path: String,
+    private val gitHost: String,
+    private val localOnly: Boolean = false,
+    private val health: dk.egernet.factory.github.GitHubHealth? = null,
+) : GitOps {
     private val log = LoggerFactory.getLogger(CliGitOps::class.java)
 
     private companion object {
         /** The mode of a gitlink (a submodule pointer) in a tree. */
         const val GITLINK_MODE = "160000"
         val SHA_RE = Regex("[0-9a-f]{40}|[0-9a-f]{64}")
+        /** The git commands that talk to the remote and are recorded (docs/ARCHITECTURE.md §6 "GitHub status"). */
+        val RECORDED_COMMANDS = setOf("clone", "fetch", "push")
         /** What git and the servers say when a fetched commit does not exist there (as opposed to a remote it cannot reach). */
         val MISSING_COMMIT_RE = Regex("(?i)not our ref|couldn'?t find remote ref|no such remote ref|not a valid object|unadvertised object")
     }
 
     private fun git(cwd: Path?, home: Path, id: AgentIdentity?, vararg args: String, timeoutSec: Long = 600, token: String? = null): String {
         val (code, out) = gitStatus(cwd, home, id, *args, timeoutSec = timeoutSec, token = token)
-        if (code != 0) throw GitException("git ${args.take(2).joinToString(" ")} failed: ${out.takeLast(1000).trim()}")
+        if (code != 0) {
+            val cls = dk.egernet.factory.github.GitHubHealth.classifyGit(code, out)
+            val hint = if (cls == dk.egernet.factory.github.CallClass.SERVER_ERROR || cls == dk.egernet.factory.github.CallClass.NETWORK) {
+                dk.egernet.factory.github.GitHubFailure.GIT_HINT
+            } else ""
+            throw GitException("git ${args.take(2).joinToString(" ")} failed: ${out.takeLast(1000).trim()}$hint")
+        }
         return out
+    }
+
+    /** The git command of [args]: the first argument that is no option and not the value of a `-c`. */
+    private fun commandOf(args: Array<out String>): String? {
+        var i = 0
+        while (i < args.size) {
+            val a = args[i]
+            if (a == "-c" || a == "-C") { i += 2; continue }
+            if (!a.startsWith("-")) return a
+            i++
+        }
+        return null
+    }
+
+    /** Reports a `clone`/`fetch`/`push` against the remote; [code] null = timed out. Not in [localOnly] mode. */
+    private fun record(args: Array<out String>, code: Int?, out: String) {
+        if (localOnly || health == null) return
+        val cmd = commandOf(args) ?: return
+        if (cmd in RECORDED_COMMANDS) health.recordGit(cmd, code, out)
     }
 
     /**
      * Runs git and returns its exit code and output instead of throwing on a non-zero exit. [token]: authenticate with
-     * this GitHub token where there is no [id] (a fetch on the server's own behalf).
+     * this GitHub token where there is no [id] (a fetch on the server's own behalf). [recorded]: false for commands that
+     * may talk to other hosts than GitHub (a submodule's URL), which are not reported to [health].
      */
     private fun gitStatus(
         cwd: Path?, home: Path, id: AgentIdentity?, vararg args: String, timeoutSec: Long = 600, token: String? = null,
-        env: Map<String, String> = emptyMap(),
+        env: Map<String, String> = emptyMap(), recorded: Boolean = true,
     ): Pair<Int, String> {
         val pb = ProcessBuilder(listOf("git") + args).redirectErrorStream(true)
         if (cwd != null) pb.directory(cwd.toFile())
@@ -266,8 +300,10 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
         val out = p.inputStream.bufferedReader().readText()
         if (!p.waitFor(timeoutSec, TimeUnit.SECONDS)) {
             p.destroyForcibly()
-            throw GitException("git ${args.firstOrNull()} timed out")
+            if (recorded) record(args, null, out)
+            throw GitException("git ${args.firstOrNull()} timed out" + dk.egernet.factory.github.GitHubFailure.GIT_HINT)
         }
+        if (recorded) record(args, p.exitValue(), out)
         return p.exitValue() to out
     }
 
@@ -607,7 +643,7 @@ class CliGitOps(private val path: String, private val gitHost: String, private v
             // commands (`file`, unless the home's git config allows it), so no other repository on this server is read.
             val (code, out) = gitStatus(
                 tmp, home, null, "fetch", "-q", "--no-tags", "--depth=1", "--filter=tree:0", "origin", sha,
-                timeoutSec = 300, token = githubToken, env = mapOf("GIT_PROTOCOL_FROM_USER" to "0"),
+                timeoutSec = 300, token = githubToken, env = mapOf("GIT_PROTOCOL_FROM_USER" to "0"), recorded = false,
             )
             if (code == 0) return true
             if (MISSING_COMMIT_RE.containsMatchIn(out)) return false

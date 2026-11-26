@@ -37,6 +37,8 @@ class ReleaseService(
     private val merger: ReleaseMerger,
     private val modePolicy: ReleaseModePolicy = ReleaseModePolicy.ALLOW_ALL,
     private val workspaceDefs: dk.egernet.factory.workspace.WorkspaceService? = null,
+    /** The projects' settings: a project that merges on GitHub refuses Agern's release approval; null = defaults. */
+    private val projectSettings: dk.egernet.factory.db.ProjectSettingsStore? = null,
 ) {
     companion object {
         /** Safe as the git branch `release/<name>` and in URLs. */
@@ -77,8 +79,21 @@ class ReleaseService(
                 422 -> throw unprocessable(e.message ?: "GitHub rejected the request")
                 else -> throw ApiException(io.ktor.http.HttpStatusCode.BadGateway, "github_error", e.message ?: "GitHub error")
             }
+        } catch (e: java.nio.file.FileSystemException) {
+            throw e
+        } catch (e: java.io.FileNotFoundException) {
+            throw e
+        } catch (e: java.io.IOException) {
+            throw githubUnreachable(e)
+        } catch (e: java.nio.channels.UnresolvedAddressException) {
+            throw githubUnreachable(e)
         }
     }
+
+    /** A network error or timeout talking to GitHub: 502 `github_unreachable`, keeping [e] as the cause (still transient). */
+    private fun githubUnreachable(e: Throwable) =
+        ApiException(io.ktor.http.HttpStatusCode.BadGateway, "github_unreachable", dk.egernet.factory.github.GitHubFailure.unreachable(e, cfg.githubOrg))
+            .apply { initCause(e) }
 
     private suspend fun requireVisible(user: UserRecord, repo: String) {
         io { access.requireVisible(user, repo) }
@@ -177,8 +192,8 @@ class ReleaseService(
     }
 
     /**
-     * The seam for #24: a project that requires a human approval refuses automatic releases (409
-     * `release_mode_not_allowed`). Every project allows them until #24 adds that setting.
+     * A project that requires a human approval (merge policy other than `automatic`, docs/ARCHITECTURE.md §6 "Merge
+     * policy") refuses automatic releases (409 `release_mode_not_allowed`).
      */
     private fun requireAutomaticAllowed(repo: String) {
         if (!modePolicy.allowsAutomatic(repo)) {
@@ -334,6 +349,12 @@ class ReleaseService(
         val r = visible(user, id)
         if (!r.started) throw conflict("Release is ${ReleaseMerger.statusLabel(r.status)}, not ready to release", "release_not_ready")
         requireOwner(user, r)
+        if (io { projectSettings?.get(r.repo)?.mergePolicy } == MergePolicy.GITHUB) {
+            throw conflict(
+                "This project merges on GitHub: Agern does not merge. Review and merge the release pull request on GitHub.",
+                "merge_on_github",
+            )
+        }
         access.requireClient(user)
         return merger.approve(user, id)
     }

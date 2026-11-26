@@ -890,10 +890,17 @@ function ReleasePullSection({
           <button type="button" className="btn" onClick={onCheck} disabled={busy}>
             {checking ? 'Checking…' : 'Check again'}
           </button>
-          <button type="button" className="btn btn--primary" onClick={onApprove} disabled={busy || !approvable} aria-describedby="release-ready-status">
-            Approve and release
-          </button>
+          {/* Merge policy `github` (ARCHITECTURE §6 "Merge policy"): Agern never merges; the server refuses too. */}
+          {release.mergePolicy === 'github' ? (
+            <span className="muted small">This project merges on GitHub: review and merge the release pull request there.</span>
+          ) : (
+            <button type="button" className="btn btn--primary" onClick={onApprove} disabled={busy || !approvable} aria-describedby="release-ready-status">
+              Approve and release
+            </button>
+          )}
         </div>
+      ) : release.mergePolicy === 'github' ? (
+        <p className="muted small">This project merges on GitHub: review and merge the release pull request there.</p>
       ) : (
         <p className="muted small">Only {ownerName} can approve this release.</p>
       )}
@@ -1029,7 +1036,9 @@ function ReleaseModeField({
   onChange: (mode: ReleaseMode) => void;
 }) {
   const planning = release.status === 'planning';
-  const mayAutomatic = planning || isOwner;
+  // A project whose merge policy requires a human refuses automatic releases (the server does too).
+  const humanRequired = (release.mergePolicy ?? 'automatic') !== 'automatic';
+  const mayAutomatic = (planning || isOwner) && !humanRequired;
   const mayManual = planning || isOwner || isAdmin;
   const mayChange = release.mode === 'automatic' ? mayManual : mayAutomatic;
   const who = release.owner ? release.owner.username : 'whoever starts it';
@@ -1056,6 +1065,7 @@ function ReleaseModeField({
       )}
       <span id="release-mode-hint" className="muted small">
         {hint}
+        {humanRequired && release.mode !== 'automatic' && ' This project requires a human approval.'}
       </span>
     </div>
   );

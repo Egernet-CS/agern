@@ -40,6 +40,11 @@ data class Config(
     val networkRetryDelaysMs: List<Long> = listOf(1L, 2L, 5L, 10L, 15L).map { it * 60_000L },
     val githubApiUrl: String = "https://api.github.com",
     val fakeGithub: Boolean = false,
+    /**
+     * FACTORY_GITHUB_STATUS_URL: GitHub's official status summary shown on the GitHub status page (docs/ARCHITECTURE.md
+     * §6 "GitHub status"); null switches it off. [fromEnv] defaults it to githubstatus.com for github.com only.
+     */
+    val githubStatusUrl: String? = null,
     val pamService: String? = null,
     val agentPath: String = defaultAgentPath(),
     /** FACTORY_ATTACHMENT_MAX_MB: largest single chat attachment. */
@@ -57,10 +62,16 @@ data class Config(
     /** FACTORY_SANDBOX*: per-run build/test sandboxes (docs/ARCHITECTURE.md §5 "Sandboxes"). */
     val sandbox: SandboxConfig = SandboxConfig(),
     /**
-     * FACTORY_RELEASE_CHECKS_SETTLE_SECONDS: how long a release pull request's head commit must have had no checks at
-     * all before "no checks" counts as green for an automatic release (CI registers its checks some seconds after a push).
+     * FACTORY_RELEASE_CHECKS_SETTLE_SECONDS: how long a pull request's head commit must have had no checks at all before
+     * "no checks" counts as green, for an automatic release and before a run is merged (CI registers its checks some
+     * seconds after a push).
      */
     val releaseChecksSettleSeconds: Long = 120,
+    /**
+     * FACTORY_RUN_CHECKS_WAIT_MINUTES: how long an approved run waits in `waiting_for_checks` for the checks on its pull
+     * request's head commit before it goes to needs_human (docs/ARCHITECTURE.md §6 "Checks before a merge").
+     */
+    val runChecksWaitMinutes: Long = 60,
     /** How long `POST /mcp` waits for a call before it answers as an event stream (not configurable; tests shorten it). */
     val mcpStreamAfterMs: Long = 5_000,
     /** How often a streamed MCP answer sends a progress notification or keep-alive while the call runs. */
@@ -105,6 +116,7 @@ data class Config(
         "Config(host=$host, port=$port, dbUrl=$dbUrl, dbUser=$dbUser, githubOrg=$githubOrg, auth=$authProviders, " +
             "admins=$admins, dataDir=$dataDir, webDir=$webDir, claudeBin=$claudeBin, codexBin=$codexBin, publicUrl=$publicUrl, " +
             "maxAgentsPerUser=$maxAgentsPerUser, chatIdleMinutes=$chatIdleMinutes, stageTimeoutMs=$stageTimeoutMs, networkRetryMaxMs=$networkRetryMaxMs, fakeGithub=$fakeGithub, " +
+            "githubStatusUrl=${githubStatusUrl ?: "off"}, " +
             "attachments=${attachmentMaxCount}x${attachmentMaxBytes shr 20}MB/${attachmentMaxMessageBytes shr 20}MB, " +
             "screenshots=${screenshotMaxCount}x${screenshotMaxBytes shr 20}MB, images=$imageLimits, sandbox=$sandbox)"
 
@@ -158,6 +170,10 @@ data class Config(
                     userFilter = get("FACTORY_LDAP_USER_FILTER") ?: "(uid={0})",
                     bindDn = get("FACTORY_LDAP_BIND_DN"),
                     bindPassword = get("FACTORY_LDAP_BIND_PASSWORD"),
+                    // DNs contain commas, so several groups are separated by ';'.
+                    requiredGroups = (get("FACTORY_LDAP_REQUIRED_GROUP") ?: "").split(';').map { it.trim() }.filter { it.isNotEmpty() },
+                    groupMemberAttribute = get("FACTORY_LDAP_GROUP_MEMBER_ATTRIBUTE") ?: "member",
+                    groupMemberValue = (get("FACTORY_LDAP_GROUP_MEMBER_VALUE") ?: "dn").lowercase(),
                 ),
                 devUsers = devUsers,
                 dataDir = Paths.get(get("FACTORY_DATA_DIR") ?: "./data").toAbsolutePath().normalize(),
@@ -179,6 +195,7 @@ data class Config(
                     ?: 24) * 3_600_000L,
                 githubApiUrl = get("FACTORY_GITHUB_API_URL") ?: "https://api.github.com",
                 fakeGithub = fakeGithub,
+                githubStatusUrl = githubStatusUrl(env["FACTORY_GITHUB_STATUS_URL"], get("FACTORY_GITHUB_API_URL") ?: "https://api.github.com", fakeGithub),
                 pamService = get("FACTORY_PAM_SERVICE"),
                 agentPath = get("FACTORY_AGENT_PATH") ?: defaultAgentPath(),
                 attachmentMaxBytes = mb(get("FACTORY_ATTACHMENT_MAX_MB"), "FACTORY_ATTACHMENT_MAX_MB", 20),
@@ -201,11 +218,30 @@ data class Config(
                     (v.toLongOrNull() ?: throw IllegalArgumentException("FACTORY_RELEASE_CHECKS_SETTLE_SECONDS must be a whole number of seconds"))
                         .also { require(it in 0..3600) { "FACTORY_RELEASE_CHECKS_SETTLE_SECONDS must be between 0 and 3600" } }
                 } ?: 120,
+                runChecksWaitMinutes = get("FACTORY_RUN_CHECKS_WAIT_MINUTES")?.let { v ->
+                    (v.toLongOrNull() ?: throw IllegalArgumentException("FACTORY_RUN_CHECKS_WAIT_MINUTES must be a whole number of minutes"))
+                        .also { require(it in 1..1440) { "FACTORY_RUN_CHECKS_WAIT_MINUTES must be between 1 and 1440" } }
+                } ?: 60,
             ).also {
                 require(it.attachmentMaxMessageBytes >= it.attachmentMaxBytes) {
                     "FACTORY_ATTACHMENT_MAX_MESSAGE_MB must be at least FACTORY_ATTACHMENT_MAX_MB"
                 }
             }
+        }
+
+        /**
+         * FACTORY_GITHUB_STATUS_URL: unset → githubstatus.com for github.com without the fake GitHub, else off; `off` or
+         * empty → off; anything else must be an http(s) URL.
+         */
+        fun githubStatusUrl(raw: String?, apiUrl: String, fakeGithub: Boolean): String? {
+            if (raw == null) return if (apiUrl == "https://api.github.com" && !fakeGithub) "https://www.githubstatus.com/api/v2/summary.json" else null
+            val v = raw.trim()
+            if (v.isEmpty() || v.equals("off", ignoreCase = true)) return null
+            val uri = runCatching { java.net.URI(v) }.getOrNull()
+            require(uri != null && uri.scheme?.lowercase() in setOf("http", "https") && !uri.host.isNullOrEmpty()) {
+                "FACTORY_GITHUB_STATUS_URL must be an http:// or https:// URL, or 'off'"
+            }
+            return v
         }
 
         private fun intIn(v: String?, name: String, default: Int, range: IntRange): Int {
@@ -277,8 +313,15 @@ data class LdapConfig(
     val userFilter: String = "(uid={0})",
     val bindDn: String? = null,
     val bindPassword: String? = null,
+    /** Group DNs, any one of which must list the user (FACTORY_LDAP_REQUIRED_GROUP); empty = no group check. */
+    val requiredGroups: List<String> = emptyList(),
+    /** Attribute of the group entry that lists members (FACTORY_LDAP_GROUP_MEMBER_ATTRIBUTE). */
+    val groupMemberAttribute: String = "member",
+    /** `dn` (the member attribute holds user DNs) or `uid` (it holds login names) (FACTORY_LDAP_GROUP_MEMBER_VALUE). */
+    val groupMemberValue: String = "dn",
 ) {
-    override fun toString() = "LdapConfig(url=$url, userDnTemplate=$userDnTemplate, baseDn=$baseDn, bindDn=$bindDn)"
+    override fun toString() = "LdapConfig(url=$url, userDnTemplate=$userDnTemplate, baseDn=$baseDn, bindDn=$bindDn, " +
+        "requiredGroups=$requiredGroups, groupMemberAttribute=$groupMemberAttribute, groupMemberValue=$groupMemberValue)"
 }
 
 /** Sandbox settings (docs/ARCHITECTURE.md §3, §5 "Sandboxes"). */

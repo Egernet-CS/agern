@@ -54,17 +54,20 @@ const RUN_TONE: Record<RunStatus, string> = {
   building: 'active',
   reviewing: 'active',
   approving: 'active',
+  waiting_for_checks: 'active',
   merged: 'pass',
   needs_human: 'escalate',
   failed: 'fail',
   cancelled: 'idle',
+  // Passed every reviewer; the pull request waits on GitHub (merge policy `github`). An existing tone, no new colour.
+  ready: 'pass',
 };
 /** [kind] `sync`: a merged run that brought a release up to date reads "up to date" (it merged nothing). */
 export function RunStatusPill({ status, kind }: { status: RunStatus; kind?: string }) {
   return (
     <span className={`pill pill--${RUN_TONE[status]}`}>
       <span className="pill-dot" aria-hidden />
-      {kind === 'sync' && status === 'merged' ? 'up to date' : status.replace('_', ' ')}
+      {kind === 'sync' && status === 'merged' ? 'up to date' : status.replaceAll('_', ' ')}
     </span>
   );
 }

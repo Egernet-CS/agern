@@ -13,10 +13,12 @@ import type {
   CredentialKind,
   FactoryEvent,
   FeedFrame,
+  GitHubStatus,
   Issue,
   LoginStep,
   IssueKind,
   Project,
+  ProjectSettings,
   Release,
   ReleaseMode,
   Run,
@@ -45,6 +47,8 @@ export type ChannelHandlers<T> = {
 /** The whole HTTP + WebSocket surface of docs/ARCHITECTURE.md §8. */
 export interface Api {
   health(): Promise<{ status: 'ok'; version: string; name: string }>;
+  /** GitHub as Agern sees it (any logged-in user). `brief`: verdict and official status only (kinds [], rateLimits null). */
+  githubStatus(opts?: { brief?: boolean }): Promise<GitHubStatus>;
   providers(): Promise<{ providers: string[]; org: string; twoFactor: boolean }>;
   login(username: string, password: string): Promise<LoginStep>;
   totp(code: string): Promise<LoginStep>;
@@ -89,6 +93,8 @@ export interface Api {
   setProjectIcon(repo: string, file: File): Promise<Project>;
   /** Sets the project's icon from an image file on its default branch (copied once). Admin only; answers the updated project. */
   setProjectIconFromRepository(repo: string, path: string): Promise<Project>;
+  /** Sets the project's merge policy and its reviewers. Admin only; answers the updated project. */
+  setProjectSettings(repo: string, settings: ProjectSettings): Promise<Project>;
   /** Removes the project's icon (also when none is set). Admin only; answers the updated project. */
   deleteProjectIcon(repo: string): Promise<Project>;
   issues(repo: string, state?: 'open' | 'closed' | 'all'): Promise<Issue[]>;
@@ -189,6 +195,11 @@ export interface Api {
   runs(filter?: { active?: boolean; status?: RunStatus[] }): Promise<Run[]>;
   run(id: string): Promise<Run>;
   approveRun(id: string): Promise<Run>;
+  /**
+   * Owner only: merges although the checks on `headSha` have not passed (docs/ARCHITECTURE.md §6 "Checks before a
+   * merge"). 409 `run_not_overridable` / `checks_changed` / `review_required` / `review_in_progress` / `agent_busy`.
+   */
+  mergeAnywayRun(id: string, headSha: string): Promise<Run>;
   cancelRun(id: string): Promise<Run>;
   /** "Retry now" for a run waiting for the network. Owner or admin (403); 409 `run_not_waiting_for_network`. */
   retryRunNow(id: string): Promise<Run>;

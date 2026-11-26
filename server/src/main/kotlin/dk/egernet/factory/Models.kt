@@ -75,7 +75,35 @@ data class ProjectDto(
     val iconUrl: String? = null,
     /** The workspace definition (docs/ARCHITECTURE.md §5 "Workspace projects"); filled by `GET /api/projects/{repo}` only. */
     val workspace: WorkspaceDto? = null,
+    /** The project's settings (docs/ARCHITECTURE.md §6 "Merge policy"); defaults without a stored row. */
+    val settings: ProjectSettingsDto = ProjectSettingsDto(),
 )
+
+/**
+ * Per-project settings set by an admin (docs/ARCHITECTURE.md §6 "Merge policy"): the [MergePolicy] and, used only with
+ * [MergePolicy.GITHUB], the GitHub logins and team slugs requested as reviewers on a run's pull request.
+ */
+@Serializable
+data class ProjectSettingsDto(
+    val mergePolicy: String = MergePolicy.AUTOMATIC,
+    val reviewers: List<String> = emptyList(),
+    val teamReviewers: List<String> = emptyList(),
+)
+
+/** `PUT /api/projects/{repo}/settings`. Omitted lists are empty lists. */
+@Serializable
+data class ProjectSettingsReq(val mergePolicy: String? = null, val reviewers: List<String>? = null, val teamReviewers: List<String>? = null)
+
+/** How a project's runs reach the default branch (docs/ARCHITECTURE.md §6 "Merge policy"). */
+object MergePolicy {
+    /** The approver agent may merge (the default). */
+    const val AUTOMATIC = "automatic"
+    /** The approver only recommends; every merge waits in `needs_human` for the run owner's approval. */
+    const val OWNER_APPROVES = "owner_approves"
+    /** Agern never merges: a passing run ends `ready` and the team merges the pull request on GitHub. */
+    const val GITHUB = "github"
+    val ALL = setOf(AUTOMATIC, OWNER_APPROVES, GITHUB)
+}
 
 /**
  * [path]: where the definition comes from, `.agern/workspace.yml` or `.gitmodules` (members derived from the
@@ -240,6 +268,8 @@ data class ReleaseDto(
     val syncNeeded: Boolean = false,
     /** The release's latest run that brought it up to date (kind `sync`), or null. */
     val sync: ReleaseSyncDto? = null,
+    /** The project's current [MergePolicy], so the release page can explain why it cannot be approved or automatic. */
+    val mergePolicy: String = MergePolicy.AUTOMATIC,
 ) {
     /**
      * This release as [canSee] lets a viewer see it: a member repository the viewer cannot read keeps its name and
@@ -357,6 +387,14 @@ data class RunDto(
     /** A workspace run: the member repository and directory it changes; null otherwise. */
     val targetRepo: String? = null,
     val targetDirectory: String? = null,
+    /** The project's [MergePolicy] when the run started; never changes afterwards. */
+    val mergePolicy: String = MergePolicy.AUTOMATIC,
+    /** True when the run's pull request was merged on GitHub, outside Agern (followed for `github` runs). */
+    val mergedOnGitHub: Boolean = false,
+    /** The GitHub login that merged the pull request on GitHub; null when unknown or merged by Agern. */
+    val mergedBy: String? = null,
+    /** The checks on the pull request's head commit as last evaluated before a merge; null until the first evaluation. */
+    val checks: RunChecksDto? = null,
     /** Set while the run sleeps before retrying an operation that failed for lack of network; null otherwise. */
     val waiting: RunWaitDto? = null,
     /** [RunKind]: `issue`, or `sync` for a run that brings a release up to date (it has no issue: [issueNumber] is 0). */
@@ -372,6 +410,26 @@ object RunKind {
     /** Merges the default branch into a release branch; belongs to no issue. */
     const val SYNC = "sync"
 }
+
+/**
+ * The checks a run's merge was decided on (docs/ARCHITECTURE.md §6 "Checks before a merge"). [state] is a
+ * [ReleaseChecksState]; [items] are the checks that have not passed (at most [MAX_ITEMS]); [waitingSince] and [deadline]
+ * are set only while the run is `waiting_for_checks`; [overriddenBy] / [overriddenAt] when the owner merged anyway.
+ * Names, details and URLs come from GitHub and are untrusted; [RunCheckItemDto.url] is only ever an `https://` URL.
+ */
+@Serializable
+data class RunChecksDto(
+    val state: String, val sha: String, val detail: String, val items: List<RunCheckItemDto> = emptyList(),
+    val waitingSince: String? = null, val deadline: String? = null,
+    val overriddenBy: String? = null, val overriddenAt: String? = null,
+) {
+    companion object {
+        const val MAX_ITEMS = 50
+    }
+}
+
+/** One check that has not passed: [state] `failed` (with its [conclusion]) or `pending`. */
+@Serializable data class RunCheckItemDto(val name: String, val state: String, val conclusion: String? = null, val url: String? = null)
 
 /** Ways to retry a failed run (docs/ARCHITECTURE.md §6 "Retrying a run"). */
 object RetryMode {
@@ -396,6 +454,11 @@ object FailureKind {
     const val STEP = "step"
     /** The merge was refused: a submodule pointer names a commit its remote does not have (the run needs a human). */
     const val SUBMODULE_COMMIT_MISSING = "submodule_commit_missing"
+    /**
+     * The merge was not made because the checks on the pull request's head commit failed, did not finish within the
+     * time limit or could not be read (docs/ARCHITECTURE.md §6 "Checks before a merge").
+     */
+    const val CHECKS = "checks"
     const val OTHER = "other"
 
     /**
@@ -672,6 +735,68 @@ data class AttachmentDto(
 
 @Serializable data class ClientConfigDto(val attachments: AttachmentLimitsDto, val images: ImageConfigDto)
 
+/** `GET /api/github/status` (docs/ARCHITECTURE.md §6 "GitHub status", §8). */
+@Serializable
+data class GitHubStatusDto(
+    val verdict: GitHubVerdictDto,
+    val generatedAt: String,
+    val official: GitHubOfficialDto,
+    val kinds: List<GitHubKindDto>,
+    /** null with `brief=1`. */
+    val rateLimits: GitHubRateLimitsDto?,
+)
+
+/** [state]: `working`, `degraded` or `down`. */
+@Serializable data class GitHubVerdictDto(val state: String, val reason: String)
+
+/** GitHub's own status page. [state]: `ok`, `unreachable` or `disabled`; [indicator] only with `ok`. */
+@Serializable
+data class GitHubOfficialDto(
+    val state: String,
+    val indicator: String?,
+    val description: String?,
+    val components: List<GitHubComponentDto>,
+    val incidents: List<GitHubIncidentDto>,
+    val fetchedAt: String?,
+    val error: String?,
+)
+
+/** A component that is not `operational`; [relevant]: one Agern depends on. */
+@Serializable data class GitHubComponentDto(val name: String, val status: String, val relevant: Boolean)
+
+/** An open incident; [url] only when it is an `https://` link. */
+@Serializable data class GitHubIncidentDto(val title: String, val status: String, val impact: String?, val updatedAt: String?, val url: String?)
+
+/** One kind of call as Agern sees it. */
+@Serializable
+data class GitHubKindDto(
+    val kind: String,
+    val label: String,
+    val last15m: GitHubCallCountsDto,
+    val last24h: GitHubCallCountsDto,
+    val lastError: GitHubLastErrorDto?,
+)
+
+/** [calls] counts every outcome, successes included. */
+@Serializable data class GitHubCallCountsDto(val calls: Int, val serverErrors: Int, val network: Int, val rateLimited: Int, val auth: Int)
+
+/** [errorClass]: `server_error`, `network`, `rate_limited` or `auth`; [message] is scrubbed. */
+@Serializable
+data class GitHubLastErrorDto(
+    val at: String,
+    @kotlinx.serialization.SerialName("class") val errorClass: String,
+    val status: Int?,
+    val requestId: String?,
+    val message: String,
+)
+
+/** [own]: null when the caller has no GitHub token. Other tokens appear only as a count and one anonymous minimum. */
+@Serializable data class GitHubRateLimitsDto(val own: GitHubOwnRateLimitsDto?, val otherTokens: Int, val lowestOther: GitHubRateLimitDto?)
+
+@Serializable data class GitHubOwnRateLimitsDto(val rest: GitHubRateLimitDto?, val graphql: GitHubRateLimitDto?)
+
+@Serializable data class GitHubRateLimitDto(val limit: Int, val remaining: Int, val resetAt: String, val observedAt: String)
+
 /** An image provider of the catalogue (`GET /api/config`); the web renders whatever is listed. */
 @Serializable data class ImageProviderInfoDto(
     val id: String, val label: String, val models: List<String>, val defaultModel: String, val supportsTransparency: Boolean,
@@ -728,8 +853,15 @@ object RunStatus {
     const val QUEUED = "queued"; const val SPEC = "spec"; const val BUILDING = "building"
     const val REVIEWING = "reviewing"; const val APPROVING = "approving"; const val MERGED = "merged"
     const val NEEDS_HUMAN = "needs_human"; const val FAILED = "failed"; const val CANCELLED = "cancelled"
-    val ACTIVE = setOf(QUEUED, SPEC, BUILDING, REVIEWING, APPROVING, NEEDS_HUMAN)
-    val TERMINAL = setOf(MERGED, FAILED, CANCELLED)
+    /** Passed every reviewer under [MergePolicy.GITHUB]: the pull request waits on GitHub; Agern follows it. */
+    const val READY = "ready"
+    /**
+     * Approved, but the checks on the pull request's head commit have not passed yet: merges by itself when they do
+     * (docs/ARCHITECTURE.md §6 "Checks before a merge"). Survives a restart, like [NEEDS_HUMAN].
+     */
+    const val WAITING_FOR_CHECKS = "waiting_for_checks"
+    val ACTIVE = setOf(QUEUED, SPEC, BUILDING, REVIEWING, APPROVING, WAITING_FOR_CHECKS, NEEDS_HUMAN)
+    val TERMINAL = setOf(MERGED, FAILED, CANCELLED, READY)
     val ALL = ACTIVE + TERMINAL
 }
 

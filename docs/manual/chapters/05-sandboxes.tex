@@ -16,8 +16,10 @@ and tests in the container, which sees the run's working copy at \file{/workspac
 else from the server. The containers run in rootless Podman as the \texttt{agern} user.
 
 A sandbox is a toolchain and resource boundary, \emph{not} a security boundary: the agent itself
-still runs on the server as \texttt{agern} (chapter~\ref{ch:what}). Never put secrets into the
-file; everybody who can see the project can read it.
+still runs on the server as \texttt{agern} (chapter~\ref{ch:what}). No credentials are passed
+into the container, and its network is not restricted: it can reach the internet and the server's
+LAN. Never put secrets into the file; everybody who can see the project can read it. See also
+\securitydoc{the README's section ``Security: read this first''}.
 
 \section{Turn sandboxes on (on the server)}\label{sec:sandbox-enable}
 

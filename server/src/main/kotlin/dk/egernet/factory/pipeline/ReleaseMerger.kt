@@ -40,9 +40,9 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Whether a project allows automatic releases (docs/ARCHITECTURE.md §6 "Release mode"). The seam for #24: a project
- * that requires a human approval refuses automatic here, both when the mode is set and before an automatic merge.
- * Until #24 exists every project allows it.
+ * Whether a project allows automatic releases (docs/ARCHITECTURE.md §6 "Release mode"): a project whose merge policy
+ * requires a human approval (§6 "Merge policy") refuses automatic here, both when the mode is set and before an
+ * automatic merge. The services derive it from the project settings; [ALLOW_ALL] is for tests.
  */
 fun interface ReleaseModePolicy {
     fun allowsAutomatic(repo: String): Boolean
@@ -75,6 +75,8 @@ class ReleaseMerger(
     private val scope: CoroutineScope,
     private val policy: ReleaseModePolicy = ReleaseModePolicy.ALLOW_ALL,
     private val clock: java.time.Clock = java.time.Clock.systemUTC(),
+    /** The project's current merge policy (docs/ARCHITECTURE.md §6 "Merge policy"); blocking. */
+    private val mergePolicyOf: (String) -> String = { dk.egernet.factory.MergePolicy.AUTOMATIC },
 ) {
     private val log = LoggerFactory.getLogger(ReleaseMerger::class.java)
     private val org get() = cfg.githubOrg
@@ -496,12 +498,15 @@ class ReleaseMerger(
         "**Agern: release `${r.name}` is ready to release.** ${r.merged.size} issue(s) merged. " + if (r.automatic) {
             "It is set to release automatically: Agern merges it for @${login(owner)} once it merges cleanly and all " +
                 "checks on this pull request have passed. It can be switched to manual approval on ${pageUrl(r)}."
+        } else if (mergePolicyOf(r.repo) == dk.egernet.factory.MergePolicy.GITHUB) {
+            "This project merges on GitHub: review and merge this pull request there; Agern follows it."
         } else {
             "@${login(owner)} can approve it on ${pageUrl(r)} or with `/factory release approve ${r.name}`."
         }
 
     /**
-     * Reads and stores the checks on head commit [sha]; a read GitHub refuses is `unknown` with the reason. No checks
+     * Reads and stores the checks on head commit [sha] ([ChecksSummary.read], the rules runs use too); a read GitHub
+     * refuses is `unknown` with the reason. No checks
      * on a head first seen less than [checksSettleSeconds] ago is `awaiting` (CI registers its checks some seconds after
      * a push, so "none" right after opening the pull request or a new commit means nothing yet), not `none`.
      */
@@ -510,7 +515,11 @@ class ReleaseMerger(
         val now = clock.instant().truncatedTo(java.time.temporal.ChronoUnit.MICROS)
         val seen = io { store.headSeenAt(r.id, sha, now, r.memberRepo) }
         var summary = try {
-            io { ChecksSummary.of(client.combinedStatus(org, r.repo, sha), client.checkRuns(org, r.repo, sha)) }
+            io {
+                ChecksSummary.read(client, org, r.repo, sha) { e ->
+                    log.info("Release {}: workflow runs of {} could not be read, judging statuses and check runs only: {}", r.id, sha, e.message)
+                }
+            }
         } catch (e: GitHubException) {
             ChecksSummary(ReleaseChecksState.UNKNOWN, "Could not read the checks: ${e.message}".take(500))
         }

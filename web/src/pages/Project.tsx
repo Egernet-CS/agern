@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, ApiError, isReleaseFinished, isReleaseOpen, isRunWorking, isSessionActive, runRef, type AgentSession, type CheckoutInfo, type Issue, type IssueKind, type Release, type ReleaseMode, type Run, type Workspace } from '../api';
+import { api, ApiError, isReleaseFinished, isReleaseOpen, isRunWorking, isSessionActive, runRef, type AgentSession, type CheckoutInfo, type Issue, type IssueKind, type MergePolicy, type Release, type ReleaseMode, type Run, type Workspace } from '../api';
 import { ChatView } from '../components/chat/ChatView';
 import { IssueImagesDialog } from '../components/images/IssueImagesDialog';
 import { REVIEWERS, roundName } from '../components/pipeline/model';
 import { sandboxSummary } from '../components/sandbox/SandboxBits';
 import { ProjectIconControl } from '../components/ui/ProjectIconControl';
+import { MergePolicyControl } from '../components/ui/MergePolicyControl';
 import { Dialog, Empty, ErrorBox, KindBadge, Loading, Notice, ProjectIcon, ReleaseStatusPill, RoleBadge, RunStatusPill, SessionStatusPill } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
@@ -121,6 +122,14 @@ export function ProjectPage() {
           )}
           {p && <a href={p.htmlUrl} target="_blank" rel="noreferrer">GitHub ↗</a>}
         </div>
+        {p?.settings && (
+          <MergePolicyControl
+            repo={repo}
+            settings={p.settings}
+            isAdmin={me.isAdmin}
+            onChanged={(np) => project.setData((old) => ({ ...np, workspace: old?.workspace ?? np.workspace }))}
+          />
+        )}
         {iconError && (
           <div className="ph-alert" role="alert">
             <span>{iconError}</span>
@@ -161,6 +170,7 @@ export function ProjectPage() {
             loading={!runsBase.data || !sessionsBase.data}
             releases={releases}
             workspace={p?.workspace ?? null}
+            mergePolicy={p?.settings?.mergePolicy ?? 'automatic'}
             onSelectChat={selectSession}
             onCloseChat={setClosing}
             currentId={closedNotice ? null : current?.id ?? null}
@@ -802,7 +812,7 @@ function ReleaseHistory({ repo, releases }: { repo: string; releases: Release[] 
 }
 
 /** Creates a release; the new release shows through the shared live list (once, even though its feed frame follows). */
-function NewReleaseDialog({ repo, open, onClose }: { repo: string; open: boolean; onClose: () => void }) {
+function NewReleaseDialog({ repo, open, onClose, humanRequired }: { repo: string; open: boolean; onClose: () => void; humanRequired: boolean }) {
   const { noteReleases } = useFeed();
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -852,13 +862,21 @@ function NewReleaseDialog({ repo, open, onClose }: { repo: string; open: boolean
               Manual approval <span className="muted small">— it waits until whoever starts it approves the release.</span>
             </span>
           </label>
-          <label>
-            <input type="radio" name="release-mode" value="automatic" checked={mode === 'automatic'} onChange={() => setMode('automatic')} />
+          <label className={humanRequired ? 'is-disabled' : ''}>
+            <input
+              type="radio"
+              name="release-mode"
+              value="automatic"
+              checked={mode === 'automatic'}
+              onChange={() => setMode('automatic')}
+              disabled={humanRequired}
+            />
             <span>
               Release automatically{' '}
               <span className="muted small">
-                — once everything is built, merges cleanly and all checks on the release pull request have passed, Agern merges it with the
-                owner&apos;s GitHub token.
+                {humanRequired
+                  ? '— this project requires a human approval.'
+                  : '— once everything is built, merges cleanly and all checks on the release pull request have passed, Agern merges it with the owner’s GitHub token.'}
               </span>
             </span>
           </label>
@@ -1045,6 +1063,7 @@ function ActivityPanel({
   loading,
   releases,
   workspace,
+  mergePolicy,
   onSelectChat,
   onCloseChat,
   currentId,
@@ -1056,6 +1075,8 @@ function ActivityPanel({
   releases: { releases: Release[]; loading: boolean; error: Error | undefined; reload: () => void };
   /** The project's workspace definition; null for a project that is one repository. */
   workspace: Workspace | null;
+  /** The project's merge policy: anything but `automatic` refuses automatic releases. */
+  mergePolicy: MergePolicy;
   onSelectChat: (id: string) => void;
   onCloseChat: (s: AgentSession) => void;
   currentId: string | null;
@@ -1148,7 +1169,7 @@ function ActivityPanel({
         ))}
       </ul>
       <ReleaseHistory repo={repo} releases={historyOf(releases.releases)} />
-      <NewReleaseDialog repo={repo} open={creatingRelease} onClose={() => setCreatingRelease(false)} />
+      <NewReleaseDialog repo={repo} open={creatingRelease} onClose={() => setCreatingRelease(false)} humanRequired={mergePolicy !== 'automatic'} />
       {/* A workspace's sandboxes belong to its member projects (a submodule workspace's own runs use its own). */}
       {ownSandbox && <SandboxSection repo={repo} />}
       <div className="panel-head">
