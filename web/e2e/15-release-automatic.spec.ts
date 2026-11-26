@@ -32,6 +32,17 @@ async function assignAndStart(page: Page, id: string, numbers: number[]) {
   expect(started.status(), await started.text()).toBe(200);
 }
 
+/**
+ * The owner's "Check again", waiting for that check's own answer. The page also follows the live feed, and other
+ * evaluations publish there too (switching to automatic re-evaluates in the background): what the page shows while this
+ * check is still running ("Checking…") may come from one of those, read before the checks changed.
+ */
+async function checkAgain(page: Page, id: string) {
+  const answered = page.waitForResponse((r) => new URL(r.url()).pathname === `/api/releases/${id}/check` && r.request().method() === 'POST');
+  await page.getByRole('region', { name: 'Release pull request' }).getByRole('button', { name: 'Check again' }).click();
+  expect((await answered).status()).toBe(200);
+}
+
 async function openRelease(page: Page, id: string, name: string) {
   await page.goto(`${BASE()}/p/demo-app/releases/${id}`);
   await expect(page.getByRole('heading', { level: 1, name })).toBeVisible();
@@ -119,14 +130,14 @@ test('checks gate the release: pending waits, a failure holds it, green releases
 
   // A failed check holds it, with a notice.
   setChecks(`release/${name}`, { 'ci/e2e': 'failure' });
-  await section.getByRole('button', { name: 'Check again' }).click();
+  await checkAgain(page, id);
   await expect(checks).toContainText('checks failed');
   await expect(page.locator('.release-notice')).toContainText('Checks failed on pull request #');
   await expect(pill(page)).toHaveText('ready to release');
 
   // Green: released by Agern for alice.
   setChecks(`release/${name}`, { 'ci/e2e': 'success' });
-  await section.getByRole('button', { name: 'Check again' }).click();
+  await checkAgain(page, id);
   await expect(pill(page)).toHaveText('released');
   await expect(page.locator('.release-released')).toContainText('Released automatically');
 });
