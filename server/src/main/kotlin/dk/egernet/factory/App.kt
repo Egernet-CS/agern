@@ -76,6 +76,8 @@ class Services(
     imageProviders: List<dk.egernet.factory.images.ImageProvider>? = null,
     /** Called with every exception that escapes a background coroutine of [scope], after it is logged. Tests record them. */
     onBackgroundFailure: ((Throwable) -> Unit)? = null,
+    /** What Agern sees of GitHub: the same instance [github] and [git] record into (docs/ARCHITECTURE.md §6 "GitHub status"). */
+    val githubHealth: dk.egernet.factory.github.GitHubHealth = dk.egernet.factory.github.GitHubHealth(cfg.githubOrg, clock),
 ) {
     /**
      * Background work of the server. A failure that escapes one of its coroutines is logged (instead of going to the
@@ -96,6 +98,10 @@ class Services(
     val twoFactorStore = TwoFactorStore(db)
     val twoFactor = TwoFactorService(users, twoFactorStore, box)
     val access = Access(cfg, users, box, github)
+    /** `GET /api/github/status`: official status, recorded outcomes, verdict and rate limits. */
+    val githubStatus = dk.egernet.factory.github.GitHubStatusService(
+        githubHealth, dk.egernet.factory.github.OfficialGitHubStatus(cfg.githubStatusUrl, clock), access, clock,
+    )
     val workspaceDefs = dk.egernet.factory.workspace.WorkspaceService(access, gitHost = cfg.gitHost)
     val bus = EventBus()
     val mcpRegistry = McpRegistry()
@@ -231,6 +237,7 @@ class Services(
         fun production(cfg: Config): Services {
             val db = Db.connect(cfg.dbUrl, cfg.dbUser, cfg.dbPassword)
             val gitHost = cfg.gitHost
+            val health = dk.egernet.factory.github.GitHubHealth(cfg.githubOrg)
             val github: GitHub = if (cfg.fakeGithub) {
                 LoggerFactory.getLogger("dk.egernet.factory").warn("!!!!!!!! FACTORY_DEV_FAKE_GITHUB: using an in-memory fake GitHub. Tokens 'fake-<login>' are accepted. !!!!!!!!")
                 FakeGitHub.seeded(cfg.githubOrg).apply {
@@ -238,10 +245,10 @@ class Services(
                     checksDir = cfg.dataDir.resolve("fake-github-checks")
                 }
             } else {
-                HttpGitHub(cfg.githubApiUrl, gitHost.trimEnd('/'))
+                HttpGitHub(cfg.githubApiUrl, gitHost.trimEnd('/'), health)
             }
-            val git = CliGitOps(cfg.agentPath, gitHost, localOnly = cfg.fakeGithub)
-            return Services(cfg, db, github, git, LocalProcessLauncher(cfg.claudeBin, cfg.agentPath))
+            val git = CliGitOps(cfg.agentPath, gitHost, localOnly = cfg.fakeGithub, health = health)
+            return Services(cfg, db, github, git, LocalProcessLauncher(cfg.claudeBin, cfg.agentPath), githubHealth = health)
         }
     }
 }

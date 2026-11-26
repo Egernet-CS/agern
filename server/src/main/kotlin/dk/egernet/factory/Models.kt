@@ -627,6 +627,68 @@ data class AttachmentDto(
 
 @Serializable data class ClientConfigDto(val attachments: AttachmentLimitsDto, val images: ImageConfigDto)
 
+/** `GET /api/github/status` (docs/ARCHITECTURE.md §6 "GitHub status", §8). */
+@Serializable
+data class GitHubStatusDto(
+    val verdict: GitHubVerdictDto,
+    val generatedAt: String,
+    val official: GitHubOfficialDto,
+    val kinds: List<GitHubKindDto>,
+    /** null with `brief=1`. */
+    val rateLimits: GitHubRateLimitsDto?,
+)
+
+/** [state]: `working`, `degraded` or `down`. */
+@Serializable data class GitHubVerdictDto(val state: String, val reason: String)
+
+/** GitHub's own status page. [state]: `ok`, `unreachable` or `disabled`; [indicator] only with `ok`. */
+@Serializable
+data class GitHubOfficialDto(
+    val state: String,
+    val indicator: String?,
+    val description: String?,
+    val components: List<GitHubComponentDto>,
+    val incidents: List<GitHubIncidentDto>,
+    val fetchedAt: String?,
+    val error: String?,
+)
+
+/** A component that is not `operational`; [relevant]: one Agern depends on. */
+@Serializable data class GitHubComponentDto(val name: String, val status: String, val relevant: Boolean)
+
+/** An open incident; [url] only when it is an `https://` link. */
+@Serializable data class GitHubIncidentDto(val title: String, val status: String, val impact: String?, val updatedAt: String?, val url: String?)
+
+/** One kind of call as Agern sees it. */
+@Serializable
+data class GitHubKindDto(
+    val kind: String,
+    val label: String,
+    val last15m: GitHubCallCountsDto,
+    val last24h: GitHubCallCountsDto,
+    val lastError: GitHubLastErrorDto?,
+)
+
+/** [calls] counts every outcome, successes included. */
+@Serializable data class GitHubCallCountsDto(val calls: Int, val serverErrors: Int, val network: Int, val rateLimited: Int, val auth: Int)
+
+/** [errorClass]: `server_error`, `network`, `rate_limited` or `auth`; [message] is scrubbed. */
+@Serializable
+data class GitHubLastErrorDto(
+    val at: String,
+    @kotlinx.serialization.SerialName("class") val errorClass: String,
+    val status: Int?,
+    val requestId: String?,
+    val message: String,
+)
+
+/** [own]: null when the caller has no GitHub token. Other tokens appear only as a count and one anonymous minimum. */
+@Serializable data class GitHubRateLimitsDto(val own: GitHubOwnRateLimitsDto?, val otherTokens: Int, val lowestOther: GitHubRateLimitDto?)
+
+@Serializable data class GitHubOwnRateLimitsDto(val rest: GitHubRateLimitDto?, val graphql: GitHubRateLimitDto?)
+
+@Serializable data class GitHubRateLimitDto(val limit: Int, val remaining: Int, val resetAt: String, val observedAt: String)
+
 /** An image provider of the catalogue (`GET /api/config`); the web renders whatever is listed. */
 @Serializable data class ImageProviderInfoDto(
     val id: String, val label: String, val models: List<String>, val defaultModel: String, val supportsTransparency: Boolean,

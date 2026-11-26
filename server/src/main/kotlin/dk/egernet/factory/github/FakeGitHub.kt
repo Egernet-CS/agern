@@ -45,8 +45,15 @@ class FakeGitHub(private val org: String) : GitHub {
     /** Throws for [unreachable] and [serverError]; called first by every client call. */
     private fun outage() {
         if (unreachable) throw java.net.ConnectException()
-        serverError?.let { throw GitHubException(it, "GitHub request failed: $it") }
+        serverError?.let { throw failure(it, "request", "GitHub request failed: $it") }
     }
+
+    /**
+     * A failure knob's exception: for a status of 500 and above the same text as the real client
+     * ([GitHubFailure.serverError], with the fake request id [FAKE_REQUEST_ID]); below 500 [text] as it always was.
+     */
+    private fun failure(status: Int, what: String, text: String, githubMessage: String? = null): GitHubException =
+        if (status >= 500) GitHubFailure.serverError(what, status, FAKE_REQUEST_ID, githubMessage, org) else GitHubException(status, text)
     /** Pull request bodies by number. */
     val pullBodies = java.util.concurrent.ConcurrentHashMap<Int, String>()
     /** Branches per repo besides `main`, which always exists. */
@@ -283,6 +290,8 @@ class FakeGitHub(private val org: String) : GitHub {
     }
 
     companion object {
+        /** The request id of every 5xx the fake's failure knobs throw. */
+        const val FAKE_REQUEST_ID = "FAKE:0000:0000"
         fun seeded(org: String): FakeGitHub = FakeGitHub(org).apply {
             addRepo("demo-app", "A small demo web app used to try Agern without GitHub", private = false)
             addRepo("private-lab", "Only visible to alice", private = true, visibleTo = setOf("alice"))
@@ -388,6 +397,12 @@ class FakeGitHub(private val org: String) : GitHub {
             allowMergeCommit = if (hideMergeSettings) null else allowMergeCommit,
         )
 
+        override fun rateLimit(): GhRateLimits {
+            outage()
+            val now = Instant.now()
+            return GhRateLimits(GhRateLimit(5000, 4987, now.plusSeconds(3600), now), GhRateLimit(5000, 5000, now.plusSeconds(3600), now))
+        }
+
         override fun currentUser(): GhUser {
             outage()
             return GhUser(login, login.replaceFirstChar { it.uppercase() }, scopes)
@@ -401,7 +416,7 @@ class FakeGitHub(private val org: String) : GitHub {
 
         override fun getRepo(org: String, repo: String) = synchronized(this@FakeGitHub) {
             outage()
-            getRepoFailure?.let { throw GitHubException(it, "GitHub getRepo failed: $it") }
+            getRepoFailure?.let { throw failure(it, "getRepo", "GitHub getRepo failed: $it") }
             runCatching { ghRepo(repo(org, repo)) }.getOrNull()
         }
 
@@ -495,12 +510,12 @@ class FakeGitHub(private val org: String) : GitHub {
             repo(org, repo)
             if (failMerge) throw GitHubException(405, "Pull Request is not mergeable")
             if (failingMerge(repo)) throw GitHubException(405, "Base branch was modified. Review and try the merge again.")
-            mergeFailure?.let { if (!mergeFailureAfterMerging) throw GitHubException(it, "GitHub merge failed: $it") }
+            mergeFailure?.let { if (!mergeFailureAfterMerging) throw failure(it, "merge", "GitHub merge failed: $it") }
             val m = pullMeta[number]
             if (m != null) applyMerge(m, number, "squash")
             else pulls.values.forEach { l -> l.replaceAll { if (it.number == number) it.copy(state = "merged") else it } }
             actions += "merge $repo #$number"
-            mergeFailure?.let { throw GitHubException(it, "GitHub merge failed: $it") }
+            mergeFailure?.let { throw failure(it, "merge", "GitHub merge failed: $it") }
             Unit
         }
 
@@ -516,7 +531,7 @@ class FakeGitHub(private val org: String) : GitHub {
             outage()
             repo(org, repo)
             if (failCreateBranch) throw GitHubException(403, "Resource not accessible by personal access token")
-            createBranchFailure?.let { throw GitHubException(it, "GitHub create branch failed: $it") }
+            createBranchFailure?.let { throw failure(it, "create branch", "GitHub create branch failed: $it") }
             if (branch == "main" || branch in branches[repo].orEmpty()) throw GitHubException(422, "Reference already exists")
             branches.getOrPut(repo) { mutableSetOf() } += branch
             // The new branch has the commits of the branch whose tip it starts at (`sha-<branch>`).
@@ -533,7 +548,7 @@ class FakeGitHub(private val org: String) : GitHub {
             pullReads.incrementAndGet()
             if (getPullFailures > 0) {
                 getPullFailures--
-                throw GitHubException(502, "GitHub GET pull request failed: 502 Bad Gateway")
+                throw failure(502, "GET pull request", "GitHub GET pull request failed: 502 Bad Gateway", "Bad Gateway")
             }
             val m = pullMeta[number]?.takeIf { it.repo == repo } ?: return@synchronized null
             val computing = mergeableComputing > 0
@@ -595,7 +610,7 @@ class FakeGitHub(private val org: String) : GitHub {
         override fun combinedStatus(org: String, repo: String, sha: String): GhCombinedStatus = synchronized(this@FakeGitHub) {
             outage()
             repo(org, repo)
-            checksFailure?.let { throw GitHubException(it, "GitHub GET commit status failed: $it Resource not accessible by personal access token") }
+            checksFailure?.let { throw failure(it, "GET commit status", "GitHub GET commit status failed: $it Resource not accessible by personal access token") }
             checkReads.incrementAndGet()
             val branch = branchOfSha(sha)
             val set = statuses["$repo:$branch"]?.takeIf { it.isNotEmpty() } ?: checksFile(repo, branch)?.statuses.orEmpty()
@@ -612,7 +627,7 @@ class FakeGitHub(private val org: String) : GitHub {
         override fun checkRuns(org: String, repo: String, sha: String): List<GhCheckRun> = synchronized(this@FakeGitHub) {
             outage()
             repo(org, repo)
-            checksFailure?.let { throw GitHubException(it, "GitHub GET check runs failed: $it Resource not accessible by personal access token") }
+            checksFailure?.let { throw failure(it, "GET check runs", "GitHub GET check runs failed: $it Resource not accessible by personal access token") }
             val branch = branchOfSha(sha)
             (checkRunsByBranch["$repo:$branch"]?.values?.takeIf { it.isNotEmpty() } ?: checksFile(repo, branch)?.checkRuns.orEmpty())
                 .sortedBy { it.name }
@@ -668,7 +683,7 @@ class FakeGitHub(private val org: String) : GitHub {
             synchronized(this@FakeGitHub) {
                 outage()
                 val r = repo(org, repo)
-                createLabelFailure?.let { throw GitHubException(it, "Resource not accessible by personal access token") }
+                createLabelFailure?.let { throw failure(it, "create label", "Resource not accessible by personal access token") }
                 if (labelsReadOnly(repo)) throw GitHubException(403, "Resource not accessible by personal access token")
                 if (listLabels(org, repo).any { it.name.equals(name, ignoreCase = true) }) return@synchronized false
                 r.labels[name.lowercase()] = GhLabel(name, color)

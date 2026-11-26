@@ -267,6 +267,13 @@ fun Application.installApi(s: Services) {
                     ),
                 )
             }
+            // GitHub as Agern sees it (docs/ARCHITECTURE.md §6 "GitHub status"): any logged-in user, no token needed.
+            // brief=1 (the shell's banner) skips the caller's rate-limit lookup and the per-kind table.
+            get("/github/status") {
+                val u = call.requireUser(s)
+                val brief = call.request.queryParameters["brief"]?.trim()?.lowercase() in setOf("1", "true")
+                call.respond(withContext(Dispatchers.IO) { s.githubStatus.status(u, brief) })
+            }
             authRoutes(s)
             meRoutes(s)
             projectRoutes(s)

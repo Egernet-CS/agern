@@ -16,7 +16,8 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 
-class GitHubException(val status: Int, message: String) : RuntimeException(message)
+/** A GitHub answer that was not a success. [requestId]: GitHub's `x-github-request-id`, when it sent one. */
+class GitHubException(val status: Int, message: String, val requestId: String? = null) : RuntimeException(message)
 
 @Serializable
 data class GhUser(
@@ -228,6 +229,11 @@ interface GitHubClient {
      * already exists (422 `already_exists`); other refusals surface as [GitHubException] (403/404: no permission).
      */
     fun createLabel(org: String, repo: String, name: String, color: String, description: String): Boolean
+    /**
+     * This token's REST (`core`) and GraphQL limits from `GET /rate_limit`; null when GitHub has rate limiting off
+     * (GitHub Enterprise) or the implementation does not know them.
+     */
+    fun rateLimit(): GhRateLimits? = null
 }
 
 /** The merge methods [GitHubClient.mergePull] accepts: never `squash`. */
@@ -241,13 +247,24 @@ interface GitHub {
     val isFake: Boolean get() = false
 }
 
-class HttpGitHub(private val apiUrl: String = "https://api.github.com", private val webUrl: String = "https://github.com") : GitHub {
+/**
+ * GitHub's REST API. Every exchange goes through one function that reports its outcome to [health] (docs/ARCHITECTURE.md
+ * §6 "GitHub status"), when given.
+ */
+class HttpGitHub(
+    private val apiUrl: String = "https://api.github.com",
+    private val webUrl: String = "https://github.com",
+    private val health: GitHubHealth? = null,
+) : GitHub {
     private val http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).followRedirects(HttpClient.Redirect.NORMAL).build()
 
     override fun client(token: String): GitHubClient = Client(token)
     override fun cloneUrl(org: String, repo: String) = "$webUrl/$org/$repo.git"
 
     private inner class Client(private val token: String) : GitHubClient {
+        /** The token's fingerprint for the rate-limit observations; the token itself never reaches [health]. */
+        private val fingerprint: String? by lazy { if (health == null) null else GitHubHealth.fingerprint(token) }
+
         private fun enc(s: String) = URLEncoder.encode(s, Charsets.UTF_8).replace("+", "%20")
 
         private fun request(method: String, path: String, body: JsonObject? = null, accept: String = "application/vnd.github+json"): HttpRequest {
@@ -263,17 +280,51 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
             return b.build()
         }
 
+        /**
+         * The one place an HTTP exchange with GitHub happens: sends [req] and records the outcome (the answer's status,
+         * headers and [bodyMessage], or the exception, which is rethrown unchanged).
+         */
+        private fun <T> exchange(
+            req: HttpRequest, path: String, handler: HttpResponse.BodyHandler<T>, bodyMessage: (HttpResponse<T>) -> String?,
+        ): HttpResponse<T> {
+            val r = try {
+                http.send(req, handler)
+            } catch (e: Throwable) {
+                health?.recordHttpFailure(relative(path), e)
+                throw e
+            }
+            health?.let { h ->
+                val msg = if (r.statusCode() >= 400) runCatching { bodyMessage(r) }.getOrNull() else null
+                h.recordHttp(relative(path), r.statusCode(), { name -> r.headers().firstValue(name).orElse(null) }, msg, fingerprint)
+            }
+            return r
+        }
+
+        /** [path] without the API base when it is an absolute URL on it (pagination links). */
+        private fun relative(path: String): String {
+            val base = apiUrl.trimEnd('/')
+            return if (path.startsWith("$base/")) path.removePrefix(base) else path
+        }
+
         private fun send(method: String, path: String, body: JsonObject? = null, accept: String = "application/vnd.github+json"): HttpResponse<String> =
-            http.send(request(method, path, body, accept), HttpResponse.BodyHandlers.ofString())
+            exchange(request(method, path, body, accept), path, HttpResponse.BodyHandlers.ofString()) { messageOf(it.body()) }
 
         private fun ok(r: HttpResponse<String>, what: String): String {
             if (r.statusCode() in 200..299) return r.body()
-            throw failure(r.statusCode(), r.body(), what)
+            throw failure(r.statusCode(), r.body(), what, r.headers())
         }
 
-        private fun failure(status: Int, body: String, what: String): GitHubException {
+        /** GitHub's `message` of an error body; null when the body is no JSON object with a string `message`. */
+        private fun messageOf(body: String?): String? = runCatching {
+            ((AppJson.parseToJsonElement(body ?: return null) as? JsonObject)?.get("message") as? kotlinx.serialization.json.JsonPrimitive)
+                ?.takeIf { it.isString }?.content
+        }.getOrNull()
+
+        private fun failure(status: Int, body: String, what: String, headers: java.net.http.HttpHeaders): GitHubException {
+            val requestId = GitHubHealth.validRequestId(headers.firstValue(GitHubHealth.REQUEST_ID_HEADER).orElse(null))
+            if (status >= 500) return GitHubFailure.serverError(what, status, requestId, messageOf(body), health?.org ?: "")
             val msg = runCatching { AppJson.parseToJsonElement(body).let { (it as JsonObject)["message"].toString().trim('"') } }.getOrNull()
-            return GitHubException(status, "GitHub $what failed: $status ${msg ?: ""}".trim())
+            return GitHubException(status, "GitHub $what failed: $status ${msg ?: ""}".trim(), requestId)
         }
 
         private fun nextLink(r: HttpResponse<String>): String? =
@@ -366,14 +417,16 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
 
         override fun getFileBytes(org: String, repo: String, path: String, ref: String, maxBytes: Long): ByteArray? {
             val p = path.split('/').joinToString("/") { enc(it) }
-            val req = request("GET", "/repos/${enc(org)}/${enc(repo)}/contents/$p?ref=${enc(ref)}", accept = "application/vnd.github.raw+json")
-            val r = http.send(req, HttpResponse.BodyHandlers.ofInputStream())
+            val path = "/repos/${enc(org)}/${enc(repo)}/contents/$p?ref=${enc(ref)}"
+            val req = request("GET", path, accept = "application/vnd.github.raw+json")
+            // The body is a stream that is read only below: GitHub's message is not known when the exchange is recorded.
+            val r = exchange(req, path, HttpResponse.BodyHandlers.ofInputStream()) { null }
             // Closing the stream early drops the rest of the body: never more than the limit is read.
             return r.body().use { body ->
                 when (r.statusCode()) {
                     404 -> null
                     in 200..299 -> body.readNBytes(maxBytes.coerceIn(0, Int.MAX_VALUE.toLong() - 8).toInt())
-                    else -> throw failure(r.statusCode(), String(body.readNBytes(64 * 1024), Charsets.UTF_8), "GET contents")
+                    else -> throw failure(r.statusCode(), String(body.readNBytes(64 * 1024), Charsets.UTF_8), "GET contents", r.headers())
                 }
             }
         }
@@ -491,6 +544,22 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
         override fun forceUpdateBranch(org: String, repo: String, branch: String, sha: String, force: Boolean) {
             ok(send("PATCH", "/repos/${enc(org)}/${enc(repo)}/git/refs/heads/${encBranch(branch)}",
                 buildJsonObject { put("sha", sha); put("force", force) }), "update branch")
+        }
+
+        override fun rateLimit(): GhRateLimits? {
+            val r = send("GET", "/rate_limit")
+            if (r.statusCode() == 404) return null
+            val resources = (AppJson.parseToJsonElement(ok(r, "GET rate limit")) as? JsonObject)?.get("resources") as? JsonObject ?: return null
+            val now = java.time.Instant.now()
+            fun one(name: String): GhRateLimit? {
+                val o = resources[name] as? JsonObject ?: return null
+                fun n(k: String) = (o[k] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toLongOrNull()
+                val limit = n("limit") ?: return null
+                val remaining = n("remaining") ?: return null
+                val reset = n("reset") ?: return null
+                return GhRateLimit(limit.toInt(), remaining.toInt(), java.time.Instant.ofEpochSecond(reset), now)
+            }
+            return GhRateLimits(one("core"), one("graphql"))
         }
 
         override fun checkRuns(org: String, repo: String, sha: String): List<GhCheckRun> {
