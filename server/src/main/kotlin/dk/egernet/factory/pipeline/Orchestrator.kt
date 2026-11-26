@@ -144,6 +144,8 @@ class Orchestrator(
     private val projectSettings: dk.egernet.factory.db.ProjectSettingsStore? = null,
     /** Time source of the checks before a merge (settle period, wait limit); tests use a controllable clock. */
     private val clock: java.time.Clock = java.time.Clock.systemUTC(),
+    /** Sandbox VMs (docs/SANDBOX-VMS.md); null in setups without them. */
+    private val vms: dk.egernet.factory.sandboxvm.SandboxVmManager? = null,
 ) {
     private val log = LoggerFactory.getLogger(Orchestrator::class.java)
     private val jobs = ConcurrentHashMap<UUID, Job>()
@@ -200,7 +202,11 @@ class Orchestrator(
 
     fun publish(runId: UUID) {
         runs.touch(runId)
-        runs.get(runId)?.let { bus.emitFeed(FeedItem.Run(runs.toDto(it), it.contextRepos)) }
+        runs.get(runId)?.let {
+            // A human preview on the sandbox VM ends when the run leaves needs_human (or a follow-up review starts).
+            vms?.onRunChanged(it)
+            bus.emitFeed(FeedItem.Run(runs.toDto(it), it.contextRepos))
+        }
     }
 
     // ------------------------------------------------------------ waiting for the network (docs/ARCHITECTURE.md §6 "Transient failures")
@@ -784,6 +790,7 @@ class Orchestrator(
             jobs[runId]?.let { it.cancel(); it.join() }
             runs.get(runId)?.advisorSessionId?.let { agents.stopAdvisor(it, ended = true) }
             sandboxes.release(runId)
+            vms?.releaseAll(runId)
             val after = runs.get(runId) ?: return false
             if (!proceed(after)) return false
             withContext(Dispatchers.IO) { cleanupWorktree(runId, merged) }
@@ -1212,6 +1219,7 @@ class Orchestrator(
             // Clean up first, so a run shown as ended has left nothing behind: the sandbox (it bind-mounts the worktree),
             // then the worktree.
             withContext(NonCancellable) { sandboxes.release(runId) }
+            vms?.releaseBuild(runId)
             withContext(Dispatchers.IO) { cleanupWorktree(runId, merged = false) }
             fail(runId, reason)
             withContext(Dispatchers.IO) { commentEnded(runId, "**Agern:** run `$runId` failed: $reason") }
@@ -1222,6 +1230,8 @@ class Orchestrator(
             // Safety net; normally released already (end of the build/review loop, failure, cancel) — and always before
             // settled(), so the next run of a release finds the slot free.
             withContext(NonCancellable) { sandboxes.release(runId) }
+            // Only the build lease: a preview of a run at needs_human outlives the pipeline.
+            vms?.releaseBuild(runId)
         }
         settled(runId)
     }
@@ -1323,13 +1333,15 @@ class Orchestrator(
             else -> baseRef.removeSuffix(target) + repoInfo.defaultBranch
         }
         val sandbox = sandboxes.prepare(run.id, run.repo, worktree, definitionRef, home, definitionRepo = prRepo(run), runDir = root)
+        // The sandbox VM's decision: from the same commit and for the same repository as the sandbox's (docs/SANDBOX-VMS.md).
+        val sandboxVm = vms?.prepare(run.id, worktree, definitionRef, home, prRepo(run))
         // Images selected for the issue in a chat go into the agents' working directory (docs/ARCHITECTURE.md §6 "Generated images").
         val prepared = withContext(Dispatchers.IO) { images.handOver(runs.get(run.id)!!, root) }
         publish(run.id)
         val ctx = RunContext(
             run.id, run.repo, issue, issueText(issue, comments), branch, baseRef, target, worktree, releaseName, memberBase ?: repoInfo.defaultBranch, sandbox,
             prepared, root = root, gitRepo = prRepo(run), memberDir = run.targetDir, workspaceBlock = setUp.block,
-            contextRepos = runs.get(run.id)!!.contextRepos,
+            contextRepos = runs.get(run.id)!!.contextRepos, sandboxVm = sandboxVm,
         )
         val imageNotes = (if (prepared.isEmpty()) emptyList()
             else listOf("info" to "Prepared images: ${prepared.size} (${prepared.joinToString(", ") { it.meta.name ?: it.meta.purpose }})")) +
@@ -1418,7 +1430,8 @@ class Orchestrator(
                 val b = stage(run.id, "builder", round, owner, ctx, prompt,
                     resume = builderClaudeSession, parent = builderSessionId,
                     extraTools = (if (sandboxes.enabled) dk.egernet.factory.sandbox.SandboxManager.TOOLS else emptySet()) +
-                        dk.egernet.factory.images.ImageService.TOOLS,
+                        dk.egernet.factory.images.ImageService.TOOLS +
+                        (if (sandboxVmOn(ctx)) dk.egernet.factory.sandboxvm.SandboxVmManager.TOOLS else emptySet()),
                     notes = sandboxNotes(ctx) + (if (round == 0) imageNotes else emptyList()) +
                         (if (round == 0 && previous != null) listOf("info" to "Continues run ${previous.id} from branch ${previous.branch} ($inherited commit(s))") else emptyList()))
                 builderClaudeSession = b.claudeSessionId ?: builderClaudeSession
@@ -1521,6 +1534,7 @@ class Orchestrator(
             if (changes.isEmpty()) break
             if (round >= maxRounds) {
                 sandboxes.release(run.id)
+                vms?.releaseBuild(run.id)
                 skipStage(run.id, "approver")
                 needsHuman(
                     runs.get(run.id)!!, owner,
@@ -1534,6 +1548,7 @@ class Orchestrator(
 
         // The build sandbox is removed as soon as no fix round can follow (the review sandbox went with the round).
         sandboxes.release(run.id)
+        vms?.releaseBuild(run.id)
 
         // 3. Approval
         setStatus(run.id, RunStatus.APPROVING)
@@ -2022,6 +2037,8 @@ class Orchestrator(
         val workspaceBlock: String = "",
         /** The member repositories checked out for the run (recorded on its sessions). */
         val contextRepos: List<String> = emptyList(),
+        /** The run's sandbox VM decision; null when the run has none (sync runs, setups without sandbox VMs). */
+        val sandboxVm: dk.egernet.factory.RunSandboxVmDto? = null,
     ) {
         /** The issue's number (0 for a sync run, whose prompts never name one). */
         val issueNumber: Int get() = issue?.number ?: 0
@@ -2800,6 +2817,7 @@ class Orchestrator(
     private fun cleanupWorktree(runId: UUID, merged: Boolean) {
         // The sandbox bind-mounts the worktree: its containers go first (normally already gone; never recreated after).
         sandboxes.releaseNow(runId)
+        vms?.releaseAll(runId)
         val run = runs.get(runId) ?: return
         val owner = users.byId(run.ownerId) ?: return
         // Member worktrees of a workspace run first, then the run's own worktree.
@@ -2896,7 +2914,7 @@ class Orchestrator(
         |
         |${c.workspaceBlock}${c.issueText}${c.imagesBlock}
         |${if (c.memberDir == null) "Your working directory is a checkout of the repository at `${c.baseRef}`." else "The target member `${c.memberDir}` is checked out at `${c.baseRef}`."} Explore it (read-only) before writing.
-        |${specSandboxLine(c)}Your final message must be the spec in Markdown and nothing else: it is posted verbatim as a comment on the issue
+        |${specSandboxLine(c)}${specSandboxVmLine(c)}Your final message must be the spec in Markdown and nothing else: it is posted verbatim as a comment on the issue
         |and handed to the builder.
     """.trimMargin()
 
@@ -2906,7 +2924,7 @@ class Orchestrator(
         |${c.workspaceBlock}${worktreeSentence(c)} on branch `${c.branch}`, created from `${c.baseRef}`. Commit your work to this branch.
         |Do not push, open pull requests or merge: the factory does that after you finish.
         |${migrationLine(c)}
-        |${sandboxLine(c)}
+        |${sandboxLine(c)}${sandboxVmLine(c)}
         |${c.releaseNote}${c.issueText}${c.imagesBlock}
         |<spec>
         |$spec
@@ -2933,7 +2951,7 @@ class Orchestrator(
         append("(`${c.git} log HEAD..${c.baseRef}`), merge it in and resolve any conflicts.\n")
         append("Do not push, open pull requests or merge: the factory does that after you finish.\n")
         append(migrationLine(c)).append('\n')
-        append(sandboxLine(c)).append('\n')
+        append(sandboxLine(c)).append(sandboxVmLine(c)).append('\n')
         previous.builderSummary?.takeIf { it.isNotBlank() }?.let {
             append("<previous_builder_summary>\n").append(it.take(4000)).append("\n</previous_builder_summary>\n\n")
         }
@@ -2950,7 +2968,7 @@ class Orchestrator(
         append("If you are convinced a finding is wrong, do not change the code for it; explain why in your final summary ")
         append("so the reviewers see your reasoning.\n")
         append(migrationLine(c)).append('\n')
-        append(sandboxLine(c)).append('\n')
+        append(sandboxLine(c)).append(sandboxVmLine(c)).append('\n')
         for ((role, v) in changes) {
             append("### Reviewer: $role — ${v.verdict}\n${v.summary}\n")
             v.findings.forEach { f -> append("- [${f.severity}] ${f.file ?: "(general)"}: ${f.detail}\n") }
@@ -3012,6 +3030,28 @@ class Orchestrator(
         } else {
             "\nSandbox: none for this run (${sb.reason}). Build and test on the host as usual.\n"
         }
+    }
+
+    /** Whether this run's builder gets the sandbox VM tools: the feature on and the run's definition approved. */
+    private fun sandboxVmOn(c: RunContext) = vms?.enabled == true && c.sandboxVm?.state == "approved"
+
+    /** One line for the spec-writer about the run's sandbox VM, ending in a line break; empty unless it is approved. */
+    private fun specSandboxVmLine(c: RunContext): String {
+        if (!sandboxVmOn(c)) return ""
+        val vm = c.sandboxVm!!
+        return "Sandbox VM: the project has a shared sandbox VM `${vm.name}` the builder can deploy its commits to and run commands on " +
+            "(the app as it really runs: services, web server, database); the spec's Verification section may name checks to run there.\n"
+    }
+
+    /** One paragraph for the builder about the run's sandbox VM (empty unless it is approved, so other prompts stay as they were). */
+    private fun sandboxVmLine(c: RunContext): String {
+        if (!sandboxVmOn(c)) return ""
+        val vm = c.sandboxVm!!
+        return "\nSandbox VM: the project has a shared sandbox VM `${vm.name}` (`${vm.user}@${vm.host}`" + (vm.url?.let { ", $it" } ?: "") +
+            "). After committing, deploy HEAD to it with `factory_sandbox_vm_deploy` (only committed changes are deployed) and verify " +
+            "your change there with `factory_sandbox_vm_exec`. Builds and unit tests stay in the container sandbox or on the host. " +
+            "When the VM is in use by another run, continue without it and say in your summary that the VM check was skipped. " +
+            "Agern holds the SSH key: never look for, ask for or handle SSH keys.\n"
     }
 
     /** The task of a sync run's builder (docs/ARCHITECTURE.md §6 "Bringing a release up to date"). */

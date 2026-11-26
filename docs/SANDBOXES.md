@@ -35,6 +35,10 @@ clean environment, without anyone installing that toolchain on the factory host:
 - **a network boundary.** Outbound network is Podman's default, so package registries work — and so
   does the host's LAN. Nothing is restricted in this release.
 
+For an app that only runs meaningfully on a whole machine (systemd, nginx, a native database), a run
+can also deploy to a **sandbox VM** after building and testing here: see [SANDBOX-VMS.md](SANDBOX-VMS.md).
+Both can be used in the same run.
+
 For the whole trust model (who can do what, what agents can do with the owner's GitHub token, what is
 merged without a human), see [README.md, "Security: read this first"](../README.md#security-read-this-first).
 

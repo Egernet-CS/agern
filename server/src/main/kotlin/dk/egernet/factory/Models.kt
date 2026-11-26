@@ -368,6 +368,8 @@ data class RunDto(
     val createdAt: String, val updatedAt: String, val endedAt: String?, val stages: List<StageDto>,
     /** What the run decided about its sandbox when it started; null before that (and for runs from before sandboxes). */
     val sandbox: RunSandboxDto? = null,
+    /** What the run decided about its sandbox VM, and its preview (docs/SANDBOX-VMS.md); null for runs without a decision. */
+    val sandboxVm: RunSandboxVmDto? = null,
     /** The release this run builds an issue for; null for a single run (or when the release was deleted). */
     val releaseId: String? = null,
     /** The branch the run starts from and merges into; null = the repository's default branch. */
@@ -629,6 +631,112 @@ data class DeployCheckDto(
     /** `connect`, `host_key`, `auth` (the step that failed) or `ok`. */
     val stage: String,
     val message: String, val durationMs: Long,
+)
+
+/**
+ * A run's sandbox VM decision (docs/SANDBOX-VMS.md), fixed when the run starts, plus what happened with the VM since.
+ * `state`: `disabled` (FACTORY_SANDBOX_VM=off), `none` (no `.agern/sandbox-vm.yml`), `invalid`, `unapproved`, `approved`.
+ */
+@Serializable
+data class RunSandboxVmDto(
+    val state: String,
+    val reason: String,
+    val sha256: String? = null,
+    /** The VM's label, host, SSH user and URL (`approved` only). */
+    val name: String? = null,
+    val host: String? = null,
+    val user: String? = null,
+    val url: String? = null,
+    /** The builder deployed to the VM at least once. */
+    val used: Boolean = false,
+    /** How long a human preview holds the VM (FACTORY_SANDBOX_VM_PREVIEW_MINUTES). */
+    val previewMinutes: Int = 120,
+    /** The latest human preview of the run; null when nobody started one. */
+    val preview: SandboxVmPreviewDto? = null,
+)
+
+/** A human preview of a run on its sandbox VM (`POST /api/runs/{id}/sandbox-vm/preview`). */
+@Serializable
+data class SandboxVmPreviewDto(
+    /** `deploying`, `ready`, `failed` or `released`. */
+    val state: String,
+    /** The commit deployed (or being deployed). */
+    val sha: String? = null,
+    val url: String? = null,
+    val startedBy: OwnerDto? = null,
+    val startedAt: String? = null,
+    /** `ready`: until when the preview holds the VM. */
+    val expiresAt: String? = null,
+    /** `released` / `failed`: when the preview ended. */
+    val endedAt: String? = null,
+    /** `released` because the preview time ran out. */
+    val expired: Boolean = false,
+    /** `failed`: `upload`, `checkout`, `setup`, `ready` or `connect`. */
+    val failedStep: String? = null,
+    val error: String? = null,
+    /** `failed`: the tail of the failed step's output (at most 20,000 characters). */
+    val output: String? = null,
+)
+
+/** The VM of a valid `.agern/sandbox-vm.yml`. */
+@Serializable
+data class SandboxVmDto(
+    val name: String, val host: String, val port: Int, val user: String,
+    val hostKeyType: String, val hostKeyFingerprint: String, val description: String?, val url: String?,
+    val checkout: String, val setup: String?, val ready: SandboxReadyDto?, val reset: String?,
+)
+
+/** Who holds a sandbox VM now. [runId], [repo] and [issueNumber] are withheld ([visible] false) from viewers who cannot see the holder's project. */
+@Serializable
+data class SandboxVmLeaseDto(
+    /** `build` (a run's builder) or `preview` (a human). */
+    val kind: String,
+    /** `held` or `resetting`. */
+    val state: String,
+    val since: String,
+    val expiresAt: String?,
+    val visible: Boolean,
+    val runId: String?,
+    val repo: String?,
+    val issueNumber: Int?,
+)
+
+/** `GET /api/projects/{repo}/sandbox-vm`: the definition on the default branch, its approval, the key and the lease. */
+@Serializable
+data class SandboxVmStatusDto(
+    val repo: String,
+    /** FACTORY_SANDBOX_VM is not `off`. Definitions can be approved either way. */
+    val enabled: Boolean,
+    /** `ssh`, `fake` or `off`. */
+    val mode: String,
+    val path: String,
+    val branch: String,
+    /** `none` (no file), `invalid`, `pending` (valid, this content not approved) or `approved`. */
+    val state: String,
+    val sha256: String?,
+    val content: String?,
+    val errors: List<String>,
+    val vm: SandboxVmDto?,
+    val approval: SandboxApprovalDto?,
+    val approvers: List<OwnerDto> = emptyList(),
+    /** The project's deploy key (shared with deploy targets); null when it has none. */
+    val key: DeployKeyDto?,
+    /** The VM's lease (keyed by host and port, so possibly held by another project's run); null when free. */
+    val lease: SandboxVmLeaseDto?,
+    val previewMinutes: Int = 120,
+)
+
+/** `POST /api/projects/{repo}/sandbox-vm/check`: how far a connection got, and the readiness check. */
+@Serializable
+data class SandboxVmCheckDto(
+    val ok: Boolean,
+    /** `connect`, `host_key`, `auth`, `ready` (the step that failed) or `ok`. */
+    val stage: String,
+    val message: String,
+    val durationMs: Long,
+    /** Stage `ready`: the readiness command's exit code and output tail. */
+    val exitCode: Int? = null,
+    val output: String? = null,
 )
 
 /** A sandbox that exists right now (`GET /api/admin/sandboxes`). */

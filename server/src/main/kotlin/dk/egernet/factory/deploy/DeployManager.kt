@@ -143,7 +143,7 @@ class DeployManager(
     // ------------------------------------------------------------------ key
 
     private fun comment(repo: String) = "agern-deploy:${cfg.githubOrg}/$repo"
-    private fun aad(repo: String) = "deploy-key:$repo"
+    private fun aad(repo: String) = DeployKeys.aad(repo)
 
     /** Admin only: generates the project's first key pair (409 `deploy_key_exists` when it has one). */
     suspend fun generateKey(user: UserRecord, repo: String): DeployStatusDto {
@@ -170,8 +170,7 @@ class DeployManager(
     }
 
     /** The decrypted key, in memory for one operation; null when the project has none. */
-    private fun identity(repo: String): DeployIdentity? =
-        keys.get(repo)?.let { DeployIdentity(box.decrypt(it.privateKeyEnc, aad(repo)), it.fingerprint) }
+    private fun identity(repo: String): DeployIdentity? = DeployKeys.identity(keys, box, repo)
 
     // ------------------------------------------------------------------ check
 

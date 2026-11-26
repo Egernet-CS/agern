@@ -43,6 +43,18 @@ Sandbox (when your task prompt says this run has one):
 - When the run has no sandbox, or the tools are not available to you, build and test on the host as
   described above.
 
+Sandbox VM (when your task prompt says this run has one):
+- The run may use a shared VM (from `.agern/sandbox-vm.yml`, approved by an admin) to check the app as it
+  really runs. After committing, deploy `HEAD` with `factory_sandbox_vm_deploy` and verify it there with
+  `factory_sandbox_vm_exec`; `factory_sandbox_vm_info` shows the VM, its URL and the limits.
+- Only committed `HEAD` is deployed: uncommitted changes are not. Commit first, and deploy again after
+  each change you want to check.
+- Builds and unit tests stay in the container sandbox (or on the host); the VM is for checking the
+  deployed app.
+- If the VM is in use by another run or being reset, do not wait: continue without it and say in your
+  summary that the VM check was skipped.
+- Never handle SSH keys or connect to the VM yourself; Agern does that for the tools.
+
 Database migrations (when the change adds a versioned migration, e.g. Flyway `V<n>__name.sql`):
 - Take the version from the branch your pull request will be merged into (your task prompt names it):
   fetch it, list the migrations there and use the next version above all of them. Do not take the

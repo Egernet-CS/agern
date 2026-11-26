@@ -416,8 +416,14 @@ data class RunRecord(
     val kind: String = dk.egernet.factory.RunKind.ISSUE,
     /** A sync run: the commit it last pushed to its release branch. */
     val syncPushedSha: String? = null,
+    /** JSON of [dk.egernet.factory.RunSandboxVmDto]: the run's sandbox VM decision and preview; null for runs without one. */
+    val sandboxVmJson: String? = null,
 ) {
     val isSync: Boolean get() = kind == dk.egernet.factory.RunKind.SYNC
+
+    /** [sandboxVmJson] decoded; null when there is none (or it cannot be read). */
+    val sandboxVm: dk.egernet.factory.RunSandboxVmDto?
+        get() = sandboxVmJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunSandboxVmDto.serializer(), it) }.getOrNull() }
 
     /** [checksJson] decoded; null when there is none (or it cannot be read). */
     val checks: dk.egernet.factory.RunChecksDto?
@@ -465,6 +471,7 @@ class RunStore(private val db: Db) {
         rs.getString("merge_policy"), rs.getBoolean("merged_on_github"), rs.getString("merged_by"),
         rs.getString("checks"), rs.instantOrNull("checks_waiting_since"), rs.instantOrNull("checks_deadline"),
         rs.getString("merge_approved_by"), rs.runWait(), rs.getString("kind"), rs.getString("sync_pushed_sha"),
+        rs.getString("sandbox_vm"),
     )
 
     private fun mapStage(rs: ResultSet) = StageRecord(
@@ -708,6 +715,11 @@ class RunStore(private val db: Db) {
         "UPDATE runs SET updated_at = GREATEST(now(), date_trunc('milliseconds', updated_at) + interval '1 millisecond') WHERE id = ?", id,
     )
 
+    fun setSandboxVm(id: UUID, info: dk.egernet.factory.RunSandboxVmDto) = db.update(
+        "UPDATE runs SET sandbox_vm = ?, updated_at = now() WHERE id = ?",
+        JsonbParam(AppJson.encodeToString(dk.egernet.factory.RunSandboxVmDto.serializer(), info)), id,
+    )
+
     fun setSandbox(id: UUID, info: dk.egernet.factory.RunSandboxDto) = db.update(
         "UPDATE runs SET sandbox = ?, updated_at = now() WHERE id = ?",
         JsonbParam(AppJson.encodeToString(dk.egernet.factory.RunSandboxDto.serializer(), info)), id,
@@ -833,6 +845,7 @@ class RunStore(private val db: Db) {
             error = r.error, createdAt = r.createdAt.iso(), updatedAt = r.updatedAt.iso(), endedAt = r.endedAt?.iso(),
             stages = stageRows.map { it.toDto(shots[it.id].orEmpty(), it.sessionId?.let { s -> imgs[s] }.orEmpty()) },
             sandbox = r.sandboxJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunSandboxDto.serializer(), it) }.getOrNull() },
+            sandboxVm = r.sandboxVm,
             releaseId = r.releaseId?.toString(), baseBranch = r.baseBranch,
             conversation = dk.egernet.factory.RunConversationDto(r.advisorSessionId?.toString(), r.reviewState, r.followUpFrom),
             continuesRunId = r.continuesRunId?.toString(), continuedByRunId = continuedBy(r.id)?.toString(),

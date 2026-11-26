@@ -7,6 +7,7 @@ import { ApiError, type Api, type Channel } from '../api/api';
 import * as deploy from './deploy';
 import { githubStatus } from './githubStatus';
 import * as images from './images';
+import * as sandboxVm from './sandboxVm';
 
 /**
  * A light-theme sketch of a shop page with an open cart drawer (demo content, 320×200), used for every mock
@@ -84,6 +85,7 @@ import {
 } from './engine';
 
 images.seedRunImage();
+sandboxVm.seedSandboxVmPreview();
 
 /** Mock rule: any 6 digits except 000000, or a recovery code like abcd-1234 (login only). */
 function secondFactor(u: User, code: string, allowRecovery: boolean) {
@@ -456,6 +458,13 @@ export const mockApi: Api = {
   generateDeployKey: (repo) => ok(() => (project(repo), deploy.generateDeployKey(repo, me()))),
   rotateDeployKey: (repo) => ok(() => (project(repo), deploy.rotateDeployKey(repo, me()))),
   checkDeployTarget: (repo, target) => ok(() => (project(repo), deploy.checkDeployTarget(repo, target, me()))),
+  getSandboxVm: (repo) => ok(() => sandboxVm.getSandboxVm(repo, project(repo).defaultBranch)),
+  approveSandboxVm: (repo, sha256) => ok(() => (project(repo), sandboxVm.approveSandboxVm(repo, sha256, me()))),
+  revokeSandboxVm: (repo) => ok(() => (project(repo), sandboxVm.revokeSandboxVm(repo, me()))),
+  checkSandboxVm: (repo) => ok(() => (project(repo), sandboxVm.checkSandboxVm(repo, me()))),
+  releaseSandboxVmLease: (repo) => ok(() => (project(repo), sandboxVm.releaseSandboxVmLease(repo, me()))),
+  startSandboxVmPreview: (runId) => ok(() => (needGithub(), sandboxVm.startSandboxVmPreview(run(runId), me()))),
+  releaseSandboxVmPreview: (runId) => ok(() => (needGithub(), sandboxVm.releaseSandboxVmPreview(run(runId), me()))),
   sandboxStatus: (repo) => ok(() => sandboxStatus(repo, project(repo).defaultBranch)),
   approveSandbox: (repo, sha256) => ok(() => (project(repo), approveSandbox(repo, sha256, me()))),
   revokeSandboxApproval: (repo) => ok(() => (project(repo), revokeSandboxApproval(repo, me()))),

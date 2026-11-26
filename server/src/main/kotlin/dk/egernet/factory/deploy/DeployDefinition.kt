@@ -72,7 +72,7 @@ object DeployDefinitions {
     private val TOP_KEYS = listOf("targets")
     private val TARGET_KEYS = listOf("host", "port", "user", "hostKey", "description")
     val TARGET_NAME_RE = Regex("^[a-z][a-z0-9-]{0,30}$")
-    private val USER_RE = Regex("^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
+    val USER_RE = Regex("^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
     private val LABEL_RE = Regex("^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
     private val IPV4_RE = Regex("^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}$")
     private val IPV6_CHARS_RE = Regex("^[0-9A-Fa-f:.]+$")

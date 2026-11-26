@@ -38,6 +38,7 @@ import type {
   Verdict,
   Workspace,
 } from '../api/types';
+import { runLeftNeedsHuman, runSandboxVmFor, sandboxVmBuilderSteps } from './sandboxVm';
 import { approverScript, builderScript, chatReplies, reviewSandboxSteps, reviewerScript, sandboxBuilderScript, seededChat, specScript, type Step } from './scripts';
 
 export const ORG = 'Egernet-CS';
@@ -402,7 +403,7 @@ function play(
     });
   };
   const system = (st: Extract<Step, { kind: 'system' }>, gap: number) =>
-    p.after(gap, (ts) => emit(sid, 'system', { level: st.level, text: st.text, ...(st.sandbox ? { sandbox: st.sandbox } : {}) }, ts));
+    p.after(gap, (ts) => emit(sid, 'system', { level: st.level, text: st.text, ...(st.sandbox ? { sandbox: st.sandbox } : {}), ...(st.sandboxVm ? { sandboxVm: st.sandboxVm } : {}) }, ts));
   for (const step of steps) {
     if (step.kind === 'pause') p.after(step.ms, () => {});
     else if (step.kind === 'system') system(step, step.ms ?? 300);
@@ -734,7 +735,9 @@ function findRun(idOrPrefix: string) {
 }
 
 function setRunStatus(r: Run, status: Run['status'], ts: string) {
+  const left = r.status === 'needs_human' && status !== 'needs_human';
   r.status = status;
+  if (left) runLeftNeedsHuman(r);
   if (['merged', 'failed', 'cancelled', 'ready'].includes(status)) {
     r.endedAt = ts;
     const issue = db.issues[r.repo]?.find((i) => i.number === r.issueNumber);
@@ -783,6 +786,8 @@ function runStage(r: Run, role: StageRole, round: number, plan: Plan, startMs: n
     const sb = r.sandbox;
     const def = sb?.state === 'approved' ? db.sandboxFiles.get(r.repo)?.definition : null;
     steps = def ? sandboxBuilderScript(round, def.image, def.setup, def.services.map((x) => x.name), def.platforms) : builderScript(round, prev);
+    // Like the backend: after committing, a builder with an approved sandbox VM deploys there and checks it (first build only).
+    if (round === 0) steps = [...steps, ...sandboxVmBuilderSteps(r)];
     // Like the backend: the builder's transcript starts with the run's sandbox decision.
     if (sb && sb.state !== 'disabled') steps = [{ kind: 'system', level: sb.state === 'approved' ? 'info' : 'warn', text: `Sandbox: ${sb.reason}`, ms: 50 }, ...steps];
     if (def && !db.runningSandboxes.has(r.id)) {
@@ -1150,6 +1155,7 @@ function makeRun(repo: string, issue: Issue, owner: User, createdMs: number, sta
     endedAt: null,
     stages: [],
     sandbox: runSandboxFor(repo),
+    sandboxVm: runSandboxVmFor(repo),
     releaseId: release?.id ?? null,
     baseBranch: release ? `release/${release.name}` : null,
     conversation: { sessionId: null, review: 'none', followUpFrom: null },
@@ -1249,7 +1255,7 @@ export function startRun(repo: string, issueNumber: number, owner: User, started
   const target = release ? null : workspaceTarget(repo, issue, owner);
   if (issue.activeRunId) throw new MockError(409, 'active_run_exists', `Issue #${issueNumber} already has an active run`);
   const r = makeRun(repo, issue, owner, createdMs, startedBy, release);
-  if (target) Object.assign(r, { targetRepo: target.repository, targetDirectory: target.directory, baseBranch: target.branch, sandbox: runSandboxFor(target.repository) });
+  if (target) Object.assign(r, { targetRepo: target.repository, targetDirectory: target.directory, baseBranch: target.branch, sandbox: runSandboxFor(target.repository), sandboxVm: runSandboxVmFor(target.repository) });
   touchRun(r, iso(createdMs));
   const full: Plan = {
     changes: { code: ['Merge logic duplicates quantity handling from `CheckoutService`; extract a **shared helper**.'], security: ['Cart routes accept any cart id; ownership is not checked (**IDOR**).', 'Log line prints the full cart including email.'] },

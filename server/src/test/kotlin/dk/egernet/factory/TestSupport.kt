@@ -273,6 +273,15 @@ class FakeGitOps : GitOps {
     /** What [head] answers; tests move it to simulate a commit. */
     @Volatile var headSha = "0000000000000000000000000000000000000001"
     override fun head(worktree: Path, home: Path) = headSha
+    /** What [isDirty] answers. */
+    @Volatile var dirty = false
+    override fun isDirty(worktree: Path, home: Path) = dirty
+    /** Every [archiveHead], as `"<sha> <file>"`; the archive's content is `archive of <sha>`. */
+    val archives = CopyOnWriteArrayList<String>()
+    override fun archiveHead(worktree: Path, sha: String, file: Path, home: Path) {
+        archives += "$sha $file"
+        Files.writeString(file, "archive of $sha")
+    }
     /** What [changedFiles] answers (null, the default: it cannot be told, so no UI-change check). */
     @Volatile var changed: List<String>? = null
     override fun changedFiles(worktree: Path, baseRef: String, home: Path): List<String>? = changed
@@ -398,12 +407,15 @@ class TestWorld(
     val sandboxRuntime = FakeSandboxRuntime()
     /** How deploy operations "connect" (unless the tweaked config switches deploys off). */
     val deployTransport = FakeDeployTransport()
+    /** How sandbox VM operations "connect" (its own instance, as in production). */
+    val vmTransport = FakeDeployTransport()
     /** Exceptions that escaped a background coroutine of [services]; [close] fails the test when there are any. */
     val backgroundFailures = CopyOnWriteArrayList<Throwable>()
     val services = Services(
         cfg, TestDb.fresh(), github, gitOps ?: realGitOps ?: git, launcher ?: this.launcher, loginThrottle = loginThrottle, clock = clock,
         releaseStarter = releaseStarter, sandboxRuntime = if (sandbox) sandboxRuntime else null, imageProviders = imageProviders,
         deployTransport = if (cfg.deploy.enabled) deployTransport else null,
+        sandboxVmTransport = if (cfg.sandboxVm.enabled) vmTransport else null,
         onBackgroundFailure = { backgroundFailures += it },
     )
 
@@ -423,6 +435,12 @@ class TestWorld(
     /** Puts `.agern/deploy.yml` on [repo]'s default branch; null removes it. */
     fun deployFile(content: String?, repo: String = "demo-app") {
         github.setFile(repo, dk.egernet.factory.deploy.DEPLOY_FILE, content)
+    }
+
+    /** Puts `.agern/sandbox-vm.yml` on [repo]'s default branch (GitHub API and git alike); null removes it. */
+    fun sandboxVmFile(content: String?, repo: String = "demo-app") {
+        github.setFile(repo, dk.egernet.factory.sandboxvm.SANDBOX_VM_FILE, content)
+        if (content == null) git.files.remove(dk.egernet.factory.sandboxvm.SANDBOX_VM_FILE) else git.files[dk.egernet.factory.sandboxvm.SANDBOX_VM_FILE] = content
     }
 
     /** Creates a user with credentials registered, as if they had logged in and filled in Settings. */
@@ -500,6 +518,23 @@ class FakeDeployTransport : dk.egernet.factory.deploy.DeployTransport {
         { _, cmd, _ -> dk.egernet.factory.deploy.DeployExecResult(0, null, "ran: $cmd\n", false, false, 7) }
     @Volatile var onCopy: (dk.egernet.factory.deploy.DeployEndpoint, String) -> Unit = { _, _ -> }
     @Volatile var closed = false
+    /** Every cancel token an exec was given that was cancelled while it ran. */
+    val cancelledExecs = CopyOnWriteArrayList<String>()
+
+    override fun exec(
+        endpoint: dk.egernet.factory.deploy.DeployEndpoint, identity: dk.egernet.factory.deploy.DeployIdentity, command: String, timeoutMs: Long,
+        cancel: dk.egernet.factory.deploy.DeployCancel,
+    ): dk.egernet.factory.deploy.DeployExecResult {
+        // Like the real transport: a cancel ends the call early (here: interrupts the thread blocked in [onExec]).
+        val thread = Thread.currentThread()
+        val hook = cancel.onCancel { cancelledExecs += command; thread.interrupt() }
+        try {
+            return exec(endpoint, identity, command, timeoutMs)
+        } finally {
+            hook.close()
+            Thread.interrupted()
+        }
+    }
 
     override fun check(endpoint: dk.egernet.factory.deploy.DeployEndpoint, identity: dk.egernet.factory.deploy.DeployIdentity) {
         calls += "check ${endpoint.name}"; identities += identity.fingerprint

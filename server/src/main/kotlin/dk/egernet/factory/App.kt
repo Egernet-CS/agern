@@ -72,6 +72,12 @@ class Services(
         "fake" -> dk.egernet.factory.deploy.DevFakeDeployTransport()
         else -> null
     },
+    /** How sandbox VM operations connect (docs/SANDBOX-VMS.md): its own transport, or null when FACTORY_SANDBOX_VM=off. */
+    val sandboxVmTransport: dk.egernet.factory.deploy.DeployTransport? = when (cfg.sandboxVm.mode) {
+        "ssh" -> dk.egernet.factory.deploy.MinaDeployTransport()
+        "fake" -> dk.egernet.factory.deploy.DevFakeDeployTransport()
+        else -> null
+    },
     /** Time source of the release scheduler (tests use a controllable clock). */
     val clock: java.time.Clock = java.time.Clock.systemUTC(),
     /** What a scheduled start calls; null = the real start ([ReleaseService.startScheduled]). Tests may replace it. */
@@ -140,6 +146,21 @@ class Services(
         chatDir = { owner, repo -> workspaces.mainDir(owner.username, repo) },
         approvers = { adminApprovers() },
     )
+    val sandboxVms = dk.egernet.factory.sandboxvm.SandboxVmManager(
+        cfg, sandboxVmTransport, dk.egernet.factory.db.DeployKeyStore(db), box, dk.egernet.factory.db.SandboxVmApprovalStore(db),
+        dk.egernet.factory.db.SandboxVmLeaseStore(db), runs, access, git, scope,
+        publishSystem = { sessionId, payload -> agents.publish(sessionId, "system", payload) },
+        emitRun = { id -> runs.get(id)?.let { bus.emitFeed(dk.egernet.factory.agent.FeedItem.Run(runs.toDto(it), it.contextRepos)) } },
+        checkoutOf = { run ->
+            val root = workspaces.runDir(run.ownerUsername, run.repo, run.id)
+            (run.targetDir?.let { workspaces.memberPath(root, it) } ?: root) to workspaces.home(run.ownerUsername)
+        },
+        approvers = { adminApprovers() },
+        devDefinitionSource = (github as? FakeGitHub)?.takeIf { cfg.fakeGithub }?.let { fake ->
+            { repo -> fake.fileOf(repo, dk.egernet.factory.sandboxvm.SANDBOX_VM_FILE) }
+        },
+        clock = clock,
+    )
     val screenshotStore = dk.egernet.factory.db.ScreenshotStore(db)
     val images = dk.egernet.factory.images.ImageService(
         cfg,
@@ -164,7 +185,7 @@ class Services(
     val modePolicy: dk.egernet.factory.pipeline.ReleaseModePolicy = releaseModePolicy
         ?: dk.egernet.factory.pipeline.ReleaseModePolicy { repo -> projectSettings.get(repo).mergePolicy == MergePolicy.AUTOMATIC }
     val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes, screenshotStore,
-        sessions, events, images, workspaceDefs, releaseStore, projectSettings, clock)
+        sessions, events, images, workspaceDefs, releaseStore, projectSettings, clock, sandboxVms)
     val screenshots = dk.egernet.factory.agent.Screenshots(cfg, screenshotStore, runs, workspaces, publishRun = { orchestrator.publish(it) })
     val releaseLocks = dk.egernet.factory.pipeline.ReleaseLocks()
     val releaseMerger = dk.egernet.factory.pipeline.ReleaseMerger(
@@ -192,7 +213,7 @@ class Services(
     val mcpTokens = dk.egernet.factory.db.McpTokenStore(db)
     /** Checks the bearer of `POST /mcp`; its `limiter` throttles unknown bearers per client address. */
     val mcpAuth = dk.egernet.factory.mcp.McpAuthenticator(mcpRegistry, mcpTokens, users, access, twoFactorStore, cfg.githubOrg, clock)
-    val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes, screenshots, images, mcpAuth, cfg, deploys)
+    val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes, screenshots, images, mcpAuth, cfg, deploys, sandboxVms)
 
     /** The admins, who approve sandbox and deploy definitions: known admins plus FACTORY_ADMINS who never logged in. */
     private fun adminApprovers(): List<OwnerDto> {
@@ -236,6 +257,10 @@ class Services(
             .onFailure { LoggerFactory.getLogger("dk.egernet.factory").warn("Reaping run worktrees failed: {}", it.message) }
             .getOrDefault(emptyList())
         if (reaped.isNotEmpty()) LoggerFactory.getLogger("dk.egernet.factory").info("Removed {} worktree(s) of ended runs", reaped.size)
+        // Sandbox VM leases: previews of runs still waiting for a human are kept, the others end (their resets run in the
+        // background, so the start never waits for a VM).
+        runCatching { sandboxVms.recover() }
+            .onFailure { LoggerFactory.getLogger("dk.egernet.factory").warn("Recovering sandbox VM leases failed: {}", it.message) }
         releaseBuilder.recoverAfterRestart()
         // Runs that were waiting for the checks on their pull request go on waiting, with their original deadline.
         orchestrator.resumeChecksWaits()
@@ -259,6 +284,7 @@ class Services(
         agents.shutdown()
         runCatching { runBlocking { withTimeoutOrNull(30_000) { sandboxes.shutdown() } } }
         deploys.shutdown()
+        sandboxVms.shutdown()
         scope.cancel()
     }
 

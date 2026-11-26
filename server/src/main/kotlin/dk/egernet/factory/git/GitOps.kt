@@ -98,6 +98,15 @@ interface GitOps {
     /** The commit the worktree has checked out (`git rev-parse HEAD`). */
     fun head(worktree: Path, home: Path): String
     /**
+     * Writes `git archive --format=tar.gz <sha>` of [worktree] to [file] (a sandbox VM deploy, docs/SANDBOX-VMS.md):
+     * only committed content, no submodule content. [sha] is a full commit id. Throws [GitException] when git fails.
+     */
+    fun archiveHead(worktree: Path, sha: String, file: Path, home: Path) {
+        throw GitException("git archive is not supported here")
+    }
+    /** True when `git status --porcelain` of [worktree] lists anything (uncommitted or untracked changes). */
+    fun isDirty(worktree: Path, home: Path): Boolean = false
+    /**
      * The paths HEAD of [worktree] changes relative to its merge base with [baseRef] (`git diff --name-only
      * <baseRef>...HEAD`, renames as their new path, deletions included). Null when it cannot be told (the default for
      * implementations that do not support it); throws [GitException] when git fails.
@@ -421,6 +430,14 @@ class CliGitOps(
         git(worktree, home, null, "rev-list", "--count", "$baseRef..HEAD").trim().toIntOrNull() ?: 0
 
     override fun head(worktree: Path, home: Path): String = git(worktree, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim()
+
+    override fun archiveHead(worktree: Path, sha: String, file: Path, home: Path) {
+        require(SHA_RE.matches(sha)) { "Invalid commit id" }
+        git(worktree, home, null, "archive", "--format=tar.gz", "-o", file.toAbsolutePath().toString(), sha, timeoutSec = 600)
+    }
+
+    override fun isDirty(worktree: Path, home: Path): Boolean =
+        git(worktree, home, null, "status", "--porcelain", timeoutSec = 120).isNotBlank()
 
     override fun changedFiles(worktree: Path, baseRef: String, home: Path): List<String> {
         require(!baseRef.startsWith("-")) { "Invalid ref" }

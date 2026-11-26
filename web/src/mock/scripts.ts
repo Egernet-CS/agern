@@ -1,9 +1,9 @@
 // Canned agent transcripts for the mock backend. Each script is a list of steps that the
 // engine either plays live (with streamed partials) or materialises instantly as history.
-import type { SandboxLog, SandboxPlatform } from '../api/types';
+import type { SandboxLog, SandboxPlatform, SandboxVmLog } from '../api/types';
 
 /** A `system` event; with `sandbox` the full log of a sandbox command (docs/ARCHITECTURE.md §8 "Event"). */
-export type SystemStep = { kind: 'system'; level: 'info' | 'warn' | 'error'; text: string; sandbox?: SandboxLog; ms?: number };
+export type SystemStep = { kind: 'system'; level: 'info' | 'warn' | 'error'; text: string; sandbox?: SandboxLog; sandboxVm?: SandboxVmLog; ms?: number };
 
 export type Step =
   | { kind: 'think'; text: string }

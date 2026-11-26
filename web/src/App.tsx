@@ -17,6 +17,7 @@ import { ProjectsPage } from './pages/Projects';
 import { ReleasePage } from './pages/Release';
 import { RunPage } from './pages/Run';
 import { DeployPage } from './pages/Deploy';
+import { SandboxVmPage } from './pages/SandboxVm';
 import { SandboxPage } from './pages/Sandbox';
 import { SettingsPage } from './pages/Settings';
 
@@ -34,6 +35,7 @@ export function App() {
               <Route path="/p/:repo/releases/:releaseId" element={<ReleasePage />} />
               <Route path="/p/:repo/sandbox" element={<SandboxPage />} />
               <Route path="/p/:repo/deploy" element={<DeployPage />} />
+              <Route path="/p/:repo/sandbox-vm" element={<SandboxVmPage />} />
               <Route path="/agents" element={<AgentsPage />} />
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="/admin" element={<AdminPage />} />

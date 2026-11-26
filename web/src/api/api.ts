@@ -28,6 +28,8 @@ import type {
   DeployCheck,
   DeployStatus,
   PendingSandbox,
+  SandboxVmCheck,
+  SandboxVmStatus,
   SandboxOverview,
   SandboxStatus,
   Settings,
@@ -207,6 +209,34 @@ export interface Api {
    * problems are `ok: false`; 409 `deploy_not_approved`, `deploy_key_missing`, `deploy_busy` or `deploy_disabled`, 404 unknown target.
    */
   checkDeployTarget(repo: string, target: string): Promise<DeployCheck>;
+
+  /**
+   * The project's `.agern/sandbox-vm.yml` on its default branch, its approval, the project's public deploy key (shared with
+   * deploy targets; generated with `generateDeployKey`) and the VM's lease (anyone who can see the project).
+   */
+  getSandboxVm(repo: string): Promise<SandboxVmStatus>;
+  /**
+   * Admin: approves exactly the content with this hash. 409 `sandbox_vm_definition_changed` when the file changed meanwhile,
+   * 422 `sandbox_vm_definition_invalid`, 404 when there is no file, 403 for non-admins.
+   */
+  approveSandboxVm(repo: string, sha256: string): Promise<SandboxVmStatus>;
+  /** Admin: removes the approval; the repository's leases end at once (without `reset`). */
+  revokeSandboxVm(repo: string): Promise<SandboxVmStatus>;
+  /**
+   * Admin: connects, verifies the host key, authenticates and runs `ready.command` once. Connection problems are `ok: false`;
+   * 409 `sandbox_vm_disabled`, `sandbox_vm_not_approved` or `sandbox_vm_key_missing`.
+   */
+  checkSandboxVm(repo: string): Promise<SandboxVmCheck>;
+  /** Admin: ends the VM's lease (its `reset` runs). 404 when there is no lease. */
+  releaseSandboxVmLease(repo: string): Promise<SandboxVmStatus>;
+  /**
+   * Owner or admin of a run that needs a human: deploys its latest commit to the sandbox VM in the background and answers
+   * the run (preview `deploying`). 409 `run_not_waiting`, `sandbox_vm_disabled`, `sandbox_vm_not_approved`,
+   * `sandbox_vm_key_missing` or `sandbox_vm_busy`; 403 for others.
+   */
+  startSandboxVmPreview(runId: string): Promise<Run>;
+  /** Owner or admin: ends the run's preview (the VM's `reset` runs); the preview becomes `released`. 404 when none is active. */
+  releaseSandboxVmPreview(runId: string): Promise<Run>;
 
   projectRuns(repo: string): Promise<Run[]>;
   startRun(repo: string, issueNumber: number): Promise<Run>;

@@ -6,6 +6,7 @@ import { IssueImagesDialog } from '../components/images/IssueImagesDialog';
 import { REVIEWERS, roundName } from '../components/pipeline/model';
 import { deploySummary } from '../components/deploy/DeployBits';
 import { sandboxSummary } from '../components/sandbox/SandboxBits';
+import { sandboxVmSummary } from '../components/sandboxvm/SandboxVmBits';
 import { ProjectIconControl } from '../components/ui/ProjectIconControl';
 import { MergePolicyControl } from '../components/ui/MergePolicyControl';
 import { Dialog, Empty, ErrorBox, KindBadge, Loading, Notice, ProjectIcon, ReleaseStatusPill, RoleBadge, RunStatusPill, SessionStatusPill } from '../components/ui/ui';
@@ -1084,6 +1085,40 @@ function DeploySection({ repo }: { repo: string }) {
   );
 }
 
+/**
+ * The project's sandbox VM in one row: state pill and one line, linking to its page (docs/SANDBOX-VMS.md). Hidden when the
+ * project has no `.agern/sandbox-vm.yml`, and when it cannot be read (the page says why).
+ */
+function SandboxVmSection({ repo }: { repo: string }) {
+  const reconnects = useFeedReconnects();
+  const q = useAsync(() => api.getSandboxVm(repo), [repo, reconnects]);
+  if (!q.data || q.data.state === 'none') return null;
+  const s = sandboxVmSummary(q.data);
+  return (
+    <>
+      <div className="panel-head">
+        <h2>Sandbox VM</h2>
+      </div>
+      <ul className="run-list">
+        <li>
+          <Link to={`/p/${repo}/sandbox-vm`} className={`run-row svm-row svm-row--${s.tone}`}>
+            <div className="rr-top">
+              <span className="rr-title mono">{q.data.path}</span>
+            </div>
+            <div className="rr-bot">
+              <span className={`pill pill--${s.tone}`}>
+                <span className="pill-dot" aria-hidden />
+                {s.label}
+              </span>
+              <span className="rr-line">{s.line}</span>
+            </div>
+          </Link>
+        </li>
+      </ul>
+    </>
+  );
+}
+
 export function runStageLine(r: Run): string {
   const running = r.stages.filter((s) => s.status === 'running').map((s) => s.role);
   if (r.status === 'reviewing') {
@@ -1213,6 +1248,7 @@ function ActivityPanel({
       {/* A workspace's sandboxes belong to its member projects (a submodule workspace's own runs use its own). */}
       {ownSandbox && <SandboxSection repo={repo} />}
       <DeploySection repo={repo} />
+      <SandboxVmSection repo={repo} />
       <div className="panel-head">
         <h2>Runs</h2>
       </div>

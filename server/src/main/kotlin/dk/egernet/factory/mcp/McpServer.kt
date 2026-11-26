@@ -48,6 +48,7 @@ class McpServer(
     private val auth: McpAuthenticator,
     cfg: dk.egernet.factory.Config,
     private val deploys: dk.egernet.factory.deploy.DeployManager? = null,
+    private val sandboxVms: dk.egernet.factory.sandboxvm.SandboxVmManager? = null,
 ) {
     private val publicUrl = cfg.publicUrl.trimEnd('/')
     private val org = cfg.githubOrg
@@ -198,6 +199,32 @@ class McpServer(
                 Triple("dest", "string", "Remote path; an existing directory or a path ending in '/' keeps the file's name. " +
                     "Letters, digits and . _ / @ % + = : , ~ - only"),
                 required = listOf("target", "path", "dest"))),
+        Tool("factory_sandbox_vm_info", "Whether this run can use the project's shared sandbox VM (a full machine, defined in " +
+            ".agern/sandbox-vm.yml and approved by an admin) and, if not, why. When it can: name, host, user, URL, which commands " +
+            "the definition has (checkout, setup, ready, reset), who holds the VM now, the commit last deployed and the limits. " +
+            "Agern holds the SSH key and connects for you; you never get or need a key.",
+            schema()),
+        Tool("factory_sandbox_vm_deploy", "Deploy this run's committed HEAD to the sandbox VM: Agern uploads a git archive of HEAD " +
+            "(uncommitted changes are not included), then runs the definition's checkout, setup and ready commands. Takes the VM for " +
+            "this run (only one run can use it at a time; when another run holds it you get an error: continue without it). Returns " +
+            "{ handle, ok, sha, dirty, url, steps: [{ step, ok, exitCode, timedOut, durationMs }], failedStep, output (the tail), " +
+            "truncated, durationMs }; a failing step is ok: false and you keep the VM to investigate with factory_sandbox_vm_exec. " +
+            "Pass `background: true` to get a handle at once and wait with factory_sandbox_vm_wait.",
+            schema(Triple("background", "boolean", "Optional: true starts the deploy and returns its handle at once; wait with factory_sandbox_vm_wait"))),
+        Tool("factory_sandbox_vm_exec", "Run one command on the sandbox VM over SSH, as the VM's user in its home directory; the " +
+            "login shell interprets it (no PTY, no stdin). Only after factory_sandbox_vm_deploy (while this run holds the VM). " +
+            "Returns { handle, exitCode, output (the tail, stdout and stderr interleaved), truncated, durationMs, timedOut }. One " +
+            "operation runs at a time; long commands: `background: true`, then factory_sandbox_vm_wait. If a call ever fails with " +
+            "a timeout on your side, the command is still running: call factory_sandbox_vm_wait without a handle.",
+            schema(Triple("command", "string", "Command line for the VM's shell, e.g. 'curl -fsS http://127.0.0.1:8080/health'"),
+                Triple("timeoutSeconds", "integer", "Optional time limit in seconds (default and maximum: the server's limit)"),
+                Triple("background", "boolean", "Optional: true starts the command and returns its handle at once; wait with factory_sandbox_vm_wait"),
+                required = listOf("command"))),
+        Tool("factory_sandbox_vm_wait", "Wait for a sandbox VM deploy or command (by handle; default: the most recently started " +
+            "one) to end and return its result. Without waitSeconds it waits until it ends; with waitSeconds, `running: true` means " +
+            "it is still running: call it again.",
+            schema(Triple("handle", "string", "Optional: the handle factory_sandbox_vm_deploy or factory_sandbox_vm_exec returned; default: the latest"),
+                Triple("waitSeconds", "integer", "Optional: wait at most this long (0: answer at once); default: until it ends"))),
         Tool("factory_request_software", "Ask an administrator to install software on the factory host. " +
             "Use this instead of installing system-wide software yourself.",
             schema(Triple("name", "string", "Software name, e.g. 'ffmpeg' or 'JDK 21'"),
@@ -308,6 +335,13 @@ class McpServer(
             if (grant.personal != null || grant.runId != null) return toolError(chatOnly)
             val sid = grant.sessionId ?: return toolError(chatOnly)
             if (sessions.get(sid)?.kind != "chat") return toolError(chatOnly)
+        }
+        // Sandbox VM tools act on a shared machine: only a run's builder, refused on the server whatever a grant says.
+        if (name in dk.egernet.factory.sandboxvm.SandboxVmManager.TOOLS) {
+            val builderOnly = "Sandbox VM tools are only available to a run's builder"
+            if (grant.personal != null || grant.runId == null || grant.sandboxScope != SandboxScope.BUILD) return toolError(builderOnly)
+            val sid = grant.sessionId ?: return toolError(builderOnly)
+            if (sessions.get(sid)?.let { it.kind == "builder" && it.runId == grant.runId } != true) return toolError(builderOnly)
         }
         val args = params["arguments"] as? JsonObject ?: JsonObject(emptyMap())
         val owner = users.byId(grant.ownerId) ?: return toolError("Owner not found")
@@ -453,6 +487,37 @@ class McpServer(
                     d.copy(owner, repo, grant.sessionId!!, s("target") ?: return toolError("target is required"),
                         s("path") ?: return toolError("path is required"), s("dest") ?: return toolError("dest is required"))
                         .let { if (it.isError) return toolError(it.text) else it.text }
+                }
+                "factory_sandbox_vm_info" -> {
+                    val v = sandboxVms?.takeIf { it.enabled } ?: return toolError("Sandbox VMs are switched off on this server (FACTORY_SANDBOX_VM=off).")
+                    v.info(grant.runId!!).let { if (it.isError) return toolError(it.text) else it.text }
+                }
+                "factory_sandbox_vm_deploy" -> {
+                    val v = sandboxVms?.takeIf { it.enabled } ?: return toolError("Sandbox VMs are switched off on this server (FACTORY_SANDBOX_VM=off).")
+                    val background = args["background"]?.let { el ->
+                        (el as? JsonPrimitive)?.takeIf { !it.isString }?.booleanOrNull ?: return toolError("background must be true or false")
+                    } ?: false
+                    v.deploy(grant.runId!!, grant.sessionId!!, background).let { if (it.isError) return toolError(it.text) else it.text }
+                }
+                "factory_sandbox_vm_exec" -> {
+                    val v = sandboxVms?.takeIf { it.enabled } ?: return toolError("Sandbox VMs are switched off on this server (FACTORY_SANDBOX_VM=off).")
+                    val command = args["command"]?.let { el -> (el as? JsonPrimitive)?.takeIf { it.isString }?.content } ?: return toolError("command is required")
+                    val timeout = args["timeoutSeconds"]?.let { el ->
+                        (el as? JsonPrimitive)?.takeIf { !it.isString }?.longOrNull ?: return toolError("timeoutSeconds must be a positive whole number")
+                    }
+                    val background = args["background"]?.let { el ->
+                        (el as? JsonPrimitive)?.takeIf { !it.isString }?.booleanOrNull ?: return toolError("background must be true or false")
+                    } ?: false
+                    v.exec(grant.runId!!, grant.sessionId!!, command, timeout, background).let { if (it.isError) return toolError(it.text) else it.text }
+                }
+                "factory_sandbox_vm_wait" -> {
+                    val v = sandboxVms?.takeIf { it.enabled } ?: return toolError("Sandbox VMs are switched off on this server (FACTORY_SANDBOX_VM=off).")
+                    val handle = args["handle"]?.let { el -> (el as? JsonPrimitive)?.takeIf { it.isString }?.content ?: return toolError("handle must be a string") }
+                    val waitSeconds = args["waitSeconds"]?.let { el ->
+                        (el as? JsonPrimitive)?.contentOrNull?.toLongOrNull()?.takeIf { it >= 0 }
+                            ?: return toolError("waitSeconds must be a whole number of seconds, 0 or more")
+                    }
+                    v.wait(grant.runId!!, handle, waitSeconds).let { if (it.isError) return toolError(it.text) else it.text }
                 }
                 "factory_attach_screenshot" ->
                     screenshots.attach(grant.sessionId ?: return toolError("Only reviewers of a run can attach screenshots"), grant.runId, repo, owner, str("path"), str("caption"))
