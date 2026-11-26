@@ -368,11 +368,14 @@ class TestWorld(
     val realGitOps: FailingPushGit? = cliGit?.let { FailingPushGit(it) }
     val launcher = FakeLauncher()
     val sandboxRuntime = FakeSandboxRuntime()
+    /** How deploy operations "connect" (unless the tweaked config switches deploys off). */
+    val deployTransport = FakeDeployTransport()
     /** Exceptions that escaped a background coroutine of [services]; [close] fails the test when there are any. */
     val backgroundFailures = CopyOnWriteArrayList<Throwable>()
     val services = Services(
         cfg, TestDb.fresh(), github, gitOps ?: realGitOps ?: git, launcher ?: this.launcher, loginThrottle = loginThrottle, clock = clock,
         releaseStarter = releaseStarter, sandboxRuntime = if (sandbox) sandboxRuntime else null, imageProviders = imageProviders,
+        deployTransport = if (cfg.deploy.enabled) deployTransport else null,
         onBackgroundFailure = { backgroundFailures += it },
     )
 
@@ -380,6 +383,11 @@ class TestWorld(
     fun sandboxFile(content: String?, repo: String = "demo-app") {
         github.setFile(repo, dk.egernet.factory.sandbox.SANDBOX_FILE, content)
         if (content == null) git.files.remove(dk.egernet.factory.sandbox.SANDBOX_FILE) else git.files[dk.egernet.factory.sandbox.SANDBOX_FILE] = content
+    }
+
+    /** Puts `.agern/deploy.yml` on [repo]'s default branch; null removes it. */
+    fun deployFile(content: String?, repo: String = "demo-app") {
+        github.setFile(repo, dk.egernet.factory.deploy.DEPLOY_FILE, content)
     }
 
     /** Creates a user with credentials registered, as if they had logged in and filled in Settings. */
@@ -434,6 +442,42 @@ class FailingPushGit(private val inner: GitOps) : GitOps by inner {
         pushes += branch
         inner.push(id, worktree, branch, home)
     }
+}
+
+/**
+ * A deploy transport in memory: records every call as `check|exec|copy <target> …` and answers through [onExec],
+ * [onCheck] and [onCopy] (defaults: success).
+ */
+class FakeDeployTransport : dk.egernet.factory.deploy.DeployTransport {
+    val calls = CopyOnWriteArrayList<String>()
+    /** The key fingerprints operations authenticated with, in order. */
+    val identities = CopyOnWriteArrayList<String>()
+    /** What copies sent: target, dest, name, mode and content. */
+    data class Copied(val target: String, val dest: String, val name: String, val mode: Int, val content: ByteArray)
+    val copies = CopyOnWriteArrayList<Copied>()
+    @Volatile var onCheck: (dk.egernet.factory.deploy.DeployEndpoint) -> Unit = {}
+    @Volatile var onExec: (dk.egernet.factory.deploy.DeployEndpoint, String, Long) -> dk.egernet.factory.deploy.DeployExecResult =
+        { _, cmd, _ -> dk.egernet.factory.deploy.DeployExecResult(0, null, "ran: $cmd\n", false, false, 7) }
+    @Volatile var onCopy: (dk.egernet.factory.deploy.DeployEndpoint, String) -> Unit = { _, _ -> }
+    @Volatile var closed = false
+
+    override fun check(endpoint: dk.egernet.factory.deploy.DeployEndpoint, identity: dk.egernet.factory.deploy.DeployIdentity) {
+        calls += "check ${endpoint.name}"; identities += identity.fingerprint
+        onCheck(endpoint)
+    }
+    override fun exec(endpoint: dk.egernet.factory.deploy.DeployEndpoint, identity: dk.egernet.factory.deploy.DeployIdentity, command: String, timeoutMs: Long) =
+        onExec(endpoint, command, timeoutMs).also { calls += "exec ${endpoint.name} $command"; identities += identity.fingerprint }
+    override fun copy(
+        endpoint: dk.egernet.factory.deploy.DeployEndpoint, identity: dk.egernet.factory.deploy.DeployIdentity,
+        upload: dk.egernet.factory.deploy.DeployUpload, dest: String, timeoutMs: Long,
+    ): Long {
+        calls += "copy ${endpoint.name} ${upload.name} $dest"; identities += identity.fingerprint
+        onCopy(endpoint, dest)
+        val bytes = upload.open().use { it.readNBytes(upload.size.toInt()) }
+        copies += Copied(endpoint.name, dest, upload.name, upload.mode, bytes)
+        return bytes.size.toLong()
+    }
+    override fun close() { closed = true }
 }
 
 /**

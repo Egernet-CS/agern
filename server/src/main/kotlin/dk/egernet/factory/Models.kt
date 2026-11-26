@@ -479,6 +479,48 @@ data class SandboxStatusDto(
     val approvers: List<OwnerDto> = emptyList(),
 )
 
+/** A target of a valid `.agern/deploy.yml` (docs/DEPLOY.md). */
+@Serializable
+data class DeployTargetDto(
+    val name: String, val host: String, val port: Int, val user: String,
+    val hostKeyType: String, val hostKeyFingerprint: String, val description: String?,
+)
+
+/** A project's deploy key: only the public half, never the private key. */
+@Serializable data class DeployKeyDto(val publicKey: String, val fingerprint: String, val createdBy: OwnerDto, val createdAt: String)
+
+/** `GET /api/projects/{repo}/deploy`: the definition on the default branch, its approval and the project's key. */
+@Serializable
+data class DeployStatusDto(
+    val repo: String,
+    /** FACTORY_DEPLOY is not `off`. Definitions can be approved and keys generated either way. */
+    val enabled: Boolean,
+    /** `ssh`, `fake` or `off`. */
+    val mode: String,
+    val path: String,
+    val branch: String,
+    /** `none` (no file), `invalid`, `pending` (valid, this content not approved) or `approved`. */
+    val state: String,
+    val sha256: String?,
+    val content: String?,
+    val errors: List<String>,
+    /** The targets of a valid file, in file order (empty otherwise). */
+    val targets: List<DeployTargetDto>,
+    /** The repository's approval, possibly of other content (compare [sha256]); null when none. */
+    val approval: SandboxApprovalDto?,
+    val approvers: List<OwnerDto> = emptyList(),
+    val key: DeployKeyDto?,
+)
+
+/** `POST /api/projects/{repo}/deploy/targets/{name}/check`: how far a connection got. */
+@Serializable
+data class DeployCheckDto(
+    val target: String, val ok: Boolean,
+    /** `connect`, `host_key`, `auth` (the step that failed) or `ok`. */
+    val stage: String,
+    val message: String, val durationMs: Long,
+)
+
 /** A sandbox that exists right now (`GET /api/admin/sandboxes`). */
 @Serializable
 data class RunningSandboxDto(

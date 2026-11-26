@@ -66,6 +66,12 @@ class Services(
         "fake" -> dk.egernet.factory.sandbox.DevFakeSandboxRuntime()
         else -> null
     },
+    /** How deploy operations connect (docs/DEPLOY.md): MINA SSHD, the dev fake, or null when FACTORY_DEPLOY=off. */
+    val deployTransport: dk.egernet.factory.deploy.DeployTransport? = when (cfg.deploy.mode) {
+        "ssh" -> dk.egernet.factory.deploy.MinaDeployTransport()
+        "fake" -> dk.egernet.factory.deploy.DevFakeDeployTransport()
+        else -> null
+    },
     /** Time source of the release scheduler (tests use a controllable clock). */
     val clock: java.time.Clock = java.time.Clock.systemUTC(),
     /** What a scheduled start calls; null = the real start ([ReleaseService.startScheduled]). Tests may replace it. */
@@ -105,21 +111,25 @@ class Services(
     val preferences = dk.egernet.factory.db.PreferenceStore(db, settings)
     val usage = dk.egernet.factory.db.ClaudeUsageStore(db, clock)
     val agents = AgentManager(cfg, sessions, events, access, launcher, bus, mcpRegistry, settings, prompts, workspaces, scope, attachments, preferences, usage,
-        workspaceDefs)
+        workspaceDefs,
+        // Deploy tools only for chats, and only when switched on (never in McpRegistry.CHAT_TOOLS, so personal tokens cannot inherit them).
+        chatExtraTools = if (cfg.deploy.enabled && deployTransport != null) dk.egernet.factory.deploy.DeployManager.TOOLS else emptySet())
     val sandboxes = SandboxManager(
         cfg, sandboxRuntime, SandboxApprovalStore(db), runs, access, git, scope,
         publishSystem = { sessionId, payload -> agents.publish(sessionId, "system", payload) },
         emitFeed = { bus.emitFeed(it) },
         emitRun = { id -> runs.get(id)?.let { bus.emitFeed(dk.egernet.factory.agent.FeedItem.Run(runs.toDto(it), it.contextRepos)) } },
-        approvers = {
-            val known = users.all().filter { it.isAdmin }
-            (known.map { OwnerDto(it.username, it.displayName) } + (cfg.admins - known.map { it.username }.toSet()).map { OwnerDto(it, it) })
-                .sortedBy { it.username }
-        },
+        approvers = { adminApprovers() },
         // The fake GitHub's workspaces are local `git init` repositories without the file: runs read the fake's copy.
         devDefinitionSource = (github as? FakeGitHub)?.takeIf { cfg.fakeGithub }?.let { fake ->
             { repo -> fake.fileOf(repo, dk.egernet.factory.sandbox.SANDBOX_FILE) }
         },
+    )
+    val deploys = dk.egernet.factory.deploy.DeployManager(
+        cfg, deployTransport, dk.egernet.factory.db.DeployKeyStore(db), dk.egernet.factory.db.DeployApprovalStore(db), access, box, scope,
+        publishSystem = { sessionId, payload -> agents.publish(sessionId, "system", payload) },
+        chatDir = { owner, repo -> workspaces.mainDir(owner.username, repo) },
+        approvers = { adminApprovers() },
     )
     val screenshotStore = dk.egernet.factory.db.ScreenshotStore(db)
     val images = dk.egernet.factory.images.ImageService(
@@ -168,9 +178,14 @@ class Services(
     val mcpTokens = dk.egernet.factory.db.McpTokenStore(db)
     /** Checks the bearer of `POST /mcp`; its `limiter` throttles unknown bearers per client address. */
     val mcpAuth = dk.egernet.factory.mcp.McpAuthenticator(mcpRegistry, mcpTokens, users, access, twoFactorStore, cfg.githubOrg, clock)
-    val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes, screenshots, images, mcpAuth, cfg)
+    val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes, screenshots, images, mcpAuth, cfg, deploys)
 
-    /** The start-up removal of leftover sandboxes (runs in the background; tests wait for it). */
+    /** The admins, who approve sandbox and deploy definitions: known admins plus FACTORY_ADMINS who never logged in. */
+    private fun adminApprovers(): List<OwnerDto> {
+        val known = users.all().filter { it.isAdmin }
+        return (known.map { OwnerDto(it.username, it.displayName) } + (cfg.admins - known.map { it.username }.toSet()).map { OwnerDto(it, it) })
+            .sortedBy { it.username }
+    }
 
     init {
         agents.commandHandler = { session, owner, text -> factory.handleCommand(session, owner, text) }
@@ -224,6 +239,7 @@ class Services(
         codexLogins?.close()
         agents.shutdown()
         runCatching { runBlocking { withTimeoutOrNull(30_000) { sandboxes.shutdown() } } }
+        deploys.shutdown()
         scope.cancel()
     }
 

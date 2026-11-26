@@ -223,6 +223,8 @@ class AgentManager(
     private val preferences: dk.egernet.factory.db.PreferenceStore,
     private val usageStore: dk.egernet.factory.db.ClaudeUsageStore,
     private val workspaceDefs: dk.egernet.factory.workspace.WorkspaceService? = null,
+    /** MCP tools a (non-advisor) chat gets on top of [McpRegistry.CHAT_TOOLS]: the deploy tools when they are switched on. */
+    private val chatExtraTools: Set<String> = emptySet(),
 ) {
     private val log = LoggerFactory.getLogger(AgentManager::class.java)
 
@@ -624,7 +626,7 @@ class AgentManager(
             // The attachment files are a cache of the database: put back what a cleaned data dir lost.
             if (!advisor) withContext(Dispatchers.IO) { attachments.materialiseSession(sessionId) }
             val mayInstall = settings.get().agentsMayInstallSoftware
-            val granted = if (advisor) McpRegistry.STAGE_TOOLS else McpRegistry.CHAT_TOOLS
+            val granted = if (advisor) McpRegistry.STAGE_TOOLS else McpRegistry.CHAT_TOOLS + chatExtraTools
             val tools = if (mayInstall) granted - "factory_request_software" else granted
             token = mcp.issue(McpGrant(sessionId, owner.id, s.repo, launch?.runId, tools))
             val spec = LaunchSpec(
