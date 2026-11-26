@@ -55,6 +55,7 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_2FA` | `required` | `required` or `off`; `off` is accepted only when `FACTORY_AUTH=dev` (sole provider), otherwise the server refuses to start |
 | `FACTORY_PAM_SERVICE` | `chkpasswd` (macOS) / `login` (other) | PAM service used by the `os` provider |
 | `FACTORY_ADMINS` | empty | Comma list of usernames that are admins |
+| `FACTORY_LDAP_REQUIRED_GROUP`, `FACTORY_LDAP_GROUP_MEMBER_ATTRIBUTE`, `FACTORY_LDAP_GROUP_MEMBER_VALUE` | —, `member`, `dn` | LDAP group check (§4): one group DN or several separated by `;` (any one admits); the group attribute that lists members (`uniqueMember`, `memberUid`, …); whether it holds the user's DN (`dn`) or login name (`uid`). Unset: no check. Recommended whenever the directory is wider than the team |
 | `FACTORY_LDAP_URL`, `FACTORY_LDAP_USER_DN_TEMPLATE`, `FACTORY_LDAP_BASE_DN`, `FACTORY_LDAP_USER_FILTER`, `FACTORY_LDAP_BIND_DN`, `FACTORY_LDAP_BIND_PASSWORD` | — | LDAP. Either a DN template (`uid={0},ou=people,dc=x`) or search-then-bind |
 | `FACTORY_DEV_USERS` | — | `alice:pw,bob:pw`. Only read when `dev` is in `FACTORY_AUTH`. Never for production |
 | `FACTORY_DATA_DIR` | `./data` | Workspaces and per-user homes |
@@ -106,7 +107,23 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
   bearers from one client address within 15 minutes block personal tokens from that address (429).
 - `os`: a user account on the machine the factory runs on (PAM on Linux; on macOS PAM or
   `dscl . -authonly`). The password must never appear in a process argument list.
-- `ldap`: bind against the directory.
+- `ldap`: bind against the directory. Without `FACTORY_LDAP_REQUIRED_GROUP` any successful bind is
+  a login, so everyone in the directory can log in; set the group check whenever the directory is
+  wider than the team.
+  - The group check runs after the user's own bind, on the same connection and as the user, in both
+    the DN-template and the search-then-bind mode: an LDAP compare of each configured group's member
+    attribute against the user's DN (`dn`) or login name as typed (`uid`). The first group that
+    answers true admits the user ("any of"). No search and no service account are involved, so no
+    extra secret lies on the host; this is why it is preferred over a filter with a service account.
+  - It fails closed: compare false, a missing group, insufficient access or a connection error all
+    refuse the login, with exactly the answer of a wrong password (401 `invalid_credentials`,
+    `login_failed` audit row, throttle). Only the server log says why
+    (`ldap: <user> is not in <group>`, `ldap: cannot check <group> for <user>: <result code>`).
+  - It is evaluated at every password login, without caching. Removing someone from the group shuts
+    them out at their next login; sessions that already exist last up to 14 days.
+  - Prerequisite: the directory's ACLs must let authenticated users compare (or read) the member
+    attribute of the configured group entries.
+  - `FACTORY_ADMINS` is unchanged; an admin must pass the group check like anyone else.
 - `dev`: static users from `FACTORY_DEV_USERS`, for local development and tests. The server logs a
   loud warning at startup when it is enabled.
 
