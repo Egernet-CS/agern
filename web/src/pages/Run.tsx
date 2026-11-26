@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, ApiError, isRunActive, isRunWorking, type AgentSession, type GeneratedImage, type Run, type Screenshot, type StageRole } from '../api';
+import { api, ApiError, isRunActive, isRunWorking, isSyncRun, runRef, type AgentSession, type GeneratedImage, type Run, type Screenshot, type StageRole } from '../api';
 import { ChatView } from '../components/chat/ChatView';
 import { RunSandboxLine } from '../components/sandbox/SandboxBits';
 import { Markdown } from '../components/chat/Markdown';
@@ -46,7 +46,7 @@ export function RunPage() {
   const now = useNow(1000, run ? isRunWorking(run) : false);
 
   useEffect(() => {
-    if (run) document.title = `#${run.issueNumber} ${run.issueTitle} · ${repo} · Agern`;
+    if (run) document.title = `${isSyncRun(run) ? '' : `#${run.issueNumber} `}${run.issueTitle} · ${repo} · Agern`;
   }, [run, repo]);
 
   // Sessions created after first load: refetch when the run references one we don't know.
@@ -125,10 +125,10 @@ export function RunPage() {
         </div>
         <div className="rh-title">
           <h1>
-            <span className="rh-num">#{run.issueNumber}</span> {run.issueTitle}
+            <span className="rh-num">{runRef(run)}</span> {run.issueTitle}
           </h1>
-          <KindBadge kind={run.issueKind} />
-          <RunStatusPill status={run.status} />
+          {!isSyncRun(run) && <KindBadge kind={run.issueKind} />}
+          <RunStatusPill status={run.status} kind={run.kind} />
           {waiting && <span className="rh-waiting small">waiting for network</span>}
         </div>
         <dl className="rh-meta">
@@ -185,7 +185,7 @@ export function RunPage() {
             </>
           )}
           {run.status === 'needs_human' && !isOwner && <span className="muted small">Waiting for {run.owner.username} to approve.</span>}
-          {(run.status === 'failed' || run.status === 'cancelled') && isOwner && (
+          {(run.status === 'failed' || run.status === 'cancelled') && isOwner && !isSyncRun(run) && (
             <button className="btn btn--primary" onClick={() => setRetrying(true)} disabled={busy !== null}>Retry…</button>
           )}
           {active && (isOwner || me.isAdmin) && (
@@ -428,6 +428,42 @@ function FirstMessage({ run }: { run: Run }) {
   );
 }
 
+/** A sync run has no issue: its first node shows the release it brings up to date. */
+function SyncReleaseDetail({ run }: { run: Run }) {
+  const release = useAsync(() => (run.releaseId ? api.release(run.releaseId) : Promise.resolve(null)), [run.releaseId]);
+  const r = release.data;
+  return (
+    <div className="stage-detail stage-detail--issue">
+      <div className="sd-info">
+        <p className="eyebrow">release</p>
+        <h2>{run.issueTitle}</h2>
+        <p className="muted small">
+          {r ? <>Release {r.name} · </> : null}
+          <span className="mono">
+            {run.baseBranch ?? 'the release branch'} → {r?.targetBranch ?? 'the default branch'}
+          </span>
+          {run.releaseId && (
+            <>
+              {' '}· <Link to={`/p/${run.repo}/releases/${run.releaseId}`}>Open the release</Link>
+            </>
+          )}
+        </p>
+        {run.syncPushedSha && (
+          <p className="muted small">
+            pushed <code title={run.syncPushedSha}>{run.syncPushedSha.slice(0, 7)}</code> to {run.baseBranch}
+          </p>
+        )}
+      </div>
+      <div className="sd-body card">
+        <p>
+          The default branch is merged into the release branch with a merge commit; nothing is merged into the default branch. The builder resolves
+          the conflicts and renumbers the release’s own migrations; the reviewers then look at the conflict resolution.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function IssueDetail({ run }: { run: Run }) {
   const issue = useAsync(() => api.issue(run.repo, run.issueNumber), [run.repo, run.issueNumber]);
   return (
@@ -451,7 +487,7 @@ function IssueDetail({ run }: { run: Run }) {
 
 function StageDetail({ run, node, round, sessions, onRound }: { run: Run; node: NodeId; round: string | null; sessions: Map<string, AgentSession>; onRound: (r: number) => void }) {
   const now = useNow(1000);
-  if (node === 'issue') return <IssueDetail run={run} />;
+  if (node === 'issue') return isSyncRun(run) ? <SyncReleaseDetail run={run} /> : <IssueDetail run={run} />;
   if (!ROLE_ORDER.includes(node as StageRole)) return null;
   const role = node as StageRole;
   const all = stagesFor(run, role);
