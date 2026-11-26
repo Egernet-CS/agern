@@ -4,6 +4,7 @@ import { api, ApiError, isReleaseFinished, isReleaseOpen, isRunWorking, isSessio
 import { ChatView } from '../components/chat/ChatView';
 import { IssueImagesDialog } from '../components/images/IssueImagesDialog';
 import { REVIEWERS, roundName } from '../components/pipeline/model';
+import { deploySummary } from '../components/deploy/DeployBits';
 import { sandboxSummary } from '../components/sandbox/SandboxBits';
 import { ProjectIconControl } from '../components/ui/ProjectIconControl';
 import { Dialog, Empty, ErrorBox, KindBadge, Loading, Notice, ProjectIcon, ReleaseStatusPill, RoleBadge, RunStatusPill, SessionStatusPill } from '../components/ui/ui';
@@ -1026,6 +1027,45 @@ function SandboxSection({ repo }: { repo: string }) {
   );
 }
 
+/** The project's deploy targets in one row: state pill and one line, linking to the Deploy page (docs/DEPLOY.md). */
+function DeploySection({ repo }: { repo: string }) {
+  const reconnects = useFeedReconnects();
+  const q = useAsync(() => api.deployStatus(repo), [repo, reconnects]);
+  const s = q.data && deploySummary(q.data);
+  return (
+    <>
+      <div className="panel-head">
+        <h2>Deploy</h2>
+      </div>
+      {q.loading && !q.data && <Loading />}
+      {q.error && !q.data && (
+        <p className="form-error pad" role="alert">
+          Could not read the deploy targets: {q.error.message}{' '}
+          <button type="button" className="btn btn--ghost btn--sm" onClick={q.reload}>Retry</button>
+        </p>
+      )}
+      {q.data && s && (
+        <ul className="run-list">
+          <li>
+            <Link to={`/p/${repo}/deploy`} className={`run-row sbx-row dpl-row sbx-row--${s.tone}`}>
+              <div className="rr-top">
+                <span className="rr-title mono">{q.data.path}</span>
+              </div>
+              <div className="rr-bot">
+                <span className={`pill pill--${s.tone}`}>
+                  <span className="pill-dot" aria-hidden />
+                  {s.label}
+                </span>
+                <span className="rr-line">{s.line}</span>
+              </div>
+            </Link>
+          </li>
+        </ul>
+      )}
+    </>
+  );
+}
+
 export function runStageLine(r: Run): string {
   const running = r.stages.filter((s) => s.status === 'running').map((s) => s.role);
   if (r.status === 'reviewing') {
@@ -1151,6 +1191,7 @@ function ActivityPanel({
       <NewReleaseDialog repo={repo} open={creatingRelease} onClose={() => setCreatingRelease(false)} />
       {/* A workspace's sandboxes belong to its member projects (a submodule workspace's own runs use its own). */}
       {ownSandbox && <SandboxSection repo={repo} />}
+      <DeploySection repo={repo} />
       <div className="panel-head">
         <h2>Runs</h2>
       </div>

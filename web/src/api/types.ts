@@ -591,6 +591,55 @@ export type SandboxStatus = {
   approvers: Owner[];
 };
 
+/** A target of a valid `.agern/deploy.yml` (docs/DEPLOY.md). */
+export type DeployTarget = {
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+  /** e.g. `ssh-ed25519`. */
+  hostKeyType: string;
+  /** OpenSSH style, `SHA256:…`. */
+  hostKeyFingerprint: string;
+  description: string | null;
+};
+
+export type DeployApproval = { sha256: string; content: string; approvedBy: Owner; approvedAt: string };
+
+/** The project's deploy key pair: only the public half ever leaves the server. */
+export type DeployKey = { publicKey: string; fingerprint: string; createdBy: Owner; createdAt: string };
+
+/** `GET /api/projects/{repo}/deploy`: the deploy targets on the default branch, their approval and the project's key. */
+export type DeployStatus = {
+  repo: string;
+  /** FACTORY_DEPLOY is not off. Files can be approved and keys generated either way. */
+  enabled: boolean;
+  /** `fake`: commands only pretend to run (development). */
+  mode: 'ssh' | 'fake' | 'off';
+  path: string;
+  branch: string;
+  /** `pending`: valid, but this exact content is not approved. */
+  state: 'none' | 'invalid' | 'pending' | 'approved';
+  sha256: string | null;
+  content: string | null;
+  errors: string[];
+  /** The targets of a valid file (pending or approved); empty otherwise. */
+  targets: DeployTarget[];
+  approval: DeployApproval | null;
+  approvers: Owner[];
+  key: DeployKey | null;
+};
+
+/** `POST /api/projects/{repo}/deploy/targets/{name}/check`: connects, verifies the host key, authenticates, disconnects. */
+export type DeployCheck = {
+  target: string;
+  ok: boolean;
+  /** Where it stopped: `ok`, or the step that failed. */
+  stage: 'connect' | 'host_key' | 'auth' | 'ok';
+  message: string;
+  durationMs: number;
+};
+
 /** A sandbox that exists right now (`GET /api/admin/sandboxes`). */
 export type RunningSandbox = {
   runId: string;
@@ -655,6 +704,27 @@ export type SandboxLog = {
   platform?: string | null;
 };
 
+/** On `system` events of deploy commands and copies in a chat: what ran on which target, and its full output. */
+export type DeployLog = {
+  kind: 'exec' | 'copy';
+  target: string;
+  host: string;
+  port: number;
+  user: string;
+  command?: string;
+  path?: string;
+  dest?: string;
+  bytes?: number;
+  /** null: no exit status (a copy, a connection failure, a signal). */
+  exitCode: number | null;
+  timedOut: boolean;
+  durationMs: number;
+  output: string;
+  outputTruncated: boolean;
+  /** Why the operation failed before or instead of an exit status (connect, host key, authentication, transfer). */
+  error: string | null;
+};
+
 export type EventType = 'user' | 'claude' | 'system' | 'status' | 'images' | 'checkout';
 
 /**
@@ -706,7 +776,7 @@ export type ClientConfig = {
 };
 
 export type UserPayload = { text: string; username: string; attachments?: Attachment[] };
-export type SystemPayload = { level: 'info' | 'warn' | 'error'; text: string; messageId?: string; sandbox?: SandboxLog };
+export type SystemPayload = { level: 'info' | 'warn' | 'error'; text: string; messageId?: string; sandbox?: SandboxLog; deploy?: DeployLog };
 export type StatusPayload = { status: SessionStatus };
 
 export type Settings = {

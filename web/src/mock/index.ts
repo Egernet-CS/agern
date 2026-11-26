@@ -2,6 +2,7 @@
 // Scenarios via ?mock=default|fresh|noclaude|observer|loggedout|nosandbox|usage-none|usage-high|usage-limit (remembered per tab;
 // nosandbox: FACTORY_SANDBOX=off; usage-*: alice's Claude usage without data, at 86 % or at a reached limit).
 import { ApiError, type Api, type Channel } from '../api/api';
+import * as deploy from './deploy';
 import * as images from './images';
 
 /**
@@ -435,6 +436,12 @@ export const mockApi: Api = {
       return i;
     }),
 
+  deployStatus: (repo) => ok(() => deploy.deployStatus(repo, project(repo).defaultBranch)),
+  approveDeploy: (repo, sha256) => ok(() => (project(repo), deploy.approveDeploy(repo, sha256, me()))),
+  revokeDeployApproval: (repo) => ok(() => (project(repo), deploy.revokeDeployApproval(repo, me()))),
+  generateDeployKey: (repo) => ok(() => (project(repo), deploy.generateDeployKey(repo, me()))),
+  rotateDeployKey: (repo) => ok(() => (project(repo), deploy.rotateDeployKey(repo, me()))),
+  checkDeployTarget: (repo, target) => ok(() => (project(repo), deploy.checkDeployTarget(repo, target, me()))),
   sandboxStatus: (repo) => ok(() => sandboxStatus(repo, project(repo).defaultBranch)),
   approveSandbox: (repo, sha256) => ok(() => (project(repo), approveSandbox(repo, sha256, me()))),
   revokeSandboxApproval: (repo) => ok(() => (project(repo), revokeSandboxApproval(repo, me()))),
