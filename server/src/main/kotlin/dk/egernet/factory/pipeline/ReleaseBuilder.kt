@@ -184,7 +184,7 @@ class ReleaseBuilder(
         val oldRunRecord = before.runId?.let { io { runs.get(it) } }
         val mode = if (oldRunRecord == null) {
             if (requested != null && requested != RetryMode.START_OVER && requested != RetryMode.RECOMMENDED) {
-                if (requested !in RetryMode.ALL) throw dk.egernet.factory.badRequest("mode must be one of step, continue, start_over, recommended")
+                if (requested !in RetryMode.ALL) throw dk.egernet.factory.badRequest("mode must be one of update, step, continue, start_over, recommended")
                 throw conflict("Issue #$number has no run to continue or retry a step of", "retry_mode_unavailable")
             }
             RetryMode.START_OVER
@@ -205,6 +205,10 @@ class ReleaseBuilder(
                 RetryMode.START_OVER -> io { store.setIssue(id, number, ReleaseIssueState.WAITING, null, null) }
                 RetryMode.CONTINUE -> io {
                     store.setIssue(id, number, ReleaseIssueState.WAITING, "Retry: continues from the commits of run ${issue.runId}", issue.runId, RetryMode.CONTINUE)
+                }
+                RetryMode.UPDATE -> io {
+                    val target = oldRunRecord?.baseBranch ?: r.branch ?: "release/${r.name}"
+                    store.setIssue(id, number, ReleaseIssueState.WAITING, "Retry: updates run ${issue.runId} with `$target` and merges it", issue.runId, RetryMode.UPDATE)
                 }
                 else -> io {
                     store.setIssue(id, number, ReleaseIssueState.WAITING, "Retry: the failed step of run ${issue.runId}", issue.runId, RetryMode.STEP)
@@ -294,7 +298,7 @@ class ReleaseBuilder(
                         continue
                     }
                     val previous = if (next.retryMode != null) next.runId?.let { io { runs.get(it) } } else null
-                    if (previous != null && next.retryMode == RetryMode.STEP && previous.status == RunStatus.MERGED) {
+                    if (previous != null && (next.retryMode == RetryMode.STEP || next.retryMode == RetryMode.UPDATE) && previous.status == RunStatus.MERGED) {
                         // Approved and merged by its owner while it waited.
                         io { store.setIssue(id, next.number, ReleaseIssueState.MERGED, null, previous.id) }
                         publish(id)
@@ -303,6 +307,8 @@ class ReleaseBuilder(
                     val branch = r.branch ?: "release/${r.name}"
                     val run = when {
                         previous != null && next.retryMode == RetryMode.STEP -> orchestrator.retryStep(owner, previous)
+                        // "Update and merge" in the issue's turn, on the same run.
+                        previous != null && next.retryMode == RetryMode.UPDATE -> orchestrator.update(owner, previous.id)
                         previous != null && next.retryMode == RetryMode.CONTINUE -> {
                             // A continuation keeps the target of the run it continues; its member branch exists already.
                             val expected = Orchestrator.ExpectedTarget(previous.targetRepo)
@@ -492,7 +498,7 @@ class ReleaseBuilder(
             when (ref.state) {
                 ReleaseIssueState.RUNNING -> when (run.status) {
                     RunStatus.MERGED -> io { store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.MERGED, null, run.id) }
-                    RunStatus.NEEDS_HUMAN -> io { store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.HELD, note, run.id) }
+                    RunStatus.NEEDS_HUMAN -> autoUpdateOrHold(ref.releaseId, ref.number, run, note)
                     RunStatus.FAILED, RunStatus.CANCELLED -> when {
                         outcome.usageLimit != null && run.status == RunStatus.FAILED -> {
                             io { store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.WAITING, USAGE_LIMIT_ISSUE_NOTE, run.id, autoRetryMode(run)) }
@@ -521,6 +527,37 @@ class ReleaseBuilder(
         }
         publish(releaseId)
         advance(releaseId)
+    }
+
+    /**
+     * A running issue whose run needs a human: in a `building` release, a run whose merge was refused only for a
+     * conflict with `release/<name>` is updated automatically, once (its first update round), and the issue stays
+     * `running`; otherwise, or when the update cannot start, the issue is held with the run's reason. Called under the
+     * release lock.
+     */
+    private suspend fun autoUpdateOrHold(releaseId: UUID, number: Int, run: dk.egernet.factory.db.RunRecord, note: String) {
+        val release = io { store.get(releaseId) }
+        if (release?.status != ReleaseStatus.BUILDING || !run.updateAvailable || run.updateRounds != 0) {
+            io { store.setIssue(releaseId, number, ReleaseIssueState.HELD, note, run.id) }
+            return
+        }
+        val target = run.baseBranch ?: release.branch ?: "release/${release.name}"
+        try {
+            val owner = io { users.byId(run.ownerId) } ?: throw IllegalStateException("The run's owner no longer exists")
+            orchestrator.update(owner, run.id, dk.egernet.factory.db.UpdateTrigger.RELEASE)
+            io { store.setIssue(releaseId, number, ReleaseIssueState.RUNNING, "Updating with `$target` (automatic)", run.id) }
+            log.info("Release {}: #{} is updated automatically with {}", releaseId, number, target)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log.warn("Release {}: the automatic update of #{} could not start: {}", releaseId, number, e.message)
+            io {
+                store.setIssue(
+                    releaseId, number, ReleaseIssueState.HELD,
+                    "$note Automatic update could not start: ${startFailure(e)}".take(1000), run.id,
+                )
+            }
+        }
     }
 
     /**

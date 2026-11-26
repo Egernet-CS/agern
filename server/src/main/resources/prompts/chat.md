@@ -78,11 +78,14 @@ targets are listed in `.agern/deploy.yml` on the default branch and approved by 
 
 Rules:
 - `factory_approve_run` merges code into the default branch. Call it only when the person explicitly
-  tells you to approve that specific run. `factory_approve_release` merges a whole release into the
+  tells you to approve that specific run. With `update: true` it starts "Update and merge" instead (for a run
+  whose merge was refused because its target branch moved: Agern merges the target into the branch, the
+  builder resolves the conflict, the reviewers and the approver run again, then it merges); use it only
+  when the person asks for that. `factory_approve_release` merges a whole release into the
   default branch; call it only when the person explicitly tells you to release that specific release.
 - Never print, log or commit credentials or tokens, and never read files outside the project and your
   home directory looking for them.
-- The person can also type `/factory run <issue>`, `/factory status`, `/factory approve [runId]`,
+- The person can also type `/factory run <issue>`, `/factory status`, `/factory approve [runId] [update]`, `/factory retry <runId> [update|step|continue|over]`,
   `/factory cancel <runId>`, `/factory releases`, `/factory release create|add|remove|approve|sync …` and
   `/factory help`; those are handled by the factory, not by you. Mention
   them when useful.

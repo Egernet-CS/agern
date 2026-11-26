@@ -70,6 +70,25 @@ export function builderScript(round: number, findings: string[]): Step[] {
   ];
 }
 
+/** The builder of an update round ("Update and merge"): finish Agern's merge of the target, renumber, test, commit. */
+export function updateBuilderScript(target: string, kind: 'migration' | 'conflict'): Step[] {
+  return kind === 'migration'
+    ? [
+        { kind: 'think', text: `Agern merged ${target}; my migration V7 now has the same version as one that landed there. Renumber mine to V8.` },
+        tool('Bash', { command: 'git mv src/main/resources/db/migration/V7__saved_carts.sql src/main/resources/db/migration/V8__saved_carts.sql', description: 'Renumber my migration' }, '', 400),
+        tool('Bash', { command: './gradlew test', description: 'Run the test suite' }, testOutput(9), 2400),
+        tool('Bash', { command: 'git commit -am "Renumber the saved-carts migration to V8"', description: 'Commit' }, '[factory c41d2e9] Renumber the saved-carts migration to V8\n 1 file changed, 0 insertions(+), 0 deletions(-)', 500),
+        { kind: 'text', text: `Merged ${target}: my migration is now V8 (V7 on ${target} keeps its version). Tests green.` },
+      ]
+    : [
+        tool('Bash', { command: 'git diff --name-only --diff-filter=U', description: 'Conflicted files' }, 'src/main/kotlin/shop/cart/CartService.kt', 400),
+        tool('Edit', { file_path: 'src/main/kotlin/shop/cart/CartService.kt', old_string: '<<<<<<< HEAD', new_string: '…' }, 'The file src/main/kotlin/shop/cart/CartService.kt has been updated.', 700),
+        tool('Bash', { command: './gradlew test', description: 'Run the test suite' }, testOutput(9), 2400),
+        tool('Bash', { command: 'git add -A && git commit --no-edit', description: 'Finish the merge' }, `[factory 9b0e7a1] Merge ${target} into the run branch`, 500),
+        { kind: 'text', text: `Resolved the conflict in CartService.kt with the change from ${target}; tests green.` },
+      ];
+}
+
 // ---------------------------------------------------------------- sandboxes
 
 const EXEC = 'mcp__factory__factory_sandbox_exec';

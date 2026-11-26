@@ -310,7 +310,8 @@ class RunChecksTest {
         val tools = runBlocking { AppJson.parseToJsonElement(s.mcp.handle(token, """{"jsonrpc":"2.0","id":1,"method":"tools/list"}""").second!!) }
             .jsonObject["result"]!!.jsonObject["tools"]!!.jsonArray.map { it.jsonObject }
         val approve = tools.single { it["name"]!!.jsonPrimitive.content == "factory_approve_run" }
-        assertEquals(setOf("runId"), approve["inputSchema"]!!.jsonObject["properties"]!!.jsonObject.keys)
+        // `update` starts "Update and merge" (a new review and approval); it never merges past the checks.
+        assertEquals(setOf("runId", "update"), approve["inputSchema"]!!.jsonObject["properties"]!!.jsonObject.keys)
         assertTrue(approve["description"]!!.jsonPrimitive.content.contains("waits for the checks"))
         assertTrue(tools.none { t -> t["name"]!!.jsonPrimitive.content.let { it.contains("anyway") || it.contains("override") } })
         val help = runBlocking { s.factory.handleCommand(chat, alice, "/factory help") }

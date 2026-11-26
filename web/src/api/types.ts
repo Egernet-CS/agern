@@ -166,14 +166,20 @@ export type ReleaseIssue = {
   /** The pull request of its run into the release branch. */
   prNumber: number | null;
   prUrl: string | null;
-  /** A waiting issue retried with `continue` or `step` from `runId`; null when it is built from scratch. */
-  retryMode?: 'continue' | 'step' | null;
+  /** A waiting issue retried with `continue`, `step` or `update` from `runId`; null when it is built from scratch. */
+  retryMode?: 'continue' | 'step' | 'update' | null;
   /** The member repository the issue's run targets; null without a run or for the project (workspace) repository. */
   targetRepo: string | null;
   /** That member's directory in the workspace; null like `targetRepo`. */
   targetDir: string | null;
   /** While the issue is `running` and its run waits for the network: that run's wait. */
   waiting?: RunWait | null;
+  /** From its run: whether "Update and merge" can start now, the update rounds used and the limit. */
+  updateAvailable?: boolean;
+  updateRounds?: number;
+  maxUpdateRounds?: number;
+  /** The one-line summary of its run's latest update round, if it had one. */
+  updateSummary?: string | null;
 };
 
 /**
@@ -561,7 +567,44 @@ export type Run = {
   syncPushedSha?: string | null;
   /** The run's sandbox VM decision and its human preview (docs/SANDBOX-VMS.md); null for sync runs and older runs. */
   sandboxVm?: RunSandboxVm | null;
+  /** Update rounds ("Update and merge") started on the run, and its limit. */
+  updateRounds?: number;
+  maxUpdateRounds?: number;
+  /** True when the owner can start an update round now. */
+  updateAvailable?: boolean;
+  /** The run's update rounds, oldest first. */
+  updates?: RunUpdate[];
 };
+
+/**
+ * One update round: Agern merged `target` into the run's branch, the builder resolved what conflicted, and the reviewers
+ * and the approver ran again. Subjects, paths, problems and errors come from the repository: render them as text only.
+ */
+export type RunUpdate = {
+  number: number;
+  round: number;
+  maxRounds: number;
+  /** `release`: started automatically by a building release. */
+  trigger: 'owner' | 'release';
+  target: string;
+  reason: string | null;
+  status: 'running' | 'resolved' | 'failed' | 'cancelled';
+  mergeStatus: 'up_to_date' | 'merged' | 'conflict' | null;
+  targetSha: string | null;
+  incomingCount: number;
+  /** Subjects of the first-parent commits that came in, newest first. */
+  incoming: string[];
+  conflicts: string[];
+  migrations: string[];
+  /** The builder's commits, `<short sha> <subject>`, oldest first. */
+  commits: string[];
+  error: string | null;
+  startedAt: string;
+  endedAt: string | null;
+  /** One line, composed by the server. */
+  summary: string;
+};
+
 
 export type RunKind = 'issue' | 'sync';
 
@@ -593,11 +636,16 @@ export type RunChecks = {
 /** Checks states that block a merge (and that the owner may merge anyway). */
 export const BLOCKING_CHECK_STATES: RunChecks['state'][] = ['failed', 'pending', 'awaiting', 'unknown'];
 
-export type FailureKind = 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | 'submodule_commit_missing' | 'checks';
+export type FailureKind =
+  | 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other'
+  | 'submodule_commit_missing' | 'checks' | 'migration_conflict' | 'merge_conflict';
 export type FailedStep = 'push' | 'pull_request' | 'merge';
 
-/** `step`: retry the failed step on the same run; `continue`: a new run from its commits; `start_over`: from scratch. */
-export type RetryMode = 'step' | 'continue' | 'start_over';
+/**
+ * `update`: merge the target into the branch and let the builder resolve the conflict, then review and merge ("Update and
+ * merge"); `step`: retry the failed step on the same run; `continue`: a new run from its commits; `start_over`: from scratch.
+ */
+export type RetryMode = 'update' | 'step' | 'continue' | 'start_over';
 export type RetryOption = { mode: RetryMode; available: boolean; detail: string };
 /** How a run (or a held release issue) can be retried, and what is recommended, with a one-line reason. */
 export type RetryOptions = {

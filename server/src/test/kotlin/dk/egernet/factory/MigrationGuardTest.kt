@@ -125,10 +125,13 @@ class MigrationGuardTest {
         assertEquals(
             "Database migration conflict with `main`: `$dir/V16__mine.sql` has the same version (16) as `$dir/V16__other.sql`. " +
                 "Pull request #${held.prNumber} was not merged. Migrations already on `main` must stay unchanged, and a new " +
-                "migration needs a version above all of them. Fix the migration on the pull request's branch and approve " +
-                "again, or build the issue again from the current `main` (in a release: Retry).",
+                "migration needs a version above all of them. Use \"Update and merge\" to have Agern merge `main` into the branch " +
+                "and let the builder renumber the migration (update round 1 of 2), or fix the migration on the pull request's " +
+                "branch and approve again.",
             held.error,
         )
+        assertEquals(FailureKind.MIGRATION_CONFLICT, held.failureKind)
+        assertTrue(held.updateAvailable)
         assertEquals(emptyList(), merges(), "nothing was merged")
         assertTrue("${held.branch} -> main" in world.git.comparisons, world.git.comparisons.toString())
         assertTrue(gh.actions.any { it.startsWith("label demo-app#1") && it.contains("needs-human") }, gh.actions.toString())
@@ -194,7 +197,9 @@ class MigrationGuardTest {
         assertEquals(ReleaseIssueState.MERGED, ready.issues.single { it.number == ok }.state)
         val issue = ready.issues.single { it.number == clash }
         assertEquals(ReleaseIssueState.HELD, issue.state)
-        assertTrue(issue.note!!.startsWith("Database migration conflict with `release/h`: `$dir/V16__mine.sql` has the same version (16)"), issue.note)
+        // The automatic update round ran once; its builder did not renumber, so the issue is held with both reasons.
+        assertTrue(issue.note!!.startsWith("Update round 1 of 2 with `release/h` did not finish: the builder made no commits."), issue.note)
+        assertTrue(issue.note!!.contains("Migrations: `$dir/V16__mine.sql` has the same version (16)"), issue.note)
         assertNull(ready.prNumber, "an incomplete release opens no pull request")
         assertEquals("release_incomplete", assertFailsWith<ApiException> { runBlocking { s.releases.approve(alice, r.id) } }.code)
     }

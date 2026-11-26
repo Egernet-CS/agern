@@ -440,8 +440,16 @@ export function ReleasePage() {
                       <span className="ro-note small">{i.note}</span>
                     )}
                     {started && i.state === 'waiting' && i.retryMode && (
-                      <span className="ro-note small">{i.retryMode === 'step' ? 'Retries the failed step of its run' : 'Continues from the commits of its run'} when its turn comes.</span>
+                      <span className="ro-note small">
+                        {i.retryMode === 'update'
+                          ? 'Updates its run with the release branch and merges it'
+                          : i.retryMode === 'step'
+                            ? 'Retries the failed step of its run'
+                            : 'Continues from the commits of its run'}{' '}
+                        when its turn comes.
+                      </span>
                     )}
+                    {started && i.updateSummary && <span className="ro-note ro-update small muted">{i.updateSummary}</span>}
                   </span>
                   {i.targetDir && (
                     <span className="tag tag--plain issue-member" title={`Member ${i.targetDir}${i.targetRepo ? ` · ${i.targetRepo}` : ''}`}>
@@ -461,6 +469,18 @@ export function ReleasePage() {
                     </a>
                   )}
                   <span className="ro-actions">
+                    {may.retry(i) && i.state === 'held' && i.updateAvailable && (
+                      <button
+                        type="button"
+                        className="btn btn--primary btn--sm"
+                        aria-label={`Update and merge #${i.number}`}
+                        title={`Merge ${release.branch ?? 'the release branch'} into its branch, let the builder resolve the conflict, review again and merge`}
+                        disabled={busy}
+                        onClick={() => void change(() => api.retryReleaseIssue(release.id, i.number, 'update'))}
+                      >
+                        Update and merge
+                      </button>
+                    )}
                     {may.retry(i) && (
                       <button type="button" className="btn btn--ghost btn--sm" aria-label={`Retry #${i.number}`} title="Build it again: retry the failed step, continue from the commits, or start over" disabled={busy} onClick={() => setRetryIssue(i.number)}>
                         Retry

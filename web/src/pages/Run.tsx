@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, ApiError, BLOCKING_CHECK_STATES, isRunActive, isRunWorking, isSyncRun, runRef, type AgentSession, type GeneratedImage, type Run, type RunCheckItem, type Screenshot, type StageRole } from '../api';
+import { api, ApiError, BLOCKING_CHECK_STATES, isRunActive, isRunWorking, isSyncRun, runRef, type AgentSession, type GeneratedImage, type Run, type RunCheckItem, type RunUpdate, type Screenshot, type StageRole } from '../api';
 import { ChatView } from '../components/chat/ChatView';
 import { RunSandboxLine } from '../components/sandbox/SandboxBits';
 import { RunSandboxVmLine } from '../components/sandboxvm/SandboxVmBits';
 import { SandboxVmPreviewPanel } from '../components/sandboxvm/SandboxVmPreview';
 import { Markdown } from '../components/chat/Markdown';
-import { approverEscalation, buildNodes, humanSelectable, isFollowUp, latestStage, REVIEWERS, ROLE_BLURB, roundName, rounds, stagesFor, type NodeId } from '../components/pipeline/model';
+import { approverEscalation, buildNodes, humanSelectable, isFollowUp, latestStage, REVIEWERS, ROLE_BLURB, roundName, rounds, stagesFor, updateOf, type NodeId } from '../components/pipeline/model';
 import { Prompt } from '../components/chat/Prompt';
 import { PipelineDiagram } from '../components/pipeline/PipelineDiagram';
 import { RetryDialog } from '../components/ui/RetryDialog';
@@ -38,7 +38,7 @@ export function RunPage() {
   const run = useLiveRun(runQ.data);
   const sessions = useLiveSessions(sessQ.data, (s) => s.runId === runId);
   const sessionMap = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions]);
-  const [busy, setBusy] = useState<'approve' | 'cancel' | 'retry-now' | 'give-up' | 'merge-anyway' | null>(null);
+  const [busy, setBusy] = useState<'approve' | 'update' | 'cancel' | 'retry-now' | 'give-up' | 'merge-anyway' | null>(null);
   const [confirmGiveUp, setConfirmGiveUp] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [confirmApprove, setConfirmApprove] = useState(false);
@@ -110,6 +110,28 @@ export function RunPage() {
           ? 'The agent is still working.'
           : null;
 
+  // "Update and merge": not while the advisor works or a follow-up review runs (unreviewed changes do not block it).
+  const updateBlocked =
+    run.conversation.review === 'running' ? 'Changes from the conversation are being reviewed.' : advisorWorking ? 'The agent is still working.' : null;
+  const startUpdate = async () => {
+    setBusy('update');
+    setErr(null);
+    try {
+      if (run.releaseId) {
+        await api.retryReleaseIssue(run.releaseId, run.issueNumber, 'update');
+        runQ.reload();
+      } else {
+        const r = await api.retryRun(run.id, 'update');
+        runQ.setData(() => r);
+      }
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  };
+  const currentUpdate = updateOf(run.round, run);
+
   // Checks before the merge (docs/ARCHITECTURE.md §6 "Checks before a merge"): the owner may merge anyway while they block it.
   const checks = run.checks ?? null;
   const checksBlock = checks !== null && BLOCKING_CHECK_STATES.includes(checks.state);
@@ -159,7 +181,7 @@ export function RunPage() {
         </div>
         <dl className="rh-meta">
           <div><dt>owner</dt><dd>{run.owner.displayName || run.owner.username}{isOwner ? ' (you)' : ''}</dd></div>
-          <div><dt>round</dt><dd>{run.round === 0 ? 'build' : isFollowUp(run.round, run) ? roundName(run.round, run) : <>fix round {run.round} <span className="muted">of {run.maxRounds}</span></>}{run.round === 0 && <span className="muted"> · up to {run.maxRounds} fix rounds</span>}</dd></div>
+          <div><dt>round</dt><dd>{currentUpdate ? <>update round {currentUpdate.number} <span className="muted">of {currentUpdate.maxRounds}</span></> : run.round === 0 ? 'build' : isFollowUp(run.round, run) ? roundName(run.round, run) : <>fix round {run.round} <span className="muted">of {run.maxRounds}</span></>}{run.round === 0 && <span className="muted"> · up to {run.maxRounds} fix rounds</span>}</dd></div>
           {run.targetRepo && (
             <>
               <div><dt>repository</dt><dd><Link to={`/p/${run.targetRepo}`}>{run.targetRepo}</Link></dd></div>
@@ -196,6 +218,18 @@ export function RunPage() {
         <div className="rh-actions">
           {run.status === 'needs_human' && isOwner && (
             <>
+              {run.updateAvailable && (
+                <>
+                  <button
+                    className="btn btn--primary"
+                    onClick={() => void startUpdate()}
+                    disabled={busy !== null || updateBlocked !== null}
+                    aria-describedby={updateBlocked ? 'update-hint update-blocked' : 'update-hint'}
+                  >
+                    {busy === 'update' ? 'Updating…' : 'Update and merge'}
+                  </button>
+                </>
+              )}
               {!onGitHub && (
                 <button
                   className="btn btn--approve"
@@ -229,6 +263,15 @@ export function RunPage() {
             <button className="btn btn--ghost btn--danger" onClick={() => setConfirmCancel(true)} disabled={busy !== null}>Cancel run</button>
           )}
         </div>
+        {run.status === 'needs_human' && isOwner && run.updateAvailable && (
+          <p className="rh-update-hint muted small">
+            <span id="update-hint">
+              Recommended: merges {run.baseBranch ? <code>{run.baseBranch}</code> : 'the default branch'} into the branch, the builder resolves the
+              conflict, then review and merge (update round {(run.updateRounds ?? 0) + 1} of {run.maxUpdateRounds}).
+            </span>
+            {updateBlocked && <span id="update-blocked"> {updateBlocked}</span>}
+          </p>
+        )}
       </header>
       {waiting && (
         <NetworkWaitBanner
@@ -298,6 +341,8 @@ export function RunPage() {
       })}
 
       <PipelineDiagram run={run} nodes={nodes} selected={selected} onSelect={select} />
+
+      <UpdatesSection run={run} onShowBuilder={(round) => { params.set('stage', 'builder'); params.set('round', String(round)); setParams(params, { replace: true }); }} />
 
       <RoundsStrip run={run} onPick={(role, round) => { params.set('stage', role); params.set('round', String(round)); setParams(params, { replace: true }); }} />
 
@@ -390,6 +435,72 @@ export function RunPage() {
         </div>
       </Dialog>
     </div>
+  );
+}
+
+const UPDATE_STATUS: Record<RunUpdate['status'], string> = { running: 'running', resolved: 'resolved', failed: 'failed', cancelled: 'cancelled' };
+
+/**
+ * The run's update rounds ("Update and merge"): what was merged in, what conflicted, what the builder changed. Every text
+ * here comes from the repository and is rendered as plain text.
+ */
+function UpdatesSection({ run, onShowBuilder }: { run: Run; onShowBuilder: (round: number) => void }) {
+  const updates = run.updates ?? [];
+  if (updates.length === 0) return null;
+  const commits = (k: number) => `${k} commit${k === 1 ? '' : 's'}`;
+  return (
+    <section className="run-updates" aria-label="Updates">
+      {updates.map((u) => (
+        <article key={u.number} className={`run-update run-update--${u.status}`} aria-labelledby={`update-${u.number}`}>
+          <h2 id={`update-${u.number}`} className="run-update-h">
+            Update round {u.number} of {u.maxRounds}
+            {u.trigger === 'release' && <span className="muted"> · automatic</span>}
+            <span className={`run-update-status run-update-status--${u.status}`}> · {UPDATE_STATUS[u.status]}</span>
+          </h2>
+          <p className="small">
+            {u.mergeStatus === 'up_to_date' ? (
+              <>Already up to date with <code>{u.target}</code></>
+            ) : u.mergeStatus === 'conflict' ? (
+              <>Merge of <code>{u.target}</code> stopped with conflicts ({commits(u.incomingCount)})</>
+            ) : u.mergeStatus === 'merged' ? (
+              <>Merged <code>{u.target}</code> ({commits(u.incomingCount)})</>
+            ) : (
+              <>Merging <code>{u.target}</code>…</>
+            )}
+          </p>
+          {u.incoming.length > 0 && (
+            <details className="small">
+              <summary>{commits(u.incomingCount)} merged in</summary>
+              <ul className="run-update-list">{u.incoming.map((c, i) => <li key={i}>{c}</li>)}</ul>
+            </details>
+          )}
+          {u.conflicts.length > 0 && (
+            <div className="small">
+              Conflicted files:
+              <ul className="run-update-list mono">{u.conflicts.map((c, i) => <li key={i}>{c}</li>)}</ul>
+            </div>
+          )}
+          {u.migrations.length > 0 && (
+            <div className="small">
+              Migration problems:
+              <ul className="run-update-list">{u.migrations.map((c, i) => <li key={i}>{c}</li>)}</ul>
+            </div>
+          )}
+          {u.commits.length > 0 && (
+            <div className="small">
+              The builder added:
+              <ul className="run-update-list mono">{u.commits.map((c, i) => <li key={i}>{c}</li>)}</ul>
+            </div>
+          )}
+          {u.status === 'failed' && u.error && (
+            <div className="notice notice--warn" role="note"><div className="notice-text">{u.error}</div></div>
+          )}
+          {run.stages.some((st) => st.role === 'builder' && st.round === u.round) && (
+            <button type="button" className="btn btn--sm btn--ghost" onClick={() => onShowBuilder(u.round)}>Show the builder's work</button>
+          )}
+        </article>
+      ))}
+    </section>
   );
 }
 
@@ -649,9 +760,11 @@ function StageDetail({ run, node, round, sessions, onRound }: { run: Run; node: 
               <div><dt>cost</dt><dd>{cost(session?.costUsd)}</dd></div>
               <div><dt>turns</dt><dd>{session?.numTurns ?? '—'}</dd></div>
             </dl>
-            {role === 'builder' && stage.round > 0 && (
+            {role === 'builder' && stage.round > 0 && (updateOf(stage.round, run) ? (
+              <p className="muted small">Continues the builder conversation (a new agent session resumed with <code>--resume</code>), given the merge of <code>{updateOf(stage.round, run)!.target}</code> and what conflicted.</p>
+            ) : (
               <p className="muted small">Continues the builder conversation of {roundName(stage.round - 1, run)} (a new agent session resumed with <code>--resume</code>), given all reviewer findings.</p>
-            )}
+            ))}
             {stage.warning && <p className="sd-warning" role="note">⚠ {stage.warning}</p>}
             {stage.summary && <div className="sd-summary"><Markdown text={stage.summary} /></div>}
             {stage.findings.length > 0 && (

@@ -304,7 +304,7 @@ class RetryTest {
         assertEquals(200, opts.status.value)
         val o = AppJson.parseToJsonElement(opts.bodyAsText()).jsonObject
         assertEquals("continue", o["recommended"]!!.jsonPrimitive.content)
-        assertEquals(3, o["options"]!!.jsonArray.size)
+        assertEquals(4, o["options"]!!.jsonArray.size)
 
         val denied = bob.post("/api/runs/${failed.id}/retry") { header("X-Factory-Request", "1"); contentType(ContentType.Application.Json); setBody("{}") }
         assertEquals(403, denied.status.value)

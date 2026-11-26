@@ -36,6 +36,11 @@ data class Config(
      * before it fails or holds (docs/ARCHITECTURE.md §6 "Transient failures"); 0 switches waiting off.
      */
     val networkRetryMaxMs: Long = 24 * 3_600_000L,
+    /**
+     * FACTORY_MAX_UPDATE_ROUNDS: update rounds ("Update and merge") a run may use after its merge was refused because its
+     * target moved (docs/ARCHITECTURE.md §6 "Retrying a run"); fixed per run when it is created, 0 switches them off.
+     */
+    val maxUpdateRounds: Int = 2,
     /** Delays before the 2nd, 3rd, … attempt after a transient failure; the last repeats (not configurable; tests shorten it). */
     val networkRetryDelaysMs: List<Long> = listOf(1L, 2L, 5L, 10L, 15L).map { it * 60_000L },
     val githubApiUrl: String = "https://api.github.com",
@@ -120,7 +125,7 @@ data class Config(
     override fun toString(): String =
         "Config(host=$host, port=$port, dbUrl=$dbUrl, dbUser=$dbUser, githubOrg=$githubOrg, auth=$authProviders, " +
             "admins=$admins, dataDir=$dataDir, webDir=$webDir, claudeBin=$claudeBin, codexBin=$codexBin, publicUrl=$publicUrl, " +
-            "maxAgentsPerUser=$maxAgentsPerUser, chatIdleMinutes=$chatIdleMinutes, stageTimeoutMs=$stageTimeoutMs, networkRetryMaxMs=$networkRetryMaxMs, fakeGithub=$fakeGithub, " +
+            "maxAgentsPerUser=$maxAgentsPerUser, chatIdleMinutes=$chatIdleMinutes, stageTimeoutMs=$stageTimeoutMs, networkRetryMaxMs=$networkRetryMaxMs, maxUpdateRounds=$maxUpdateRounds, fakeGithub=$fakeGithub, " +
             "githubStatusUrl=${githubStatusUrl ?: "off"}, " +
             "attachments=${attachmentMaxCount}x${attachmentMaxBytes shr 20}MB/${attachmentMaxMessageBytes shr 20}MB, " +
             "screenshots=${screenshotMaxCount}x${screenshotMaxBytes shr 20}MB, images=$imageLimits, sandbox=$sandbox, deploy=$deploy, sandboxVm=$sandboxVm)"
@@ -202,6 +207,11 @@ data class Config(
                     ?.also { require(it in 0..168) { "FACTORY_NETWORK_RETRY_HOURS must be between 0 and 168" } }
                     ?: (get("FACTORY_NETWORK_RETRY_HOURS")?.let { throw IllegalArgumentException("FACTORY_NETWORK_RETRY_HOURS must be a whole number of hours") })
                     ?: 24) * 3_600_000L,
+                maxUpdateRounds = get("FACTORY_MAX_UPDATE_ROUNDS")?.let { v ->
+                    val n = v.toIntOrNull() ?: throw IllegalArgumentException("FACTORY_MAX_UPDATE_ROUNDS must be a whole number")
+                    require(n in 0..10) { "FACTORY_MAX_UPDATE_ROUNDS must be between 0 and 10" }
+                    n
+                } ?: 2,
                 githubApiUrl = get("FACTORY_GITHUB_API_URL") ?: "https://api.github.com",
                 fakeGithub = fakeGithub,
                 githubStatusUrl = githubStatusUrl(env["FACTORY_GITHUB_STATUS_URL"], get("FACTORY_GITHUB_API_URL") ?: "https://api.github.com", fakeGithub),

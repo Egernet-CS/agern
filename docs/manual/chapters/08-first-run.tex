@@ -110,9 +110,17 @@ A run can fail, for example when a stage takes longer than its time limit, your 
 reached, or the server restarts while it runs. The run page shows the error in red.
 
 \begin{enumerate}
-  \item Choose \ui{Retry\ldots}. The dialog offers three ways and preselects the sensible one, with
-    its reason (figure~\ref{fig:run-retry}):
+  \item Choose \ui{Retry\ldots}. The dialog offers the ways that fit and preselects the sensible one,
+    with its reason (figure~\ref{fig:run-retry}):
     \begin{itemize}
+      \item \ui{Update and merge}: only when the work is finished and approved, but the merge was
+        refused because the target branch moved on meanwhile (a database migration with the same
+        version, or a merge conflict). Agern merges the target into the run's branch, the builder
+        resolves the conflict, and the reviewers and the approver run again before it merges; no new
+        spec and no new build. A run that waits for you offers it as a button of its own,
+        \ui{Update and merge}, before \ui{Approve \& merge}; in the chat it is
+        \cmd{/factory approve <run> update}. Each run has two update rounds (an administrator can
+        change that with \envvar{FACTORY_MAX_UPDATE_ROUNDS});
       \item \ui{Retry the failed step}: only when the builder finished and a later step (push,
         pull request, merge) failed;
       \item \ui{Continue from the commits}: a new run starts from the old branch, reuses the spec

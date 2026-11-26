@@ -102,8 +102,12 @@ class McpServer(
         Tool("factory_approve_run", "Merge a run that waits in needs_human. Only the run's owner may do this. The merge waits " +
                 "for the checks on the pull request's head commit: passed checks merge at once, pending ones leave the run " +
                 "waiting_for_checks until they pass, failed ones leave it in needs_human. Refused for projects that merge " +
-                "on GitHub (merge policy `github`): their pull requests are reviewed and merged there.",
-            schema(Triple("runId", "string", "Run id"), required = listOf("runId"))),
+                "on GitHub (merge policy `github`): their pull requests are reviewed and merged there. With update: true, " +
+                "\"Update and merge\" instead: for a finished run whose merge was refused because its target branch moved (a " +
+                "migration or merge conflict), Agern merges the target into the run's branch, the builder resolves the conflict, " +
+                "the reviewers and the approver run again and the pull request is merged.",
+            schema(Triple("runId", "string", "Run id"), Triple("update", "boolean", "Update and merge instead of merging as it is"),
+                required = listOf("runId"))),
         Tool("factory_cancel_run", "Cancel a pipeline run.",
             schema(Triple("runId", "string", "Run id"), required = listOf("runId"))),
         Tool("factory_send_to_agent", "Pass a message from the person you are talking to (who must own the run) to a running " +
@@ -395,8 +399,9 @@ class McpServer(
                 }
                 "factory_approve_run" -> {
                     val runId = uuid("runId")
-                    if (grant.personal != null && factory.visibleRun(owner, runId).repo != repo) return toolError("Run belongs to another project")
-                    FactoryService.approvedRunReply(factory.approveRun(owner, runId))
+                    val run = factory.visibleRun(owner, runId)
+                    if (grant.personal != null && run.repo != repo) return toolError("Run belongs to another project")
+                    factory.approveRunTool(owner, run.repo, runId, args["update"]?.jsonPrimitive?.contentOrNull == "true")
                 }
                 "factory_cancel_run" -> {
                     val runId = uuid("runId")

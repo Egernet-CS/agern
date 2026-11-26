@@ -58,4 +58,16 @@ class StageTimeoutTest {
         }
         assertEquals(listOf(1L, 2L, 5L, 10L, 15L).map { it * 60_000L }, Config.fromEnv(base).networkRetryDelaysMs)
     }
+
+    @Test
+    fun `the update round limit is a whole number from 0 to 10`() {
+        val base = mapOf("FACTORY_MASTER_KEY" to java.util.Base64.getEncoder().encodeToString(ByteArray(32)), "FACTORY_GITHUB_ORG" to "o")
+        assertEquals(2, Config.fromEnv(base).maxUpdateRounds)
+        assertEquals(0, Config.fromEnv(base + ("FACTORY_MAX_UPDATE_ROUNDS" to "0")).maxUpdateRounds)
+        assertEquals(10, Config.fromEnv(base + ("FACTORY_MAX_UPDATE_ROUNDS" to "10")).maxUpdateRounds)
+        listOf("11", "-1", "two", "1.5").forEach { v ->
+            val e = kotlin.test.assertFailsWith<IllegalArgumentException> { Config.fromEnv(base + ("FACTORY_MAX_UPDATE_ROUNDS" to v)) }
+            assertTrue(e.message!!.contains("FACTORY_MAX_UPDATE_ROUNDS"), e.message)
+        }
+    }
 }

@@ -422,7 +422,11 @@ class FactoryService(
                 }
             }
             "approve" -> {
-                val id = parts.getOrNull(1)?.let { parseUuid(it) } ?: run {
+                val args = parts.drop(1)
+                val update = args.any { it.equals("update", ignoreCase = true) }
+                val rest = args.filterNot { it.equals("update", ignoreCase = true) }
+                if (rest.size > 1) return "Usage: /factory approve [runId] [update]"
+                val id = rest.firstOrNull()?.let { parseUuid(it) } ?: run {
                     val candidates = runs.list(repo, activeOnly = true).filter { it.status == RunStatus.NEEDS_HUMAN && it.ownerId == owner.id }
                     when (candidates.size) {
                         0 -> return "None of your runs in $repo is waiting for approval."
@@ -431,7 +435,9 @@ class FactoryService(
                             candidates.joinToString("\n") { "• ${it.id}  #${it.issueNumber} ${it.issueTitle}" }
                     }
                 }
-                approvedRunReply(approveRun(owner, id))
+                if (update) return retryCommand(owner, repo, listOf(id.toString(), "update"))
+                val r = approveRun(owner, id)
+                approvedRunReply(r) + updateHint(r)
             }
             "cancel" -> {
                 val id = parts.getOrNull(1)?.let { parseUuid(it) } ?: return "Usage: /factory cancel <runId>"
@@ -491,13 +497,14 @@ class FactoryService(
      * run is retried through its release (its issue must be held or skipped).
      */
     private suspend fun retryCommand(owner: UserRecord, repo: String, args: List<String>): String {
-        val usage = "Usage: /factory retry <runId> [step|continue|over|recommended]"
+        val usage = "Usage: /factory retry <runId> [update|step|continue|over|recommended]"
         val id = args.firstOrNull()?.let { parseUuid(it) } ?: return usage
         val run = visibleRun(owner, id)
         if (run.repo != repo) throw notFound("Run not found in this project")
         if (run.isSync) throw dk.egernet.factory.pipeline.Orchestrator.syncNotRetried()
         val mode = when (args.getOrNull(1)?.lowercase()) {
             null -> null
+            "update" -> RetryMode.UPDATE
             "step" -> RetryMode.STEP
             "continue" -> RetryMode.CONTINUE
             "over", "start-over", "start_over" -> RetryMode.START_OVER
@@ -515,15 +522,35 @@ class FactoryService(
         }
         if (run.releaseId != null) {
             val r = releases.retry(owner, run.releaseId, run.issueNumber, mode)
+            val waiting = r.issues.firstOrNull { it.number == run.issueNumber }
+            if (waiting?.retryMode == RetryMode.UPDATE) return "Release \"${r.name}\": #${run.issueNumber} is waiting to be updated and merged."
             return "Release \"${r.name}\": #${run.issueNumber} is waiting to be built again (${modeWord(mode)})."
         }
         val r = retryRun(owner, id, mode)
+        val u = r.updates.lastOrNull()
+        if (r.id == run.id.toString() && run.status == RunStatus.NEEDS_HUMAN && u != null) {
+            return "Run ${r.id}: updating with ${u.target} and merging (update round ${u.number} of ${u.maxRounds})."
+        }
         return if (r.id == run.id.toString()) "Run ${r.id}: retrying the failed step (status ${r.status})."
         else "Started run ${r.id} for #${r.issueNumber}" + (if (r.continuesRunId != null) ", continuing from run ${r.continuesRunId}" else ", from scratch") +
             " (status ${r.status})."
     }
 
     private fun modeWord(mode: String) = if (mode == RetryMode.START_OVER) "over" else mode
+
+    /** After a plain approval: the line that offers "Update and merge" when the run can be updated now. */
+    private fun updateHint(r: RunDto): String =
+        if (r.updateAvailable) "\nUpdate and merge is available: /factory approve ${r.id} update" else ""
+
+    /**
+     * `factory_approve_run`: a plain approval (merge as it is, with the hint when an update is possible), or with [update]
+     * "Update and merge" exactly as `/factory approve <runId> update`.
+     */
+    suspend fun approveRunTool(owner: UserRecord, repo: String, runId: UUID, update: Boolean): String {
+        if (update) return retryCommand(owner, repo, listOf(runId.toString(), "update"))
+        val r = approveRun(owner, runId)
+        return approvedRunReply(r) + updateHint(r)
+    }
 
     private fun parseUuid(s: String): UUID = try {
         UUID.fromString(s)
@@ -623,9 +650,12 @@ class FactoryService(
             |Factory commands (handled by Agern, not sent to Claude):
             |  /factory run <issue>       start a pipeline run for an issue in this project
             |  /factory status            list recent runs in this project
-            |  /factory approve [runId]   merge a run that waits for a human (owner only; not when the project merges on GitHub)
+            |  /factory approve [runId] [update]   merge a run that waits for a human (owner only; not when the project merges
+            |                             on GitHub); with update: merge the target into its branch, let the builder
+            |                             resolve the conflict, review and merge
             |  /factory cancel <runId>    cancel a run (owner or admin)
-            |  /factory retry <runId> [step|continue|over]   retry a failed run (owner only); without a mode: the options
+            |  /factory retry <runId> [update|step|continue|over]   retry a failed run, or update and merge one (owner only);
+            |                             without a mode: the options
             |  /factory releases          list the releases planned in this project
             |  /factory release create <name> [description]   plan a new release
             |  /factory release add <name> <issue>…            put issues into a release (moves them from another)

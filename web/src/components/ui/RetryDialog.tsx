@@ -3,14 +3,15 @@ import type { RetryMode, RetryOptions } from '../../api';
 import { Dialog, Loading } from './ui';
 
 export const RETRY_LABEL: Record<RetryMode, string> = {
+  update: 'Update and merge',
   step: 'Retry the failed step',
   continue: 'Continue from the commits',
   start_over: 'Start over',
 };
 
 /**
- * Asks how to retry a failed run (docs/ARCHITECTURE.md §6 "Retrying a run"): the failed step, continue from its commits,
- * or start over, with the server's recommendation preselected and its one-line reason shown.
+ * Asks how to retry a failed run (docs/ARCHITECTURE.md §6 "Retrying a run"): update and merge (a finished run whose merge
+ * was refused), the failed step, continue from its commits, or start over, with the server's recommendation preselected and its one-line reason shown.
  */
 export function RetryDialog({
   open,
@@ -91,7 +92,7 @@ export function RetryDialog({
       <div className="dialog-actions">
         <button type="button" className="btn btn--ghost" onClick={onClose}>Cancel</button>
         <button type="button" className="btn btn--primary" onClick={() => void submit()} disabled={busy || !opts}>
-          {busy ? 'Retrying…' : RETRY_LABEL[mode]}
+          {busy ? (mode === 'update' ? 'Updating…' : 'Retrying…') : RETRY_LABEL[mode]}
         </button>
       </div>
     </Dialog>

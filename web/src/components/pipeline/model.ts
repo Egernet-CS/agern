@@ -119,7 +119,10 @@ export function buildNodes(run: Run, sessions: Map<string, AgentSession>): Recor
       }
       if (st.status === 'running' && TERMINAL_FAIL.includes(run.status)) n.state = 'failed';
     } else if (TERMINAL_FAIL.includes(run.status)) n.state = 'skipped';
-    if (role === 'builder' && st && st.round > 0) n.note = `fix round ${st.round}/${run.maxRounds}`;
+    if (role === 'builder' && st && st.round > 0) {
+      const u = updateOf(st.round, run);
+      n.note = u ? `update round ${u.number}/${u.maxRounds}` : `fix round ${st.round}/${run.maxRounds}`;
+    }
     nodes[role] = n;
   }
 
@@ -185,13 +188,30 @@ export function buildNodes(run: Run, sessions: Map<string, AgentSession>): Recor
   return nodes;
 }
 
-/** True for a round that reviewed changes made in the conversation while the run needed a human. */
-export const isFollowUp = (round: number, run?: Pick<Run, 'conversation'>) =>
-  run?.conversation.followUpFrom != null && round >= run.conversation.followUpFrom;
+/** What [roundName] and [isFollowUp] read of a run. */
+type RoundsOf = Pick<Run, 'conversation'> & Partial<Pick<Run, 'updates'>>;
 
-/** "build" for round 0, "fix round N" after; "follow-up N" for rounds that reviewed changes from the conversation. */
-export const roundName = (round: number, run?: Pick<Run, 'conversation'>) =>
-  isFollowUp(round, run) ? `follow-up ${round - run!.conversation.followUpFrom! + 1}` : round === 0 ? 'build' : `fix round ${round}`;
+/** The update round ("Update and merge") that ran in [round], if it was one. */
+export const updateOf = (round: number, run?: Partial<Pick<Run, 'updates'>>) => run?.updates?.find((u) => u.round === round) ?? null;
+
+/** True for a round that reviewed changes made in the conversation while the run needed a human (never an update round). */
+export const isFollowUp = (round: number, run?: RoundsOf) =>
+  run?.conversation.followUpFrom != null && round >= run.conversation.followUpFrom && !updateOf(round, run);
+
+/**
+ * "build" for round 0, "fix round N" after; "update N" for an update round; "follow-up N" for rounds that reviewed changes
+ * from the conversation (numbered without the update rounds in between).
+ */
+export const roundName = (round: number, run?: RoundsOf): string => {
+  const update = updateOf(round, run);
+  if (update) return `update ${update.number}`;
+  if (isFollowUp(round, run)) {
+    const from = run!.conversation.followUpFrom!;
+    const skipped = (run!.updates ?? []).filter((u) => u.round >= from && u.round <= round).length;
+    return `follow-up ${round - from + 1 - skipped}`;
+  }
+  return round === 0 ? 'build' : `fix round ${round}`;
+};
 
 /** The run's selectable conversation node: while it needs a human, or once it has a conversation. */
 export const humanSelectable = (run: Run) => run.status === 'needs_human' || run.conversation.sessionId !== null;

@@ -120,7 +120,7 @@ private suspend fun ApplicationCall.retryReq(): dk.egernet.factory.RetryReq {
     return try {
         AppJson.decodeFromString(dk.egernet.factory.RetryReq.serializer(), text)
     } catch (e: Exception) {
-        throw badRequest("Invalid retry request: expected {\"mode\": \"step\" | \"continue\" | \"start_over\" | \"recommended\"}")
+        throw badRequest("Invalid retry request: expected {\"mode\": \"update\" | \"step\" | \"continue\" | \"start_over\" | \"recommended\"}")
     }
 }
 @Serializable data class CreateSessionReq(val model: String? = null)

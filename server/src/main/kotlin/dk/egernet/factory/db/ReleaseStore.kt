@@ -35,6 +35,8 @@ data class ReleaseIssueRecord(
     val targetRepo: String? = null, val targetDir: String? = null,
     /** The network wait of [runId] (with the run's status), if it has one. */
     val runWait: RunWait? = null, val runStatus: String? = null,
+    /** From [runId]: whether "Update and merge" can start now, its update rounds and limit, the latest update's summary. */
+    val updateAvailable: Boolean = false, val updateRounds: Int = 0, val maxUpdateRounds: Int = 0, val updateSummary: String? = null,
 )
 
 /**
@@ -148,6 +150,8 @@ data class ReleaseRecord(
             ReleaseIssueDto(
                 it.number, it.title, it.kind, it.state, it.runId?.toString(), it.note, it.prNumber, it.prUrl, it.retryMode, it.targetRepo, it.targetDir,
                 waiting = it.runWait?.takeIf { _ -> it.state == ReleaseIssueState.RUNNING && it.runStatus in WAITABLE_STATUSES }?.toDto(),
+                updateAvailable = it.updateAvailable, updateRounds = it.updateRounds, maxUpdateRounds = it.maxUpdateRounds,
+                updateSummary = it.updateSummary,
             )
         },
         owner = if (ownerId != null && ownerUsername != null) OwnerDto(ownerUsername, ownerDisplayName ?: ownerUsername) else null,
@@ -306,17 +310,32 @@ class ReleaseStore(private val db: Db) {
         rs.intOrNull("pr_number"), rs.getString("pr_url"), rs.getString("retry_mode"),
         rs.getString("target_repo"), rs.getString("target_dir"),
         rs.runWait(), rs.getString("run_status"),
+        updateAvailable = updatable(
+            rs.getString("run_status"), rs.getString("run_failure_kind"), rs.getString("run_branch"), rs.intOrNull("pr_number"),
+            rs.getInt("run_update_rounds"), rs.getInt("run_max_update_rounds"),
+        ),
+        updateRounds = rs.getInt("run_update_rounds"), maxUpdateRounds = rs.getInt("run_max_update_rounds"),
     )
 
     private fun issuesOf(ids: List<UUID>): Map<UUID, List<ReleaseIssueRecord>> {
         if (ids.isEmpty()) return emptyMap()
-        return db.query(
+        val rows = db.query(
             "SELECT ri.release_id, ri.issue_number, ri.issue_title, ri.issue_kind, ri.state, ri.run_id, ri.note, ri.retry_mode, ru.pr_number, ru.pr_url, " +
-                "ru.target_repo, ru.target_dir, ru.status AS run_status, ru.wait_reason, ru.wait_since, ru.wait_next_at, ru.wait_attempts, ru.wait_detail " +
+                "ru.target_repo, ru.target_dir, ru.status AS run_status, ru.wait_reason, ru.wait_since, ru.wait_next_at, ru.wait_attempts, ru.wait_detail, " +
+                "ru.failure_kind AS run_failure_kind, ru.branch AS run_branch, COALESCE(ru.update_rounds, 0) AS run_update_rounds, " +
+                "COALESCE(ru.max_update_rounds, 0) AS run_max_update_rounds " +
                 "FROM release_issues ri LEFT JOIN runs ru ON ru.id = ri.run_id WHERE ri.release_id IN (" +
                 ids.joinToString(",") { "?" } + ") ORDER BY ri.position, ri.added_at",
             *ids.toTypedArray(),
         ) { it.uuid("release_id") to mapIssue(it) }
+        // The summary of each linked run's latest update round (one query for all of them).
+        val runIds = rows.mapNotNull { it.second.runId }.distinct()
+        val latest = if (runIds.isEmpty()) emptyMap() else db.query(
+            "SELECT DISTINCT ON (u.run_id) $RUN_UPDATE_COLUMNS FROM run_updates u WHERE u.run_id IN (" +
+                runIds.joinToString(",") { "?" } + ") ORDER BY u.run_id, u.number DESC",
+            *runIds.toTypedArray(), map = ::mapRunUpdate,
+        ).associate { it.runId to it.summary }
+        return rows.map { (rid, issue) -> rid to (issue.runId?.let { latest[it] }?.let { issue.copy(updateSummary = it) } ?: issue) }
             .groupBy({ it.first }, { it.second })
     }
 

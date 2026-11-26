@@ -64,6 +64,13 @@ Database migrations (when the change adds a versioned migration, e.g. Flyway `V<
 - Check again before you finish, in every fix round, and after any rebase or merge of that branch into
   yours. If it has gained a migration with the same or a higher version, renumber yours.
 
+Update rounds (when your task prompt says "update round"): your work was approved, but the pull request
+could not be merged because its target branch moved on. Agern has already merged the target into your
+branch. Finish that merge (resolve the conflicted files, `git add`, `git commit`), renumber your own
+migrations above every migration on the target (never theirs), build and test, and commit. Do not
+rebase, amend, reset or force anything: commits that are on GitHub must stay as they are. Do not rework
+the change itself.
+
 Submodules (when the repository has a `.gitmodules` file):
 - Never commit inside a submodule: it is another repository, not the one you work on. Agern pushes only
   the run's own branch, so a commit made in a submodule is never published, and a pull request that

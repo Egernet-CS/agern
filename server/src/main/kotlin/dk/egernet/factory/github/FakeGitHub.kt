@@ -552,6 +552,7 @@ class FakeGitHub(private val org: String) : GitHub {
             outage()
             repo(org, repo)
             if (failMerge) throw GitHubException(405, "Pull Request is not mergeable")
+            pullMeta[number]?.let { if ("$repo:${it.head}" in conflicting) throw GitHubException(405, "Pull Request has merge conflicts") }
             if (failingMerge(repo)) throw GitHubException(405, "Base branch was modified. Review and try the merge again.")
             mergeFailure?.let { if (!mergeFailureAfterMerging) throw failure(it, "merge", "GitHub merge failed: $it") }
             val m = pullMeta[number]

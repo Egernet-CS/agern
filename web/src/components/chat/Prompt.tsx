@@ -3,7 +3,7 @@ import { useEffect, useId, useMemo, useRef, useState, type ClipboardEvent, type 
 export const FACTORY_COMMANDS = [
   { cmd: '/factory run ', usage: '/factory run <issue>', help: 'Start a pipeline run for an issue' },
   { cmd: '/factory status', usage: '/factory status', help: 'List runs in this project' },
-  { cmd: '/factory approve', usage: '/factory approve [runId]', help: 'Approve a run waiting for a human' },
+  { cmd: '/factory approve', usage: '/factory approve [runId] [update]', help: 'Approve a run waiting for a human; update: update and merge it' },
   { cmd: '/factory cancel ', usage: '/factory cancel <runId>', help: 'Cancel a run' },
   { cmd: '/factory help', usage: '/factory help', help: 'Show factory commands' },
 ];
