@@ -7,6 +7,7 @@ import dk.egernet.factory.ReleaseMergeMethod
 import dk.egernet.factory.ReleaseMergeState
 import dk.egernet.factory.ReleaseMode
 import dk.egernet.factory.ReleaseStatus
+import dk.egernet.factory.ReleaseSyncState
 import dk.egernet.factory.agent.EventBus
 import dk.egernet.factory.agent.FeedItem
 import dk.egernet.factory.agent.Workspaces
@@ -154,6 +155,31 @@ class ReleaseMerger(
     }
 
     /**
+     * Starts bringing a `ready` release up to date (docs/ARCHITECTURE.md §6 "Bringing a release up to date") under the
+     * release's mutex, so an approval and a sync start serialise: re-reads the release and refuses when it is no longer
+     * `ready` (409 `release_not_ready`), a sync run of it is in progress (409 `release_sync_running`) or nothing needs to
+     * be done (409 `release_up_to_date`); otherwise [start] creates the run. Permission and credential checks are the
+     * caller's. The release is published afterwards.
+     */
+    suspend fun startSync(id: UUID, start: suspend (ReleaseRecord) -> dk.egernet.factory.db.RunRecord): dk.egernet.factory.db.RunRecord {
+        val run = locks.of(id).withLock {
+            val r = current(id)
+            if (r.status != ReleaseStatus.READY) throw notReady(r)
+            if (r.syncState == ReleaseSyncState.RUNNING) throw Orchestrator.syncRunning(r.name, r.sync?.id)
+            if (!r.syncNeeded) {
+                throw conflict(
+                    "`${r.branch ?: "release/${r.name}"}` is not behind `${r.targetBranch ?: "the default branch"}` and has no conflicts. " +
+                        "Use \"Check again\" if that changed.",
+                    "release_up_to_date",
+                )
+            }
+            start(r)
+        }
+        publish(id)
+        return run
+    }
+
+    /**
      * The periodic re-evaluation: every [periodicMillis], each `ready` release that is automatic (it may have become
      * green: there is no webhook) or whose checks are pending (so the page shows when they finish) is re-evaluated, and
      * every other `ready` release with a pull request is reconciled ([reconcileLocked]: merged or closed on GitHub, its
@@ -212,6 +238,9 @@ class ReleaseMerger(
             reconcileMultiLocked(r)
             return
         }
+        // How far the release branch is behind its target, and its migrations (shown with "Bring up to date").
+        val target = r.targetBranch
+        if (target != null) io { ownerOf(r) }?.let { compareWithTarget(projectSlot(r), it, target) }
         val number = r.prNumber ?: return
         val client = ownerClient(r) ?: return // a check or an approval says so
         val info = try {
@@ -379,6 +408,9 @@ class ReleaseMerger(
             }
         }
 
+        // Before the pull request is opened (or not): how far the release branch is behind the target, and whether its
+        // migrations collide with the target's ("Bring up to date", docs/ARCHITECTURE.md §6).
+        val migrationNotice = owner?.let { compareWithTarget(projectSlot(current(id)), it, repo.defaultBranch) }
         val now = current(id)
         if (existing == null && !now.complete) {
             // Incomplete or empty: no pull request yet. The release page says why.
@@ -438,11 +470,9 @@ class ReleaseMerger(
         val checks = headSha?.let { readChecks(projectSlot(withPr), client, it) }
         // Database migrations that collide with the target's hold the release like a conflict: no announcement, no
         // automatic merge, and approval refuses (docs/ARCHITECTURE.md §6 "Database migrations").
-        if (headSha != null && owner != null) {
-            migrationConflict(projectSlot(withPr), owner, repo.defaultBranch)?.let {
-                setNotice(id, it)
-                return
-            }
+        if (headSha != null && migrationNotice != null) {
+            setNotice(id, migrationNotice)
+            return
         }
         // Rebase is impossible and merge commits are not allowed: no method works (Agern never squashes). Held like a
         // conflict: no announcement, no automatic merge; approval answers the same.
@@ -507,6 +537,15 @@ class ReleaseMerger(
     ) {
         val r = current(id)
         if (r.status != ReleaseStatus.READY || !r.automatic || !r.complete) return
+        // Being brought up to date: wait for the sync run (its state is on the release page).
+        if (r.syncState == ReleaseSyncState.RUNNING) return
+        if (r.syncState == ReleaseSyncState.UNREVIEWED) {
+            setNotice(
+                id, "The merge of `${r.targetBranch ?: "the default branch"}` into `${r.branch}` (run ${r.sync?.id}) was pushed but its " +
+                    "review did not pass or did not finish, so the release is not merged automatically. Look at the run, then approve by hand.",
+            )
+            return
+        }
         if (!policy.allowsAutomatic(r.repo)) {
             setNotice(id, "This project requires a human approval: the release is not merged automatically. Approve it by hand.")
             return
@@ -568,12 +607,15 @@ class ReleaseMerger(
     }
 
     /**
-     * Why the release branch must not be merged into [target] because of its database migrations, or null. Compares
-     * the two branches with git in [owner]'s clone (the one the release's runs were built in). A comparison that cannot
-     * be made is logged and blocks nothing: CI is the strict gate.
+     * Compares the release branch with [target] with git in [owner]'s clone (the one the release's runs were built in)
+     * and answers why it must not be merged because of its database migrations, or null. For the pull request of a
+     * single-repository release it also stores how far the branch is behind [target] and whether its migrations collide
+     * (docs/ARCHITECTURE.md §6 "Bringing a release up to date"). A comparison that cannot be made is logged, leaves the
+     * stored values unchanged and blocks nothing: CI is the strict gate.
      */
-    private suspend fun migrationConflict(r: Slot, owner: UserRecord, target: String): String? {
+    private suspend fun compareWithTarget(r: Slot, owner: UserRecord, target: String): String? {
         val branch = r.branch ?: return null
+        val stores = r.row == null && !r.release.multiRepo
         return io {
             try {
                 val cmp = workspaces.withRepoLock(owner.username, r.project) {
@@ -582,11 +624,12 @@ class ReleaseMerger(
                         access.githubToken(owner), MigrationCheck::rootOf,
                     )
                 }
-                if (cmp == null) log.warn("Release {}: the database migrations of {} could not be compared with {}", r.id, branch, target)
-                cmp?.let { MigrationCheck.problems(it.baseFiles, it.changes) }?.takeIf { it.isNotEmpty() }
-                    ?.let { MigrationCheck.releaseReason(target, branch, it) }
+                if (cmp == null) log.warn("Release {}: {} could not be compared with {}", r.id, branch, target)
+                val problems = cmp?.let { MigrationCheck.problems(it.baseFiles, it.changes) }.orEmpty()
+                if (cmp != null && stores) store.setComparison(r.id, cmp.behind, problems.isNotEmpty())
+                problems.takeIf { it.isNotEmpty() }?.let { MigrationCheck.releaseReason(target, branch, it, r.release.name.takeIf { stores }) }
             } catch (e: Exception) {
-                log.warn("Release {}: checking the database migrations failed: {}", r.id, e.message)
+                log.warn("Release {}: comparing {} with {} failed: {}", r.id, branch, target, e.message)
                 null
             }
         }
@@ -630,13 +673,15 @@ class ReleaseMerger(
         val fresh = slotOf(current(r.id), r.memberRepo)
         val pr = r.prNumber ?: fresh?.prNumber ?: return
         val target = r.target ?: fresh?.target ?: "the default branch"
+        val next = if (r.row == null && !r.release.multiRepo) {
+            "Use \"Bring up to date\" on the release page (or `/factory release sync ${r.release.name}`), or resolve the conflicts " +
+                "on the release branch and use \"Check again\": ${pageUrl(r.release)}"
+        } else {
+            "Resolve the conflicts on the release branch, then use \"Check again\" on the release page: ${pageUrl(r.release)}"
+        }
         bestEffort("comment on the conflicting release pull request") {
             io {
-                client.comment(
-                    org, r.repo, pr,
-                    "**Agern:** ${branchText(r)} no longer merges cleanly into `$target`. Agern will not merge it. Resolve the " +
-                        "conflicts on the release branch, then use \"Check again\" on the release page: ${pageUrl(r.release)}",
-                )
+                client.comment(org, r.repo, pr, "**Agern:** ${branchText(r)} no longer merges cleanly into `$target`. Agern will not merge it. $next")
             }
         }
     }
@@ -716,6 +761,12 @@ class ReleaseMerger(
     private suspend fun approveLocked(owner: UserRecord, id: UUID) {
         val r = current(id)
         if (r.status != ReleaseStatus.READY) throw notReady(r)
+        if (r.syncState == ReleaseSyncState.RUNNING) {
+            throw conflict(
+                "Release \"${r.name}\" is being brought up to date (run ${r.sync?.id}); wait for it to finish or cancel it.",
+                "release_sync_running",
+            )
+        }
         if (r.held.isNotEmpty()) {
             throw conflict(
                 "${r.held.size} issue(s) are held: ${r.held.joinToString(", ") { "#${it.number}" }}. " +
@@ -738,7 +789,7 @@ class ReleaseMerger(
         val target = now.targetBranch ?: "the default branch"
         val conflictMsg = "`${now.branch}` no longer merges cleanly into `$target`. Nothing was merged."
         if (now.mergeState == ReleaseMergeState.CONFLICT) throw conflict(conflictMsg, "release_conflict")
-        now.targetBranch?.let { migrationConflict(projectSlot(now), owner, it) }?.let { throw conflict("$it Nothing was merged.", "release_migration_conflict") }
+        now.targetBranch?.let { compareWithTarget(projectSlot(now), owner, it) }?.let { throw conflict("$it Nothing was merged.", "release_migration_conflict") }
         val method = when (now.mergeMethod) {
             ReleaseMergeMethod.REBASE, ReleaseMergeMethod.MERGE -> now.mergeMethod
             ReleaseMergeMethod.UNAVAILABLE -> throw methodUnavailable(
@@ -1032,7 +1083,7 @@ class ReleaseMerger(
         if (state != ReleaseMergeState.UNKNOWN || trigger != Trigger.PERIODIC) recordMergeState(withPr, state, client)
         val headSha = if (info != null && info.state == "open") info.head.sha.takeIf { it.isNotEmpty() } else null
         val checks = headSha?.let { readChecks(withPr, client, it) }
-        val problem = (if (headSha != null) migrationConflict(withPr, owner, target) else null)
+        val problem = (if (headSha != null) compareWithTarget(withPr, owner, target) else null)
             ?: (if (info?.rebaseable == false && method == ReleaseMergeMethod.REBASE) cannotRebaseText(withPr, target, before = true) else null)
             ?: (if (method == ReleaseMergeMethod.UNAVAILABLE) squashOnlyText(withPr) else null)
         return SlotState(withPr, prNumber, state, headSha, checks, problem)
@@ -1256,7 +1307,7 @@ class ReleaseMerger(
             val target = slot.target ?: "the default branch"
             val conflictMsg = "${branchText(slot)} no longer merges cleanly into `$target`. Nothing was merged."
             if (slot.mergeState == ReleaseMergeState.CONFLICT) throw conflict(conflictMsg, "release_conflict")
-            slot.target?.let { migrationConflict(slot, owner, it) }?.let { throw conflict("$it Nothing was merged.", "release_migration_conflict") }
+            slot.target?.let { compareWithTarget(slot, owner, it) }?.let { throw conflict("$it Nothing was merged.", "release_migration_conflict") }
             val method = when (slot.mergeMethod) {
                 ReleaseMergeMethod.REBASE, ReleaseMergeMethod.MERGE -> slot.mergeMethod!!
                 ReleaseMergeMethod.UNAVAILABLE -> throw methodUnavailable(squashOnlyText(slot))

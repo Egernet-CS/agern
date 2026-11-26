@@ -145,6 +145,28 @@ data class ReleaseIssueDto(
 )
 
 /**
+ * The latest run that brings a release up to date (docs/ARCHITECTURE.md §6 "Bringing a release up to date").
+ * [state]: [ReleaseSyncState]. [pushedSha]: the merge it pushed to `release/<name>` (last push), if any. [error]: why it
+ * failed or was cancelled.
+ */
+@Serializable data class ReleaseSyncDto(
+    val runId: String, val state: String, val by: OwnerDto, val startedAt: String, val endedAt: String? = null,
+    val pushedSha: String? = null, val error: String? = null,
+)
+
+/** [ReleaseSyncDto.state]. */
+object ReleaseSyncState {
+    /** The sync run is queued, building or reviewing. */
+    const val RUNNING = "running"
+    /** It ended `merged` (pushed and reviewed, or already up to date). */
+    const val DONE = "done"
+    /** It failed or was cancelled before anything was pushed. */
+    const val FAILED = "failed"
+    /** It failed or was cancelled after it pushed: the merge is on the release branch but its review did not pass. */
+    const val UNREVIEWED = "unreviewed"
+}
+
+/**
  * Why a release is paused; [resumeAt] is set for an automatic resume (after a usage limit, or the next try for reason
  * `network`). [since] and [attempt]: the start of the current network streak and its failed starts (reason `network`).
  */
@@ -207,6 +229,17 @@ data class ReleaseDto(
      * repositories in merge order (untouched ones last), then the project repository. Empty for every other release.
      */
     val repositories: List<ReleaseRepoDto> = emptyList(),
+    /** Commits on [targetBranch] that are not on `release/<name>`, as last compared; null = not known. */
+    val behindBy: Int? = null,
+    /** The last evaluation found database migrations of `release/<name>` that collide with [targetBranch]'s. */
+    val migrationConflict: Boolean = false,
+    /**
+     * Whether "Bring up to date" is offered: `ready`, a single repository, a branch, and a conflict, a branch behind its
+     * target or a migration conflict (docs/ARCHITECTURE.md §6 "Bringing a release up to date").
+     */
+    val syncNeeded: Boolean = false,
+    /** The release's latest run that brought it up to date (kind `sync`), or null. */
+    val sync: ReleaseSyncDto? = null,
 ) {
     /**
      * This release as [canSee] lets a viewer see it: a member repository the viewer cannot read keeps its name and
@@ -326,7 +359,19 @@ data class RunDto(
     val targetDirectory: String? = null,
     /** Set while the run sleeps before retrying an operation that failed for lack of network; null otherwise. */
     val waiting: RunWaitDto? = null,
+    /** [RunKind]: `issue`, or `sync` for a run that brings a release up to date (it has no issue: [issueNumber] is 0). */
+    val kind: String = RunKind.ISSUE,
+    /** A sync run: the commit it last pushed to its release branch; null before (and for every other run). */
+    val syncPushedSha: String? = null,
 )
+
+/** What a run works on (docs/ARCHITECTURE.md §6 "Bringing a release up to date"). */
+object RunKind {
+    /** Builds an issue (every run before sync runs existed). */
+    const val ISSUE = "issue"
+    /** Merges the default branch into a release branch; belongs to no issue. */
+    const val SYNC = "sync"
+}
 
 /** Ways to retry a failed run (docs/ARCHITECTURE.md §6 "Retrying a run"). */
 object RetryMode {

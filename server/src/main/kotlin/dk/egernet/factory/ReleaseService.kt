@@ -347,6 +347,46 @@ class ReleaseService(
         return merger.check(user, id)
     }
 
+    /** A sync run that was started: the release afterwards, the run and the branch it merges ([target]). */
+    data class SyncStarted(val release: ReleaseRecord, val run: dk.egernet.factory.db.RunRecord, val target: String)
+
+    /**
+     * "Bring up to date" (docs/ARCHITECTURE.md §6 "Bringing a release up to date"): starts a sync run that merges the
+     * default branch into `release/<name>`. Visibility first (404), then `ready` (409 `release_not_ready`), the release
+     * owner or an admin (403), a single repository (409 `release_sync_unsupported`), the caller's credentials (422 /
+     * as [Access.requireClient]) and a repository that allows merge commits (409
+     * `release_sync_merge_commits_disallowed`); under the release's mutex: still `ready`, no sync run in progress (409
+     * `release_sync_running`) and something to do (409 `release_up_to_date`). The run belongs to the caller and uses only
+     * the caller's credentials, also when an admin starts it.
+     */
+    suspend fun sync(user: UserRecord, id: UUID): SyncStarted {
+        val r = visible(user, id)
+        if (!r.started || r.status != ReleaseStatus.READY) {
+            throw conflict("Release is ${ReleaseMerger.statusLabel(r.status)}, not ready to release", "release_not_ready")
+        }
+        requireOwnerOrAdmin(user, r)
+        val branch = r.branch ?: "release/${r.name}"
+        if (r.multiRepo) {
+            throw conflict(
+                "Bringing a release of several repositories up to date is not supported yet; merge the base branch into `$branch` " +
+                    "in each repository by hand.",
+                "release_sync_unsupported",
+            )
+        }
+        if (user.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
+        val client = access.requireClient(user)
+        val repo = gh { client.getRepo(cfg.githubOrg, r.repo) } ?: throw notFound("Repository not found")
+        if (repo.allowMergeCommit == false) {
+            throw conflict(
+                "${r.repo} does not allow merge commits, and a release branch that contains a merge commit cannot be rebased; " +
+                    "allow merge commits in the repository's GitHub settings first.",
+                "release_sync_merge_commits_disallowed",
+            )
+        }
+        val run = merger.startSync(id) { now -> builder.startSyncRun(user, now, repo.defaultBranch) }
+        return SyncStarted(io { store.get(id) } ?: throw notFound("Release not found"), run, repo.defaultBranch)
+    }
+
     /** Sets or changes the scheduled start (§6 "Scheduled start"); [startAt] is an ISO-8601 instant. */
     suspend fun schedule(user: UserRecord, id: UUID, startAt: String): ReleaseRecord {
         val r = visible(user, id)
@@ -452,6 +492,18 @@ class ReleaseService(
                 (p.checks?.detail?.takeIf { p.state == "open" }?.let { ", $it" } ?: "")
         }
 
+    /** The latest sync run of a `ready` release for [describe]; null when there is none or it is done. */
+    private fun syncLine(r: ReleaseRecord): String? {
+        val s = r.sync ?: return null
+        val error = s.error?.lineSequence()?.firstOrNull()?.trim().orEmpty()
+        return when (r.syncState) {
+            ReleaseSyncState.RUNNING -> "running (run ${s.id})"
+            ReleaseSyncState.FAILED -> "failed, nothing pushed: $error"
+            ReleaseSyncState.UNREVIEWED -> "pushed but not fully reviewed: $error"
+            else -> null
+        }
+    }
+
     /** Plain-text overview for `/factory releases` and `factory_list_releases`. */
     suspend fun describe(user: UserRecord, repo: String, withIds: Boolean): String {
         val list = list(user, repo)
@@ -482,6 +534,7 @@ class ReleaseService(
                 if (withIds) append(" (id ${r.id})")
                 if (multi) pullsLine(user, r)?.let { append("\n    Pull requests: $it") }
                 r.notice?.takeIf { r.status == ReleaseStatus.READY || r.status == ReleaseStatus.RELEASED }?.let { append("\n    Notice: $it") }
+                if (r.status == ReleaseStatus.READY) syncLine(r)?.let { append("\n    Sync: $it") }
                 if (r.status == ReleaseStatus.PAUSED) r.pauseNote?.let { append("\n    Paused: $it") }
                 r.issues.forEach {
                     append("\n    #${it.number} ${it.title}")

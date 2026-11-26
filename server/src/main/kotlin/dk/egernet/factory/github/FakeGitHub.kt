@@ -176,12 +176,18 @@ class FakeGitHub(private val org: String) : GitHub {
      * Development (FACTORY_DEV_FAKE_GITHUB): a directory where `<repo>/<branch>.json` sets the checks of that branch's
      * head while the server runs (e.g. `demo-app/release/1.0.json`), for an end-to-end test or a developer:
      * `{"statuses": {"ci/lint": "success"}, "checkRuns": [{"name": "build", "status": "completed", "conclusion": "failure"}]}`.
-     * Checks set with [setStatus] or [setCheckRun] take precedence.
+     * Checks set with [setStatus] or [setCheckRun] take precedence. `"conflict": true` makes pull requests with that head
+     * conflict, exactly like an entry of [conflicting], while the file says so.
      */
     @Volatile var checksDir: java.nio.file.Path? = null
 
     @kotlinx.serialization.Serializable
-    private data class ChecksFile(val statuses: Map<String, String> = emptyMap(), val checkRuns: List<GhCheckRun> = emptyList())
+    private data class ChecksFile(
+        val statuses: Map<String, String> = emptyMap(), val checkRuns: List<GhCheckRun> = emptyList(), val conflict: Boolean = false,
+    )
+
+    /** Whether pull requests from [head] of [repo] conflict: an entry of [conflicting], or the checks file says so. */
+    private fun conflicts(repo: String, head: String): Boolean = "$repo:$head" in conflicting || checksFile(repo, head)?.conflict == true
 
     private fun checksFile(repo: String, branch: String): ChecksFile? {
         val dir = checksDir ?: return null
@@ -538,7 +544,7 @@ class FakeGitHub(private val org: String) : GitHub {
             val m = pullMeta[number]?.takeIf { it.repo == repo } ?: return@synchronized null
             val computing = mergeableComputing > 0
             if (computing) mergeableComputing--
-            val clean = "$repo:${m.head}" !in conflicting
+            val clean = !conflicts(repo, m.head)
             GhPullInfo(
                 number = number, htmlUrl = "https://github.com/$org/$repo/pull/$number", state = m.state, merged = m.merged,
                 mergeable = if (m.state != "open" || computing) null else clean,
@@ -568,7 +574,7 @@ class FakeGitHub(private val org: String) : GitHub {
                 if (method == "rebase" && allowRebaseMerge == false) throw GitHubException(405, "Rebase merges are not allowed on this repository.")
                 if (method == "merge" && allowMergeCommit == false) throw GitHubException(405, "Merge commits are not allowed on this repository.")
                 if (m.state != "open") throw GitHubException(405, "Pull Request is not mergeable")
-                if (failMerge || "$repo:${m.head}" in conflicting) throw GitHubException(405, "Pull Request is not mergeable")
+                if (failMerge || conflicts(repo, m.head)) throw GitHubException(405, "Pull Request is not mergeable")
                 if (failingMerge(repo)) throw GitHubException(405, "Base branch was modified. Review and try the merge again.")
                 if (method == "rebase" && "$repo:${m.head}" in notRebaseable) throw GitHubException(405, "This branch can't be rebased")
                 if (commitTitle != null) m.title = commitTitle
