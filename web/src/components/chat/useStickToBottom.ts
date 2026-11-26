@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 
-/** How long after a wheel, touch or key event a scroll still counts as the user's (refreshed while scrolling goes on). */
-const INTENT_MS = 300;
+/**
+ * How long after a wheel, touch or key event a scroll counts as the user's. Generous, because a busy page may start a
+ * keyboard or wheel scroll late.
+ */
+const INPUT_MS = 1000;
+/** How long after a user scroll event the next one still counts as the user's (momentum, smooth key scrolling). */
+const SCROLL_MS = 300;
 /** A user scroll that ends this close to the bottom (CSS px) follows the bottom again. */
 const RESTICK_PX = 80;
 const SCROLL_KEYS = new Set(['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' ', 'Spacebar']);
@@ -27,7 +32,8 @@ export function useStickToBottom() {
   const stick = useRef(true);
   const [atBottom, setAtBottom] = useState(true);
   const lastTop = useRef(0);
-  const lastIntent = useRef(-Infinity);
+  /** Until when (performance.now()) scroll events count as the user's. */
+  const intentUntil = useRef(-Infinity);
   const held = useRef(false);
 
   const setStuck = useCallback((v: boolean) => {
@@ -39,7 +45,7 @@ export function useStickToBottom() {
     const el = scrollerRef.current;
     if (!el || !stick.current) return;
     // A user scroll-up whose scroll event has not been handled yet must not be undone by pinning.
-    if ((held.current || performance.now() - lastIntent.current < INTENT_MS) && movedUp(el, lastTop.current)) {
+    if ((held.current || performance.now() < intentUntil.current) && movedUp(el, lastTop.current)) {
       lastTop.current = el.scrollTop;
       setStuck(false);
       return;
@@ -67,7 +73,7 @@ export function useStickToBottom() {
     const el = scrollerRef.current;
     if (!el) return;
     const intent = () => {
-      lastIntent.current = performance.now();
+      intentUntil.current = performance.now() + INPUT_MS;
     };
     const onKey = (e: KeyboardEvent) => {
       if (SCROLL_KEYS.has(e.key)) intent();
@@ -112,9 +118,9 @@ export function useStickToBottom() {
     const now = performance.now();
     const top = el.scrollTop;
     const dist = el.scrollHeight - top - el.clientHeight;
-    if (held.current || now - lastIntent.current < INTENT_MS) {
+    if (held.current || now < intentUntil.current) {
       // Momentum and smooth key scrolling keep sending scroll events after the last input event.
-      lastIntent.current = now;
+      intentUntil.current = Math.max(intentUntil.current, now + SCROLL_MS);
       if (movedUp(el, lastTop.current)) {
         if (stick.current) setStuck(false);
       } else if (dist < RESTICK_PX) {

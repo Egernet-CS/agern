@@ -112,7 +112,7 @@ test('a scroll by script does not unstick the view', async ({ page }) => {
   await loaded(page);
   await expect.poll(() => distance(page)).toBeLessThanOrEqual(1);
   // Well past the window in which a scroll counts as the user's after an input event.
-  await page.waitForTimeout(500);
+  await page.waitForTimeout(1500);
   await scroller(page).evaluate((el) => (el.scrollTop = el.scrollTop - 300));
   await expect.poll(() => distance(page)).toBeGreaterThan(80);
   await page.waitForTimeout(200);
