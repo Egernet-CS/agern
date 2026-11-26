@@ -1787,6 +1787,35 @@ html.app-locked #root {
   margin-bottom: 14px;
   font-size: 0.9rem;
 }
+/* A run (or a release's running issue) waiting for the network (docs/ARCHITECTURE.md §6 "Transient failures"). */
+.notice--wait {
+  border-color: rgba(143, 180, 255, 0.4);
+  background: linear-gradient(90deg, var(--changes-wash), var(--surface) 60%);
+}
+.network-wait {
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+}
+.network-wait .notice-text {
+  flex: 1 1 320px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.network-wait-detail {
+  color: var(--text-3);
+}
+.network-wait-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.rh-waiting {
+  color: var(--changes);
+}
+.ro-wait {
+  color: var(--changes);
+}
 .run-warning {
   flex-wrap: wrap;
   padding: 10px 14px;
