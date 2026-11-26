@@ -37,6 +37,8 @@ class FactoryService(
     private val icons: dk.egernet.factory.db.ProjectIconStore,
     private val workspaces: dk.egernet.factory.workspace.WorkspaceService,
     private val memberLabels: dk.egernet.factory.workspace.MemberLabels? = null,
+    /** The projects' settings (docs/ARCHITECTURE.md §6 "Merge policy"); null = defaults for every project. */
+    private val projectSettings: dk.egernet.factory.db.ProjectSettingsStore? = null,
 ) {
     private val org get() = cfg.githubOrg
 
@@ -88,12 +90,15 @@ class FactoryService(
     private suspend fun workspaceOf(user: UserRecord, repo: String): WorkspaceState? =
         withContext(Dispatchers.IO) { workspaces.lookup(user, repo) }
 
-    /** [iconSha256]: the SHA-256 of the project's icon, or null without one. */
-    fun projectDto(r: GhRepo, agentCounts: Map<String, Int>, runCounts: Map<String, Int>, iconSha256: String?) = ProjectDto(
+    /** [iconSha256]: the SHA-256 of the project's icon, or null without one; [settings]: its settings (defaults without a row). */
+    fun projectDto(
+        r: GhRepo, agentCounts: Map<String, Int>, runCounts: Map<String, Int>, iconSha256: String?,
+        settings: ProjectSettingsDto = ProjectSettingsDto(),
+    ) = ProjectDto(
         name = r.name, fullName = r.fullName, description = r.description, private = r.private, defaultBranch = r.defaultBranch,
         language = r.language, openIssues = r.openIssuesCount, pushedAt = r.pushedAt, htmlUrl = r.htmlUrl,
         activeAgents = agentCounts[r.name] ?: 0, activeRuns = runCounts[r.name] ?: 0,
-        iconUrl = iconSha256?.let { ProjectIcons.url(r.name, it) },
+        iconUrl = iconSha256?.let { ProjectIcons.url(r.name, it) }, settings = settings,
     )
 
     suspend fun listProjects(user: UserRecord): List<ProjectDto> {
@@ -103,7 +108,10 @@ class FactoryService(
         val agentsByRepo = agents.liveCountByRepo()
         val runsByRepo = runs.countActiveByRepo()
         val iconVersions = withContext(Dispatchers.IO) { icons.versions() }
-        return repos.sortedByDescending { it.pushedAt ?: "" }.map { projectDto(it, agentsByRepo, runsByRepo, iconVersions[it.name]) }
+        val settings = withContext(Dispatchers.IO) { projectSettings?.all().orEmpty() }
+        return repos.sortedByDescending { it.pushedAt ?: "" }.map {
+            projectDto(it, agentsByRepo, runsByRepo, iconVersions[it.name], settings[it.name] ?: ProjectSettingsDto())
+        }
     }
 
     suspend fun getProject(user: UserRecord, repo: String): ProjectDto {
@@ -150,7 +158,21 @@ class FactoryService(
 
     private suspend fun projectWithIcon(r: GhRepo): ProjectDto {
         val sha = withContext(Dispatchers.IO) { icons.meta(r.name)?.sha256 }
-        return projectDto(r, agents.liveCountByRepo(), runs.countActiveByRepo(), sha)
+        val settings = withContext(Dispatchers.IO) { projectSettings?.get(r.name) } ?: ProjectSettingsDto()
+        return projectDto(r, agents.liveCountByRepo(), runs.countActiveByRepo(), sha, settings)
+    }
+
+    /**
+     * `PUT /api/projects/{repo}/settings` (docs/ARCHITECTURE.md §6 "Merge policy"). The caller has checked that [user] is
+     * an admin; 404 when [repo] is not visible to them, 400 for an unknown policy or a bad reviewer entry. Applies to
+     * runs started from now on; a run keeps the policy it started with.
+     */
+    suspend fun setProjectSettings(user: UserRecord, repo: String, req: ProjectSettingsReq): ProjectDto {
+        val r = withContext(Dispatchers.IO) { access.requireVisible(user, repo) }
+        val store = projectSettings ?: throw dk.egernet.factory.conflict("Project settings are not available")
+        val valid = validSettings(req)
+        withContext(Dispatchers.IO) { store.put(r.name, valid, user.id) }
+        return projectWithIcon(r)
     }
 
     /**
@@ -277,6 +299,15 @@ class FactoryService(
         return runs.toDto(orchestrator.approve(user, runId))
     }
 
+    /**
+     * "Merge anyway" (docs/ARCHITECTURE.md §6 "Checks before a merge"): the owner merges although the checks on
+     * [headSha] have not passed. Web only: there is deliberately no MCP tool, MCP argument or chat command for it.
+     */
+    suspend fun mergeAnywayRun(user: UserRecord, runId: UUID, headSha: String): RunDto {
+        visibleRun(user, runId)
+        return runs.toDto(orchestrator.mergeAnyway(user, runId, headSha))
+    }
+
     /** The owner's message for the agent of a run that needs a human (docs/ARCHITECTURE.md §6 "Conversation at needs human"). */
     suspend fun talkToRun(user: UserRecord, runId: UUID, text: String): TalkAcceptedDto {
         visibleRun(user, runId)
@@ -400,8 +431,7 @@ class FactoryService(
                             candidates.joinToString("\n") { "• ${it.id}  #${it.issueNumber} ${it.issueTitle}" }
                     }
                 }
-                val r = approveRun(owner, id)
-                "Run ${r.id}: ${r.status}" + (r.error?.let { " — $it" } ?: "")
+                approvedRunReply(approveRun(owner, id))
             }
             "cancel" -> {
                 val id = parts.getOrNull(1)?.let { parseUuid(it) } ?: return "Usage: /factory cancel <runId>"
@@ -504,6 +534,15 @@ class FactoryService(
             return nums.ifEmpty { null }
         }
 
+        /** The reply to a run's approval (`/factory approve`, `factory_approve_run`). */
+        fun approvedRunReply(r: RunDto): String {
+            val c = r.checks
+            if (r.status == RunStatus.WAITING_FOR_CHECKS && c != null) {
+                return "Run ${r.id} is waiting for checks on `${c.sha.take(7)}` (${c.detail}); it merges by itself when they pass."
+            }
+            return "Run ${r.id}: ${r.status}" + (r.error?.let { " — $it" } ?: "")
+        }
+
         /** The reply to an approval (`/factory release approve`, `factory_approve_release`). */
         fun approvedReply(r: dk.egernet.factory.db.ReleaseRecord): String {
             val closed = r.merged.size
@@ -540,11 +579,39 @@ class FactoryService(
             }
         }
 
+        private val LOGIN_RE = Regex("^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+        private val TEAM_RE = Regex("^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
+        const val MAX_REVIEWERS = 15
+
+        /**
+         * The settings of a `PUT /api/projects/{repo}/settings` request, validated and normalised: entries trimmed, one
+         * leading `@` stripped, empty ones dropped, duplicates removed case-insensitively; at most [MAX_REVIEWERS] per
+         * list. They go into GitHub request bodies and Markdown comments, so only the characters GitHub allows pass.
+         */
+        fun validSettings(req: ProjectSettingsReq): ProjectSettingsDto {
+            val policy = req.mergePolicy?.trim()
+            if (policy !in MergePolicy.ALL) throw badRequest("mergePolicy must be one of ${MergePolicy.ALL.joinToString(", ")}")
+            fun list(raw: List<String>?, re: Regex, what: String, field: String): List<String> {
+                val out = mutableListOf<String>()
+                for (entry in raw.orEmpty()) {
+                    val e = entry.trim().removePrefix("@").trim()
+                    if (e.isEmpty()) continue
+                    if (!re.matches(e)) throw badRequest("$field: '${e.take(100)}' is not a valid $what")
+                    if (out.none { it.equals(e, ignoreCase = true) }) out += e
+                }
+                if (out.size > MAX_REVIEWERS) throw badRequest("$field: at most $MAX_REVIEWERS entries")
+                return out
+            }
+            return ProjectSettingsDto(
+                policy!!, list(req.reviewers, LOGIN_RE, "GitHub login", "reviewers"), list(req.teamReviewers, TEAM_RE, "team slug", "teamReviewers"),
+            )
+        }
+
         val HELP = """
             |Factory commands (handled by Agern, not sent to Claude):
             |  /factory run <issue>       start a pipeline run for an issue in this project
             |  /factory status            list recent runs in this project
-            |  /factory approve [runId]   merge a run that waits for a human (owner only)
+            |  /factory approve [runId]   merge a run that waits for a human (owner only; not when the project merges on GitHub)
             |  /factory cancel <runId>    cancel a run (owner or admin)
             |  /factory retry <runId> [step|continue|over]   retry a failed run (owner only); without a mode: the options
             |  /factory releases          list the releases planned in this project

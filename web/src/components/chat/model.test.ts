@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { FactoryEvent } from '../../api/types';
-import { buildTranscript, toolArgs, toolSummary } from './model.ts';
+import { buildTranscript, fitWidth, toolArgs, toolSummary } from './model.ts';
 
 const exec = 'mcp__factory__factory_sandbox_exec';
 const wait = 'mcp__factory__factory_sandbox_wait';
@@ -82,4 +82,19 @@ test('the heartbeat disappears once the tool result arrives', () => {
   const { items } = buildTranscript([toolUse(1, 't1'), toolResult(2, 't1')], [toolProgress({ tool_use_id: 't1', elapsed_time_seconds: 60 })]);
   assert.equal(toolItems(items)[0].progress, undefined);
   assert.equal(items.length, 1);
+});
+
+test('fitWidth fits a thumbnail into 220×160 without upscaling, keeping the aspect ratio', () => {
+  assert.equal(fitWidth(2000, 1000), 220); // landscape: limited by the width
+  assert.equal(fitWidth(1000, 2000), 80); // portrait: limited by the height
+  assert.equal(fitWidth(32, 16), 32); // small: not upscaled
+  assert.equal(fitWidth(800, 600), 213);
+  assert.equal(fitWidth(1, 100000), 1); // never 0
+  assert.equal(fitWidth(2000, 1000, 160, 160), 160);
+});
+
+test('fitWidth is null when the size is unknown', () => {
+  for (const [w, h] of [[null, 10], [10, null], [0, 10], [10, 0], [-5, 10], [10, -1], [Number.NaN, 10], [Infinity, 10], [undefined, undefined]] as const) {
+    assert.equal(fitWidth(w, h), null, `${w}×${h}`);
+  }
 });

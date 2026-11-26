@@ -48,6 +48,23 @@ export type Project = {
    * Filled by `GET /api/projects/{repo}` only (always null in the project list).
    */
   workspace?: Workspace | null;
+  /** Settings an admin sets (ARCHITECTURE §6 "Merge policy"); the defaults without a stored row. */
+  settings: ProjectSettings;
+};
+
+/**
+ * How a project's runs reach the default branch (ARCHITECTURE §6 "Merge policy"): `automatic` = the approver agent may
+ * merge; `owner_approves` = every merge waits for the run owner; `github` = Agern never merges, the team merges on GitHub.
+ */
+export type MergePolicy = 'automatic' | 'owner_approves' | 'github';
+export const MERGE_POLICIES: MergePolicy[] = ['automatic', 'owner_approves', 'github'];
+
+export type ProjectSettings = {
+  mergePolicy: MergePolicy;
+  /** GitHub logins requested as reviewers (policy `github` only). */
+  reviewers: string[];
+  /** Team slugs of the organisation requested as reviewers (policy `github` only). */
+  teamReviewers: string[];
 };
 
 /** A member repository of a workspace, as the caller sees it. */
@@ -258,6 +275,8 @@ export type Release = {
   releasedAutomatically: boolean;
   /** The checks on the release pull request, as last read; null until it has one. */
   checks: ReleaseChecks | null;
+  /** The project's current merge policy: `github` refuses Agern's approval; anything but `automatic` refuses automatic mode. */
+  mergePolicy?: MergePolicy;
   /**
    * Empty unless the release spans several repositories: then member repositories in merge order (untouched last),
    * followed by the project repository (`directory` null). The fields above describe the project repository's PR.
@@ -452,10 +471,14 @@ export type RunStatus =
   | 'building'
   | 'reviewing'
   | 'approving'
+  /** Approved; merges by itself once the checks on the pull request's head commit pass (docs/ARCHITECTURE.md §6). */
+  | 'waiting_for_checks'
   | 'merged'
   | 'needs_human'
   | 'failed'
-  | 'cancelled';
+  | 'cancelled'
+  /** Passed every reviewer under policy `github`: the pull request waits on GitHub (terminal; followed until merged or closed). */
+  | 'ready';
 
 export type Run = {
   id: string;
@@ -498,11 +521,41 @@ export type Run = {
   /** A workspace run: the member repository and directory it changes (its `baseBranch` is the member's); null otherwise. */
   targetRepo?: string | null;
   targetDirectory?: string | null;
+  /** The project's merge policy when the run started; never changes. */
+  mergePolicy?: MergePolicy;
+  /** The pull request was merged on GitHub, outside Agern. */
+  mergedOnGitHub?: boolean;
+  /** Who merged it on GitHub, when GitHub reports it. */
+  mergedBy?: string | null;
+  /** The checks on the pull request's head commit as last evaluated before a merge; null until the first evaluation. */
+  checks?: RunChecks | null;
   /** Set while the run waits for the network before trying again; it keeps its status meanwhile. */
   waiting?: RunWait | null;
 };
 
-export type FailureKind = 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | 'submodule_commit_missing';
+/** One check that has not passed. Name and URL come from GitHub (untrusted); `url` is only ever an `https://` URL. */
+export type RunCheckItem = { name: string; state: 'failed' | 'pending'; conclusion: string | null; url: string | null };
+
+/** The checks a run's merge was decided on (docs/ARCHITECTURE.md §6 "Checks before a merge"). */
+export type RunChecks = {
+  state: 'awaiting' | 'pending' | 'passed' | 'failed' | 'none' | 'unknown';
+  /** The head commit they were read for. */
+  sha: string;
+  detail: string;
+  /** At most 50. */
+  items: RunCheckItem[];
+  /** Set only while `waiting_for_checks`. */
+  waitingSince: string | null;
+  deadline: string | null;
+  /** Set when the owner merged anyway. */
+  overriddenBy: string | null;
+  overriddenAt: string | null;
+};
+
+/** Checks states that block a merge (and that the owner may merge anyway). */
+export const BLOCKING_CHECK_STATES: RunChecks['state'][] = ['failed', 'pending', 'awaiting', 'unknown'];
+
+export type FailureKind = 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | 'submodule_commit_missing' | 'checks';
 export type FailedStep = 'push' | 'pull_request' | 'merge';
 
 /** `step`: retry the failed step on the same run; `continue`: a new run from its commits; `start_over`: from scratch. */
@@ -831,7 +884,7 @@ export type GitHubStatus = {
 };
 
 /** Agents are working on these runs. */
-export const WORKING_RUN_STATUSES: RunStatus[] = ['queued', 'spec', 'building', 'reviewing', 'approving'];
+export const WORKING_RUN_STATUSES: RunStatus[] = ['queued', 'spec', 'building', 'reviewing', 'approving', 'waiting_for_checks'];
 /** Not finished: what `GET /api/runs?active=true` returns (working + needs_human). */
 export const ACTIVE_RUN_STATUSES: RunStatus[] = [...WORKING_RUN_STATUSES, 'needs_human'];
 

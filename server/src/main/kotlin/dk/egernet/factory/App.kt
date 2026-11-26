@@ -70,8 +70,11 @@ class Services(
     val clock: java.time.Clock = java.time.Clock.systemUTC(),
     /** What a scheduled start calls; null = the real start ([ReleaseService.startScheduled]). Tests may replace it. */
     releaseStarter: ReleaseStarter? = null,
-    /** Whether a project allows automatic releases: the seam for #24 (every project does until it exists). */
-    val releaseModePolicy: dk.egernet.factory.pipeline.ReleaseModePolicy = dk.egernet.factory.pipeline.ReleaseModePolicy.ALLOW_ALL,
+    /**
+     * Whether a project allows automatic releases; null = from the project's merge policy (only `automatic` allows them;
+     * docs/ARCHITECTURE.md §6 "Merge policy"). Tests may pass their own.
+     */
+    releaseModePolicy: dk.egernet.factory.pipeline.ReleaseModePolicy? = null,
     /** The image providers offered in Settings; null = OpenAI and Gemini (plus the fake one in fake-GitHub mode). Tests inject fakes. */
     imageProviders: List<dk.egernet.factory.images.ImageProvider>? = null,
     /** Called with every exception that escapes a background coroutine of [scope], after it is logged. Tests record them. */
@@ -146,12 +149,17 @@ class Services(
             dk.egernet.factory.images.CodexLogins(it, images, scope, clock)
         }
     val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
+    /** Per-project settings set by admins: the merge policy and its reviewers (docs/ARCHITECTURE.md §6 "Merge policy"). */
+    val projectSettings = dk.egernet.factory.db.ProjectSettingsStore(db)
+    val modePolicy: dk.egernet.factory.pipeline.ReleaseModePolicy = releaseModePolicy
+        ?: dk.egernet.factory.pipeline.ReleaseModePolicy { repo -> projectSettings.get(repo).mergePolicy == MergePolicy.AUTOMATIC }
     val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes, screenshotStore,
-        sessions, events, images, workspaceDefs, releaseStore)
+        sessions, events, images, workspaceDefs, releaseStore, projectSettings, clock)
     val screenshots = dk.egernet.factory.agent.Screenshots(cfg, screenshotStore, runs, workspaces, publishRun = { orchestrator.publish(it) })
     val releaseLocks = dk.egernet.factory.pipeline.ReleaseLocks()
     val releaseMerger = dk.egernet.factory.pipeline.ReleaseMerger(
-        cfg, releaseStore, users, access, workspaces, bus, releaseLocks, scope, releaseModePolicy, clock,
+        cfg, releaseStore, users, access, workspaces, bus, releaseLocks, scope, modePolicy, clock,
+        mergePolicyOf = { repo -> projectSettings.get(repo).mergePolicy },
     )
     val releaseBuilder = dk.egernet.factory.pipeline.ReleaseBuilder(
         cfg, releaseStore, runs, users, access, orchestrator, bus, scope, releaseLocks, releaseMerger, workspaceDefs,
@@ -162,13 +170,13 @@ class Services(
         releaseStarter ?: ReleaseStarter { release, owner -> releases.startScheduled(owner, release.id) },
     )
     val releases: ReleaseService = ReleaseService(
-        cfg, access, releaseStore, bus, releaseBuilder, releaseScheduler, releaseMerger, releaseModePolicy, workspaceDefs,
+        cfg, access, releaseStore, bus, releaseBuilder, releaseScheduler, releaseMerger, modePolicy, workspaceDefs, projectSettings,
     )
     val projectIcons = dk.egernet.factory.db.ProjectIconStore(db)
     val memberLabels = dk.egernet.factory.workspace.MemberLabels(access)
     val factory = FactoryService(
         cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases, images.store, projectIcons, workspaceDefs,
-        memberLabels,
+        memberLabels, projectSettings,
     )
     /** Personal MCP tokens (docs/ARCHITECTURE.md §7 "Personal tokens"). */
     val mcpTokens = dk.egernet.factory.db.McpTokenStore(db)
@@ -196,7 +204,8 @@ class Services(
      */
     fun recoverAfterRestart() {
         val failed = runs.failUnfinishedAfterRestart()
-        // Runs at needs_human survive: an interrupted follow-up review must be started again, and no stage stays open.
+        // Runs at needs_human (and waiting_for_checks) survive: an interrupted follow-up review must be started again, and
+        // no stage stays open.
         runs.recoverConversationsAfterRestart()
         if (failed.isNotEmpty()) LoggerFactory.getLogger("dk.egernet.factory").warn("Marked {} unfinished run(s) as failed after restart", failed.size)
         // Order matters: first the sandboxes of runs that are no longer active (their containers bind-mount the worktrees),
@@ -212,6 +221,8 @@ class Services(
             .getOrDefault(emptyList())
         if (reaped.isNotEmpty()) LoggerFactory.getLogger("dk.egernet.factory").info("Removed {} worktree(s) of ended runs", reaped.size)
         releaseBuilder.recoverAfterRestart()
+        // Runs that were waiting for the checks on their pull request go on waiting, with their original deadline.
+        orchestrator.resumeChecksWaits()
         sessions.recoverAfterRestart()
         webSessions.purgeExpired()
         mcpTokens.purgeRevokedBefore(clock.instant().minus(java.time.Duration.ofDays(30)))
@@ -223,6 +234,7 @@ class Services(
         agents.startIdleReaper()
         releaseBuilder.startTicker()
         releaseMerger.startTicker()
+        orchestrator.startFollower()
         attachments.startReaper(scope)
     }
 

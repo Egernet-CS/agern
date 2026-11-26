@@ -51,12 +51,14 @@ import {
   checkRelease,
   setReleaseMode,
   approveRun,
+  mergeAnywayRun,
   approveSandbox,
   cancelRun,
   reviewRun,
   talkToRun,
   revokeSandboxApproval,
   setProjectIcon,
+  setProjectSettings,
   setProjectIconFromRepository,
   deleteProjectIcon,
   pendingSandboxes,
@@ -405,6 +407,13 @@ export const mockApi: Api = {
       setProjectIconFromRepository(repo, path);
       return project(repo);
     }),
+  setProjectSettings: (repo, settings) =>
+    ok(() => {
+      needAdmin();
+      project(repo);
+      setProjectSettings(repo, settings);
+      return project(repo);
+    }),
   deleteProjectIcon: (repo) =>
     ok(() => {
       needAdmin();
@@ -534,6 +543,12 @@ export const mockApi: Api = {
     ok(() => {
       const r = run(id);
       approveRun(r, me());
+      return r;
+    }),
+  mergeAnywayRun: (id, headSha) =>
+    ok(() => {
+      const r = run(id);
+      mergeAnywayRun(r, me(), headSha);
       return r;
     }),
   runRetryOptions: (id) => ok(() => retryOptionsFor(run(id))),

@@ -75,7 +75,35 @@ data class ProjectDto(
     val iconUrl: String? = null,
     /** The workspace definition (docs/ARCHITECTURE.md §5 "Workspace projects"); filled by `GET /api/projects/{repo}` only. */
     val workspace: WorkspaceDto? = null,
+    /** The project's settings (docs/ARCHITECTURE.md §6 "Merge policy"); defaults without a stored row. */
+    val settings: ProjectSettingsDto = ProjectSettingsDto(),
 )
+
+/**
+ * Per-project settings set by an admin (docs/ARCHITECTURE.md §6 "Merge policy"): the [MergePolicy] and, used only with
+ * [MergePolicy.GITHUB], the GitHub logins and team slugs requested as reviewers on a run's pull request.
+ */
+@Serializable
+data class ProjectSettingsDto(
+    val mergePolicy: String = MergePolicy.AUTOMATIC,
+    val reviewers: List<String> = emptyList(),
+    val teamReviewers: List<String> = emptyList(),
+)
+
+/** `PUT /api/projects/{repo}/settings`. Omitted lists are empty lists. */
+@Serializable
+data class ProjectSettingsReq(val mergePolicy: String? = null, val reviewers: List<String>? = null, val teamReviewers: List<String>? = null)
+
+/** How a project's runs reach the default branch (docs/ARCHITECTURE.md §6 "Merge policy"). */
+object MergePolicy {
+    /** The approver agent may merge (the default). */
+    const val AUTOMATIC = "automatic"
+    /** The approver only recommends; every merge waits in `needs_human` for the run owner's approval. */
+    const val OWNER_APPROVES = "owner_approves"
+    /** Agern never merges: a passing run ends `ready` and the team merges the pull request on GitHub. */
+    const val GITHUB = "github"
+    val ALL = setOf(AUTOMATIC, OWNER_APPROVES, GITHUB)
+}
 
 /**
  * [path]: where the definition comes from, `.agern/workspace.yml` or `.gitmodules` (members derived from the
@@ -207,6 +235,8 @@ data class ReleaseDto(
      * repositories in merge order (untouched ones last), then the project repository. Empty for every other release.
      */
     val repositories: List<ReleaseRepoDto> = emptyList(),
+    /** The project's current [MergePolicy], so the release page can explain why it cannot be approved or automatic. */
+    val mergePolicy: String = MergePolicy.AUTOMATIC,
 ) {
     /**
      * This release as [canSee] lets a viewer see it: a member repository the viewer cannot read keeps its name and
@@ -324,9 +354,37 @@ data class RunDto(
     /** A workspace run: the member repository and directory it changes; null otherwise. */
     val targetRepo: String? = null,
     val targetDirectory: String? = null,
+    /** The project's [MergePolicy] when the run started; never changes afterwards. */
+    val mergePolicy: String = MergePolicy.AUTOMATIC,
+    /** True when the run's pull request was merged on GitHub, outside Agern (followed for `github` runs). */
+    val mergedOnGitHub: Boolean = false,
+    /** The GitHub login that merged the pull request on GitHub; null when unknown or merged by Agern. */
+    val mergedBy: String? = null,
+    /** The checks on the pull request's head commit as last evaluated before a merge; null until the first evaluation. */
+    val checks: RunChecksDto? = null,
     /** Set while the run sleeps before retrying an operation that failed for lack of network; null otherwise. */
     val waiting: RunWaitDto? = null,
 )
+
+/**
+ * The checks a run's merge was decided on (docs/ARCHITECTURE.md §6 "Checks before a merge"). [state] is a
+ * [ReleaseChecksState]; [items] are the checks that have not passed (at most [MAX_ITEMS]); [waitingSince] and [deadline]
+ * are set only while the run is `waiting_for_checks`; [overriddenBy] / [overriddenAt] when the owner merged anyway.
+ * Names, details and URLs come from GitHub and are untrusted; [RunCheckItemDto.url] is only ever an `https://` URL.
+ */
+@Serializable
+data class RunChecksDto(
+    val state: String, val sha: String, val detail: String, val items: List<RunCheckItemDto> = emptyList(),
+    val waitingSince: String? = null, val deadline: String? = null,
+    val overriddenBy: String? = null, val overriddenAt: String? = null,
+) {
+    companion object {
+        const val MAX_ITEMS = 50
+    }
+}
+
+/** One check that has not passed: [state] `failed` (with its [conclusion]) or `pending`. */
+@Serializable data class RunCheckItemDto(val name: String, val state: String, val conclusion: String? = null, val url: String? = null)
 
 /** Ways to retry a failed run (docs/ARCHITECTURE.md §6 "Retrying a run"). */
 object RetryMode {
@@ -351,6 +409,11 @@ object FailureKind {
     const val STEP = "step"
     /** The merge was refused: a submodule pointer names a commit its remote does not have (the run needs a human). */
     const val SUBMODULE_COMMIT_MISSING = "submodule_commit_missing"
+    /**
+     * The merge was not made because the checks on the pull request's head commit failed, did not finish within the
+     * time limit or could not be read (docs/ARCHITECTURE.md §6 "Checks before a merge").
+     */
+    const val CHECKS = "checks"
     const val OTHER = "other"
 
     /**
@@ -745,8 +808,15 @@ object RunStatus {
     const val QUEUED = "queued"; const val SPEC = "spec"; const val BUILDING = "building"
     const val REVIEWING = "reviewing"; const val APPROVING = "approving"; const val MERGED = "merged"
     const val NEEDS_HUMAN = "needs_human"; const val FAILED = "failed"; const val CANCELLED = "cancelled"
-    val ACTIVE = setOf(QUEUED, SPEC, BUILDING, REVIEWING, APPROVING, NEEDS_HUMAN)
-    val TERMINAL = setOf(MERGED, FAILED, CANCELLED)
+    /** Passed every reviewer under [MergePolicy.GITHUB]: the pull request waits on GitHub; Agern follows it. */
+    const val READY = "ready"
+    /**
+     * Approved, but the checks on the pull request's head commit have not passed yet: merges by itself when they do
+     * (docs/ARCHITECTURE.md §6 "Checks before a merge"). Survives a restart, like [NEEDS_HUMAN].
+     */
+    const val WAITING_FOR_CHECKS = "waiting_for_checks"
+    val ACTIVE = setOf(QUEUED, SPEC, BUILDING, REVIEWING, APPROVING, WAITING_FOR_CHECKS, NEEDS_HUMAN)
+    val TERMINAL = setOf(MERGED, FAILED, CANCELLED, READY)
     val ALL = ACTIVE + TERMINAL
 }
 

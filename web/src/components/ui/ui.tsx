@@ -54,16 +54,19 @@ const RUN_TONE: Record<RunStatus, string> = {
   building: 'active',
   reviewing: 'active',
   approving: 'active',
+  waiting_for_checks: 'active',
   merged: 'pass',
   needs_human: 'escalate',
   failed: 'fail',
   cancelled: 'idle',
+  // Passed every reviewer; the pull request waits on GitHub (merge policy `github`). An existing tone, no new colour.
+  ready: 'pass',
 };
 export function RunStatusPill({ status }: { status: RunStatus }) {
   return (
     <span className={`pill pill--${RUN_TONE[status]}`}>
       <span className="pill-dot" aria-hidden />
-      {status.replace('_', ' ')}
+      {status.replaceAll('_', ' ')}
     </span>
   );
 }

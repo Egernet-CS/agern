@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError, type Attachment, type ClientConfig } from '../../api';
 import { bytes } from '../../lib/format';
 import { Dialog } from '../ui/ui';
+import { fitWidth } from './model';
 
 // ---------------------------------------------------------------- limits (from GET /api/config)
 
@@ -195,10 +196,17 @@ export function MessageAttachments({ sessionId, list }: { sessionId: string; lis
     <div className="t-att">
       {images.length > 0 && (
         <div className="t-att-images">
-          {images.map((a) => (
+          {images.map((a) => {
+            // Known size: reserve the thumbnail's box before it loads, so the transcript does not shift.
+            const fitted = fitWidth(a.width, a.height);
+            return (
             <figure key={a.id} className="t-att-figure">
               <button type="button" className="t-att-img" onClick={() => setOpen(a)} aria-label={`Open image ${a.name}`}>
-                <img src={api.attachmentUrl(sessionId, a.id, { preview: true })} alt={a.name} loading="lazy" />
+                {fitted != null ? (
+                  <img src={api.attachmentUrl(sessionId, a.id, { preview: true })} alt={a.name} loading="lazy" width={a.width ?? undefined} height={a.height ?? undefined} style={{ width: fitted }} />
+                ) : (
+                  <img src={api.attachmentUrl(sessionId, a.id, { preview: true })} alt={a.name} loading="lazy" />
+                )}
               </button>
               <figcaption>
                 <span className="t-att-name" title={a.name}>{a.name}</span>
@@ -206,7 +214,8 @@ export function MessageAttachments({ sessionId, list }: { sessionId: string; lis
                 {a.inline === 'downscaled' && <span className="t-att-note" title={a.note ?? undefined}> · downscaled for the model</span>}
               </figcaption>
             </figure>
-          ))}
+            );
+          })}
         </div>
       )}
       {files.length > 0 && (
