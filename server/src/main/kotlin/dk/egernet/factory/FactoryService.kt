@@ -52,8 +52,21 @@ class FactoryService(
                 422 -> throw unprocessable(e.message ?: "GitHub rejected the request")
                 else -> throw ApiException(io.ktor.http.HttpStatusCode.BadGateway, "github_error", e.message ?: "GitHub error")
             }
+        } catch (e: java.nio.file.FileSystemException) {
+            throw e
+        } catch (e: java.io.FileNotFoundException) {
+            throw e
+        } catch (e: java.io.IOException) {
+            throw githubUnreachable(e)
+        } catch (e: java.nio.channels.UnresolvedAddressException) {
+            throw githubUnreachable(e)
         }
     }
+
+    /** A network error or timeout talking to GitHub: 502 `github_unreachable`, keeping [e] as the cause (still transient). */
+    private fun githubUnreachable(e: Throwable) =
+        ApiException(io.ktor.http.HttpStatusCode.BadGateway, "github_unreachable", dk.egernet.factory.github.GitHubFailure.unreachable(e, org))
+            .apply { initCause(e) }
 
     /** [workspace]: the project's workspace definition, for [IssueDto.workspaceMembers]. */
     fun issueDto(

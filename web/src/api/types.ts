@@ -841,6 +841,48 @@ export type FeedFrame =
   /** Private to the receiving user: their own Claude usage changed; reload `GET /api/me/usage`. */
   | { type: 'usage' };
 
+/** `GET /api/github/status` (docs/ARCHITECTURE.md §6 "GitHub status"): whether GitHub works for this Agern. */
+export type GitHubVerdictState = 'working' | 'degraded' | 'down';
+export type GitHubCallCounts = { calls: number; serverErrors: number; network: number; rateLimited: number; auth: number };
+export type GitHubRateLimit = { limit: number; remaining: number; resetAt: string; observedAt: string };
+export type GitHubErrorClass = 'server_error' | 'network' | 'rate_limited' | 'auth';
+export type GitHubKindStatus = {
+  kind: string;
+  label: string;
+  last15m: GitHubCallCounts;
+  last24h: GitHubCallCounts;
+  lastError: { at: string; class: GitHubErrorClass; status: number | null; requestId: string | null; message: string } | null;
+};
+export type GitHubOfficialStatus = {
+  state: 'ok' | 'unreachable' | 'disabled';
+  /** null unless state = ok. */
+  indicator: 'none' | 'minor' | 'major' | 'critical' | 'unknown' | null;
+  description: string | null;
+  /** Non-operational components only; `relevant`: one Agern depends on. */
+  components: { name: string; status: string; relevant: boolean }[];
+  incidents: { title: string; status: string; impact: string | null; updatedAt: string | null; url: string | null }[];
+  /** When the cached answer (or failure) was obtained. */
+  fetchedAt: string | null;
+  /** Only for unreachable. */
+  error: string | null;
+};
+export type GitHubStatus = {
+  verdict: { state: GitHubVerdictState; reason: string };
+  generatedAt: string;
+  official: GitHubOfficialStatus;
+  /** Empty with `brief`. */
+  kinds: GitHubKindStatus[];
+  /** null with `brief`. */
+  rateLimits: {
+    /** null: the caller has no GitHub token. */
+    own: { rest: GitHubRateLimit | null; graphql: GitHubRateLimit | null } | null;
+    /** Other tokens with a current REST observation. */
+    otherTokens: number;
+    /** The lowest remaining/limit among them (REST). */
+    lowestOther: GitHubRateLimit | null;
+  } | null;
+};
+
 /** Agents are working on these runs. */
 export const WORKING_RUN_STATUSES: RunStatus[] = ['queued', 'spec', 'building', 'reviewing', 'approving', 'waiting_for_checks'];
 /** Not finished: what `GET /api/runs?active=true` returns (working + needs_human). */

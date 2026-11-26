@@ -40,6 +40,11 @@ data class Config(
     val networkRetryDelaysMs: List<Long> = listOf(1L, 2L, 5L, 10L, 15L).map { it * 60_000L },
     val githubApiUrl: String = "https://api.github.com",
     val fakeGithub: Boolean = false,
+    /**
+     * FACTORY_GITHUB_STATUS_URL: GitHub's official status summary shown on the GitHub status page (docs/ARCHITECTURE.md
+     * §6 "GitHub status"); null switches it off. [fromEnv] defaults it to githubstatus.com for github.com only.
+     */
+    val githubStatusUrl: String? = null,
     val pamService: String? = null,
     val agentPath: String = defaultAgentPath(),
     /** FACTORY_ATTACHMENT_MAX_MB: largest single chat attachment. */
@@ -111,6 +116,7 @@ data class Config(
         "Config(host=$host, port=$port, dbUrl=$dbUrl, dbUser=$dbUser, githubOrg=$githubOrg, auth=$authProviders, " +
             "admins=$admins, dataDir=$dataDir, webDir=$webDir, claudeBin=$claudeBin, codexBin=$codexBin, publicUrl=$publicUrl, " +
             "maxAgentsPerUser=$maxAgentsPerUser, chatIdleMinutes=$chatIdleMinutes, stageTimeoutMs=$stageTimeoutMs, networkRetryMaxMs=$networkRetryMaxMs, fakeGithub=$fakeGithub, " +
+            "githubStatusUrl=${githubStatusUrl ?: "off"}, " +
             "attachments=${attachmentMaxCount}x${attachmentMaxBytes shr 20}MB/${attachmentMaxMessageBytes shr 20}MB, " +
             "screenshots=${screenshotMaxCount}x${screenshotMaxBytes shr 20}MB, images=$imageLimits, sandbox=$sandbox)"
 
@@ -189,6 +195,7 @@ data class Config(
                     ?: 24) * 3_600_000L,
                 githubApiUrl = get("FACTORY_GITHUB_API_URL") ?: "https://api.github.com",
                 fakeGithub = fakeGithub,
+                githubStatusUrl = githubStatusUrl(env["FACTORY_GITHUB_STATUS_URL"], get("FACTORY_GITHUB_API_URL") ?: "https://api.github.com", fakeGithub),
                 pamService = get("FACTORY_PAM_SERVICE"),
                 agentPath = get("FACTORY_AGENT_PATH") ?: defaultAgentPath(),
                 attachmentMaxBytes = mb(get("FACTORY_ATTACHMENT_MAX_MB"), "FACTORY_ATTACHMENT_MAX_MB", 20),
@@ -220,6 +227,21 @@ data class Config(
                     "FACTORY_ATTACHMENT_MAX_MESSAGE_MB must be at least FACTORY_ATTACHMENT_MAX_MB"
                 }
             }
+        }
+
+        /**
+         * FACTORY_GITHUB_STATUS_URL: unset → githubstatus.com for github.com without the fake GitHub, else off; `off` or
+         * empty → off; anything else must be an http(s) URL.
+         */
+        fun githubStatusUrl(raw: String?, apiUrl: String, fakeGithub: Boolean): String? {
+            if (raw == null) return if (apiUrl == "https://api.github.com" && !fakeGithub) "https://www.githubstatus.com/api/v2/summary.json" else null
+            val v = raw.trim()
+            if (v.isEmpty() || v.equals("off", ignoreCase = true)) return null
+            val uri = runCatching { java.net.URI(v) }.getOrNull()
+            require(uri != null && uri.scheme?.lowercase() in setOf("http", "https") && !uri.host.isNullOrEmpty()) {
+                "FACTORY_GITHUB_STATUS_URL must be an http:// or https:// URL, or 'off'"
+            }
+            return v
         }
 
         private fun intIn(v: String?, name: String, default: Int, range: IntRange): Int {

@@ -13,6 +13,7 @@ import type {
   CredentialKind,
   FactoryEvent,
   FeedFrame,
+  GitHubStatus,
   Issue,
   LoginStep,
   IssueKind,
@@ -46,6 +47,8 @@ export type ChannelHandlers<T> = {
 /** The whole HTTP + WebSocket surface of docs/ARCHITECTURE.md §8. */
 export interface Api {
   health(): Promise<{ status: 'ok'; version: string; name: string }>;
+  /** GitHub as Agern sees it (any logged-in user). `brief`: verdict and official status only (kinds [], rateLimits null). */
+  githubStatus(opts?: { brief?: boolean }): Promise<GitHubStatus>;
   providers(): Promise<{ providers: string[]; org: string; twoFactor: boolean }>;
   login(username: string, password: string): Promise<LoginStep>;
   totp(code: string): Promise<LoginStep>;
