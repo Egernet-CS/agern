@@ -158,7 +158,10 @@ class ReleaseScheduler(
             throw e
         } catch (e: Exception) {
             // Transient (5xx, I/O): stay scheduled and due; the next tick tries again. No token in the message.
-            log.warn("Could not check {}'s GitHub access to {} for release {}; retrying at the next tick: {}", owner.username, r.repo, r.id, e.message)
+            log.warn(
+                "Could not check {}'s GitHub access to {} for release {}; retrying at the next tick: {}", owner.username, r.repo, r.id,
+                dk.egernet.factory.pipeline.Transient.describe(e),
+            )
             return
         }
         if (!canRead) {
@@ -174,15 +177,31 @@ class ReleaseScheduler(
             if (current(r).status == ReleaseStatus.SCHEDULED) "The release did not start." else null
         } catch (e: CancellationException) {
             throw e
-        } catch (e: ApiException) {
-            // Another release took the project's building slot in the meantime ("start now"): wait behind it instead.
-            if (e.code == "release_already_building" && current(r).status == ReleaseStatus.SCHEDULED) return
-            e.message
         } catch (e: Exception) {
+            if (dk.egernet.factory.pipeline.Transient.isTransient(e) && current(r).status == ReleaseStatus.SCHEDULED) {
+                // GitHub or the network failed (docs/ARCHITECTURE.md §6 "Transient failures"): stay scheduled and due, no
+                // start failure; the next tick tries again.
+                log.warn(
+                    "Starting release {} ({}) failed for lack of network; retrying at the next tick: {}", r.id, r.repo,
+                    dk.egernet.factory.pipeline.Transient.describe(e),
+                )
+                return
+            }
+            startFailureReason(r, e) ?: return
+        }
+        if (reason != null) failStart(r, reason) else publish(r)
+    }
+
+    /** Why the start of [r] failed with [e], for the recorded start failure; null when it is not one (wait instead). */
+    private suspend fun startFailureReason(r: ReleaseRecord, e: Exception): String? = when (e) {
+        is ApiException -> {
+            // Another release took the project's building slot in the meantime ("start now"): wait behind it instead.
+            if (e.code == "release_already_building" && current(r).status == ReleaseStatus.SCHEDULED) null else e.message
+        }
+        else -> {
             log.error("Starting release {} ({}) failed", r.id, r.repo, e)
             "Internal error while starting the release; see the server log."
         }
-        if (reason != null) failStart(r, reason) else publish(r)
     }
 
     private suspend fun failStart(r: ReleaseRecord, reason: String) {

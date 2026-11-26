@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type ReactNode } from 'react';
 import { api, ApiError, STEERABLE_ROLES, type AgentSession, type Attachment, type CheckoutInfo, type Run, type StageRole } from '../../api';
 import { useMe } from '../../lib/auth';
 import { cost, duration, modelLabel } from '../../lib/format';
@@ -8,6 +8,7 @@ import { DraftChips, MessageAttachments, useAttachmentDrafts } from './attachmen
 import { attachmentsOf, buildTranscript } from './model';
 import { Prompt } from './Prompt';
 import { TranscriptItems } from './Transcript';
+import { useStickToBottom } from './useStickToBottom';
 
 const GLYPHS = ['·', '✢', '✳', '✶', '✻', '✽', '✻', '✶', '✳', '✢'];
 const VERBS = ['Forging', 'Welding', 'Riveting', 'Machining', 'Assembling', 'Tempering', 'Soldering', 'Calibrating', 'Milling', 'Gathering acorns', 'Annealing', 'Fettling'];
@@ -84,40 +85,8 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header,
   const canTalk = isOwner && isAdvisor && advisorOpen && !reviewing;
   const att = useAttachmentDrafts(sessionId, canCompose);
 
-  // --- scrolling: stick to the bottom while the agent streams, unless the reader scrolled up
-  const scroller = useRef<HTMLDivElement>(null);
-  const stick = useRef(true);
-  const [atBottom, setAtBottom] = useState(true);
-  const onScroll = () => {
-    const el = scroller.current;
-    if (!el) return;
-    stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-    setAtBottom(stick.current);
-  };
-  useLayoutEffect(() => {
-    const el = scroller.current;
-    if (el && stick.current) el.scrollTop = el.scrollHeight;
-  });
-  // The pane shrinks when the composer grows (chips, more lines): keep the bottom in view.
-  useEffect(() => {
-    const el = scroller.current;
-    if (!el || typeof ResizeObserver === 'undefined') return;
-    const ro = new ResizeObserver(() => {
-      if (stick.current) el.scrollTop = el.scrollHeight;
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
-  useEffect(() => {
-    stick.current = true;
-    setAtBottom(true);
-  }, [sessionId]);
-  const jumpToLatest = () => {
-    const el = scroller.current;
-    stick.current = true;
-    setAtBottom(true);
-    el?.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
-  };
+  // --- scrolling: stick to the bottom while content arrives, unless the reader scrolled up
+  const { scrollerRef, contentRef, atBottom, onScroll, jumpToLatest, stickNow } = useStickToBottom();
 
   // The optimistic echo is hidden as soon as the server's user event is in the stream (decided while rendering, so the
   // message is never shown twice for a frame), and cleared afterwards.
@@ -143,7 +112,7 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header,
         return false;
       }
       setSending({ text, attachments });
-      stick.current = true;
+      stickNow();
       try {
         await api.sendInput(sessionId, text, attachments.map((a) => a.id));
       } catch (e) {
@@ -154,14 +123,14 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header,
       att.clearSent();
       return true;
     },
-    [sessionId, att],
+    [sessionId, att, stickNow],
   );
 
   const steer = useCallback(
     async (text: string) => {
       setError(null);
       setSending({ text, attachments: [] });
-      stick.current = true;
+      stickNow();
       try {
         await api.sendToAgent(sessionId, text);
       } catch (e) {
@@ -171,7 +140,7 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header,
       }
       return true;
     },
-    [sessionId],
+    [sessionId, stickNow],
   );
 
   const talk = useCallback(
@@ -179,7 +148,7 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header,
       if (!advisorRun) return false;
       setError(null);
       setSending({ text, attachments: [] });
-      stick.current = true;
+      stickNow();
       try {
         await api.talkToRun(advisorRun.id, text);
       } catch (e) {
@@ -189,7 +158,7 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header,
       }
       return true;
     },
-    [advisorRun],
+    [advisorRun, stickNow],
   );
 
   // --- drag and drop anywhere on the chat pane (owner only)
@@ -270,8 +239,8 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header,
         </div>
       )}
       <div className="chat-scroll-wrap">
-      <div className="chat-scroll" ref={scroller} onScroll={onScroll} tabIndex={0} aria-label="Transcript">
-        <div className="chat-log" aria-live="polite" aria-relevant="additions">
+      <div className="chat-scroll" ref={scrollerRef} onScroll={onScroll} tabIndex={0} aria-label="Transcript">
+        <div className="chat-log" ref={contentRef} aria-live="polite" aria-relevant="additions">
           {loading && <div className="t-meta">connecting to session…</div>}
           {!loading && items.length === 0 && (
             <div className="t-meta">{isChat ? 'Empty session. Say hello — or type /factory help.' : isAdvisor ? 'No messages yet.' : 'Waiting for the agent to start…'}</div>

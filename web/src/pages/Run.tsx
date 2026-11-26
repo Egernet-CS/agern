@@ -1,17 +1,21 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, ApiError, isRunActive, isRunWorking, type AgentSession, type GeneratedImage, type Run, type Screenshot, type StageRole } from '../api';
+import { api, ApiError, BLOCKING_CHECK_STATES, isRunActive, isRunWorking, isSyncRun, runRef, type AgentSession, type GeneratedImage, type Run, type RunCheckItem, type RunUpdate, type Screenshot, type StageRole } from '../api';
 import { ChatView } from '../components/chat/ChatView';
 import { RunSandboxLine } from '../components/sandbox/SandboxBits';
+import { RunSandboxVmLine } from '../components/sandboxvm/SandboxVmBits';
+import { SandboxVmPreviewPanel } from '../components/sandboxvm/SandboxVmPreview';
 import { Markdown } from '../components/chat/Markdown';
-import { approverEscalation, buildNodes, humanSelectable, isFollowUp, latestStage, REVIEWERS, ROLE_BLURB, roundName, rounds, stagesFor, type NodeId } from '../components/pipeline/model';
+import { approverEscalation, buildNodes, humanSelectable, isFollowUp, latestStage, REVIEWERS, ROLE_BLURB, roundName, rounds, stagesFor, updateOf, type NodeId } from '../components/pipeline/model';
 import { Prompt } from '../components/chat/Prompt';
 import { PipelineDiagram } from '../components/pipeline/PipelineDiagram';
 import { RetryDialog } from '../components/ui/RetryDialog';
+import { MERGE_POLICY_LABEL } from '../components/ui/mergePolicy';
+import { GIVE_UP_RUN_TEXT, GiveUpDialog, NetworkWaitBanner } from '../components/ui/NetworkWait';
 import { Dialog, Empty, ErrorBox, KindBadge, Loading, RunStatusPill, Verdict } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
-import { between, bytes, cost, modelLabel, shortId, timeAgo } from '../lib/format';
+import { between, bytes, cost, dateTime, modelLabel, shortId, timeAgo } from '../lib/format';
 import { useLiveRun, useLiveSessions } from '../lib/realtime';
 import { useNow } from '../lib/useNow';
 
@@ -34,9 +38,11 @@ export function RunPage() {
   const run = useLiveRun(runQ.data);
   const sessions = useLiveSessions(sessQ.data, (s) => s.runId === runId);
   const sessionMap = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions]);
-  const [busy, setBusy] = useState<'approve' | 'cancel' | null>(null);
+  const [busy, setBusy] = useState<'approve' | 'update' | 'cancel' | 'retry-now' | 'give-up' | 'merge-anyway' | null>(null);
+  const [confirmGiveUp, setConfirmGiveUp] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [confirmApprove, setConfirmApprove] = useState(false);
+  const [confirmMergeAnyway, setConfirmMergeAnyway] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const navigate = useNavigate();
   const [err, setErr] = useState<string | null>(null);
@@ -44,7 +50,7 @@ export function RunPage() {
   const now = useNow(1000, run ? isRunWorking(run) : false);
 
   useEffect(() => {
-    if (run) document.title = `#${run.issueNumber} ${run.issueTitle} · ${repo} · Agern`;
+    if (run) document.title = `${isSyncRun(run) ? '' : `#${run.issueNumber} `}${run.issueTitle} · ${repo} · Agern`;
   }, [run, repo]);
 
   // Sessions created after first load: refetch when the run references one we don't know.
@@ -83,6 +89,14 @@ export function RunPage() {
     setParams(params, { replace: true });
   };
   const isOwner = run.owner.username === me.username;
+  // The merge policy stored on the run when it started (ARCHITECTURE §6 "Merge policy"); `github` runs are never merged by Agern.
+  const policy = run.mergePolicy ?? 'automatic';
+  const onGitHub = policy === 'github';
+  const prLink = run.prUrl ? (
+    <a href={run.prUrl} target="_blank" rel="noreferrer">{run.targetRepo ? `${run.targetRepo}#${run.prNumber}` : `pull request #${run.prNumber}`} ↗</a>
+  ) : (
+    'the pull request'
+  );
   // The approver escalated: merging overrides it, so the owner confirms with its reason in front of them.
   const escalation = approverEscalation(run);
   const advisor = run.conversation.sessionId ? sessionMap.get(run.conversation.sessionId) : undefined;
@@ -96,11 +110,42 @@ export function RunPage() {
           ? 'The agent is still working.'
           : null;
 
-  const act = async (kind: 'approve' | 'cancel') => {
+  // "Update and merge": not while the advisor works or a follow-up review runs (unreviewed changes do not block it).
+  const updateBlocked =
+    run.conversation.review === 'running' ? 'Changes from the conversation are being reviewed.' : advisorWorking ? 'The agent is still working.' : null;
+  const startUpdate = async () => {
+    setBusy('update');
+    setErr(null);
+    try {
+      if (run.releaseId) {
+        await api.retryReleaseIssue(run.releaseId, run.issueNumber, 'update');
+        runQ.reload();
+      } else {
+        const r = await api.retryRun(run.id, 'update');
+        runQ.setData(() => r);
+      }
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  };
+  const currentUpdate = updateOf(run.round, run);
+
+  // Checks before the merge (docs/ARCHITECTURE.md §6 "Checks before a merge"): the owner may merge anyway while they block it.
+  const checks = run.checks ?? null;
+  const checksBlock = checks !== null && BLOCKING_CHECK_STATES.includes(checks.state);
+  const canMergeAnyway =
+    isOwner && run.prNumber !== null && checksBlock && (run.status === 'waiting_for_checks' || run.status === 'needs_human');
+
+  const act = async (kind: 'approve' | 'cancel' | 'retry-now' | 'give-up' | 'merge-anyway') => {
     setBusy(kind);
     setErr(null);
     try {
-      const r = kind === 'approve' ? await api.approveRun(run.id) : await api.cancelRun(run.id);
+      const r =
+        kind === 'merge-anyway'
+          ? await api.mergeAnywayRun(run.id, checks?.sha ?? '')
+          : await { approve: api.approveRun, cancel: api.cancelRun, 'retry-now': api.retryRunNow, 'give-up': api.giveUpRun }[kind](run.id);
       runQ.setData(() => r);
     } catch (e) {
       setErr((e as Error).message);
@@ -108,8 +153,16 @@ export function RunPage() {
       setBusy(null);
       setConfirmCancel(false);
       setConfirmApprove(false);
+      setConfirmMergeAnyway(false);
+      setConfirmGiveUp(false);
     }
   };
+  const mergeAnywayButton = canMergeAnyway && (
+    <button className="btn btn--ghost" onClick={() => setConfirmMergeAnyway(true)} disabled={busy !== null} aria-haspopup="dialog">
+      Merge anyway…
+    </button>
+  );
+  const waiting = active && run.status !== 'needs_human' ? run.waiting ?? null : null;
 
   return (
     <div className="page page--wide runpage">
@@ -120,14 +173,15 @@ export function RunPage() {
         </div>
         <div className="rh-title">
           <h1>
-            <span className="rh-num">#{run.issueNumber}</span> {run.issueTitle}
+            <span className="rh-num">{runRef(run)}</span> {run.issueTitle}
           </h1>
-          <KindBadge kind={run.issueKind} />
-          <RunStatusPill status={run.status} />
+          {!isSyncRun(run) && <KindBadge kind={run.issueKind} />}
+          <RunStatusPill status={run.status} kind={run.kind} />
+          {waiting && <span className="rh-waiting small">waiting for network</span>}
         </div>
         <dl className="rh-meta">
           <div><dt>owner</dt><dd>{run.owner.displayName || run.owner.username}{isOwner ? ' (you)' : ''}</dd></div>
-          <div><dt>round</dt><dd>{run.round === 0 ? 'build' : isFollowUp(run.round, run) ? roundName(run.round, run) : <>fix round {run.round} <span className="muted">of {run.maxRounds}</span></>}{run.round === 0 && <span className="muted"> · up to {run.maxRounds} fix rounds</span>}</dd></div>
+          <div><dt>round</dt><dd>{currentUpdate ? <>update round {currentUpdate.number} <span className="muted">of {currentUpdate.maxRounds}</span></> : run.round === 0 ? 'build' : isFollowUp(run.round, run) ? roundName(run.round, run) : <>fix round {run.round} <span className="muted">of {run.maxRounds}</span></>}{run.round === 0 && <span className="muted"> · up to {run.maxRounds} fix rounds</span>}</dd></div>
           {run.targetRepo && (
             <>
               <div><dt>repository</dt><dd><Link to={`/p/${run.targetRepo}`}>{run.targetRepo}</Link></dd></div>
@@ -135,6 +189,9 @@ export function RunPage() {
             </>
           )}
           <div><dt>branch</dt><dd className="mono">{run.branch ?? '—'}</dd></div>
+          {!run.releaseId && policy !== 'automatic' && (
+            <div><dt>merge policy</dt><dd>{MERGE_POLICY_LABEL[policy]}</dd></div>
+          )}
           {run.baseBranch && (
             <div>
               <dt>base</dt>
@@ -154,18 +211,36 @@ export function RunPage() {
           <div><dt>started</dt><dd>{timeAgo(run.createdAt, now)}</dd></div>
         </dl>
         <RunSandboxLine run={run} />
+        <RunSandboxVmLine run={run} />
+        {run.status === 'merged' && checks?.overriddenBy && (
+          <p className="muted small run-override">Merged by {checks.overriddenBy} despite checks: {checks.detail}</p>
+        )}
         <div className="rh-actions">
           {run.status === 'needs_human' && isOwner && (
             <>
-              <button
-                className="btn btn--approve"
-                onClick={() => (escalation !== null ? setConfirmApprove(true) : void act('approve'))}
-                disabled={busy !== null || approveHint !== null}
-                aria-describedby={approveHint ? 'approve-hint' : undefined}
-                aria-haspopup={escalation !== null ? 'dialog' : undefined}
-              >
-                {busy === 'approve' ? 'Approving…' : '✓ Approve & merge'}
-              </button>
+              {run.updateAvailable && (
+                <>
+                  <button
+                    className="btn btn--primary"
+                    onClick={() => void startUpdate()}
+                    disabled={busy !== null || updateBlocked !== null}
+                    aria-describedby={updateBlocked ? 'update-hint update-blocked' : 'update-hint'}
+                  >
+                    {busy === 'update' ? 'Updating…' : 'Update and merge'}
+                  </button>
+                </>
+              )}
+              {!onGitHub && (
+                <button
+                  className="btn btn--approve"
+                  onClick={() => (escalation !== null ? setConfirmApprove(true) : void act('approve'))}
+                  disabled={busy !== null || approveHint !== null}
+                  aria-describedby={approveHint ? 'approve-hint' : undefined}
+                  aria-haspopup={escalation !== null ? 'dialog' : undefined}
+                >
+                  {busy === 'approve' ? 'Approving…' : '✓ Approve & merge'}
+                </button>
+              )}
               <button
                 className="btn btn--ghost"
                 onClick={() => {
@@ -175,24 +250,72 @@ export function RunPage() {
               >
                 Talk to the agent
               </button>
-              {approveHint && <span id="approve-hint" className="muted small">{approveHint}</span>}
+              {!onGitHub && mergeAnywayButton}
+              {approveHint && !onGitHub && <span id="approve-hint" className="muted small">{approveHint}</span>}
             </>
           )}
-          {run.status === 'needs_human' && !isOwner && <span className="muted small">Waiting for {run.owner.username} to approve.</span>}
-          {(run.status === 'failed' || run.status === 'cancelled') && isOwner && (
+          {run.status === 'needs_human' && !isOwner && !onGitHub && <span className="muted small">Waiting for {run.owner.username} to approve.</span>}
+          {run.status === 'waiting_for_checks' && (isOwner ? mergeAnywayButton : <span className="muted small">Waiting for checks; it merges by itself.</span>)}
+          {(run.status === 'failed' || run.status === 'cancelled') && isOwner && !isSyncRun(run) && (
             <button className="btn btn--primary" onClick={() => setRetrying(true)} disabled={busy !== null}>Retry…</button>
           )}
           {active && (isOwner || me.isAdmin) && (
             <button className="btn btn--ghost btn--danger" onClick={() => setConfirmCancel(true)} disabled={busy !== null}>Cancel run</button>
           )}
         </div>
+        {run.status === 'needs_human' && isOwner && run.updateAvailable && (
+          <p className="rh-update-hint muted small">
+            <span id="update-hint">
+              Recommended: merges {run.baseBranch ? <code>{run.baseBranch}</code> : 'the default branch'} into the branch, the builder resolves the
+              conflict, then review and merge (update round {(run.updateRounds ?? 0) + 1} of {run.maxUpdateRounds}).
+            </span>
+            {updateBlocked && <span id="update-blocked"> {updateBlocked}</span>}
+          </p>
+        )}
       </header>
+      {waiting && (
+        <NetworkWaitBanner
+          wait={waiting}
+          now={now}
+          retrying={busy === 'retry-now'}
+          disabled={busy !== null}
+          onRetry={isOwner || me.isAdmin ? () => void act('retry-now') : undefined}
+          onGiveUp={isOwner || me.isAdmin ? () => setConfirmGiveUp(true) : undefined}
+        />
+      )}
       {run.error && (
         <div className="run-error" role="alert">
           <Markdown text={`**${run.status === 'needs_human' ? 'Needs a human:' : 'Error:'}** ${run.error}`} />
         </div>
       )}
+      {run.status === 'needs_human' && policy === 'owner_approves' && (
+        <div className="notice run-policy" role="note">
+          <div className="notice-text">This project requires the run owner’s approval before every merge.</div>
+        </div>
+      )}
+      {run.status === 'needs_human' && onGitHub && (
+        <div className="notice run-policy" role="note">
+          <div className="notice-text">
+            This project merges on GitHub: Agern does not merge this run. The pull request can be reviewed and merged there.
+          </div>
+        </div>
+      )}
+      {run.status === 'ready' && (
+        <div className="notice run-policy" role="status">
+          <div className="notice-text">
+            <strong>Ready for review on GitHub.</strong>
+            This project merges on GitHub: Agern does not merge. Review and merge {prLink}; this page updates when it is merged or closed.
+          </div>
+        </div>
+      )}
+      {run.status === 'merged' && run.mergedOnGitHub && (
+        <div className="notice run-policy" role="note">
+          <div className="notice-text">{run.mergedBy ? `Merged on GitHub by @${run.mergedBy}` : 'Merged on GitHub'}</div>
+        </div>
+      )}
       {err && <p className="form-error" role="alert">{err}</p>}
+      <SandboxVmPreviewPanel run={run} canAct={isOwner || me.isAdmin} onRun={(r) => runQ.setData(() => r)} />
+      {run.status === 'waiting_for_checks' && checks && <WaitingForChecks checks={checks} />}
       {(run.warnings ?? []).map((w) => {
         // "<title>: <detail>" — the title in bold, the detail as a sentence.
         const cut = w.text.indexOf(':');
@@ -219,6 +342,8 @@ export function RunPage() {
 
       <PipelineDiagram run={run} nodes={nodes} selected={selected} onSelect={select} />
 
+      <UpdatesSection run={run} onShowBuilder={(round) => { params.set('stage', 'builder'); params.set('round', String(round)); setParams(params, { replace: true }); }} />
+
       <RoundsStrip run={run} onPick={(role, round) => { params.set('stage', role); params.set('round', String(round)); setParams(params, { replace: true }); }} />
 
       {selected === 'human' ? (
@@ -244,6 +369,14 @@ export function RunPage() {
         }}
       />
 
+      <GiveUpDialog
+        open={confirmGiveUp && waiting !== null}
+        text={GIVE_UP_RUN_TEXT}
+        busy={busy === 'give-up'}
+        onClose={() => setConfirmGiveUp(false)}
+        onConfirm={() => void act('give-up')}
+      />
+
       <Dialog open={confirmApprove && escalation !== null} onClose={() => setConfirmApprove(false)} title="Merge against the approver's advice?">
         <p>The approver did not approve this change and asked for a human:</p>
         <div className="notice notice--warn escalation-reason" role="note" aria-label="The approver's reason">
@@ -259,6 +392,41 @@ export function RunPage() {
         </div>
       </Dialog>
 
+      <Dialog open={confirmMergeAnyway && canMergeAnyway} onClose={() => setConfirmMergeAnyway(false)} title="Merge without passing checks?">
+        <div className="notice notice--warn escalation-reason" role="note" aria-label="Checks that have not passed">
+          <div className="notice-text">
+            {checks && checks.items.length > 0 ? (
+              <ul className="checks-list">
+                {checks.items.map((c, i) => (
+                  <li key={i}>
+                    <CheckName item={c} /> — {c.state === 'failed' ? `failed (${c.conclusion ?? 'unknown'})` : 'pending'}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              checks?.detail
+            )}
+          </div>
+        </div>
+        {escalation !== null && (
+          <>
+            <p>The approver did not approve this change and asked for a human:</p>
+            <div className="notice notice--warn escalation-reason" role="note" aria-label="The approver's reason">
+              <div className="notice-text"><Markdown text={escalation} /></div>
+            </div>
+          </>
+        )}
+        <p>
+          Merging squash-merges {run.prNumber ? <>pull request #{run.prNumber}</> : 'the pull request'} into{' '}
+          <code>{run.baseBranch ?? 'the default branch'}</code> now, without waiting for these checks. Your decision is recorded on the run and on the
+          pull request.
+        </p>
+        <div className="dialog-actions">
+          <button className="btn btn--ghost" onClick={() => setConfirmMergeAnyway(false)} data-autofocus>Don’t merge</button>
+          <button className="btn btn--approve" onClick={() => void act('merge-anyway')} disabled={busy !== null}>{busy === 'merge-anyway' ? 'Merging…' : 'Merge anyway'}</button>
+        </div>
+      </Dialog>
+
       <Dialog open={confirmCancel} onClose={() => setConfirmCancel(false)} title="Cancel this run?">
         <p>Running agents are stopped. The branch {run.branch && <code>{run.branch}</code>} and any pull request stay on GitHub.</p>
         <div className="dialog-actions">
@@ -266,6 +434,102 @@ export function RunPage() {
           <button className="btn btn--danger" onClick={() => void act('cancel')} disabled={busy !== null}>{busy === 'cancel' ? 'Cancelling…' : 'Cancel run'}</button>
         </div>
       </Dialog>
+    </div>
+  );
+}
+
+const UPDATE_STATUS: Record<RunUpdate['status'], string> = { running: 'running', resolved: 'resolved', failed: 'failed', cancelled: 'cancelled' };
+
+/**
+ * The run's update rounds ("Update and merge"): what was merged in, what conflicted, what the builder changed. Every text
+ * here comes from the repository and is rendered as plain text.
+ */
+function UpdatesSection({ run, onShowBuilder }: { run: Run; onShowBuilder: (round: number) => void }) {
+  const updates = run.updates ?? [];
+  if (updates.length === 0) return null;
+  const commits = (k: number) => `${k} commit${k === 1 ? '' : 's'}`;
+  return (
+    <section className="run-updates" aria-label="Updates">
+      {updates.map((u) => (
+        <article key={u.number} className={`run-update run-update--${u.status}`} aria-labelledby={`update-${u.number}`}>
+          <h2 id={`update-${u.number}`} className="run-update-h">
+            Update round {u.number} of {u.maxRounds}
+            {u.trigger === 'release' && <span className="muted"> · automatic</span>}
+            <span className={`run-update-status run-update-status--${u.status}`}> · {UPDATE_STATUS[u.status]}</span>
+          </h2>
+          <p className="small">
+            {u.mergeStatus === 'up_to_date' ? (
+              <>Already up to date with <code>{u.target}</code></>
+            ) : u.mergeStatus === 'conflict' ? (
+              <>Merge of <code>{u.target}</code> stopped with conflicts ({commits(u.incomingCount)})</>
+            ) : u.mergeStatus === 'merged' ? (
+              <>Merged <code>{u.target}</code> ({commits(u.incomingCount)})</>
+            ) : (
+              <>Merging <code>{u.target}</code>…</>
+            )}
+          </p>
+          {u.incoming.length > 0 && (
+            <details className="small">
+              <summary>{commits(u.incomingCount)} merged in</summary>
+              <ul className="run-update-list">{u.incoming.map((c, i) => <li key={i}>{c}</li>)}</ul>
+            </details>
+          )}
+          {u.conflicts.length > 0 && (
+            <div className="small">
+              Conflicted files:
+              <ul className="run-update-list mono">{u.conflicts.map((c, i) => <li key={i}>{c}</li>)}</ul>
+            </div>
+          )}
+          {u.migrations.length > 0 && (
+            <div className="small">
+              Migration problems:
+              <ul className="run-update-list">{u.migrations.map((c, i) => <li key={i}>{c}</li>)}</ul>
+            </div>
+          )}
+          {u.commits.length > 0 && (
+            <div className="small">
+              The builder added:
+              <ul className="run-update-list mono">{u.commits.map((c, i) => <li key={i}>{c}</li>)}</ul>
+            </div>
+          )}
+          {u.status === 'failed' && u.error && (
+            <div className="notice notice--warn" role="note"><div className="notice-text">{u.error}</div></div>
+          )}
+          {run.stages.some((st) => st.role === 'builder' && st.round === u.round) && (
+            <button type="button" className="btn btn--sm btn--ghost" onClick={() => onShowBuilder(u.round)}>Show the builder's work</button>
+          )}
+        </article>
+      ))}
+    </section>
+  );
+}
+
+/** A check's name: a link (new tab) when GitHub gave an https URL. Name and URL are untrusted and rendered as text. */
+function CheckName({ item }: { item: RunCheckItem }) {
+  return item.url?.startsWith('https://') ? (
+    <a href={item.url} target="_blank" rel="noopener noreferrer">{item.name}</a>
+  ) : (
+    <span>{item.name}</span>
+  );
+}
+
+/** While the run waits for the checks on its pull request's head commit: what it waits for and until when. */
+function WaitingForChecks({ checks }: { checks: NonNullable<Run['checks']> }) {
+  const pending = checks.items.filter((c) => c.state === 'pending');
+  const detail = checks.detail.replace(/[.\s]+$/, '');
+  return (
+    <div className="notice run-checks" role="status">
+      <div className="notice-text">
+        Waiting for checks on <code>{checks.sha.slice(0, 7)}</code>. {detail}. The pull request is merged automatically when they pass
+        {checks.deadline ? <>; Agern stops waiting at {dateTime(checks.deadline)}.</> : '.'}
+        {pending.length > 0 && (
+          <ul className="checks-list">
+            {pending.map((c, i) => (
+              <li key={i}><CheckName item={c} /></li>
+            ))}
+          </ul>
+        )}
+      </div>
     </div>
   );
 }
@@ -404,6 +668,42 @@ function FirstMessage({ run }: { run: Run }) {
   );
 }
 
+/** A sync run has no issue: its first node shows the release it brings up to date. */
+function SyncReleaseDetail({ run }: { run: Run }) {
+  const release = useAsync(() => (run.releaseId ? api.release(run.releaseId) : Promise.resolve(null)), [run.releaseId]);
+  const r = release.data;
+  return (
+    <div className="stage-detail stage-detail--issue">
+      <div className="sd-info">
+        <p className="eyebrow">release</p>
+        <h2>{run.issueTitle}</h2>
+        <p className="muted small">
+          {r ? <>Release {r.name} · </> : null}
+          <span className="mono">
+            {run.baseBranch ?? 'the release branch'} → {r?.targetBranch ?? 'the default branch'}
+          </span>
+          {run.releaseId && (
+            <>
+              {' '}· <Link to={`/p/${run.repo}/releases/${run.releaseId}`}>Open the release</Link>
+            </>
+          )}
+        </p>
+        {run.syncPushedSha && (
+          <p className="muted small">
+            pushed <code title={run.syncPushedSha}>{run.syncPushedSha.slice(0, 7)}</code> to {run.baseBranch}
+          </p>
+        )}
+      </div>
+      <div className="sd-body card">
+        <p>
+          The default branch is merged into the release branch with a merge commit; nothing is merged into the default branch. The builder resolves
+          the conflicts and renumbers the release’s own migrations; the reviewers then look at the conflict resolution.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function IssueDetail({ run }: { run: Run }) {
   const issue = useAsync(() => api.issue(run.repo, run.issueNumber), [run.repo, run.issueNumber]);
   return (
@@ -427,7 +727,7 @@ function IssueDetail({ run }: { run: Run }) {
 
 function StageDetail({ run, node, round, sessions, onRound }: { run: Run; node: NodeId; round: string | null; sessions: Map<string, AgentSession>; onRound: (r: number) => void }) {
   const now = useNow(1000);
-  if (node === 'issue') return <IssueDetail run={run} />;
+  if (node === 'issue') return isSyncRun(run) ? <SyncReleaseDetail run={run} /> : <IssueDetail run={run} />;
   if (!ROLE_ORDER.includes(node as StageRole)) return null;
   const role = node as StageRole;
   const all = stagesFor(run, role);
@@ -460,9 +760,11 @@ function StageDetail({ run, node, round, sessions, onRound }: { run: Run; node: 
               <div><dt>cost</dt><dd>{cost(session?.costUsd)}</dd></div>
               <div><dt>turns</dt><dd>{session?.numTurns ?? '—'}</dd></div>
             </dl>
-            {role === 'builder' && stage.round > 0 && (
+            {role === 'builder' && stage.round > 0 && (updateOf(stage.round, run) ? (
+              <p className="muted small">Continues the builder conversation (a new agent session resumed with <code>--resume</code>), given the merge of <code>{updateOf(stage.round, run)!.target}</code> and what conflicted.</p>
+            ) : (
               <p className="muted small">Continues the builder conversation of {roundName(stage.round - 1, run)} (a new agent session resumed with <code>--resume</code>), given all reviewer findings.</p>
-            )}
+            ))}
             {stage.warning && <p className="sd-warning" role="note">⚠ {stage.warning}</p>}
             {stage.summary && <div className="sd-summary"><Markdown text={stage.summary} /></div>}
             {stage.findings.length > 0 && (

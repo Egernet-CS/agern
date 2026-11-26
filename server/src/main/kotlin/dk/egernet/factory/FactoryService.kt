@@ -37,6 +37,8 @@ class FactoryService(
     private val icons: dk.egernet.factory.db.ProjectIconStore,
     private val workspaces: dk.egernet.factory.workspace.WorkspaceService,
     private val memberLabels: dk.egernet.factory.workspace.MemberLabels? = null,
+    /** The projects' settings (docs/ARCHITECTURE.md §6 "Merge policy"); null = defaults for every project. */
+    private val projectSettings: dk.egernet.factory.db.ProjectSettingsStore? = null,
 ) {
     private val org get() = cfg.githubOrg
 
@@ -50,8 +52,21 @@ class FactoryService(
                 422 -> throw unprocessable(e.message ?: "GitHub rejected the request")
                 else -> throw ApiException(io.ktor.http.HttpStatusCode.BadGateway, "github_error", e.message ?: "GitHub error")
             }
+        } catch (e: java.nio.file.FileSystemException) {
+            throw e
+        } catch (e: java.io.FileNotFoundException) {
+            throw e
+        } catch (e: java.io.IOException) {
+            throw githubUnreachable(e)
+        } catch (e: java.nio.channels.UnresolvedAddressException) {
+            throw githubUnreachable(e)
         }
     }
+
+    /** A network error or timeout talking to GitHub: 502 `github_unreachable`, keeping [e] as the cause (still transient). */
+    private fun githubUnreachable(e: Throwable) =
+        ApiException(io.ktor.http.HttpStatusCode.BadGateway, "github_unreachable", dk.egernet.factory.github.GitHubFailure.unreachable(e, org))
+            .apply { initCause(e) }
 
     /** [workspace]: the project's workspace definition, for [IssueDto.workspaceMembers]. */
     fun issueDto(
@@ -75,12 +90,15 @@ class FactoryService(
     private suspend fun workspaceOf(user: UserRecord, repo: String): WorkspaceState? =
         withContext(Dispatchers.IO) { workspaces.lookup(user, repo) }
 
-    /** [iconSha256]: the SHA-256 of the project's icon, or null without one. */
-    fun projectDto(r: GhRepo, agentCounts: Map<String, Int>, runCounts: Map<String, Int>, iconSha256: String?) = ProjectDto(
+    /** [iconSha256]: the SHA-256 of the project's icon, or null without one; [settings]: its settings (defaults without a row). */
+    fun projectDto(
+        r: GhRepo, agentCounts: Map<String, Int>, runCounts: Map<String, Int>, iconSha256: String?,
+        settings: ProjectSettingsDto = ProjectSettingsDto(),
+    ) = ProjectDto(
         name = r.name, fullName = r.fullName, description = r.description, private = r.private, defaultBranch = r.defaultBranch,
         language = r.language, openIssues = r.openIssuesCount, pushedAt = r.pushedAt, htmlUrl = r.htmlUrl,
         activeAgents = agentCounts[r.name] ?: 0, activeRuns = runCounts[r.name] ?: 0,
-        iconUrl = iconSha256?.let { ProjectIcons.url(r.name, it) },
+        iconUrl = iconSha256?.let { ProjectIcons.url(r.name, it) }, settings = settings,
     )
 
     suspend fun listProjects(user: UserRecord): List<ProjectDto> {
@@ -90,7 +108,10 @@ class FactoryService(
         val agentsByRepo = agents.liveCountByRepo()
         val runsByRepo = runs.countActiveByRepo()
         val iconVersions = withContext(Dispatchers.IO) { icons.versions() }
-        return repos.sortedByDescending { it.pushedAt ?: "" }.map { projectDto(it, agentsByRepo, runsByRepo, iconVersions[it.name]) }
+        val settings = withContext(Dispatchers.IO) { projectSettings?.all().orEmpty() }
+        return repos.sortedByDescending { it.pushedAt ?: "" }.map {
+            projectDto(it, agentsByRepo, runsByRepo, iconVersions[it.name], settings[it.name] ?: ProjectSettingsDto())
+        }
     }
 
     suspend fun getProject(user: UserRecord, repo: String): ProjectDto {
@@ -137,7 +158,21 @@ class FactoryService(
 
     private suspend fun projectWithIcon(r: GhRepo): ProjectDto {
         val sha = withContext(Dispatchers.IO) { icons.meta(r.name)?.sha256 }
-        return projectDto(r, agents.liveCountByRepo(), runs.countActiveByRepo(), sha)
+        val settings = withContext(Dispatchers.IO) { projectSettings?.get(r.name) } ?: ProjectSettingsDto()
+        return projectDto(r, agents.liveCountByRepo(), runs.countActiveByRepo(), sha, settings)
+    }
+
+    /**
+     * `PUT /api/projects/{repo}/settings` (docs/ARCHITECTURE.md §6 "Merge policy"). The caller has checked that [user] is
+     * an admin; 404 when [repo] is not visible to them, 400 for an unknown policy or a bad reviewer entry. Applies to
+     * runs started from now on; a run keeps the policy it started with.
+     */
+    suspend fun setProjectSettings(user: UserRecord, repo: String, req: ProjectSettingsReq): ProjectDto {
+        val r = withContext(Dispatchers.IO) { access.requireVisible(user, repo) }
+        val store = projectSettings ?: throw dk.egernet.factory.conflict("Project settings are not available")
+        val valid = validSettings(req)
+        withContext(Dispatchers.IO) { store.put(r.name, valid, user.id) }
+        return projectWithIcon(r)
     }
 
     /**
@@ -264,6 +299,15 @@ class FactoryService(
         return runs.toDto(orchestrator.approve(user, runId))
     }
 
+    /**
+     * "Merge anyway" (docs/ARCHITECTURE.md §6 "Checks before a merge"): the owner merges although the checks on
+     * [headSha] have not passed. Web only: there is deliberately no MCP tool, MCP argument or chat command for it.
+     */
+    suspend fun mergeAnywayRun(user: UserRecord, runId: UUID, headSha: String): RunDto {
+        visibleRun(user, runId)
+        return runs.toDto(orchestrator.mergeAnyway(user, runId, headSha))
+    }
+
     /** The owner's message for the agent of a run that needs a human (docs/ARCHITECTURE.md §6 "Conversation at needs human"). */
     suspend fun talkToRun(user: UserRecord, runId: UUID, text: String): TalkAcceptedDto {
         visibleRun(user, runId)
@@ -279,6 +323,18 @@ class FactoryService(
     suspend fun cancelRun(user: UserRecord, runId: UUID): RunDto {
         visibleRun(user, runId)
         return runs.toDto(orchestrator.cancel(user, runId))
+    }
+
+    /** "Retry now" for a run waiting for the network (docs/ARCHITECTURE.md §6 "Transient failures"); owner or admin. */
+    suspend fun retryRunNow(user: UserRecord, runId: UUID): RunDto {
+        visibleRun(user, runId)
+        return runs.toDto(orchestrator.retryNow(user, runId))
+    }
+
+    /** "Give up" for a run waiting for the network: it fails now; owner or admin. Returns it once it has failed. */
+    suspend fun giveUpRun(user: UserRecord, runId: UUID): RunDto {
+        visibleRun(user, runId)
+        return runs.toDto(orchestrator.giveUp(user, runId))
     }
 
     /** How a run can be retried (docs/ARCHITECTURE.md §6 "Retrying a run"); anyone who can see it may ask. */
@@ -360,13 +416,17 @@ class FactoryService(
             "status" -> {
                 val list = runs.list(repo, activeOnly = false, limit = 10)
                 if (list.isEmpty()) "No runs in $repo yet." else list.joinToString("\n", "Runs in $repo (newest first):\n") {
-                    "• ${it.id}  #${it.issueNumber} ${it.issueTitle} — ${it.status}" +
+                    "• ${it.id}  ${if (it.isSync) "sync" else "#${it.issueNumber}"} ${it.issueTitle} — ${it.status}" +
                         (if (it.round > 0) " (fix round ${it.round}/${it.maxRounds})" else "") +
                         (it.prUrl?.let { u -> " $u" } ?: "") + (it.error?.let { e -> "\n    $e" } ?: "")
                 }
             }
             "approve" -> {
-                val id = parts.getOrNull(1)?.let { parseUuid(it) } ?: run {
+                val args = parts.drop(1)
+                val update = args.any { it.equals("update", ignoreCase = true) }
+                val rest = args.filterNot { it.equals("update", ignoreCase = true) }
+                if (rest.size > 1) return "Usage: /factory approve [runId] [update]"
+                val id = rest.firstOrNull()?.let { parseUuid(it) } ?: run {
                     val candidates = runs.list(repo, activeOnly = true).filter { it.status == RunStatus.NEEDS_HUMAN && it.ownerId == owner.id }
                     when (candidates.size) {
                         0 -> return "None of your runs in $repo is waiting for approval."
@@ -375,8 +435,9 @@ class FactoryService(
                             candidates.joinToString("\n") { "• ${it.id}  #${it.issueNumber} ${it.issueTitle}" }
                     }
                 }
+                if (update) return retryCommand(owner, repo, listOf(id.toString(), "update"))
                 val r = approveRun(owner, id)
-                "Run ${r.id}: ${r.status}" + (r.error?.let { " — $it" } ?: "")
+                approvedRunReply(r) + updateHint(r)
             }
             "cancel" -> {
                 val id = parts.getOrNull(1)?.let { parseUuid(it) } ?: return "Usage: /factory cancel <runId>"
@@ -393,7 +454,7 @@ class FactoryService(
     /** `/factory release create|add|remove …` (docs/ARCHITECTURE.md §7). */
     private suspend fun releaseCommand(owner: UserRecord, repo: String, args: List<String>): String {
         val usage = "Usage: /factory release create <name> [description] | add <name> <issue>… | remove <issue>… | " +
-            "approve <name> | mode <name> manual|automatic"
+            "approve <name> | sync <name> | mode <name> manual|automatic"
         return when (args.firstOrNull()?.lowercase()) {
             "mode" -> {
                 val modeUsage = "Usage: /factory release mode <name> manual|automatic"
@@ -404,6 +465,10 @@ class FactoryService(
             "approve" -> {
                 val name = args.getOrNull(1) ?: return "Usage: /factory release approve <name>"
                 approvedReply(releases.approve(owner, releases.find(owner, repo, name).id))
+            }
+            "sync" -> {
+                val name = args.getOrNull(1)?.takeIf { args.size == 2 } ?: return "Usage: /factory release sync <name>"
+                syncReply(releases.sync(owner, releases.find(owner, repo, name).id))
             }
             "create" -> {
                 val name = args.getOrNull(1) ?: return "Usage: /factory release create <name> [description]"
@@ -432,12 +497,14 @@ class FactoryService(
      * run is retried through its release (its issue must be held or skipped).
      */
     private suspend fun retryCommand(owner: UserRecord, repo: String, args: List<String>): String {
-        val usage = "Usage: /factory retry <runId> [step|continue|over|recommended]"
+        val usage = "Usage: /factory retry <runId> [update|step|continue|over|recommended]"
         val id = args.firstOrNull()?.let { parseUuid(it) } ?: return usage
         val run = visibleRun(owner, id)
         if (run.repo != repo) throw notFound("Run not found in this project")
+        if (run.isSync) throw dk.egernet.factory.pipeline.Orchestrator.syncNotRetried()
         val mode = when (args.getOrNull(1)?.lowercase()) {
             null -> null
+            "update" -> RetryMode.UPDATE
             "step" -> RetryMode.STEP
             "continue" -> RetryMode.CONTINUE
             "over", "start-over", "start_over" -> RetryMode.START_OVER
@@ -455,15 +522,35 @@ class FactoryService(
         }
         if (run.releaseId != null) {
             val r = releases.retry(owner, run.releaseId, run.issueNumber, mode)
+            val waiting = r.issues.firstOrNull { it.number == run.issueNumber }
+            if (waiting?.retryMode == RetryMode.UPDATE) return "Release \"${r.name}\": #${run.issueNumber} is waiting to be updated and merged."
             return "Release \"${r.name}\": #${run.issueNumber} is waiting to be built again (${modeWord(mode)})."
         }
         val r = retryRun(owner, id, mode)
+        val u = r.updates.lastOrNull()
+        if (r.id == run.id.toString() && run.status == RunStatus.NEEDS_HUMAN && u != null) {
+            return "Run ${r.id}: updating with ${u.target} and merging (update round ${u.number} of ${u.maxRounds})."
+        }
         return if (r.id == run.id.toString()) "Run ${r.id}: retrying the failed step (status ${r.status})."
         else "Started run ${r.id} for #${r.issueNumber}" + (if (r.continuesRunId != null) ", continuing from run ${r.continuesRunId}" else ", from scratch") +
             " (status ${r.status})."
     }
 
     private fun modeWord(mode: String) = if (mode == RetryMode.START_OVER) "over" else mode
+
+    /** After a plain approval: the line that offers "Update and merge" when the run can be updated now. */
+    private fun updateHint(r: RunDto): String =
+        if (r.updateAvailable) "\nUpdate and merge is available: /factory approve ${r.id} update" else ""
+
+    /**
+     * `factory_approve_run`: a plain approval (merge as it is, with the hint when an update is possible), or with [update]
+     * "Update and merge" exactly as `/factory approve <runId> update`.
+     */
+    suspend fun approveRunTool(owner: UserRecord, repo: String, runId: UUID, update: Boolean): String {
+        if (update) return retryCommand(owner, repo, listOf(runId.toString(), "update"))
+        val r = approveRun(owner, runId)
+        return approvedRunReply(r) + updateHint(r)
+    }
 
     private fun parseUuid(s: String): UUID = try {
         UUID.fromString(s)
@@ -477,6 +564,15 @@ class FactoryService(
             val nums = tokens.flatMap { it.split(',') }.map { it.trim() }.filter { it.isNotEmpty() }
                 .map { t -> t.removePrefix("#").toIntOrNull()?.takeIf { it > 0 } ?: return null }
             return nums.ifEmpty { null }
+        }
+
+        /** The reply to a run's approval (`/factory approve`, `factory_approve_run`). */
+        fun approvedRunReply(r: RunDto): String {
+            val c = r.checks
+            if (r.status == RunStatus.WAITING_FOR_CHECKS && c != null) {
+                return "Run ${r.id} is waiting for checks on `${c.sha.take(7)}` (${c.detail}); it merges by itself when they pass."
+            }
+            return "Run ${r.id}: ${r.status}" + (r.error?.let { " — $it" } ?: "")
         }
 
         /** The reply to an approval (`/factory release approve`, `factory_approve_release`). */
@@ -498,6 +594,13 @@ class FactoryService(
                 issues + (r.notice?.let { " $it" } ?: "")
         }
 
+        /** The reply to `/factory release sync`. */
+        fun syncReply(s: ReleaseService.SyncStarted): String {
+            val branch = s.release.branch ?: "release/${s.release.name}"
+            return "Bringing release \"${s.release.name}\" up to date with ${s.target}: run ${s.run.id} merges ${s.target} into $branch, " +
+                "resolves conflicts and renumbers migrations. Nothing is merged into ${s.target}."
+        }
+
         /** The reply to `/factory release mode`. */
         fun modeReply(r: dk.egernet.factory.db.ReleaseRecord): String =
             if (r.automatic) "Release \"${r.name}\" is released automatically: once it is ready, complete and merges cleanly, and all " +
@@ -515,18 +618,50 @@ class FactoryService(
             }
         }
 
+        private val LOGIN_RE = Regex("^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+        private val TEAM_RE = Regex("^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
+        const val MAX_REVIEWERS = 15
+
+        /**
+         * The settings of a `PUT /api/projects/{repo}/settings` request, validated and normalised: entries trimmed, one
+         * leading `@` stripped, empty ones dropped, duplicates removed case-insensitively; at most [MAX_REVIEWERS] per
+         * list. They go into GitHub request bodies and Markdown comments, so only the characters GitHub allows pass.
+         */
+        fun validSettings(req: ProjectSettingsReq): ProjectSettingsDto {
+            val policy = req.mergePolicy?.trim()
+            if (policy !in MergePolicy.ALL) throw badRequest("mergePolicy must be one of ${MergePolicy.ALL.joinToString(", ")}")
+            fun list(raw: List<String>?, re: Regex, what: String, field: String): List<String> {
+                val out = mutableListOf<String>()
+                for (entry in raw.orEmpty()) {
+                    val e = entry.trim().removePrefix("@").trim()
+                    if (e.isEmpty()) continue
+                    if (!re.matches(e)) throw badRequest("$field: '${e.take(100)}' is not a valid $what")
+                    if (out.none { it.equals(e, ignoreCase = true) }) out += e
+                }
+                if (out.size > MAX_REVIEWERS) throw badRequest("$field: at most $MAX_REVIEWERS entries")
+                return out
+            }
+            return ProjectSettingsDto(
+                policy!!, list(req.reviewers, LOGIN_RE, "GitHub login", "reviewers"), list(req.teamReviewers, TEAM_RE, "team slug", "teamReviewers"),
+            )
+        }
+
         val HELP = """
             |Factory commands (handled by Agern, not sent to Claude):
             |  /factory run <issue>       start a pipeline run for an issue in this project
             |  /factory status            list recent runs in this project
-            |  /factory approve [runId]   merge a run that waits for a human (owner only)
+            |  /factory approve [runId] [update]   merge a run that waits for a human (owner only; not when the project merges
+            |                             on GitHub); with update: merge the target into its branch, let the builder
+            |                             resolve the conflict, review and merge
             |  /factory cancel <runId>    cancel a run (owner or admin)
-            |  /factory retry <runId> [step|continue|over]   retry a failed run (owner only); without a mode: the options
+            |  /factory retry <runId> [update|step|continue|over]   retry a failed run, or update and merge one (owner only);
+            |                             without a mode: the options
             |  /factory releases          list the releases planned in this project
             |  /factory release create <name> [description]   plan a new release
             |  /factory release add <name> <issue>…            put issues into a release (moves them from another)
             |  /factory release remove <issue>…                take issues out of their release
             |  /factory release approve <name>                 merge a release that is ready to release (owner only)
+            |  /factory release sync <name>                    bring a ready release up to date with the default branch (owner or admin)
             |  /factory release mode <name> manual|automatic   release it on approval (default) or automatically when green
             |  /factory help              this help
             |To steer a running spec-writer or builder, select it on the run page and type below its transcript,

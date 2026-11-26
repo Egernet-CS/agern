@@ -44,29 +44,40 @@ object TestDb {
      */
     const val MAX_OPEN_POOLS = 10
 
-    /** The pools handed out by [fresh], with where each was created (closed ones are dropped on the next [fresh]). */
-    private val pools = CopyOnWriteArrayList<Pair<HikariDataSource, Throwable>>()
+    /** A pool handed out by [fresh]: its database's name and where it was created. */
+    private class Pool(val dataSource: HikariDataSource, val database: String, val createdAt: Throwable)
+
+    /** The pools handed out by [fresh] (closed ones are forgotten, and their databases dropped, on the next [fresh]). */
+    private val pools = CopyOnWriteArrayList<Pool>()
 
     /**
      * A fresh database per call, migrated from [migrations] (the application's own by default). Its pool must be closed
      * when the test ends: [TestWorld.close], [Services.stopAndReleaseDb] or closing [Db.dataSource] directly.
      */
     fun fresh(migrations: String = Db.MIGRATIONS): Db {
-        pools.removeIf { it.first.isClosed }
+        // A test database takes several megabytes in the embedded server's data directory (under the temp dir): drop
+        // the databases nobody uses any more, so the disk use stays bounded by the pools open at once.
+        val closedPools = pools.filter { it.dataSource.isClosed }
+        pools.removeAll(closedPools.toSet())
+        for (p in closedPools) {
+            runCatching {
+                pg.postgresDatabase.connection.use { c -> c.createStatement().use { it.execute("DROP DATABASE IF EXISTS ${p.database} WITH (FORCE)") } }
+            }
+        }
         check(pools.size < MAX_OPEN_POOLS) {
             "$MAX_OPEN_POOLS test database pools are still open; close them when the test ends " +
                 "(TestWorld.close() or Services.stopAndReleaseDb()). Created by: " +
-                pools.joinToString(", ") { creationSite(it.second) }
+                pools.joinToString(", ") { creationSite(it.createdAt) }
         }
         val name = "t${System.nanoTime()}_${counter.incrementAndGet()}"
         pg.postgresDatabase.connection.use { c -> c.createStatement().use { it.execute("CREATE DATABASE $name") } }
         val db = Db.connect(pg.getJdbcUrl("postgres", name), "postgres", "postgres", poolSize = 5, migrations = migrations)
-        pools += (db.dataSource as HikariDataSource) to Throwable("pool created here")
+        pools += Pool(db.dataSource as HikariDataSource, name, Throwable("pool created here"))
         return db
     }
 
     /** The number of pools from [fresh] that are not closed yet. */
-    fun openPools(): Int = pools.count { !it.first.isClosed }
+    fun openPools(): Int = pools.count { !it.dataSource.isClosed }
 
     /** The number of client connections the embedded PostgreSQL has, apart from the one asking. */
     fun clientConnections(): Int = pg.postgresDatabase.connection.use { c ->
@@ -262,6 +273,15 @@ class FakeGitOps : GitOps {
     /** What [head] answers; tests move it to simulate a commit. */
     @Volatile var headSha = "0000000000000000000000000000000000000001"
     override fun head(worktree: Path, home: Path) = headSha
+    /** What [isDirty] answers. */
+    @Volatile var dirty = false
+    override fun isDirty(worktree: Path, home: Path) = dirty
+    /** Every [archiveHead], as `"<sha> <file>"`; the archive's content is `archive of <sha>`. */
+    val archives = CopyOnWriteArrayList<String>()
+    override fun archiveHead(worktree: Path, sha: String, file: Path, home: Path) {
+        archives += "$sha $file"
+        Files.writeString(file, "archive of $sha")
+    }
     /** What [changedFiles] answers (null, the default: it cannot be told, so no UI-change check). */
     @Volatile var changed: List<String>? = null
     override fun changedFiles(worktree: Path, baseRef: String, home: Path): List<String>? = changed
@@ -291,7 +311,7 @@ class FakeGitOps : GitOps {
     ): dk.egernet.factory.git.BranchComparison? {
         comparisons += "$headBranch -> $baseBranch"
         val c = comparison(baseBranch, headBranch) ?: return null
-        return dk.egernet.factory.git.BranchComparison(c.baseFiles.filter { dirOf(it) != null }, c.changes.filter { dirOf(it.path) != null })
+        return dk.egernet.factory.git.BranchComparison(c.baseFiles.filter { dirOf(it) != null }, c.changes.filter { dirOf(it.path) != null }, c.behind)
     }
     /** What [changedGitlinks] answers for (base branch, head branch); a thrown exception is thrown by it. Default: none. */
     @Volatile var gitlinks: (base: String, head: String) -> List<dk.egernet.factory.git.GitlinkChange>? = { _, _ -> emptyList() }
@@ -303,6 +323,65 @@ class FakeGitOps : GitOps {
     /** What [unpushedSubmodules] answers for every checkout. */
     @Volatile var unpushed: List<dk.egernet.factory.git.UnpushedSubmodule> = emptyList()
     override fun unpushedSubmodules(dir: Path, home: Path) = unpushed
+    /**
+     * What [mergeBase] answers for (worktree, base branch); a thrown exception is thrown by it. Default: a clean merge of
+     * one commit, HEAD moving from [headSha] to a merge commit (and [headSha] following it).
+     */
+    @Volatile var baseMerge: (Path, String) -> dk.egernet.factory.git.BaseMerge = { _, _ ->
+        val before = headSha
+        val after = "merge-of-$before".take(40)
+        headSha = after
+        dk.egernet.factory.git.BaseMerge(dk.egernet.factory.git.UPDATE_MERGED, "target-sha-0000000000000000000000000000", before, after, 1,
+            listOf("Merged elsewhere (#99)"), emptyList())
+    }
+    /** Every [mergeBase], as `"<base branch>"`. */
+    val baseMerges = CopyOnWriteArrayList<String>()
+    override fun mergeBase(id: AgentIdentity, worktree: Path, baseBranch: String, home: Path): dk.egernet.factory.git.BaseMerge {
+        baseMerges += baseBranch
+        return baseMerge(worktree, baseBranch)
+    }
+    /** What [mergeState] answers (default: a finished merge at [headSha] that contains the target). */
+    @Volatile var mergeStateAnswer: (Path, String) -> dk.egernet.factory.git.MergeState = { _, _ ->
+        dk.egernet.factory.git.MergeState(false, emptyList(), false, true, headSha)
+    }
+    override fun mergeState(worktree: Path, targetSha: String, home: Path) = mergeStateAnswer(worktree, targetSha)
+    /** Every [restore], as `"<sha>"`; it sets [headSha] back to that commit. */
+    val restores = CopyOnWriteArrayList<String>()
+    override fun restore(worktree: Path, sha: String, home: Path) {
+        restores += sha
+        headSha = sha
+    }
+    /** What [commitSubjects] answers. */
+    @Volatile var subjects: List<String> = listOf("abc1234 Resolve the merge")
+    override fun commitSubjects(worktree: Path, from: String, home: Path, max: Int) = subjects.take(max)
+    /** What [compareWorktree] answers for the base ref (before the [dirOf] filter); default: nothing changed, not behind. */
+    @Volatile var worktreeComparison: (baseRef: String) -> dk.egernet.factory.git.BranchComparison? =
+        { _ -> dk.egernet.factory.git.BranchComparison(emptyList(), emptyList()) }
+    override fun compareWorktree(worktree: Path, baseRef: String, home: Path, dirOf: (String) -> String?): dk.egernet.factory.git.BranchComparison? {
+        val c = worktreeComparison(baseRef) ?: return null
+        return dk.egernet.factory.git.BranchComparison(c.baseFiles.filter { dirOf(it) != null }, c.changes.filter { dirOf(it.path) != null }, c.behind)
+    }
+    /** What [mergeState] answers for (start commit, merged ref); default: [headSha], merged and finished. */
+    @Volatile var merge: (start: String, mergedRef: String) -> dk.egernet.factory.git.MergeCheck =
+        { _, _ -> dk.egernet.factory.git.MergeCheck(headSha, containsStart = true, containsMerged = true, unfinished = false) }
+    /** Every [mergeState], as `"<start> <mergedRef>"`. */
+    val mergeChecks = CopyOnWriteArrayList<String>()
+    override fun mergeState(worktree: Path, startSha: String, mergedRef: String, home: Path): dk.egernet.factory.git.MergeCheck {
+        mergeChecks += "$startSha $mergedRef"
+        return merge(startSha, mergedRef)
+    }
+    /** Every fast-forward push ([pushFastForward]), as `"<branch> <sha>"`; never in [pushes]. */
+    val ffPushes = CopyOnWriteArrayList<String>()
+    /** Runs before every fast-forward push (e.g. to clear a conflict, as GitHub would after the merge). */
+    @Volatile var beforeFastForward: (branch: String) -> Unit = {}
+    /** While set, [pushFastForward] is refused as a non-fast-forward with this output. */
+    @Volatile var rejectFastForward: String? = null
+    override fun pushFastForward(id: AgentIdentity, worktree: Path, branch: String, home: Path) {
+        failPush?.let { throw dk.egernet.factory.git.GitException(it) }
+        rejectFastForward?.let { throw dk.egernet.factory.git.PushRejectedException(it) }
+        beforeFastForward(branch)
+        ffPushes += "$branch $headSha"
+    }
     override fun removeWorktree(mainDir: Path, worktree: Path, home: Path, keepUnpushed: Boolean) {
         if (!deleteWorktrees) return
         worktree.toFile().deleteRecursively()
@@ -319,6 +398,8 @@ fun testConfig(dataDir: Path, twoFactor: Boolean = true, devUsers: Map<String, S
     dataDir = dataDir,
     twoFactorRequired = twoFactor,
     chatIdleMinutes = 30,
+    // Waiting for the network is off in tests, so failures keep their meaning; tests of the wait switch it on.
+    networkRetryMaxMs = 0,
 )
 
 /** A clock whose instant the test sets and advances. */
@@ -355,15 +436,42 @@ class TestWorld(
     val realGitOps: FailingPushGit? = cliGit?.let { FailingPushGit(it) }
     val launcher = FakeLauncher()
     val sandboxRuntime = FakeSandboxRuntime()
+    /** How deploy operations "connect" (unless the tweaked config switches deploys off). */
+    val deployTransport = FakeDeployTransport()
+    /** How sandbox VM operations "connect" (its own instance, as in production). */
+    val vmTransport = FakeDeployTransport()
+    /** Exceptions that escaped a background coroutine of [services]; [close] fails the test when there are any. */
+    val backgroundFailures = CopyOnWriteArrayList<Throwable>()
     val services = Services(
         cfg, TestDb.fresh(), github, gitOps ?: realGitOps ?: git, launcher ?: this.launcher, loginThrottle = loginThrottle, clock = clock,
         releaseStarter = releaseStarter, sandboxRuntime = if (sandbox) sandboxRuntime else null, imageProviders = imageProviders,
+        deployTransport = if (cfg.deploy.enabled) deployTransport else null,
+        sandboxVmTransport = if (cfg.sandboxVm.enabled) vmTransport else null,
+        onBackgroundFailure = { backgroundFailures += it },
     )
+
+    init {
+        // The fake GitHub has no checks: without this, every run would wait out the settle period before it merges.
+        // Tests of the checks before a merge set their own values; release tests set the release merger's period.
+        services.orchestrator.checksSettleSeconds = 0
+        services.orchestrator.checksPollMillis = 50
+    }
 
     /** Puts `.agern/sandbox.yml` on the default branch (GitHub API and git alike); null removes it. */
     fun sandboxFile(content: String?, repo: String = "demo-app") {
         github.setFile(repo, dk.egernet.factory.sandbox.SANDBOX_FILE, content)
         if (content == null) git.files.remove(dk.egernet.factory.sandbox.SANDBOX_FILE) else git.files[dk.egernet.factory.sandbox.SANDBOX_FILE] = content
+    }
+
+    /** Puts `.agern/deploy.yml` on [repo]'s default branch; null removes it. */
+    fun deployFile(content: String?, repo: String = "demo-app") {
+        github.setFile(repo, dk.egernet.factory.deploy.DEPLOY_FILE, content)
+    }
+
+    /** Puts `.agern/sandbox-vm.yml` on [repo]'s default branch (GitHub API and git alike); null removes it. */
+    fun sandboxVmFile(content: String?, repo: String = "demo-app") {
+        github.setFile(repo, dk.egernet.factory.sandboxvm.SANDBOX_VM_FILE, content)
+        if (content == null) git.files.remove(dk.egernet.factory.sandboxvm.SANDBOX_VM_FILE) else git.files[dk.egernet.factory.sandboxvm.SANDBOX_VM_FILE] = content
     }
 
     /** Creates a user with credentials registered, as if they had logged in and filled in Settings. */
@@ -391,9 +499,21 @@ class TestWorld(
      * Stops the services and gives the pool's connections back to PostgreSQL (see [Services.stopAndReleaseDb]); the
      * embedded server allows only so many. Calling it again does nothing. A test that simulates a restart on the same
      * database calls `services.stop()` instead, which leaves the pool open.
+     *
+     * Throws an [AssertionError] afterwards when a background coroutine of the services failed, so the failure is
+     * reported by the test that caused it (not by whichever test happens to run next).
      */
     fun close() {
-        if (closed.compareAndSet(false, true)) services.stopAndReleaseDb()
+        if (closed.compareAndSet(false, true)) {
+            services.stopAndReleaseDb()
+            val failures = backgroundFailures.toList()
+            if (failures.isNotEmpty()) {
+                throw AssertionError(
+                    "A background coroutine of this test's services failed: " + failures.joinToString("; ") { it.toString() },
+                    failures.first(),
+                ).apply { failures.drop(1).forEach { addSuppressed(it) } }
+            }
+        }
     }
 }
 
@@ -406,6 +526,64 @@ class FailingPushGit(private val inner: GitOps) : GitOps by inner {
         pushes += branch
         inner.push(id, worktree, branch, home)
     }
+    override fun pushFastForward(id: AgentIdentity, worktree: Path, branch: String, home: Path) {
+        failPush?.let { throw dk.egernet.factory.git.GitException(it) }
+        inner.pushFastForward(id, worktree, branch, home)
+        pushes += "ff $branch"
+    }
+}
+
+/**
+ * A deploy transport in memory: records every call as `check|exec|copy <target> …` and answers through [onExec],
+ * [onCheck] and [onCopy] (defaults: success).
+ */
+class FakeDeployTransport : dk.egernet.factory.deploy.DeployTransport {
+    val calls = CopyOnWriteArrayList<String>()
+    /** The key fingerprints operations authenticated with, in order. */
+    val identities = CopyOnWriteArrayList<String>()
+    /** What copies sent: target, dest, name, mode and content. */
+    data class Copied(val target: String, val dest: String, val name: String, val mode: Int, val content: ByteArray)
+    val copies = CopyOnWriteArrayList<Copied>()
+    @Volatile var onCheck: (dk.egernet.factory.deploy.DeployEndpoint) -> Unit = {}
+    @Volatile var onExec: (dk.egernet.factory.deploy.DeployEndpoint, String, Long) -> dk.egernet.factory.deploy.DeployExecResult =
+        { _, cmd, _ -> dk.egernet.factory.deploy.DeployExecResult(0, null, "ran: $cmd\n", false, false, 7) }
+    @Volatile var onCopy: (dk.egernet.factory.deploy.DeployEndpoint, String) -> Unit = { _, _ -> }
+    @Volatile var closed = false
+    /** Every cancel token an exec was given that was cancelled while it ran. */
+    val cancelledExecs = CopyOnWriteArrayList<String>()
+
+    override fun exec(
+        endpoint: dk.egernet.factory.deploy.DeployEndpoint, identity: dk.egernet.factory.deploy.DeployIdentity, command: String, timeoutMs: Long,
+        cancel: dk.egernet.factory.deploy.DeployCancel,
+    ): dk.egernet.factory.deploy.DeployExecResult {
+        // Like the real transport: a cancel ends the call early (here: interrupts the thread blocked in [onExec]).
+        val thread = Thread.currentThread()
+        val hook = cancel.onCancel { cancelledExecs += command; thread.interrupt() }
+        try {
+            return exec(endpoint, identity, command, timeoutMs)
+        } finally {
+            hook.close()
+            Thread.interrupted()
+        }
+    }
+
+    override fun check(endpoint: dk.egernet.factory.deploy.DeployEndpoint, identity: dk.egernet.factory.deploy.DeployIdentity) {
+        calls += "check ${endpoint.name}"; identities += identity.fingerprint
+        onCheck(endpoint)
+    }
+    override fun exec(endpoint: dk.egernet.factory.deploy.DeployEndpoint, identity: dk.egernet.factory.deploy.DeployIdentity, command: String, timeoutMs: Long) =
+        onExec(endpoint, command, timeoutMs).also { calls += "exec ${endpoint.name} $command"; identities += identity.fingerprint }
+    override fun copy(
+        endpoint: dk.egernet.factory.deploy.DeployEndpoint, identity: dk.egernet.factory.deploy.DeployIdentity,
+        upload: dk.egernet.factory.deploy.DeployUpload, dest: String, timeoutMs: Long,
+    ): Long {
+        calls += "copy ${endpoint.name} ${upload.name} $dest"; identities += identity.fingerprint
+        onCopy(endpoint, dest)
+        val bytes = upload.open().use { it.readNBytes(upload.size.toInt()) }
+        copies += Copied(endpoint.name, dest, upload.name, upload.mode, bytes)
+        return bytes.size.toLong()
+    }
+    override fun close() { closed = true }
 }
 
 /**
@@ -433,6 +611,8 @@ class FakeSandboxRuntime : dk.egernet.factory.sandbox.SandboxRuntime {
         { _, cmd, _ -> dk.egernet.factory.sandbox.ExecResult(0, "ran: $cmd\n", false, false, 5) }
     /** startContainer fails for names containing this. */
     @Volatile var failStart: String? = null
+    /** Called after a container was started (e.g. to race a release against a creation). */
+    @Volatile var onStart: (dk.egernet.factory.sandbox.ContainerSpec) -> Unit = {}
 
     override fun createNetwork(name: String, labels: Map<String, String>) {
         calls += "network create $name"
@@ -447,6 +627,7 @@ class FakeSandboxRuntime : dk.egernet.factory.sandbox.SandboxRuntime {
         failStart?.let { if (spec.name.contains(it)) throw dk.egernet.factory.sandbox.SandboxRuntimeException("image pull failed (fake)") }
         started += spec
         containers[spec.name] = spec.labels.getValue("agern.run")
+        onStart(spec)
     }
     override fun exec(
         container: String, command: List<String>, workdir: String, timeoutMs: Long, user: dk.egernet.factory.sandbox.ExecUser?,

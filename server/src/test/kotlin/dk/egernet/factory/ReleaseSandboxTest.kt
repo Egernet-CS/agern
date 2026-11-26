@@ -111,7 +111,9 @@ class ReleaseSandboxTest {
         }
         // The definition comes from the default branch, not from the release branch the runs start from.
         assertTrue(world.git.worktrees.all { it.endsWith("<- release/2.0") }, world.git.worktrees.toString())
-        assertEquals(listOf("origin/main:$SANDBOX_FILE", "origin/main:$SANDBOX_FILE"), world.git.reads.toList())
+        // The sandbox VM's definition is read from the same commit (docs/SANDBOX-VMS.md).
+        val perRun = listOf("origin/main:$SANDBOX_FILE", "origin/main:${dk.egernet.factory.sandboxvm.SANDBOX_VM_FILE}")
+        assertEquals(perRun + perRun, world.git.reads.toList())
 
         // Each run's builder used its own sandbox; while the second ran, the first's was already gone.
         assertEquals(runIds.map { "agern-run-$it" }, rt.execs.filter { it.second.startsWith("make test") }.map { it.first })
@@ -165,7 +167,8 @@ class ReleaseSandboxTest {
             val sb = s.runs.toDto(s.runs.get(id)!!).sandbox!!
             assertEquals("approved", sb.state, sb.reason)
         }
-        assertEquals(listOf("origin/main:$SANDBOX_FILE", "origin/main:$SANDBOX_FILE"), world.git.reads.toList(), "definition from the default branch")
+        val perRun = listOf("origin/main:$SANDBOX_FILE", "origin/main:${dk.egernet.factory.sandboxvm.SANDBOX_VM_FILE}")
+        assertEquals(perRun + perRun, world.git.reads.toList(), "definitions from the default branch")
         assertEquals(runIds.map { "agern-run-$it" }, rt.execs.filter { it.second.startsWith("make test") }.map { it.first })
         assertTrue(seen.single { it.first == "Scheduled two" }.second.none { it.contains(runIds[0].toString()) })
         assertTrue(rt.containers.isEmpty() && rt.networks.isEmpty(), rt.calls.toString())

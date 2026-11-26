@@ -112,6 +112,16 @@ jobs:
       # The tests start their own embedded PostgreSQL (io.zonky embedded-postgres) and use fakes
       # for GitHub, git and the Claude CLI, so no database service is needed.
       - run: ./gradlew --no-daemon build
+      # The test report and XML results hold the suppressed exceptions and stderr that the log omits.
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: server-test-report
+          path: |
+            server/build/reports/tests
+            server/build/test-results
+          if-no-files-found: ignore
+          retention-days: 7
 
   packaging:
     name: Packaging scripts (shellcheck)

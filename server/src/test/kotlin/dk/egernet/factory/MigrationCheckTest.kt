@@ -111,6 +111,102 @@ class MigrationCheckTest {
         assertTrue(reason.contains("Pull request #12 was not merged."), reason)
     }
 
+    // ------------------------------------------------------------ the renumbering plan of an update round
+
+    @Test
+    fun `the next version keeps width and separators`() {
+        assertEquals("26", MigrationCheck.nextVersion("25"))
+        assertEquals("010", MigrationCheck.nextVersion("009"))
+        assertEquals("1_10", MigrationCheck.nextVersion("1_9"))
+        assertEquals("1.3", MigrationCheck.nextVersion("1.2"))
+        assertEquals("100", MigrationCheck.nextVersion("99"))
+    }
+
+    @Test
+    fun `a clash with the target renumbers the run's migration above the target's highest`() {
+        val plan = MigrationCheck.plan(listOf("$dir/V15__a.sql", "$dir/V16__other.sql"), added("$dir/V16__mine.sql"))
+        assertEquals(
+            listOf(MigrationCheck.Renumber("$dir/V16__mine.sql", "17", "$dir/V17__mine.sql", "$dir/V16__other.sql", "16")),
+            plan.renumber,
+        )
+        assertEquals(mapOf(dir to "17"), plan.nextFree)
+        assertTrue(plan.restore.isEmpty())
+    }
+
+    @Test
+    fun `below the highest, two own migrations and zero-padded versions`() {
+        val base = listOf("$dir/V009__a.sql", "$dir/V010__b.sql")
+        val plan = MigrationCheck.plan(base, added("$dir/V008__late.sql", "$dir/V010__mine.sql", "$dir/V010__more.sql"))
+        assertEquals(
+            listOf(
+                MigrationCheck.Renumber("$dir/V008__late.sql", "011", "$dir/V011__late.sql", "$dir/V010__b.sql", "010"),
+                MigrationCheck.Renumber("$dir/V010__mine.sql", "012", "$dir/V012__mine.sql", "$dir/V010__b.sql", "010"),
+                MigrationCheck.Renumber("$dir/V010__more.sql", "013", "$dir/V013__more.sql", "$dir/V010__b.sql", "010"),
+            ),
+            plan.renumber,
+        )
+        assertEquals(mapOf(dir to "011"), plan.nextFree)
+    }
+
+    @Test
+    fun `an own migration that keeps its version raises the numbering`() {
+        val plan = MigrationCheck.plan(listOf("$dir/V16__other.sql"), added("$dir/V16__mine.sql", "$dir/V18__keep.sql"))
+        assertEquals(listOf("$dir/V19__mine.sql"), plan.renumber.map { it.newPath })
+    }
+
+    @Test
+    fun `multi-group versions, changed and removed target migrations, several roots`() {
+        val other = "web/$ROOT"
+        val plan = MigrationCheck.plan(
+            listOf("$dir/V1_9__a.sql", "$dir/V1_8__b.sql", "$other/V3__x.sql"),
+            listOf(
+                FileChange('A', "$dir/V1_9__mine.sql"), FileChange('M', "$dir/V1_8__b.sql"),
+                FileChange('D', "$other/V3__x.sql"), FileChange('A', "$other/V2__low.sql"),
+            ),
+        )
+        assertEquals(listOf("$dir/V1_10__mine.sql", "$other/V4__low.sql"), plan.renumber.map { it.newPath })
+        assertEquals(listOf("$dir/V1_8__b.sql", "$other/V3__x.sql"), plan.restore)
+        assertEquals(mapOf(dir to "1_10", other to "4"), plan.nextFree)
+    }
+
+    @Test
+    fun `nothing to renumber when there is no problem`() {
+        assertTrue(MigrationCheck.plan(listOf("$dir/V16__a.sql"), added("$dir/V17__b.sql")).isEmpty)
+    }
+
+    @Test
+    fun `the run reason names the update path, the limit, or the old way`() {
+        val p = listOf("`x` was changed")
+        val head = "Database migration conflict with `main`: `x` was changed. Pull request #3 was not merged. Migrations already on " +
+            "`main` must stay unchanged, and a new migration needs a version above all of them. "
+        assertEquals(
+            head + "Use \"Update and merge\" to have Agern merge `main` into the branch and let the builder renumber the migration " +
+                "(update round 2 of 3), or fix the migration on the pull request's branch and approve again.",
+            MigrationCheck.runReason("main", 3, p, rounds = MigrationCheck.Rounds(1, 3)),
+        )
+        assertEquals(
+            head + "The limit of 2 update round(s) is reached: fix the migration on the pull request's branch and approve again, or " +
+                "build the issue again from the current `main` (in a release: Retry).",
+            MigrationCheck.runReason("main", 3, p, rounds = MigrationCheck.Rounds(2, 2)),
+        )
+        assertEquals(
+            head + "Fix the migration on the pull request's branch and approve again, or build the issue again from the current `main` " +
+                "(in a release: Retry).",
+            MigrationCheck.runReason("main", 3, p),
+        )
+        assertEquals(
+            "Merging pull request #3 failed: 405. The branch conflicts with `main` or is behind it. The limit of 1 update round(s) is " +
+                "reached: resolve the conflicts on the pull request's branch and approve again, or build the issue again from the current " +
+                "`main` (in a release: Retry).",
+            MigrationCheck.mergeConflictReason("main", "#3", "405", MigrationCheck.Rounds(1, 1)),
+        )
+        assertEquals(
+            "Merging pull request #3 failed: 405. The branch conflicts with `main` or is behind it. Resolve the conflicts on the pull " +
+                "request's branch and approve again, or build the issue again from the current `main` (in a release: Retry).",
+            MigrationCheck.mergeConflictReason("main", "#3", "405"),
+        )
+    }
+
     private companion object {
         const val ROOT = MigrationCheck.ROOT
     }

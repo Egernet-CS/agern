@@ -45,4 +45,29 @@ class StageTimeoutTest {
         kotlin.test.assertFailsWith<IllegalArgumentException> { Config.fromEnv(base + ("FACTORY_STAGE_TIMEOUT_MINUTES" to "0")) }
         kotlin.test.assertFailsWith<IllegalArgumentException> { Config.fromEnv(base + ("FACTORY_STAGE_TIMEOUT_MINUTES" to "soon")) }
     }
+
+    @Test
+    fun `the network wait is configured in hours`() {
+        val base = mapOf("FACTORY_MASTER_KEY" to java.util.Base64.getEncoder().encodeToString(ByteArray(32)), "FACTORY_GITHUB_ORG" to "o")
+        assertEquals(24 * 3_600_000L, Config.fromEnv(base).networkRetryMaxMs)
+        assertEquals(0L, Config.fromEnv(base + ("FACTORY_NETWORK_RETRY_HOURS" to "0")).networkRetryMaxMs)
+        assertEquals(168 * 3_600_000L, Config.fromEnv(base + ("FACTORY_NETWORK_RETRY_HOURS" to "168")).networkRetryMaxMs)
+        listOf("169", "-1", "soon", "1.5").forEach { v ->
+            val e = kotlin.test.assertFailsWith<IllegalArgumentException> { Config.fromEnv(base + ("FACTORY_NETWORK_RETRY_HOURS" to v)) }
+            assertTrue(e.message!!.contains("FACTORY_NETWORK_RETRY_HOURS"), e.message)
+        }
+        assertEquals(listOf(1L, 2L, 5L, 10L, 15L).map { it * 60_000L }, Config.fromEnv(base).networkRetryDelaysMs)
+    }
+
+    @Test
+    fun `the update round limit is a whole number from 0 to 10`() {
+        val base = mapOf("FACTORY_MASTER_KEY" to java.util.Base64.getEncoder().encodeToString(ByteArray(32)), "FACTORY_GITHUB_ORG" to "o")
+        assertEquals(2, Config.fromEnv(base).maxUpdateRounds)
+        assertEquals(0, Config.fromEnv(base + ("FACTORY_MAX_UPDATE_ROUNDS" to "0")).maxUpdateRounds)
+        assertEquals(10, Config.fromEnv(base + ("FACTORY_MAX_UPDATE_ROUNDS" to "10")).maxUpdateRounds)
+        listOf("11", "-1", "two", "1.5").forEach { v ->
+            val e = kotlin.test.assertFailsWith<IllegalArgumentException> { Config.fromEnv(base + ("FACTORY_MAX_UPDATE_ROUNDS" to v)) }
+            assertTrue(e.message!!.contains("FACTORY_MAX_UPDATE_ROUNDS"), e.message)
+        }
+    }
 }

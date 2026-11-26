@@ -85,10 +85,16 @@ status line such as \ui{Building \#58 \ldots}, and each issue's state: \ui{waiti
     continues. When your Claude usage limit is reached, Agern pauses the release itself and
     resumes it when the limit resets.
   \item An issue whose run needs a human, or failed, is \ui{held}, with the reason, and the release
-    goes on with the next issue. Resolve it in one of three ways:
+    goes on with the next issue. Resolve it in one of these ways:
     \begin{itemize}
       \item open its \ui{run} and approve it (section~\ref{sec:needs-human}): it merges into the
         release branch;
+      \item when its finished work could only not be merged because the release branch moved on (a
+        migration with the same version, or a merge conflict), choose \ui{Update and merge}: in its
+        turn, Agern merges the release branch into the run's branch, the builder resolves the
+        conflict, the run is reviewed and approved again, and it merges. A building release already
+        tries this once by itself before it holds the issue, so the button is there when that try did
+        not work out;
       \item choose \ui{Retry} on the issue and pick how (section~\ref{sec:retry});
       \item or choose \ui{Remove} to leave it out of this release.
     \end{itemize}

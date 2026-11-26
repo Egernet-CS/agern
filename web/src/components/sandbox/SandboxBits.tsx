@@ -57,6 +57,11 @@ export function RunSandboxLine({ run }: { run: Run }) {
             definition <code>{shortHash(sb.sha256)}</code>
           </span>
           {(sb.platforms?.length ?? 0) > 0 && <RunPlatforms declared={sb.platforms} used={sb.platformsUsed ?? []} />}
+          {sb.reviewUsed && (
+            <span className="run-sbx-why run-sbx-review" title="The ux and ui-design reviewers ran the app in a read-only review sandbox">
+              review sandbox ✓
+            </span>
+          )}
         </>
       ) : (
         <span className="run-sbx-why">none — {WHY_NONE[sb.state] ?? sb.reason}; built and tested on the host</span>

@@ -5,6 +5,8 @@ import dk.egernet.factory.mcp.McpRegistry
 import dk.egernet.factory.sandbox.ExecResult
 import dk.egernet.factory.sandbox.SandboxDefinitions
 import dk.egernet.factory.sandbox.SandboxManager
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonObject
@@ -90,22 +92,37 @@ class SandboxTest {
         AppJson.parseToJsonElement(runBlocking { w.services.mcp.handle(token, """{"jsonrpc":"2.0","id":1,"method":"tools/list"}""") }.second!!)
             .jsonObject["result"]!!.jsonObject["tools"]!!.jsonArray.map { it.jsonObject["name"]!!.jsonPrimitive.content }
 
-    /** Every stage passes; [builder] is the builder's work and returns its summary. */
-    private fun script(w: TestWorld, reviewer: (FakeProcess) -> Unit = {}, builder: (FakeProcess) -> String = { "Built it." }) {
+    /**
+     * Every stage passes unless [changes] says otherwise for (role, round); [builder] is the builder's work and returns its
+     * summary, [reviewer] and [approver] run inside those stages before they answer.
+     */
+    private fun script(
+        w: TestWorld, reviewer: (FakeProcess) -> Unit = {}, approver: (FakeProcess) -> Unit = {},
+        changes: (String, Int) -> Boolean = { _, _ -> false }, builder: (FakeProcess) -> String = { "Built it." },
+    ) {
         w.launcher.stage = { p ->
             when (val role = p.spec.kind) {
                 "spec-writer" -> { p.init(); p.result("## Spec\nDo it."); p.exit(0) }
                 "builder" -> { p.init(); val text = builder(p); p.result(text); p.exit(0) }
-                "approver" -> { p.init(); p.result(null, buildJsonObject { put("verdict", "APPROVE"); put("summary", "ok") }); p.exit(0) }
+                "approver" -> { approver(p); p.init(); p.result(null, buildJsonObject { put("verdict", "APPROVE"); put("summary", "ok") }); p.exit(0) }
                 else -> {
                     reviewer(p)
                     p.init()
-                    p.result(null, buildJsonObject { put("verdict", "PASS"); put("summary", "$role ok"); put("findings", buildJsonArray { }) })
+                    val c = changes(role, round(p))
+                    p.result(null, buildJsonObject {
+                        put("verdict", if (c) "CHANGES" else "PASS"); put("summary", "$role ok")
+                        put("findings", buildJsonArray {
+                            if (c) addJsonObject { put("severity", "major"); put("file", "a.kt"); put("detail", "fix it") }
+                        })
+                    })
                     p.exit(0)
                 }
             }
         }
     }
+
+    /** The review or fix round a stage's prompt is for. */
+    private fun round(p: FakeProcess) = Regex("fix round (\\d+)").find(p.spec.prompt ?: "")?.groupValues?.get(1)?.toInt() ?: 0
 
     private fun start(w: TestWorld, issue: Int = 1) = runBlocking { w.services.orchestrator.start(w.user("alice"), "demo-app", issue, null) }
 
@@ -114,6 +131,15 @@ class SandboxTest {
 
     private fun systemTexts(w: TestWorld, runId: UUID) =
         builderEvents(w, runId).filter { it.type == "system" }.map { it.payload.jsonObject["text"]!!.jsonPrimitive.content }
+
+    private fun stageEvents(w: TestWorld, runId: UUID, role: String, round: Int = 0) =
+        w.services.runs.stages(runId).filter { it.role == role && it.round == round }.flatMap { st -> w.services.events.list(st.sessionId!!, 0, 1000) }
+
+    private fun stageTexts(w: TestWorld, runId: UUID, role: String, round: Int = 0) =
+        stageEvents(w, runId, role, round).filter { it.type == "system" }.map { it.payload.jsonObject["text"]!!.jsonPrimitive.content }
+
+    private fun reviewNames(w: TestWorld) = w.sandboxRuntime.containers.keys.filter { it.startsWith("agern-review-") } +
+        w.sandboxRuntime.networks.keys.filter { it.startsWith("agern-review-") }
 
     private fun waitFor(timeoutMs: Long = 10_000, cond: () -> Boolean) = runBlocking {
         withTimeout(timeoutMs) { while (!cond()) kotlinx.coroutines.delay(20) }
@@ -298,16 +324,25 @@ class SandboxTest {
     }
 
     @Test
-    fun `only the builder gets the sandbox tools, reviewers cannot run anything in it`() {
+    fun `each stage gets only the sandbox tools of its scope`() {
         val w = world()
         w.sandboxFile(definition)
         approve(w)
         val toolsByRole = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
-        val reviewerExec = CopyOnWriteArrayList<ToolAnswer>()
+        val refused = java.util.concurrent.ConcurrentHashMap<String, List<ToolAnswer>>()
+        var specInfo: JsonObject? = null
+        var startedDuringSpec = -1
         w.launcher.stage = { p ->
             val role = p.spec.kind
             toolsByRole[role] = toolNames(w, token(p))
-            if (role != "builder") reviewerExec += exec(w, p, "touch /workspace/pwned")
+            when (role) {
+                "spec-writer" -> {
+                    specInfo = call(w, token(p), "factory_sandbox_info").json
+                    refused[role] = listOf(exec(w, p, "touch /workspace/pwned"), wait(w, p))
+                    startedDuringSpec = w.sandboxRuntime.started.size
+                }
+                "security", "code", "approver" -> refused[role] = listOf(exec(w, p, "touch /workspace/pwned"), call(w, token(p), "factory_sandbox_info"))
+            }
             p.init()
             when (role) {
                 "approver" -> p.result(null, buildJsonObject { put("verdict", "APPROVE"); put("summary", "ok") })
@@ -318,13 +353,439 @@ class SandboxTest {
         }
         val run = start(w)
         assertEquals(RunStatus.MERGED, w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
-        assertTrue(toolsByRole["builder"]!!.containsAll(SandboxManager.TOOLS))
-        for (role in listOf("spec-writer", "security", "ux", "ui-design", "code", "approver")) {
-            assertTrue(toolsByRole[role]!!.none { it.startsWith("factory_sandbox") }, "$role: ${toolsByRole[role]}")
+        fun sandboxTools(role: String) = toolsByRole[role]!!.filter { it.startsWith("factory_sandbox") }.toSet()
+        assertEquals(setOf("factory_sandbox_info"), sandboxTools("spec-writer"))
+        for (role in listOf("builder", "ux", "ui-design")) assertEquals(SandboxManager.TOOLS, sandboxTools(role), role)
+        for (role in listOf("security", "code", "approver")) assertTrue(sandboxTools(role).isEmpty(), "$role: ${toolsByRole[role]}")
+
+        // The spec-writer plans: info says so and creates nothing; exec and wait are refused.
+        assertEquals("plan", specInfo!!["access"]!!.jsonPrimitive.content)
+        assertEquals(true, specInfo!!["available"]!!.jsonPrimitive.booleanOrNull)
+        assertTrue(specInfo!!["note"]!!.jsonPrimitive.content.contains("cannot run commands"))
+        assertEquals(0, startedDuringSpec)
+        // Not in its grant; and even a hand-built plan-scoped grant with every sandbox tool runs nothing.
+        assertTrue(refused["spec-writer"]!!.all { it.isError && it.text.contains("not available to this agent") }, refused["spec-writer"].toString())
+        val specSession = w.services.runs.stages(run.id).single { it.role == "spec-writer" }.sessionId!!
+        val planToken = w.services.mcpRegistry.issue(McpGrant(specSession, w.user("alice").id, "demo-app", run.id, SandboxManager.TOOLS,
+            sandboxScope = dk.egernet.factory.mcp.SandboxScope.PLAN))
+        for (answer in listOf(call(w, planToken, "factory_sandbox_exec", buildJsonObject { put("command", "id") }), call(w, planToken, "factory_sandbox_wait"))) {
+            assertTrue(answer.isError && answer.text.contains("cannot run commands"), answer.text)
         }
-        assertEquals(6, reviewerExec.size)
-        assertTrue(reviewerExec.all { it.isError && it.text.contains("not available to this agent") })
-        assertTrue(w.sandboxRuntime.execs.isEmpty() && w.sandboxRuntime.started.isEmpty())
+        for (role in listOf("security", "code", "approver")) {
+            assertTrue(refused[role]!!.all { it.isError && it.text.contains("not available to this agent") }, "$role: ${refused[role]}")
+        }
+        assertTrue(w.sandboxRuntime.started.isEmpty() && w.sandboxRuntime.execs.isEmpty())
+
+        // No tool of any stage, chat or personal token can create, change, approve or revoke a definition or approval.
+        val everyTool = toolsByRole.values.flatten() + McpRegistry.CHAT_TOOLS + McpRegistry.PERSONAL_TOOLS
+        assertEquals(SandboxManager.TOOLS, everyTool.filter { "sandbox" in it }.toSet())
+        assertTrue(everyTool.none { "approv" in it && "sandbox" in it })
+
+        // Prompts and transcripts.
+        val specPrompt = w.launcher.byRole("spec-writer").single().spec.prompt!!
+        assertTrue(specPrompt.contains("Sandbox: this run has one (image docker.io/library/eclipse-temurin:21-jdk). You cannot run commands in it; " +
+            "call factory_sandbox_info"), specPrompt)
+        assertTrue(stageTexts(w, run.id, "spec-writer").first().startsWith("Sandbox: Sandbox definition"))
+        assertEquals("info", stageEvents(w, run.id, "spec-writer").first { it.type == "system" }.payload.jsonObject["level"]!!.jsonPrimitive.content)
+        assertTrue(w.launcher.byRole("builder").single().spec.prompt!!.contains("When the spec has a Verification section"))
+        for (role in listOf("ux", "ui-design")) {
+            assertTrue(w.launcher.byRole(role).single().spec.prompt!!.contains("Review sandbox: this run has a read-only review sandbox"), role)
+        }
+        for (role in listOf("security", "code")) assertFalse(w.launcher.byRole(role).single().spec.prompt!!.contains("Review sandbox"), role)
+    }
+
+    @Test
+    fun `without an approved definition only the spec-writer changes, and with sandboxes off nothing does`() {
+        // Not approved: the spec-writer is told there is none; builder and reviewers are as before.
+        val w = world()
+        w.sandboxFile(definition)
+        val tools = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+        var specInfo: JsonObject? = null
+        script(w, reviewer = { p -> tools[p.spec.kind] = toolNames(w, token(p)) })
+        val inner = w.launcher.stage
+        w.launcher.stage = { p ->
+            if (p.spec.kind == "spec-writer") {
+                tools["spec-writer"] = toolNames(w, token(p))
+                specInfo = call(w, token(p), "factory_sandbox_info").json
+            }
+            inner(p)
+        }
+        val run = start(w)
+        assertEquals(RunStatus.MERGED, w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
+        assertEquals(listOf("factory_sandbox_info"), tools["spec-writer"]!!.filter { it.startsWith("factory_sandbox") })
+        assertEquals(false, specInfo!!["available"]!!.jsonPrimitive.booleanOrNull)
+        assertEquals("unapproved", specInfo!!["state"]!!.jsonPrimitive.content)
+        for (role in REVIEWER_ROLES) assertTrue(tools[role]!!.none { it.startsWith("factory_sandbox") }, role)
+        val specPrompt = w.launcher.byRole("spec-writer").single().spec.prompt!!
+        assertTrue(specPrompt.contains("Sandbox: none for this run ("), specPrompt)
+        assertTrue(specPrompt.contains("Do not ask for one"), specPrompt)
+        val note = stageEvents(w, run.id, "spec-writer").first { it.type == "system" }.payload.jsonObject
+        assertEquals("warn", note["level"]!!.jsonPrimitive.content)
+        assertTrue(note["text"]!!.jsonPrimitive.content.startsWith("Sandbox: .agern/sandbox.yml"))
+        for (role in SCREENSHOT_ROLES) assertFalse(w.launcher.byRole(role).single().spec.prompt!!.contains("Review sandbox"), role)
+        assertTrue(w.sandboxRuntime.started.isEmpty())
+
+        // Off: no tool, note or paragraph for any stage.
+        val off = TestWorld().also { worlds += it }
+        off.sandboxFile(definition)
+        val offTools = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+        script(off, reviewer = { p -> offTools[p.spec.kind] = toolNames(off, token(p)) })
+        val offInner = off.launcher.stage
+        off.launcher.stage = { p -> offTools[p.spec.kind] = toolNames(off, token(p)); offInner(p) }
+        val offRun = runBlocking { off.services.orchestrator.start(off.user("alice"), "demo-app", 1, null) }
+        assertEquals(RunStatus.MERGED, off.awaitRun(offRun.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
+        assertTrue(offTools.values.flatten().none { it.startsWith("factory_sandbox") }, offTools.toString())
+        for (role in listOf("spec-writer", "builder") + REVIEWER_ROLES) {
+            val prompt = off.launcher.byRole(role).single().spec.prompt!!
+            assertFalse(prompt.contains("Sandbox") || prompt.contains("sandbox"), "$role: $prompt")
+            assertTrue(stageTexts(off, offRun.id, role).none { it.contains("andbox") }, role)
+        }
+        assertTrue(off.launcher.byRole("spec-writer").single().spec.prompt!!.contains("Explore it (read-only) before writing.\nYour final message"))
+    }
+
+    @Test
+    fun `the ux and ui-design reviewers share one read-only review sandbox, removed when the round ends`() {
+        val w = world()
+        w.sandboxFile(definition)
+        approve(w)
+        val rt = w.sandboxRuntime
+        var buildHandle = ""
+        val bothAsked = CountDownLatch(2)
+        val answers = java.util.concurrent.ConcurrentHashMap<String, ToolAnswer>()
+        val infos = java.util.concurrent.ConcurrentHashMap<String, JsonObject>()
+        val foreign = java.util.concurrent.ConcurrentHashMap<String, ToolAnswer>()
+        var platformRefusal: ToolAnswer? = null
+        var outputDirDuringReview = false
+        var reviewLeftAtApprover: List<String>? = null
+        var outputDirAtApprover = true
+        var outputDir: java.nio.file.Path? = null
+        script(w, reviewer = { p ->
+            val role = p.spec.kind
+            if (role in SCREENSHOT_ROLES) {
+                infos[role] = call(w, token(p), "factory_sandbox_info").json
+                bothAsked.countDown()
+                bothAsked.await(10, TimeUnit.SECONDS)
+                answers[role] = exec(w, p, "echo $role")
+                foreign[role] = wait(w, p, buildHandle, 0)
+                if (role == "ux") {
+                    platformRefusal = call(w, token(p), "factory_sandbox_exec", buildJsonObject { put("command", "id"); put("platform", "jdk17") })
+                    outputDir = p.spec.workDir.resolve(".agern-run/review")
+                    outputDirDuringReview = java.nio.file.Files.isDirectory(outputDir!!)
+                }
+            }
+        }, approver = {
+            reviewLeftAtApprover = reviewNames(w)
+            outputDirAtApprover = java.nio.file.Files.exists(outputDir!!)
+        }) { p -> buildHandle = exec(w, p, "make").str("handle"); "ok" }
+        val run = start(w)
+        val done = w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
+        assertEquals(RunStatus.MERGED, done.status, done.error)
+        val id = run.id
+
+        // Created once, by the first reviewer command, beside the build sandbox: own network, services, names and labels.
+        assertEquals(listOf("agern-run-$id-postgres", "agern-run-$id", "agern-review-$id-postgres", "agern-review-$id"), rt.started.map { it.name })
+        assertTrue(rt.calls.contains("network create agern-review-$id"), rt.calls.toString())
+        val svc = rt.started[2]
+        assertEquals("agern-review-$id", svc.network)
+        assertEquals("postgres", svc.networkAlias)
+        assertEquals("review-service", svc.labels["agern.role"])
+        val review = rt.started[3]
+        assertEquals(mapOf("agern.run" to id.toString(), "agern.repo" to "demo-app", "agern.role" to "review"), review.labels)
+        assertEquals("agern-review-$id", review.network)
+        assertEquals("/workspace", review.workdir)
+        assertEquals(mapOf("CI" to "true"), review.env)
+        val runDir = w.services.workspaces.runDir("alice", "demo-app", id).toAbsolutePath().normalize()
+        assertEquals(SandboxMountView(runDir.toString(), "/workspace", false, true), review.mounts[0].view())
+        assertEquals(SandboxMountView(runDir.resolve(".agern-run/review").toString(), "/run/agern-review", false, false), review.mounts[1].view())
+        assertEquals(rt.started[1].mounts.last(), review.mounts.last(), "the same default cache volume as the build sandbox")
+        assertTrue(rt.started[1].mounts.none { it.readOnly }, "the build sandbox stays read-write")
+
+        // Commands: the reviewers' only in the review container, the builder's only in the build container.
+        assertEquals(setOf("agern-review-$id"), rt.execs.filter { it.second.startsWith("echo ux") || it.second.startsWith("echo ui-design") }.map { it.first }.toSet())
+        assertEquals(listOf("agern-run-$id"), rt.execs.filter { it.second == "make" }.map { it.first })
+        assertEquals(listOf("agern-run-$id", "agern-review-$id"), rt.execs.filter { it.second == "echo setting up\n" }.map { it.first })
+        for (role in SCREENSHOT_ROLES) {
+            assertFalse(answers[role]!!.isError, answers[role]!!.text)
+            assertTrue(foreign[role]!!.isError && foreign[role]!!.text.startsWith("Unknown handle 'cmd-"), foreign[role]!!.text)
+            val info = infos[role]!!
+            assertEquals("review", info["access"]!!.jsonPrimitive.content)
+            assertEquals(true, info["readOnly"]!!.jsonPrimitive.booleanOrNull)
+            assertEquals(false, info["created"]!!.jsonPrimitive.booleanOrNull)
+            assertEquals("/run/agern-review", info["outputDir"]!!.jsonObject["container"]!!.jsonPrimitive.content)
+            assertEquals(".agern-run/review", info["outputDir"]!!.jsonObject["host"]!!.jsonPrimitive.content)
+            assertFalse(info.containsKey("platforms"))
+        }
+        assertTrue(platformRefusal!!.isError && platformRefusal!!.text == "The review sandbox has only the default image; leave platform out.", platformRefusal!!.text)
+        assertTrue(outputDirDuringReview)
+
+        // Logs: each command in its reviewer's transcript, marked as review; lifecycle and setup in the creator's.
+        val ux = stageEvents(w, id, "ux").mapNotNull { it.payload.jsonObject["sandbox"]?.jsonObject }.filter { it["kind"]!!.jsonPrimitive.content == "exec" }
+        assertEquals(listOf("echo ux"), ux.map { it["command"]!!.jsonPrimitive.content })
+        assertEquals(true, ux.single()["review"]!!.jsonPrimitive.booleanOrNull)
+        assertTrue(stageTexts(w, id, "ux").any { it.startsWith("Review sandbox `echo ux`: exit 0") }, stageTexts(w, id, "ux").toString())
+        val both = stageTexts(w, id, "ux") + stageTexts(w, id, "ui-design")
+        assertEquals(1, both.count { it.startsWith("Creating the review sandbox: image docker.io/library/eclipse-temurin:21-jdk, services postgres") }, both.toString())
+        assertEquals(1, both.count { it.startsWith("Review sandbox ready in") }, both.toString())
+        assertEquals(1, both.count { it.startsWith("Review sandbox setup script: exit 0") }, both.toString())
+        assertTrue(systemTexts(w, id).none { it.contains("Review sandbox") })
+
+        // Removed when the round ended, before the approver, with its output directory; the run records its use.
+        assertEquals(emptyList(), reviewLeftAtApprover)
+        assertFalse(outputDirAtApprover)
+        assertTrue(rt.calls.contains("rm agern-review-$id agern-review-$id-postgres"), rt.calls.toString())
+        assertTrue(rt.calls.contains("network rm agern-review-$id"), rt.calls.toString())
+        assertTrue(rt.containers.isEmpty() && rt.networks.isEmpty(), rt.calls.toString())
+        assertEquals(0, w.services.sandboxes.inUse())
+        assertEquals(true, w.services.runs.toDto(done).sandbox!!.reviewUsed)
+    }
+
+    private data class SandboxMountView(val source: String, val target: String, val volume: Boolean, val readOnly: Boolean)
+    private fun dk.egernet.factory.sandbox.SandboxMount.view() = SandboxMountView(source, target, volume, readOnly)
+
+    @Test
+    fun `each review round gets a fresh review sandbox, gone before the next builder round`() {
+        val w = world()
+        w.sandboxFile(definition)
+        approve(w)
+        val atBuilder = CopyOnWriteArrayList<List<String>>()
+        script(w, reviewer = { p -> if (p.spec.kind == "ux") exec(w, p, "echo round ${round(p)}") }, changes = { role, r -> role == "ux" && r == 0 }) { _ ->
+            atBuilder += reviewNames(w)
+            "ok"
+        }
+        val run = start(w)
+        assertEquals(RunStatus.MERGED, w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
+        assertEquals(listOf(emptyList(), emptyList()), atBuilder)
+        assertEquals(2, w.sandboxRuntime.calls.count { it == "start agern-review-${run.id}" })
+        assertEquals(listOf("echo round 0", "echo round 1"), w.sandboxRuntime.execs.filter { it.first == "agern-review-${run.id}" && it.second.startsWith("echo round") }.map { it.second })
+        assertTrue(reviewNames(w).isEmpty())
+        assertEquals(0, w.services.sandboxes.inUse())
+    }
+
+    @Test
+    fun `the review sandbox is removed when a reviewer fails, the run is cancelled or a stage times out`() {
+        // A reviewer fails after using it.
+        val w = world()
+        w.sandboxFile(definition)
+        approve(w)
+        w.launcher.stage = { p ->
+            p.init()
+            when (p.spec.kind) {
+                "spec-writer", "builder" -> { p.result("ok"); p.exit(0) }
+                "ux" -> {
+                    exec(w, p, "echo ux")
+                    if (p.spec.prompt.orEmpty().contains("<issue_body>\nhang\n</issue_body>")) {
+                        while (!p.killed) Thread.sleep(10)
+                    } else p.exit(1)
+                }
+                else -> { p.result(null, buildJsonObject { put("verdict", "PASS"); put("summary", "ok"); put("findings", buildJsonArray { }) }); p.exit(0) }
+            }
+        }
+        val failed = start(w, 1)
+        assertEquals(RunStatus.FAILED, w.awaitRun(failed.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
+        assertTrue(w.sandboxRuntime.calls.contains("start agern-review-${failed.id}"))
+        assertTrue(reviewNames(w).isEmpty(), w.sandboxRuntime.calls.toString())
+        assertEquals(0, w.services.sandboxes.inUse())
+
+        // Cancelled while the reviewer works.
+        w.github.repos["demo-app"]!!.issues.replaceAll { if (it.number == 2) it.copy(body = "hang") else it }
+        val cancelled = start(w, 2)
+        waitFor { w.sandboxRuntime.execs.any { it.first == "agern-review-${cancelled.id}" && it.second == "echo ux" } }
+        runBlocking { w.services.orchestrator.cancel(w.user("alice"), cancelled.id) }
+        assertEquals(RunStatus.CANCELLED, w.services.runs.get(cancelled.id)!!.status)
+        assertTrue(reviewNames(w).isEmpty(), w.sandboxRuntime.calls.toString())
+        assertEquals(0, w.services.sandboxes.inUse())
+
+        // A reviewer's stage time limit.
+        val t = world { it.copy(stageTimeoutMs = 1500) }
+        t.sandboxFile(definition)
+        approve(t)
+        t.launcher.stage = { p ->
+            p.init()
+            when (p.spec.kind) {
+                "spec-writer", "builder" -> { p.result("ok"); p.exit(0) }
+                "ux" -> { exec(t, p, "echo ux"); while (!p.killed) Thread.sleep(10) }
+                else -> { p.result(null, buildJsonObject { put("verdict", "PASS"); put("summary", "ok"); put("findings", buildJsonArray { }) }); p.exit(0) }
+            }
+        }
+        val timedOut = start(t, 1)
+        assertEquals(RunStatus.FAILED, t.awaitRun(timedOut.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
+        assertTrue(t.sandboxRuntime.calls.contains("start agern-review-${timedOut.id}"))
+        assertTrue(t.sandboxRuntime.containers.isEmpty() && t.sandboxRuntime.networks.isEmpty(), t.sandboxRuntime.calls.toString())
+        assertEquals(0, t.services.sandboxes.inUse())
+    }
+
+    @Test
+    fun `no review sandbox survives the run's release, also when the release races its creation`() {
+        val w = world()
+        w.sandboxFile(definition)
+        approve(w)
+        val rt = w.sandboxRuntime
+        val answers = CopyOnWriteArrayList<ToolAnswer>()
+        script(w, reviewer = { p ->
+            if (p.spec.kind == "ux") {
+                rt.onStart = { spec ->
+                    if (spec.name.startsWith("agern-review-") && spec.labels["agern.role"] == "review") {
+                        runBlocking { w.services.sandboxes.release(UUID.fromString(spec.labels.getValue("agern.run"))) }
+                    }
+                }
+                answers += exec(w, p, "echo racing")
+                rt.onStart = {}
+                answers += exec(w, p, "echo after the release")
+                answers += wait(w, p)
+            }
+        })
+        val run = start(w)
+        assertEquals(RunStatus.MERGED, w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
+        assertTrue(answers[0].isError && answers[0].text.startsWith("The review round ended while its review sandbox was being created"), answers[0].text)
+        assertTrue(answers[1].isError, answers[1].text)
+        assertTrue(answers[2].isError, answers[2].text)
+        assertEquals(1, rt.calls.count { it == "start agern-review-${run.id}" })
+        assertTrue(rt.execs.none { it.first == "agern-review-${run.id}" && it.second.startsWith("echo") && it.second != "echo setting up\n" })
+        assertTrue(rt.containers.isEmpty() && rt.networks.isEmpty(), rt.calls.toString())
+        assertEquals(0, w.services.sandboxes.inUse())
+    }
+
+    @Test
+    fun `at start leftover review sandboxes are removed, also of an active run`() {
+        val w = world()
+        val alice = w.user("alice")
+        val active = w.services.runs.createIfNoActive("demo-app", 1, "x", "task", 2, alice.id, null)!!
+        w.services.runs.setStatus(active.id, RunStatus.NEEDS_HUMAN)
+        val rt = w.sandboxRuntime
+        rt.containers["agern-run-${active.id}"] = active.id.toString()
+        rt.networks["agern-run-${active.id}"] = active.id.toString()
+        rt.containers["agern-review-${active.id}"] = active.id.toString()
+        rt.containers["agern-review-${active.id}-postgres"] = active.id.toString()
+        rt.networks["agern-review-${active.id}"] = active.id.toString()
+        w.services.start()
+        assertEquals(setOf("agern-run-${active.id}"), rt.containers.keys)
+        assertEquals(setOf("agern-run-${active.id}"), rt.networks.keys)
+    }
+
+    @Test
+    fun `without a free slot a reviewer is told at once to review on the host, and the run completes`() {
+        val w = world { it.copy(sandbox = it.sandbox.copy(maxConcurrent = 1)) }
+        w.sandboxFile(definition)
+        approve(w)
+        val aHolds = CountDownLatch(1)
+        val releaseA = CountDownLatch(1)
+        val answers = CopyOnWriteArrayList<ToolAnswer>()
+        var tookMs = -1L
+        script(w, reviewer = { p ->
+            if (p.spec.kind == "ux" && p.spec.prompt!!.contains("issue #2 ")) {
+                val t0 = System.currentTimeMillis()
+                answers += exec(w, p, "echo b")
+                tookMs = System.currentTimeMillis() - t0
+                releaseA.countDown()
+            }
+        }) { p ->
+            if (p.spec.prompt!!.contains("Implement issue #1 ")) {
+                exec(w, p, "build a")
+                aHolds.countDown()
+                releaseA.await(10, TimeUnit.SECONDS)
+            }
+            "ok"
+        }
+        val a = start(w, 1)
+        assertTrue(aHolds.await(10, TimeUnit.SECONDS))
+        val b = start(w, 2)
+        for (r in listOf(a, b)) assertEquals(RunStatus.MERGED, w.awaitRun(r.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
+        assertEquals(
+            "The server's sandboxes are all in use (1 of 1 containers). No review sandbox was created and nothing was run. Review without it, " +
+                "on the host, as your role instructions describe; do not wait for a slot.",
+            answers.single().text,
+        )
+        assertTrue(answers.single().isError)
+        assertTrue(tookMs in 0..5_000, "answered at once: $tookMs ms")
+        assertTrue(w.sandboxRuntime.calls.none { it == "start agern-review-${b.id}" })
+        assertEquals(0, w.services.sandboxes.inUse())
+    }
+
+    @Test
+    fun `the review sandbox takes the slot of the run's idle build container, but never of a running command`() {
+        // Idle: the builder's container is removed to make room.
+        val w = world { it.copy(sandbox = it.sandbox.copy(maxConcurrent = 1)) }
+        w.sandboxFile(definition)
+        approve(w)
+        val answers = CopyOnWriteArrayList<ToolAnswer>()
+        var inUseDuringReview = -1
+        script(w, reviewer = { p ->
+            if (p.spec.kind == "ux") {
+                answers += exec(w, p, "echo ux")
+                inUseDuringReview = w.services.sandboxes.inUse()
+            }
+        }) { p -> exec(w, p, "make"); "ok" }
+        val run = start(w)
+        assertEquals(RunStatus.MERGED, w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
+        assertFalse(answers.single().isError, answers.single().text)
+        assertEquals(1, inUseDuringReview)
+        val calls = w.sandboxRuntime.calls
+        assertTrue(calls.indexOf("rm agern-run-${run.id}") in 0 until calls.indexOf("start agern-review-${run.id}"), calls.toString())
+        assertTrue(stageTexts(w, run.id, "ux").any { it.startsWith("Removed this run's idle `default` container to make room for the review sandbox") })
+        assertEquals(0, w.services.sandboxes.inUse())
+
+        // Running: the builder's background command still runs, so nothing is evicted and the reviewer is told.
+        val b = world { it.copy(sandbox = it.sandbox.copy(maxConcurrent = 1)) }
+        b.sandboxFile(definition)
+        approve(b)
+        val finish = CountDownLatch(1)
+        b.sandboxRuntime.onExec = { _, cmd, _ ->
+            if (cmd == "long") finish.await(10, TimeUnit.SECONDS)
+            ExecResult(0, "ran: $cmd\n", false, false, 5)
+        }
+        val bAnswers = CopyOnWriteArrayList<ToolAnswer>()
+        script(b, reviewer = { p ->
+            if (p.spec.kind == "ux") {
+                bAnswers += exec(b, p, "echo ux")
+                finish.countDown()
+            }
+        }) { p -> execBg(b, p, "long"); "ok" }
+        val bRun = runBlocking { b.services.orchestrator.start(b.user("alice"), "demo-app", 1, null) }
+        assertEquals(RunStatus.MERGED, b.awaitRun(bRun.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
+        assertTrue(bAnswers.single().isError && bAnswers.single().text.contains("No review sandbox was created"), bAnswers.single().text)
+        assertTrue(b.sandboxRuntime.calls.none { it == "rm agern-run-${bRun.id}" || it == "start agern-review-${bRun.id}" }, b.sandboxRuntime.calls.toString())
+        assertEquals(0, b.services.sandboxes.inUse())
+    }
+
+    @Test
+    fun `an admin's stop removes both sandboxes and the overview lists the review container`() {
+        val w = world()
+        w.sandboxFile(definition)
+        approve(w)
+        val root = w.user("root", admin = true)
+        val runIdRef = java.util.concurrent.atomic.AtomicReference<UUID>()
+        var before: RunningSandboxDto? = null
+        var reviewOnly: RunningSandboxDto? = null
+        var leftAfterStop: Set<String>? = null
+        var notFound: Throwable? = null
+        script(w, reviewer = { p ->
+            if (p.spec.kind == "ux") {
+                waitFor { runIdRef.get() != null }
+                val runId = runIdRef.get()!!
+                exec(w, p, "echo first")
+                before = runBlocking { w.services.sandboxes.overview(root) }.sandboxes.single()
+                runBlocking { w.services.sandboxes.stop(root, runId) }
+                leftAfterStop = w.sandboxRuntime.containers.keys.toSet()
+                notFound = runCatching { runBlocking { w.services.sandboxes.stop(root, runId) } }.exceptionOrNull()
+                exec(w, p, "echo again")
+                reviewOnly = runBlocking { w.services.sandboxes.overview(root) }.sandboxes.single()
+            }
+        }) { p -> exec(w, p, "make"); "ok" }
+        val run = start(w)
+        runIdRef.set(run.id)
+        assertEquals(RunStatus.MERGED, w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
+        val b = before!!
+        assertEquals(listOf("build" to "default", "review" to "default"), b.containers.map { it.kind to it.platform })
+        assertEquals(2, b.slots)
+        assertEquals("4g", b.memoryTotal, "1g × (2 command containers + 2 services)")
+        assertEquals(emptySet(), leftAfterStop)
+        assertTrue(notFound is ApiException && (notFound as ApiException).status.value == 404, notFound.toString())
+        assertTrue(systemTexts(w, run.id).any { it.startsWith("An admin (root) stopped this run's sandbox") })
+        assertTrue(stageTexts(w, run.id, "ux").any { it.startsWith("An admin (root) stopped this run's review sandbox") })
+        // Recreated by the next reviewer command; a run with only a review sandbox is listed.
+        assertEquals(listOf("review"), reviewOnly!!.containers.map { it.kind })
+        assertEquals(1, reviewOnly!!.slots)
+        assertEquals(0, w.services.sandboxes.inUse())
     }
 
     @Test
@@ -876,6 +1337,7 @@ class SandboxTest {
         val inHang = CountDownLatch(1)
         val stopped = CountDownLatch(1)
         val inHang2 = CountDownLatch(1)
+        val released = CountDownLatch(1)
         val a = linkedMapOf<String, ToolAnswer>()
         var runId: UUID? = null
         script(w) { p ->
@@ -893,7 +1355,7 @@ class SandboxTest {
             do { next = execBg(w, p, "hang 2"); if (next.isError) Thread.sleep(20) } while (next.isError && next.text.startsWith("A command"))
             a["next"] = next
             inHang2.countDown()
-            a["afterRelease"] = wait(w, p, next.str("handle"))
+            released.await(10, TimeUnit.SECONDS)
             a["released"] = wait(w, p, next.str("handle"), 0)
             "ok"
         }
@@ -907,7 +1369,14 @@ class SandboxTest {
         stopped.countDown()
         assertTrue(inHang2.await(10, TimeUnit.SECONDS))
         waitFor { rt.execs.count { it.second == "hang 2" } == 1 }
-        w.services.sandboxes.releaseNow(run.id)
+        // Started undispatched, the wait has reached its suspension point (awaiting the command's result) when async returns.
+        val afterRelease = runBlocking {
+            val waiting = async(start = CoroutineStart.UNDISPATCHED) { w.services.sandboxes.wait(run.id, a["next"]!!.str("handle"), null) }
+            assertTrue(waiting.isActive, "the wait is suspended on the running command")
+            w.services.sandboxes.releaseNow(run.id)
+            waiting.await()
+        }
+        released.countDown()
         hang2.countDown()
         assertEquals(0, w.services.sandboxes.inUse())
         assertTrue(rt.containers.isEmpty() && rt.networks.isEmpty(), rt.calls.toString())
@@ -925,8 +1394,8 @@ class SandboxTest {
             assertTrue(a[k]!!.isError && a[k]!!.text.startsWith("An admin stopped this run's sandbox while the command ran"), "$k: ${a[k]!!.text}")
         }
         assertFalse(a["next"]!!.isError, a["next"]!!.text)
-        assertTrue(a["afterRelease"]!!.isError && a["afterRelease"]!!.text == "The run's sandbox was removed while the command ran (the run ended).",
-            a["afterRelease"]!!.text)
+        assertTrue(afterRelease.isError && afterRelease.text == "The run's sandbox was removed while the command ran (the run ended).",
+            afterRelease.text)
         assertTrue(a["released"]!!.isError && a["released"]!!.text.startsWith("This run has no sandbox"), a["released"]!!.text)
         assertEquals(0, w.services.sandboxes.inUse())
     }

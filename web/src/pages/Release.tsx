@@ -2,11 +2,14 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api, ApiError, isReleaseActive, releaseReadiness, type Release, type ReleaseChecks, type ReleaseIssue, type ReleaseMode, type ReleaseRepo } from '../api';
 import { RetryDialog } from '../components/ui/RetryDialog';
+import { GIVE_UP_RUN_TEXT, GiveUpDialog } from '../components/ui/NetworkWait';
 import { Dialog, Empty, ErrorBox, IssueStateBadge, KindBadge, Loading, Notice, ReleaseStatusPill } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
 import { dateTime, timeAgo, toDateTimeLocal } from '../lib/format';
+import { issueWaitNote, networkBlockedIssue, releaseNetworkLine, runningWaitLine } from '../lib/networkWait';
 import { useFeed, useFeedReconnects, useLiveRelease, useProjectReleases } from '../lib/realtime';
+import { useNow } from '../lib/useNow';
 
 /** Codes after which the page's copy of the release is stale: reload it and show the server's message. */
 const STALE_SCHEDULE = new Set(['release_not_scheduled', 'release_not_schedulable', 'release_scheduled']);
@@ -38,8 +41,13 @@ export function ReleasePage() {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [scheduling, setScheduling] = useState(false);
   const [confirmStart, setConfirmStart] = useState(false);
+  /** The give-up confirmation: for the issue a network pause blocks, or for the running issue's waiting run. */
+  const [confirmGiveUp, setConfirmGiveUp] = useState<'release' | 'run' | null>(null);
+  const [retryingRun, setRetryingRun] = useState(false);
+  const now = useNow(1000, !!release && (release.pause?.reason === 'network' || release.issues.some((i) => i.waiting)));
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [confirmRelease, setConfirmRelease] = useState(false);
+  const [confirmSync, setConfirmSync] = useState(false);
   const [checking, setChecking] = useState(false);
   const [retryIssue, setRetryIssue] = useState<number | null>(null);
   // Set before this user's own delete request, so they are not told "This release was deleted".
@@ -181,6 +189,10 @@ export function ReleasePage() {
     await change(() => api.approveRelease(release.id));
     setConfirmRelease(false);
   };
+  const doSync = async () => {
+    await change(() => api.syncRelease(release.id));
+    setConfirmSync(false);
+  };
   const setMode = (mode: ReleaseMode) => void change(() => api.setReleaseMode(release.id, mode));
 
   const n = release.issues.length;
@@ -198,7 +210,31 @@ export function ReleasePage() {
   const multi = release.repositories.length > 0;
   const branchGone = status === 'released' || (multi && status === 'cancelled');
   const branchUrl = project.data && release.branch && !branchGone ? `${project.data.htmlUrl}/tree/${release.branch}` : undefined;
-  const statusLine = releaseStatusLine(release, running, held);
+  const statusLine = releaseStatusLine(release, running, held, now);
+  // Waiting for the network (docs/ARCHITECTURE.md §6 "Transient failures"): the issue that could not start, or the
+  // running issue whose run waits.
+  const blocked = networkBlockedIssue(release);
+  const waitingRun = status === 'building' && running?.waiting && running.runId ? running.runId : null;
+  /** "Retry now" / "Give up" on the running issue's waiting run, through the run's endpoints. */
+  const runAction = async (kind: 'retry' | 'give-up') => {
+    if (!waitingRun) return;
+    setBusy(true);
+    if (kind === 'retry') setRetryingRun(true);
+    setErr(null);
+    try {
+      await (kind === 'retry' ? api.retryRunNow(waitingRun) : api.giveUpRun(waitingRun));
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(false);
+      setRetryingRun(false);
+      setConfirmGiveUp(null);
+    }
+  };
+  const giveUpRelease = async () => {
+    await change(() => api.giveUpReleaseNetwork(release.id));
+    setConfirmGiveUp(null);
+  };
 
   return (
     <div className="page releasepage">
@@ -233,8 +269,23 @@ export function ReleasePage() {
           )}
           {may.resume && (
             <button type="button" className="btn btn--primary" onClick={() => void change(() => api.resumeRelease(release.id))} disabled={busy}>
-              Resume
+              {blocked ? 'Retry now' : 'Resume'}
             </button>
+          )}
+          {blocked && ownerOrAdmin && (
+            <button type="button" className="btn btn--ghost btn--danger" onClick={() => setConfirmGiveUp('release')} disabled={busy} aria-haspopup="dialog">
+              Give up on #{blocked.number}…
+            </button>
+          )}
+          {waitingRun && ownerOrAdmin && (
+            <>
+              <button type="button" className="btn btn--primary" onClick={() => void runAction('retry')} disabled={busy}>
+                {retryingRun ? 'Retrying…' : 'Retry now'}
+              </button>
+              <button type="button" className="btn btn--ghost btn--danger" onClick={() => setConfirmGiveUp('run')} disabled={busy} aria-haspopup="dialog">
+                Give up…
+              </button>
+            </>
           )}
           {may.cancel && (
             <button type="button" className="btn btn--ghost btn--danger" onClick={() => setConfirmCancel(true)} disabled={busy}>
@@ -344,11 +395,13 @@ export function ReleasePage() {
         <ReleasePullSection
           release={release}
           isOwner={isOwner}
+          maySync={ownerOrAdmin}
           ownerName={ownerName}
           busy={busy}
           checking={checking}
           onCheck={() => void doCheck()}
           onApprove={() => setConfirmRelease(true)}
+          onSync={() => setConfirmSync(true)}
         />
       )}
 
@@ -387,8 +440,16 @@ export function ReleasePage() {
                       <span className="ro-note small">{i.note}</span>
                     )}
                     {started && i.state === 'waiting' && i.retryMode && (
-                      <span className="ro-note small">{i.retryMode === 'step' ? 'Retries the failed step of its run' : 'Continues from the commits of its run'} when its turn comes.</span>
+                      <span className="ro-note small">
+                        {i.retryMode === 'update'
+                          ? 'Updates its run with the release branch and merges it'
+                          : i.retryMode === 'step'
+                            ? 'Retries the failed step of its run'
+                            : 'Continues from the commits of its run'}{' '}
+                        when its turn comes.
+                      </span>
                     )}
+                    {started && i.updateSummary && <span className="ro-note ro-update small muted">{i.updateSummary}</span>}
                   </span>
                   {i.targetDir && (
                     <span className="tag tag--plain issue-member" title={`Member ${i.targetDir}${i.targetRepo ? ` · ${i.targetRepo}` : ''}`}>
@@ -401,12 +462,25 @@ export function ReleasePage() {
                       run
                     </Link>
                   )}
+                  {started && issueWaitNote(i, now) && <span className="ro-note ro-wait small">{issueWaitNote(i, now)}</span>}
                   {i.prUrl && (
                     <a href={i.prUrl} target="_blank" rel="noreferrer" className="ro-run small" aria-label={i.targetRepo ? `pull request ${i.targetRepo} #${i.prNumber} of #${i.number}` : `pull request #${i.prNumber} of #${i.number}`}>
                       {i.targetRepo ? `${i.targetRepo} #${i.prNumber}` : `PR #${i.prNumber}`}
                     </a>
                   )}
                   <span className="ro-actions">
+                    {may.retry(i) && i.state === 'held' && i.updateAvailable && (
+                      <button
+                        type="button"
+                        className="btn btn--primary btn--sm"
+                        aria-label={`Update and merge #${i.number}`}
+                        title={`Merge ${release.branch ?? 'the release branch'} into its branch, let the builder resolve the conflict, review again and merge`}
+                        disabled={busy}
+                        onClick={() => void change(() => api.retryReleaseIssue(release.id, i.number, 'update'))}
+                      >
+                        Update and merge
+                      </button>
+                    )}
                     {may.retry(i) && (
                       <button type="button" className="btn btn--ghost btn--sm" aria-label={`Retry #${i.number}`} title="Build it again: retry the failed step, continue from the commits, or start over" disabled={busy} onClick={() => setRetryIssue(i.number)}>
                         Retry
@@ -478,6 +552,7 @@ export function ReleasePage() {
         onStarted={(r) => noteReleases([r])}
       />
       <ApproveReleaseDialog release={release} open={confirmRelease} busy={busy} onClose={() => setConfirmRelease(false)} onConfirm={() => void doRelease()} />
+      <SyncReleaseDialog release={release} open={confirmSync} busy={busy} onClose={() => setConfirmSync(false)} onConfirm={() => void doSync()} />
       <RetryDialog
         open={retryIssue !== null}
         title={`Retry #${retryIssue ?? ''}?`}
@@ -487,6 +562,21 @@ export function ReleasePage() {
           if (retryIssue === null) return;
           noteReleases([await api.retryReleaseIssue(release.id, retryIssue, mode)]);
         }}
+      />
+
+      <GiveUpDialog
+        open={confirmGiveUp === 'release' && blocked !== null}
+        text={`Issue #${blocked?.number ?? ''} is held and the release goes on with the next issue. You can retry it later.`}
+        busy={busy}
+        onClose={() => setConfirmGiveUp(null)}
+        onConfirm={() => void giveUpRelease()}
+      />
+      <GiveUpDialog
+        open={confirmGiveUp === 'run' && waitingRun !== null}
+        text={GIVE_UP_RUN_TEXT}
+        busy={busy}
+        onClose={() => setConfirmGiveUp(null)}
+        onConfirm={() => void runAction('give-up')}
       />
 
       <Dialog open={confirmCancel} onClose={() => setConfirmCancel(false)} title="Cancel release?">
@@ -562,13 +652,15 @@ function clockTime(isoTs: string): string {
 const sentence = (text: string) => (/[.!?]$/.test(text.trim()) ? text.trim() : `${text.trim()}.`);
 
 /** What a started release is doing, as one plain sentence (null while planning). */
-function releaseStatusLine(release: Release, running: ReleaseIssue | undefined, held: number): string | null {
+function releaseStatusLine(release: Release, running: ReleaseIssue | undefined, held: number, now: number): string | null {
   const branch = release.branch ?? `release/${release.name}`;
   switch (release.status) {
     case 'planning':
     case 'scheduled':
       return null;
     case 'building': {
+      const waiting = running ? runningWaitLine(running, now) : null;
+      if (waiting) return waiting;
       if (running) return `Building #${running.number} ${running.title}.`;
       const next = release.issues.find((i) => i.state === 'waiting');
       if (next) return `Starting #${next.number} ${next.title}.`;
@@ -579,6 +671,7 @@ function releaseStatusLine(release: Release, running: ReleaseIssue | undefined, 
       const note = sentence(p?.note ?? 'Paused');
       if (p?.reason === 'usage_limit') return `${note}${p.resumeAt ? ` Resumes automatically ${clockTime(p.resumeAt)}.` : ''}`;
       if (p?.reason === 'credentials') return note;
+      if (p?.reason === 'network') return releaseNetworkLine(release, now);
       return `${note}${running ? ` #${running.number} is finishing; no further issue starts.` : ''}`;
     }
     case 'cancelled':
@@ -621,8 +714,8 @@ function readyLine(release: Release, target: string) {
   if (release.mergeState === 'conflict')
     return (
       <>
-        <code>{branch}</code> no longer merges cleanly into {target}. Agern will not merge it. Resolve the conflicts on the release branch, then check
-        again.
+        <code>{branch}</code> no longer merges cleanly into {target}. Agern will not merge it. Bring it up to date, or resolve the conflicts on the
+        release branch and check again.
       </>
     );
   if (release.mergeMethod === 'unavailable')
@@ -749,19 +842,24 @@ function ReleaseReposSection({ release }: { release: Release }) {
 function ReleasePullSection({
   release,
   isOwner,
+  maySync,
   ownerName,
   busy,
   checking,
   onCheck,
   onApprove,
+  onSync,
 }: {
   release: Release;
   isOwner: boolean;
+  /** The viewer is the release owner or an admin: may bring it up to date. */
+  maySync: boolean;
   ownerName: string;
   busy: boolean;
   checking: boolean;
   onCheck: () => void;
   onApprove: () => void;
+  onSync: () => void;
 }) {
   const target = release.targetBranch ?? 'the default branch';
   const readiness = releaseReadiness(release);
@@ -770,7 +868,9 @@ function ReleasePullSection({
   const blocked = multi
     ? readiness !== 'complete' || pending.some(repoBlocked)
     : readiness !== 'complete' || release.mergeState === 'conflict' || release.mergeMethod === 'unavailable';
-  const approvable = multi ? !blocked && pending.length > 0 && pending.every((r) => r.state === 'open') : !blocked && release.prNumber !== null;
+  const syncRunning = release.sync?.state === 'running';
+  const approvable =
+    (multi ? !blocked && pending.length > 0 && pending.every((r) => r.state === 'open') : !blocked && release.prNumber !== null) && !syncRunning;
   // Each repository merges with its own method; the list says how each one stands.
   const method = approvable && !multi ? methodWords(release, target, false) : '';
   const checks = multi ? (worstChecks(pending)?.checks ?? null) : release.checks;
@@ -801,6 +901,7 @@ function ReleasePullSection({
       <p id="release-ready-status" className={`release-status release-status--${blocked ? 'blocked' : 'ready'}`} role="status">
         {readyLine(release, target)}
       </p>
+      {!multi && <SyncPart release={release} target={target} mayStart={maySync} ownerName={ownerName} busy={busy} onSync={onSync} />}
       {!multi && release.checks && <ChecksLine checks={release.checks} />}
       {method && <p className="muted small">{method}</p>}
       {auto && <p className="muted small release-auto">{auto}</p>}
@@ -809,14 +910,129 @@ function ReleasePullSection({
           <button type="button" className="btn" onClick={onCheck} disabled={busy}>
             {checking ? 'Checking…' : 'Check again'}
           </button>
-          <button type="button" className="btn btn--primary" onClick={onApprove} disabled={busy || !approvable} aria-describedby="release-ready-status">
-            Approve and release
-          </button>
+          {/* Merge policy `github` (ARCHITECTURE §6 "Merge policy"): Agern never merges; the server refuses too. */}
+          {release.mergePolicy === 'github' ? (
+            <span className="muted small">This project merges on GitHub: review and merge the release pull request there.</span>
+          ) : (
+            <button type="button" className="btn btn--primary" onClick={onApprove} disabled={busy || !approvable} aria-describedby="release-ready-status">
+              Approve and release
+            </button>
+          )}
         </div>
+      ) : release.mergePolicy === 'github' ? (
+        <p className="muted small">This project merges on GitHub: review and merge the release pull request there.</p>
       ) : (
         <p className="muted small">Only {ownerName} can approve this release.</p>
       )}
     </section>
+  );
+}
+
+/**
+ * Bringing a single-repository `ready` release up to date (docs/ARCHITECTURE.md §10 "Releases"): how far its branch
+ * is behind, the state of its latest sync run and, for the owner or an admin, the "Bring up to date" button.
+ */
+function SyncPart({
+  release,
+  target,
+  mayStart,
+  ownerName,
+  busy,
+  onSync,
+}: {
+  release: Release;
+  target: string;
+  mayStart: boolean;
+  ownerName: string;
+  busy: boolean;
+  onSync: () => void;
+}) {
+  const branch = release.branch ?? `release/${release.name}`;
+  const sync = release.sync ?? null;
+  const behind = release.behindBy ?? 0;
+  const runLink = sync && (
+    <Link to={`/p/${release.repo}/runs/${sync.runId}`} className="release-sync-link">
+      Open the run
+    </Link>
+  );
+  const offer = !!release.syncNeeded && sync?.state !== 'running';
+  return (
+    <>
+      {release.mergeState !== 'conflict' && behind > 0 && (
+        <p className="muted small">
+          <code>{branch}</code> is {behind} commit{behind === 1 ? '' : 's'} behind {target}.
+        </p>
+      )}
+      {sync?.state === 'running' && (
+        <p className="release-sync release-sync--running small" role="status">
+          Bringing {branch} up to date with {target} (started by {sync.by.username}). {runLink}
+        </p>
+      )}
+      {sync?.state === 'failed' && (
+        <div className="release-sync release-sync--failed form-error small" role="alert">
+          Could not bring it up to date. {sync.error} {runLink}
+        </div>
+      )}
+      {sync?.state === 'unreviewed' && (
+        <div className="release-sync release-sync--unreviewed form-error small" role="alert">
+          {target} was merged into {branch} (commit <code>{(sync.pushedSha ?? '').slice(0, 7)}</code>), but the review of the merge did not pass or
+          did not finish. {sync.error} Look at the run before releasing. {runLink}
+        </div>
+      )}
+      {sync?.state === 'done' && (
+        <p className="muted small release-sync release-sync--done">
+          Brought up to date with {target} {timeAgo(sync.endedAt ?? sync.startedAt)} by {sync.by.username}. {runLink}
+        </p>
+      )}
+      {offer &&
+        (mayStart ? (
+          <div className="release-sync-actions">
+            <button type="button" className="btn" onClick={onSync} disabled={busy} aria-haspopup="dialog">
+              Bring up to date
+            </button>
+          </div>
+        ) : (
+          <p className="muted small">Only {ownerName} or an admin can bring it up to date.</p>
+        ))}
+    </>
+  );
+}
+
+/** Confirms "Bring up to date": what the agent run does, and with whose credentials. */
+function SyncReleaseDialog({
+  release,
+  open,
+  busy,
+  onClose,
+  onConfirm,
+}: {
+  release: Release;
+  open: boolean;
+  busy: boolean;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  const target = release.targetBranch ?? 'the default branch';
+  const branch = release.branch ?? `release/${release.name}`;
+  return (
+    <Dialog open={open} onClose={onClose} title={`Bring ${branch} up to date?`}>
+      <div className="form">
+        <p>
+          An agent run merges {target} into {branch} with a merge commit (no rebase, no force-push), resolves the conflicts, renumbers this release’s
+          own database migrations above {target}’s, runs the project’s checks and pushes {branch}. Reviewers then look at the conflict resolution.
+          Nothing is merged into {target}. It runs with your Claude credential and GitHub token.
+        </p>
+        {release.mergeMethod === 'rebase' && <p>Afterwards the release is merged with a merge commit instead of by rebasing.</p>}
+        <div className="dialog-actions">
+          <button type="button" className="btn btn--ghost" onClick={onClose} disabled={busy} data-autofocus>
+            Cancel
+          </button>
+          <button type="button" className="btn btn--primary" onClick={onConfirm} disabled={busy}>
+            {busy ? 'Starting…' : 'Bring up to date'}
+          </button>
+        </div>
+      </div>
+    </Dialog>
   );
 }
 
@@ -840,7 +1056,9 @@ function ReleaseModeField({
   onChange: (mode: ReleaseMode) => void;
 }) {
   const planning = release.status === 'planning';
-  const mayAutomatic = planning || isOwner;
+  // A project whose merge policy requires a human refuses automatic releases (the server does too).
+  const humanRequired = (release.mergePolicy ?? 'automatic') !== 'automatic';
+  const mayAutomatic = (planning || isOwner) && !humanRequired;
   const mayManual = planning || isOwner || isAdmin;
   const mayChange = release.mode === 'automatic' ? mayManual : mayAutomatic;
   const who = release.owner ? release.owner.username : 'whoever starts it';
@@ -867,6 +1085,7 @@ function ReleaseModeField({
       )}
       <span id="release-mode-hint" className="muted small">
         {hint}
+        {humanRequired && release.mode !== 'automatic' && ' This project requires a human approval.'}
       </span>
     </div>
   );

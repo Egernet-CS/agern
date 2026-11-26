@@ -1,6 +1,6 @@
 // Turns raw session events (incl. Claude Code stream-json) into renderable transcript items.
 // Everything here is defensive: unknown shapes become compact "unknown" items, never throws.
-import type { Attachment, CheckoutInfo, FactoryEvent, ImagesPayload, SandboxLog, SessionStatus } from '../../api/types';
+import type { Attachment, CheckoutInfo, DeployLog, FactoryEvent, ImagesPayload, SandboxLog, SandboxVmLog, SessionStatus } from '../../api/types';
 
 export type ToolResult = { text: string; isError: boolean; images: number };
 
@@ -23,7 +23,7 @@ export type Item =
   | { k: 'tool'; id: string; name: string; input: unknown; inputPartial?: string; result?: ToolResult; streaming?: boolean; progress?: ToolProgress }
   | { k: 'init'; id: string; model: string; cwd: string | null; tools: number; mcp: { name: string; status: string }[] }
   | { k: 'result'; id: string; ok: boolean; subtype: string; costUsd: number | null; turns: number | null; durationMs: number | null; text: string | null }
-  | { k: 'system'; id: string; level: 'info' | 'warn' | 'error'; text: string; sandbox?: SandboxLog }
+  | { k: 'system'; id: string; level: 'info' | 'warn' | 'error'; text: string; sandbox?: SandboxLog; deploy?: DeployLog; sandboxVm?: SandboxVmLog }
   | { k: 'status'; id: string; status: string }
   | { k: 'images'; id: string; images: ImagesPayload }
   | { k: 'unknown'; id: string; label: string; json: string };
@@ -78,6 +78,15 @@ function compactJson(v: unknown, max = 220): string {
 }
 
 /** Attachment refs of a `user` event, defensively (only well-formed entries). */
+/**
+ * The displayed width (CSS px) of a transcript thumbnail of `width`×`height`, fitted into `maxW`×`maxH` without upscaling,
+ * so its box can be reserved before the image loads. Null when the size is unknown.
+ */
+export function fitWidth(width: number | null | undefined, height: number | null | undefined, maxW = 220, maxH = 160): number | null {
+  if (width == null || height == null || !Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+  return Math.max(1, Math.round(width * Math.min(1, maxW / width, maxH / height)));
+}
+
 export function attachmentsOf(v: unknown): Attachment[] {
   if (!Array.isArray(v)) return [];
   return v.filter((a): a is Attachment => isObj(a) && typeof a.id === 'string' && typeof a.name === 'string').map((a) => ({
@@ -99,6 +108,69 @@ export function sandboxLogOf(v: unknown): SandboxLog | undefined {
     output: str(v.output) ?? '',
     outputTruncated: v.outputTruncated === true,
     platform: str(v.platform) ?? null,
+    ...(v.review === true ? { review: true } : {}),
+  };
+}
+
+/** The `deploy` log of a system event (a chat's deploy command or copy), defensively (undefined unless well-formed). */
+export function deployLogOf(v: unknown): DeployLog | undefined {
+  if (!isObj(v) || typeof v.target !== 'string' || !v.target) return undefined;
+  const kind = v.kind === 'copy' ? 'copy' : v.kind === 'exec' ? 'exec' : null;
+  if (!kind) return undefined;
+  const command = str(v.command) ?? undefined;
+  const path = str(v.path) ?? undefined;
+  const dest = str(v.dest) ?? undefined;
+  if (kind === 'exec' && command === undefined) return undefined;
+  if (kind === 'copy' && (path === undefined || dest === undefined)) return undefined;
+  const exit = num(v.exitCode);
+  return {
+    kind,
+    target: v.target,
+    host: str(v.host) ?? '',
+    port: num(v.port) ?? 22,
+    user: str(v.user) ?? '',
+    command,
+    path,
+    dest,
+    bytes: num(v.bytes) ?? undefined,
+    exitCode: exit != null && Number.isInteger(exit) ? exit : null,
+    timedOut: v.timedOut === true,
+    durationMs: num(v.durationMs) ?? 0,
+    output: str(v.output) ?? '',
+    outputTruncated: v.outputTruncated === true,
+    error: str(v.error) || null,
+  };
+}
+
+const VM_STEPS = ['upload', 'checkout', 'setup', 'ready'] as const;
+
+/**
+ * The `sandboxVm` log of a system event (a deploy step, a command or a reset on a run's sandbox VM), defensively
+ * (undefined unless well-formed: a known kind, a VM name, and a command for `exec` and `reset`).
+ */
+export function sandboxVmLogOf(v: unknown): SandboxVmLog | undefined {
+  if (!isObj(v) || typeof v.vm !== 'string' || !v.vm) return undefined;
+  const kind = v.kind === 'deploy' || v.kind === 'exec' || v.kind === 'reset' ? v.kind : null;
+  if (!kind) return undefined;
+  const command = str(v.command);
+  if (kind !== 'deploy' && command === null) return undefined;
+  const step = kind === 'deploy' ? (VM_STEPS.find((x) => x === v.step) ?? null) : null;
+  const exit = num(v.exitCode);
+  return {
+    kind,
+    step,
+    vm: v.vm,
+    host: str(v.host) ?? '',
+    port: num(v.port) ?? 22,
+    user: str(v.user) ?? '',
+    command,
+    sha: str(v.sha) || null,
+    exitCode: exit != null && Number.isInteger(exit) ? exit : null,
+    timedOut: v.timedOut === true,
+    durationMs: num(v.durationMs) ?? 0,
+    output: str(v.output) ?? '',
+    outputTruncated: v.outputTruncated === true,
+    error: str(v.error) || null,
   };
 }
 
@@ -202,7 +274,7 @@ export function buildTranscript(events: FactoryEvent[], partials: unknown[]): { 
           continue;
         }
         const level = s.level === 'warn' || s.level === 'error' ? s.level : 'info';
-        items.push({ k: 'system', id, level, text: str(s.text) ?? compactJson(p), sandbox: sandboxLogOf(s.sandbox) });
+        items.push({ k: 'system', id, level, text: str(s.text) ?? compactJson(p), sandbox: sandboxLogOf(s.sandbox), deploy: deployLogOf(s.deploy), sandboxVm: sandboxVmLogOf(s.sandboxVm) });
         continue;
       }
       if (ev.type === 'status') {
@@ -392,6 +464,11 @@ export function toolArgs(name: string, input: unknown, partial?: string): string
   }
   if (name.endsWith('__factory_sandbox_exec')) out = s('command');
   if (name.endsWith('__factory_sandbox_wait')) out = s('handle')?.trim() || 'latest command';
+  if (name.endsWith('__factory_deploy_exec')) out = `${s('target') ?? '?'}: ${s('command') ?? ''}`;
+  if (name.endsWith('__factory_deploy_copy')) out = `${s('target') ?? '?'}: ${s('path') ?? '?'} → ${s('dest') ?? '?'}`;
+  if (name.endsWith('__factory_sandbox_vm_deploy')) out = input.background === true ? 'HEAD, in the background' : 'HEAD';
+  if (name.endsWith('__factory_sandbox_vm_exec')) out = s('command');
+  if (name.endsWith('__factory_sandbox_vm_wait')) out = s('handle')?.trim() || 'latest operation';
   if (out == null) {
     const entries = Object.entries(input).filter(([, v]) => v !== undefined);
     out = entries
@@ -426,6 +503,53 @@ export function toolSummary(name: string, r: ToolResult): string | null {
       /* not JSON: show the text */
     }
   }
+  if (name.endsWith('__factory_deploy_exec') || name.endsWith('__factory_deploy_copy')) {
+    // The agent gets JSON; the full record is the deploy block in the transcript.
+    try {
+      const j = JSON.parse(r.text) as { exitCode?: number; durationMs?: number; timedOut?: boolean; bytes?: number };
+      const secs = typeof j.durationMs === 'number' ? ` in ${(j.durationMs / 1000).toFixed(1)} s` : '';
+      if (typeof j.exitCode === 'number') return `${j.timedOut ? 'Timed out' : `Exit ${j.exitCode}`}${secs} · full log below`;
+      if (typeof j.bytes === 'number') return `Copied ${j.bytes.toLocaleString('en-GB')} bytes${secs}`;
+    } catch {
+      /* not JSON: show the text */
+    }
+  }
+  if (name.includes('__factory_sandbox_vm_')) {
+    const vm = sandboxVmSummary(name, r.text);
+    if (vm) return vm;
+  }
   if (r.images) return `${r.images} image${r.images > 1 ? 's' : ''}${r.text ? ` + ${lines} lines` : ''}`;
+  return null;
+}
+
+/** The one-line summary of a sandbox VM tool's JSON answer (the full logs are the sandbox VM blocks in the transcript). */
+function sandboxVmSummary(name: string, text: string): string | null {
+  let j: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (!isObj(parsed)) return null;
+    j = parsed;
+  } catch {
+    return null;
+  }
+  const secs = (ms: unknown) => (typeof ms === 'number' ? ` in ${(ms / 1000).toFixed(1)} s` : '');
+  if (name.endsWith('__factory_sandbox_vm_info')) {
+    const vm = [str(j.name), str(j.user) && str(j.host) ? `(${str(j.user)}@${str(j.host)})` : null].filter(Boolean).join(' ');
+    if (j.available !== true) return `Not available${str(j.reason) ? `: ${str(j.reason)}` : ''}`;
+    const lease = isObj(j.lease) ? j.lease : {};
+    const state = lease.heldByThisRun === true ? 'held by this run' : isObj(lease.heldByOther) ? 'in use by another run' : lease.resetting === true ? 'being reset' : 'free';
+    return `${vm || 'Sandbox VM'} · ${state}`;
+  }
+  if (j.running === true && typeof j.exitCode !== 'number' && typeof j.ok !== 'boolean') {
+    return typeof j.elapsedMs === 'number' ? `Still running after ${Math.round(j.elapsedMs / 1000)} s` : 'Started in the background';
+  }
+  if (typeof j.ok === 'boolean' && Array.isArray(j.steps)) {
+    const sha = str(j.sha)?.slice(0, 7);
+    const dirty = j.dirty === true ? ' (uncommitted changes not deployed)' : '';
+    return j.ok
+      ? `Deployed ${sha ?? 'HEAD'}${secs(j.durationMs)}${dirty} · full log below`
+      : `Failed at ${str(j.failedStep) ?? 'a step'}${secs(j.durationMs)} · full log below`;
+  }
+  if (typeof j.exitCode === 'number') return `${j.timedOut === true ? 'Timed out' : `Exit ${j.exitCode}`}${secs(j.durationMs)} · full log below`;
   return null;
 }

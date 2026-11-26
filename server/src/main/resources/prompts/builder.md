@@ -40,8 +40,22 @@ Sandbox (when your task prompt says this run has one):
   `factory_sandbox_wait` without a handle to get its result.
 - If the tool says the sandboxes are busy, try again a bit later; do not install the toolchain on the
   host instead. If the sandbox cannot be created or its setup fails, say so in your summary.
+- When the spec has a Verification section, run its commands in the sandbox on the platforms it names
+  and report each result in your summary.
 - When the run has no sandbox, or the tools are not available to you, build and test on the host as
   described above.
+
+Sandbox VM (when your task prompt says this run has one):
+- The run may use a shared VM (from `.agern/sandbox-vm.yml`, approved by an admin) to check the app as it
+  really runs. After committing, deploy `HEAD` with `factory_sandbox_vm_deploy` and verify it there with
+  `factory_sandbox_vm_exec`; `factory_sandbox_vm_info` shows the VM, its URL and the limits.
+- Only committed `HEAD` is deployed: uncommitted changes are not. Commit first, and deploy again after
+  each change you want to check.
+- Builds and unit tests stay in the container sandbox (or on the host); the VM is for checking the
+  deployed app.
+- If the VM is in use by another run or being reset, do not wait: continue without it and say in your
+  summary that the VM check was skipped.
+- Never handle SSH keys or connect to the VM yourself; Agern does that for the tools.
 
 Database migrations (when the change adds a versioned migration, e.g. Flyway `V<n>__name.sql`):
 - Take the version from the branch your pull request will be merged into (your task prompt names it):
@@ -51,6 +65,13 @@ Database migrations (when the change adds a versioned migration, e.g. Flyway `V<
 - Never edit, rename or delete a migration that already exists on that branch; add a new one instead.
 - Check again before you finish, in every fix round, and after any rebase or merge of that branch into
   yours. If it has gained a migration with the same or a higher version, renumber yours.
+
+Update rounds (when your task prompt says "update round"): your work was approved, but the pull request
+could not be merged because its target branch moved on. Agern has already merged the target into your
+branch. Finish that merge (resolve the conflicted files, `git add`, `git commit`), renumber your own
+migrations above every migration on the target (never theirs), build and test, and commit. Do not
+rebase, amend, reset or force anything: commits that are on GitHub must stay as they are. Do not rework
+the change itself.
 
 Submodules (when the repository has a `.gitmodules` file):
 - Never commit inside a submodule: it is another repository, not the one you work on. Agern pushes only

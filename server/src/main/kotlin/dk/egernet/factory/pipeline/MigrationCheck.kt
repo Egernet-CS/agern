@@ -104,16 +104,139 @@ object MigrationCheck {
     fun listed(problems: List<String>): String =
         problems.take(MAX_LISTED).joinToString("; ") + if (problems.size > MAX_LISTED) " (and ${problems.size - MAX_LISTED} more)" else ""
 
-    /** Why a run's pull request #[pr] into [target] was not merged; the run's needs-human reason and a held issue's note. */
-    fun runReason(target: String, pr: Int, problems: List<String>, prRef: String = "#$pr"): String =
-        "Database migration conflict with `$target`: ${listed(problems)}. Pull request $prRef was not merged. Migrations " +
-            "already on `$target` must stay unchanged, and a new migration needs a version above all of them. Fix the " +
-            "migration on the pull request's branch and approve again, or build the issue again from the current `$target` " +
-            "(in a release: Retry)."
+    /**
+     * Where a run stands with its update rounds ("Update and merge", docs/ARCHITECTURE.md §6 "Retrying a run"): [used] of
+     * [max] started. With [max] 0 the feature is off.
+     */
+    data class Rounds(val used: Int, val max: Int) {
+        val left: Int get() = (max - used).coerceAtLeast(0)
+        val available: Boolean get() = used < max
+    }
 
-    /** Why the release branch [branch] is not merged into [target]: the release's notice and the approval refusal. */
-    fun releaseReason(target: String, branch: String, problems: List<String>): String =
-        "Database migration conflict with `$target`: ${listed(problems)}. The release is not merged. Fix the migrations on " +
-            "`$branch` (merge `$target` into it; a new migration needs a version above every migration on `$target`, and " +
-            "existing ones must stay unchanged), then use \"Check again\"."
+    /**
+     * The end of a merge refusal that an update round can resolve: "Update and merge" while rounds are left ([what] it
+     * lets the builder do, or [fix] by hand), the limit when they are used up ([fixAtLimit] by hand), else [off] (the
+     * feature is off).
+     */
+    fun updateEnding(target: String, rounds: Rounds, what: String, fix: String, off: String, fixAtLimit: String = fix): String = when {
+        rounds.max <= 0 -> off
+        rounds.available -> "Use \"Update and merge\" to have Agern merge `$target` into the branch and let the builder $what " +
+            "(update round ${rounds.used + 1} of ${rounds.max}), or $fix and approve again."
+        else -> "The limit of ${rounds.max} update round(s) is reached: $fixAtLimit and approve again, or build the issue again from the " +
+            "current `$target` (in a release: Retry)."
+    }
+
+    /**
+     * Why a run's pull request #[pr] into [target] was not merged; the run's needs-human reason and a held issue's note.
+     * [rounds]: the run's update rounds, for the way forward the reason names.
+     */
+    fun runReason(target: String, pr: Int, problems: List<String>, prRef: String = "#$pr", rounds: Rounds = Rounds(0, 0)): String =
+        "Database migration conflict with `$target`: ${listed(problems)}. Pull request $prRef was not merged. Migrations " +
+            "already on `$target` must stay unchanged, and a new migration needs a version above all of them. " +
+            updateEnding(
+                target, rounds, "renumber the migration", "fix the migration on the pull request's branch",
+                "Fix the migration on the pull request's branch and approve again, or build the issue again from the current " +
+                    "`$target` (in a release: Retry).",
+            )
+
+    /** Why a run's pull request [prRef] was not merged because it conflicts with [target] or is behind it ([why]: GitHub's answer). */
+    fun mergeConflictReason(target: String, prRef: String, why: String, rounds: Rounds = Rounds(0, 0)): String =
+        "Merging pull request $prRef failed: $why. The branch conflicts with `$target` or is behind it. " +
+            updateEnding(
+                target, rounds, "resolve the conflicts", "resolve them on the pull request's branch",
+                "Resolve the conflicts on the pull request's branch and approve again, or build the issue again from the current " +
+                    "`$target` (in a release: Retry).",
+                fixAtLimit = "resolve the conflicts on the pull request's branch",
+            )
+
+    /** One migration of the run to renumber: [path] gets [version] ([newPath]); [kept] on the target keeps [keptVersion]. */
+    data class Renumber(val path: String, val version: String, val newPath: String, val kept: String?, val keptVersion: String?)
+
+    /**
+     * How the run's migrations fit the target again ([plan]): the ones to renumber, the first free version on the target
+     * per migration root, and the target's migrations the run changed or removed (to be restored as they are there).
+     */
+    data class Plan(val renumber: List<Renumber>, val nextFree: Map<String, String>, val restore: List<String>) {
+        val isEmpty: Boolean get() = renumber.isEmpty() && restore.isEmpty()
+    }
+
+    /**
+     * The version after [v]: its last digit group plus one, with its width of leading zeros and its separators kept
+     * (`25` → `26`, `009` → `010`, `1_9` → `1_10`, `1.2` → `1.3`).
+     */
+    fun nextVersion(v: String): String {
+        val m = Regex("(\\d+)$").find(v) ?: return "1"
+        val digits = m.groupValues[1]
+        val next = BigInteger(digits).add(BigInteger.ONE).toString().padStart(digits.length, '0')
+        return v.substring(0, m.range.first) + next
+    }
+
+    /**
+     * The renumbering that resolves [problems] for the same input: per migration root, every added migration that
+     * [problems] flags (same version as one on the base or an earlier added one, or below the base's highest) gets a new
+     * version, in order of (version, path), counting up from the highest of the base's versions and of the added ones
+     * that keep theirs. Pure.
+     */
+    fun plan(baseFiles: Collection<String>, changes: Collection<FileChange>): Plan {
+        val renumber = mutableListOf<Renumber>()
+        val nextFree = sortedMapOf<String, String>()
+        val restore = mutableListOf<String>()
+        val base = baseFiles.filter { rootOf(it) != null && versionOf(it) != null }.toSet()
+        val relevant = changes.filter { rootOf(it.path) != null && versionOf(it.path) != null }
+        for (root in relevant.mapNotNull { rootOf(it.path) }.distinct().sorted()) {
+            val onBase = base.filter { rootOf(it) == root }.associateWith { versionOf(it)!! }
+            val mine = relevant.filter { rootOf(it.path) == root }.sortedBy { it.path }
+            val removed = mutableSetOf<String>()
+            val added = mutableListOf<String>()
+            for (c in mine) {
+                when {
+                    c.path in onBase && (c.status == 'D' || c.status == 'M') -> { restore += c.path; if (c.status == 'D') removed += c.path }
+                    c.path in onBase -> {}
+                    c.status != 'D' -> added += c.path
+                }
+            }
+            val highest = onBase.entries.maxWithOrNull(compareBy<Map.Entry<String, Version>> { it.value }.thenBy { it.key })
+            nextFree[root] = highest?.let { nextVersion(it.value.text) } ?: "1"
+            val flagged = mutableListOf<Pair<String, String?>>()
+            for ((i, a) in added.withIndex()) {
+                val v = versionOf(a)!!
+                val same = onBase.entries.firstOrNull { it.key !in removed && it.value == v }?.key
+                val sameAdded = added.take(i).firstOrNull { versionOf(it) == v }
+                when {
+                    same != null -> flagged += a to same
+                    sameAdded != null -> flagged += a to null
+                    highest != null && v < highest.value -> flagged += a to null
+                }
+            }
+            if (flagged.isEmpty()) continue
+            val flaggedPaths = flagged.map { it.first }.toSet()
+            val keep = added.filter { it !in flaggedPaths }.map { versionOf(it)!! }
+            var current: Version? = (listOfNotNull(highest?.value) + keep).maxWithOrNull(compareBy { it })
+            // The base's text wins over an added file's when both have the highest version (its width is the target's).
+            if (highest != null && current == highest.value) current = highest.value
+            for ((a, same) in flagged.sortedWith(compareBy<Pair<String, String?>> { versionOf(it.first)!! }.thenBy { it.first })) {
+                val next = current?.let { nextVersion(it.text) } ?: "1"
+                current = Version(next)
+                val name = a.substringAfterLast('/')
+                val newPath = a.substringBeforeLast('/', "").let { if (it.isEmpty()) "" else "$it/" } + "V${next}__" + name.substringAfter("__")
+                val kept = same ?: highest?.key
+                renumber += Renumber(a, next, newPath, kept, kept?.let { versionOf(it)?.text })
+            }
+        }
+        return Plan(renumber, nextFree, restore)
+    }
+
+    /**
+     * Why the release branch [branch] is not merged into [target]: the release's notice and the approval refusal. With
+     * [releaseName] (a single-repository release) it points at "Bring up to date" (docs/ARCHITECTURE.md §6 "Bringing a
+     * release up to date").
+     */
+    fun releaseReason(target: String, branch: String, problems: List<String>, releaseName: String? = null): String =
+        "Database migration conflict with `$target`: ${listed(problems)}. The release is not merged. A new migration needs " +
+            "a version above every migration on `$target`, and existing ones must stay unchanged. " + if (releaseName != null) {
+            "Use \"Bring up to date\" on the release page (or `/factory release sync $releaseName`), or fix the migrations on " +
+                "`$branch` and use \"Check again\"."
+        } else {
+            "Fix the migrations on `$branch` (merge `$target` into it), then use \"Check again\"."
+        }
 }

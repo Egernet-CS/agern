@@ -75,7 +75,35 @@ data class ProjectDto(
     val iconUrl: String? = null,
     /** The workspace definition (docs/ARCHITECTURE.md §5 "Workspace projects"); filled by `GET /api/projects/{repo}` only. */
     val workspace: WorkspaceDto? = null,
+    /** The project's settings (docs/ARCHITECTURE.md §6 "Merge policy"); defaults without a stored row. */
+    val settings: ProjectSettingsDto = ProjectSettingsDto(),
 )
+
+/**
+ * Per-project settings set by an admin (docs/ARCHITECTURE.md §6 "Merge policy"): the [MergePolicy] and, used only with
+ * [MergePolicy.GITHUB], the GitHub logins and team slugs requested as reviewers on a run's pull request.
+ */
+@Serializable
+data class ProjectSettingsDto(
+    val mergePolicy: String = MergePolicy.AUTOMATIC,
+    val reviewers: List<String> = emptyList(),
+    val teamReviewers: List<String> = emptyList(),
+)
+
+/** `PUT /api/projects/{repo}/settings`. Omitted lists are empty lists. */
+@Serializable
+data class ProjectSettingsReq(val mergePolicy: String? = null, val reviewers: List<String>? = null, val teamReviewers: List<String>? = null)
+
+/** How a project's runs reach the default branch (docs/ARCHITECTURE.md §6 "Merge policy"). */
+object MergePolicy {
+    /** The approver agent may merge (the default). */
+    const val AUTOMATIC = "automatic"
+    /** The approver only recommends; every merge waits in `needs_human` for the run owner's approval. */
+    const val OWNER_APPROVES = "owner_approves"
+    /** Agern never merges: a passing run ends `ready` and the team merges the pull request on GitHub. */
+    const val GITHUB = "github"
+    val ALL = setOf(AUTOMATIC, OWNER_APPROVES, GITHUB)
+}
 
 /**
  * [path]: where the definition comes from, `.agern/workspace.yml` or `.gitmodules` (members derived from the
@@ -140,10 +168,51 @@ data class ReleaseIssueDto(
     val retryMode: String? = null,
     /** The member repository and directory its linked run targets; null without a run or for the project repository. */
     val targetRepo: String? = null, val targetDir: String? = null,
+    /** The linked run's network wait while the issue is `running` and its run waits for the network. */
+    val waiting: RunWaitDto? = null,
+    /** From the linked run: whether "Update and merge" can start now, its update rounds and limit, the latest update's summary. */
+    val updateAvailable: Boolean = false,
+    val updateRounds: Int = 0,
+    val maxUpdateRounds: Int = 0,
+    val updateSummary: String? = null,
 )
 
-/** Why a release is paused; [resumeAt] is set only for an automatic resume after a usage limit. */
-@Serializable data class ReleasePauseDto(val reason: String, val note: String?, val resumeAt: String?)
+/**
+ * The latest run that brings a release up to date (docs/ARCHITECTURE.md §6 "Bringing a release up to date").
+ * [state]: [ReleaseSyncState]. [pushedSha]: the merge it pushed to `release/<name>` (last push), if any. [error]: why it
+ * failed or was cancelled.
+ */
+@Serializable data class ReleaseSyncDto(
+    val runId: String, val state: String, val by: OwnerDto, val startedAt: String, val endedAt: String? = null,
+    val pushedSha: String? = null, val error: String? = null,
+)
+
+/** [ReleaseSyncDto.state]. */
+object ReleaseSyncState {
+    /** The sync run is queued, building or reviewing. */
+    const val RUNNING = "running"
+    /** It ended `merged` (pushed and reviewed, or already up to date). */
+    const val DONE = "done"
+    /** It failed or was cancelled before anything was pushed. */
+    const val FAILED = "failed"
+    /** It failed or was cancelled after it pushed: the merge is on the release branch but its review did not pass. */
+    const val UNREVIEWED = "unreviewed"
+}
+
+/**
+ * Why a release is paused; [resumeAt] is set for an automatic resume (after a usage limit, or the next try for reason
+ * `network`). [since] and [attempt]: the start of the current network streak and its failed starts (reason `network`).
+ */
+@Serializable data class ReleasePauseDto(
+    val reason: String, val note: String?, val resumeAt: String?, val since: String? = null, val attempt: Int? = null,
+)
+
+/**
+ * A run that lost the network and waits before trying again (docs/ARCHITECTURE.md §6 "Transient failures"); ISO instants.
+ * [attempt]: failed attempts of the current streak so far (≥ 1); [detail]: what failed.
+ */
+@Serializable
+data class RunWaitDto(val reason: String, val since: String, val nextAttemptAt: String, val attempt: Int, val detail: String)
 
 @Serializable
 data class ReleaseDto(
@@ -193,6 +262,19 @@ data class ReleaseDto(
      * repositories in merge order (untouched ones last), then the project repository. Empty for every other release.
      */
     val repositories: List<ReleaseRepoDto> = emptyList(),
+    /** Commits on [targetBranch] that are not on `release/<name>`, as last compared; null = not known. */
+    val behindBy: Int? = null,
+    /** The last evaluation found database migrations of `release/<name>` that collide with [targetBranch]'s. */
+    val migrationConflict: Boolean = false,
+    /**
+     * Whether "Bring up to date" is offered: `ready`, a single repository, a branch, and a conflict, a branch behind its
+     * target or a migration conflict (docs/ARCHITECTURE.md §6 "Bringing a release up to date").
+     */
+    val syncNeeded: Boolean = false,
+    /** The release's latest run that brought it up to date (kind `sync`), or null. */
+    val sync: ReleaseSyncDto? = null,
+    /** The project's current [MergePolicy], so the release page can explain why it cannot be approved or automatic. */
+    val mergePolicy: String = MergePolicy.AUTOMATIC,
 ) {
     /**
      * This release as [canSee] lets a viewer see it: a member repository the viewer cannot read keeps its name and
@@ -291,6 +373,8 @@ data class RunDto(
     val createdAt: String, val updatedAt: String, val endedAt: String?, val stages: List<StageDto>,
     /** What the run decided about its sandbox when it started; null before that (and for runs from before sandboxes). */
     val sandbox: RunSandboxDto? = null,
+    /** What the run decided about its sandbox VM, and its preview (docs/SANDBOX-VMS.md); null for runs without a decision. */
+    val sandboxVm: RunSandboxVmDto? = null,
     /** The release this run builds an issue for; null for a single run (or when the release was deleted). */
     val releaseId: String? = null,
     /** The branch the run starts from and merges into; null = the repository's default branch. */
@@ -310,7 +394,88 @@ data class RunDto(
     /** A workspace run: the member repository and directory it changes; null otherwise. */
     val targetRepo: String? = null,
     val targetDirectory: String? = null,
+    /** The project's [MergePolicy] when the run started; never changes afterwards. */
+    val mergePolicy: String = MergePolicy.AUTOMATIC,
+    /** True when the run's pull request was merged on GitHub, outside Agern (followed for `github` runs). */
+    val mergedOnGitHub: Boolean = false,
+    /** The GitHub login that merged the pull request on GitHub; null when unknown or merged by Agern. */
+    val mergedBy: String? = null,
+    /** The checks on the pull request's head commit as last evaluated before a merge; null until the first evaluation. */
+    val checks: RunChecksDto? = null,
+    /** Set while the run sleeps before retrying an operation that failed for lack of network; null otherwise. */
+    val waiting: RunWaitDto? = null,
+    /** [RunKind]: `issue`, or `sync` for a run that brings a release up to date (it has no issue: [issueNumber] is 0). */
+    val kind: String = RunKind.ISSUE,
+    /** A sync run: the commit it last pushed to its release branch; null before (and for every other run). */
+    val syncPushedSha: String? = null,
+    /** Update rounds started on the run, and its limit (docs/ARCHITECTURE.md §6 "Retrying a run", "Update and merge"). */
+    val updateRounds: Int = 0,
+    val maxUpdateRounds: Int = 0,
+    /** True when the owner can start an update round now ("Update and merge"). */
+    val updateAvailable: Boolean = false,
+    /** The run's update rounds, oldest first. */
+    val updates: List<RunUpdateDto> = emptyList(),
 )
+
+/**
+ * One update round of a run ("Update and merge"): Agern merged [target] into the run's branch, the builder resolved what
+ * conflicted, and the reviewers and the approver ran again. Texts from the repository ([incoming], [conflicts],
+ * [migrations], [commits]) are untrusted data.
+ */
+@Serializable
+data class RunUpdateDto(
+    val number: Int, val round: Int, val maxRounds: Int,
+    /** `owner` or `release` (automatic, in a building release). */
+    val trigger: String,
+    val target: String,
+    /** The merge refusal that caused the update. */
+    val reason: String? = null,
+    /** `running`, `resolved` (pushed; review and merge follow), `failed` or `cancelled`. */
+    val status: String,
+    /** `up_to_date`, `merged` or `conflict`; null before the merge. */
+    val mergeStatus: String? = null,
+    val targetSha: String? = null,
+    val incomingCount: Int = 0,
+    /** Subjects of the commits that came in (first parent, at most 50). */
+    val incoming: List<String> = emptyList(),
+    val conflicts: List<String> = emptyList(),
+    val migrations: List<String> = emptyList(),
+    /** The builder's commits, `<short sha> <subject>`, oldest first. */
+    val commits: List<String> = emptyList(),
+    val error: String? = null,
+    val startedAt: String,
+    val endedAt: String? = null,
+    /** One line for people, composed by the server. */
+    val summary: String,
+)
+
+/** What a run works on (docs/ARCHITECTURE.md §6 "Bringing a release up to date"). */
+object RunKind {
+    /** Builds an issue (every run before sync runs existed). */
+    const val ISSUE = "issue"
+    /** Merges the default branch into a release branch; belongs to no issue. */
+    const val SYNC = "sync"
+}
+
+/**
+ * The checks a run's merge was decided on (docs/ARCHITECTURE.md §6 "Checks before a merge"). [state] is a
+ * [ReleaseChecksState]; [items] are the checks that have not passed (at most [MAX_ITEMS]); [waitingSince] and [deadline]
+ * are set only while the run is `waiting_for_checks`; [overriddenBy] / [overriddenAt] when the owner merged anyway.
+ * Names, details and URLs come from GitHub and are untrusted; [RunCheckItemDto.url] is only ever an `https://` URL.
+ */
+@Serializable
+data class RunChecksDto(
+    val state: String, val sha: String, val detail: String, val items: List<RunCheckItemDto> = emptyList(),
+    val waitingSince: String? = null, val deadline: String? = null,
+    val overriddenBy: String? = null, val overriddenAt: String? = null,
+) {
+    companion object {
+        const val MAX_ITEMS = 50
+    }
+}
+
+/** One check that has not passed: [state] `failed` (with its [conclusion]) or `pending`. */
+@Serializable data class RunCheckItemDto(val name: String, val state: String, val conclusion: String? = null, val url: String? = null)
 
 /** Ways to retry a failed run (docs/ARCHITECTURE.md §6 "Retrying a run"). */
 object RetryMode {
@@ -320,9 +485,14 @@ object RetryMode {
     const val CONTINUE = "continue"
     /** A new run from scratch (the behaviour before retry modes existed; the default when a client sends none). */
     const val START_OVER = "start_over"
+    /**
+     * "Update and merge": a finished run whose merge was refused because its target moved gets an update round on the
+     * same run (merge the target in, the builder resolves it, review, approve, merge).
+     */
+    const val UPDATE = "update"
     /** Whatever the server recommends for the run. Only accepted in requests. */
     const val RECOMMENDED = "recommended"
-    val ALL = listOf(STEP, CONTINUE, START_OVER)
+    val ALL = listOf(UPDATE, STEP, CONTINUE, START_OVER)
 }
 
 /** Why a run failed, recorded when it fails. */
@@ -335,13 +505,26 @@ object FailureKind {
     const val STEP = "step"
     /** The merge was refused: a submodule pointer names a commit its remote does not have (the run needs a human). */
     const val SUBMODULE_COMMIT_MISSING = "submodule_commit_missing"
+    /** The merge was refused: the run's migrations collide with its target's (the run needs a human; "Update and merge"). */
+    const val MIGRATION_CONFLICT = "migration_conflict"
+    /** The merge was refused: the pull request conflicts with its target or is behind it ("Update and merge"). */
+    const val MERGE_CONFLICT = "merge_conflict"
+    /**
+     * The merge was not made because the checks on the pull request's head commit failed, did not finish within the
+     * time limit or could not be read (docs/ARCHITECTURE.md §6 "Checks before a merge").
+     */
+    const val CHECKS = "checks"
     const val OTHER = "other"
 
     /**
      * Failures that come from the environment rather than the work. Continuing is recommended for them when the branch
-     * has commits; issue #57 (pause and retry transient failures automatically) can build on this set.
+     * has commits. A run only fails with [API_UNREACHABLE] after it waited for the network and gave up (or waiting is
+     * off); see [dk.egernet.factory.pipeline.Transient] and docs/ARCHITECTURE.md §6 "Transient failures".
      */
     val INTERRUPTED = setOf(TIME_LIMIT, USAGE_LIMIT, RESTART, API_UNREACHABLE)
+
+    /** Refusals of the merge that an update round can resolve. */
+    val UPDATABLE = setOf(MIGRATION_CONFLICT, MERGE_CONFLICT)
 
     private val API_UNREACHABLE_RE = Regex(
         "(?i)can'?t reach the api|unable to connect to (the )?api|api error: (connection|network)|connection error|" +
@@ -408,6 +591,8 @@ data class RunSandboxDto(
     val platforms: List<String> = emptyList(),
     /** Where the builder ran commands: `default` and platform names, in first-use order (only when there are platforms). */
     val platformsUsed: List<String> = emptyList(),
+    /** A review sandbox of the run was created at least once (the ux and ui-design reviewers ran the app in it). */
+    val reviewUsed: Boolean = false,
 )
 
 /** A sidecar's readiness check (`ready:`). */
@@ -462,6 +647,154 @@ data class SandboxStatusDto(
     val approvers: List<OwnerDto> = emptyList(),
 )
 
+/** A target of a valid `.agern/deploy.yml` (docs/DEPLOY.md). */
+@Serializable
+data class DeployTargetDto(
+    val name: String, val host: String, val port: Int, val user: String,
+    val hostKeyType: String, val hostKeyFingerprint: String, val description: String?,
+)
+
+/** A project's deploy key: only the public half, never the private key. */
+@Serializable data class DeployKeyDto(val publicKey: String, val fingerprint: String, val createdBy: OwnerDto, val createdAt: String)
+
+/** `GET /api/projects/{repo}/deploy`: the definition on the default branch, its approval and the project's key. */
+@Serializable
+data class DeployStatusDto(
+    val repo: String,
+    /** FACTORY_DEPLOY is not `off`. Definitions can be approved and keys generated either way. */
+    val enabled: Boolean,
+    /** `ssh`, `fake` or `off`. */
+    val mode: String,
+    val path: String,
+    val branch: String,
+    /** `none` (no file), `invalid`, `pending` (valid, this content not approved) or `approved`. */
+    val state: String,
+    val sha256: String?,
+    val content: String?,
+    val errors: List<String>,
+    /** The targets of a valid file, in file order (empty otherwise). */
+    val targets: List<DeployTargetDto>,
+    /** The repository's approval, possibly of other content (compare [sha256]); null when none. */
+    val approval: SandboxApprovalDto?,
+    val approvers: List<OwnerDto> = emptyList(),
+    val key: DeployKeyDto?,
+)
+
+/** `POST /api/projects/{repo}/deploy/targets/{name}/check`: how far a connection got. */
+@Serializable
+data class DeployCheckDto(
+    val target: String, val ok: Boolean,
+    /** `connect`, `host_key`, `auth` (the step that failed) or `ok`. */
+    val stage: String,
+    val message: String, val durationMs: Long,
+)
+
+/**
+ * A run's sandbox VM decision (docs/SANDBOX-VMS.md), fixed when the run starts, plus what happened with the VM since.
+ * `state`: `disabled` (FACTORY_SANDBOX_VM=off), `none` (no `.agern/sandbox-vm.yml`), `invalid`, `unapproved`, `approved`.
+ */
+@Serializable
+data class RunSandboxVmDto(
+    val state: String,
+    val reason: String,
+    val sha256: String? = null,
+    /** The VM's label, host, SSH user and URL (`approved` only). */
+    val name: String? = null,
+    val host: String? = null,
+    val user: String? = null,
+    val url: String? = null,
+    /** The builder deployed to the VM at least once. */
+    val used: Boolean = false,
+    /** How long a human preview holds the VM (FACTORY_SANDBOX_VM_PREVIEW_MINUTES). */
+    val previewMinutes: Int = 120,
+    /** The latest human preview of the run; null when nobody started one. */
+    val preview: SandboxVmPreviewDto? = null,
+)
+
+/** A human preview of a run on its sandbox VM (`POST /api/runs/{id}/sandbox-vm/preview`). */
+@Serializable
+data class SandboxVmPreviewDto(
+    /** `deploying`, `ready`, `failed` or `released`. */
+    val state: String,
+    /** The commit deployed (or being deployed). */
+    val sha: String? = null,
+    val url: String? = null,
+    val startedBy: OwnerDto? = null,
+    val startedAt: String? = null,
+    /** `ready`: until when the preview holds the VM. */
+    val expiresAt: String? = null,
+    /** `released` / `failed`: when the preview ended. */
+    val endedAt: String? = null,
+    /** `released` because the preview time ran out. */
+    val expired: Boolean = false,
+    /** `failed`: `upload`, `checkout`, `setup`, `ready` or `connect`. */
+    val failedStep: String? = null,
+    val error: String? = null,
+    /** `failed`: the tail of the failed step's output (at most 20,000 characters). */
+    val output: String? = null,
+)
+
+/** The VM of a valid `.agern/sandbox-vm.yml`. */
+@Serializable
+data class SandboxVmDto(
+    val name: String, val host: String, val port: Int, val user: String,
+    val hostKeyType: String, val hostKeyFingerprint: String, val description: String?, val url: String?,
+    val checkout: String, val setup: String?, val ready: SandboxReadyDto?, val reset: String?,
+)
+
+/** Who holds a sandbox VM now. [runId], [repo] and [issueNumber] are withheld ([visible] false) from viewers who cannot see the holder's project. */
+@Serializable
+data class SandboxVmLeaseDto(
+    /** `build` (a run's builder) or `preview` (a human). */
+    val kind: String,
+    /** `held` or `resetting`. */
+    val state: String,
+    val since: String,
+    val expiresAt: String?,
+    val visible: Boolean,
+    val runId: String?,
+    val repo: String?,
+    val issueNumber: Int?,
+)
+
+/** `GET /api/projects/{repo}/sandbox-vm`: the definition on the default branch, its approval, the key and the lease. */
+@Serializable
+data class SandboxVmStatusDto(
+    val repo: String,
+    /** FACTORY_SANDBOX_VM is not `off`. Definitions can be approved either way. */
+    val enabled: Boolean,
+    /** `ssh`, `fake` or `off`. */
+    val mode: String,
+    val path: String,
+    val branch: String,
+    /** `none` (no file), `invalid`, `pending` (valid, this content not approved) or `approved`. */
+    val state: String,
+    val sha256: String?,
+    val content: String?,
+    val errors: List<String>,
+    val vm: SandboxVmDto?,
+    val approval: SandboxApprovalDto?,
+    val approvers: List<OwnerDto> = emptyList(),
+    /** The project's deploy key (shared with deploy targets); null when it has none. */
+    val key: DeployKeyDto?,
+    /** The VM's lease (keyed by host and port, so possibly held by another project's run); null when free. */
+    val lease: SandboxVmLeaseDto?,
+    val previewMinutes: Int = 120,
+)
+
+/** `POST /api/projects/{repo}/sandbox-vm/check`: how far a connection got, and the readiness check. */
+@Serializable
+data class SandboxVmCheckDto(
+    val ok: Boolean,
+    /** `connect`, `host_key`, `auth`, `ready` (the step that failed) or `ok`. */
+    val stage: String,
+    val message: String,
+    val durationMs: Long,
+    /** Stage `ready`: the readiness command's exit code and output tail. */
+    val exitCode: Int? = null,
+    val output: String? = null,
+)
+
 /** A sandbox that exists right now (`GET /api/admin/sandboxes`). */
 @Serializable
 data class RunningSandboxDto(
@@ -475,18 +808,21 @@ data class RunningSandboxDto(
     val createdAt: String,
     /** Per-container limits it runs with. */
     val cpus: Double, val memory: String,
-    /** The containers that run commands right now (the default image and/or platforms), each taking one slot. */
+    /** The containers that run commands right now (the default image, platforms, the review sandbox), each taking one slot. */
     val containers: List<SandboxContainerDto> = emptyList(),
     /** The definition's platforms (whether or not they exist right now). */
     val platforms: List<String> = emptyList(),
     /** Slots of FACTORY_SANDBOX_MAX_CONCURRENT this run holds: one per entry of [containers]. */
     val slots: Int = 0,
-    /** The memory all of the run's containers may use together: [memory] × (command containers + services). */
+    /** The memory all of the run's containers may use together: [memory] × (command containers + services, of both sandboxes). */
     val memoryTotal: String = memory,
 )
 
-/** One container of a run's sandbox that runs commands: `default` (the top-level image) or a platform. */
-@Serializable data class SandboxContainerDto(val platform: String, val image: String, val createdAt: String)
+/**
+ * One container of a run that runs commands: `default` (the top-level image) or a platform of the build sandbox ([kind]
+ * `build`), or the review sandbox's container ([kind] `review`, [platform] `default`).
+ */
+@Serializable data class SandboxContainerDto(val platform: String, val image: String, val createdAt: String, val kind: String = "build")
 
 @Serializable
 data class SandboxServerLimitsDto(
@@ -610,6 +946,68 @@ data class AttachmentDto(
 
 @Serializable data class ClientConfigDto(val attachments: AttachmentLimitsDto, val images: ImageConfigDto)
 
+/** `GET /api/github/status` (docs/ARCHITECTURE.md §6 "GitHub status", §8). */
+@Serializable
+data class GitHubStatusDto(
+    val verdict: GitHubVerdictDto,
+    val generatedAt: String,
+    val official: GitHubOfficialDto,
+    val kinds: List<GitHubKindDto>,
+    /** null with `brief=1`. */
+    val rateLimits: GitHubRateLimitsDto?,
+)
+
+/** [state]: `working`, `degraded` or `down`. */
+@Serializable data class GitHubVerdictDto(val state: String, val reason: String)
+
+/** GitHub's own status page. [state]: `ok`, `unreachable` or `disabled`; [indicator] only with `ok`. */
+@Serializable
+data class GitHubOfficialDto(
+    val state: String,
+    val indicator: String?,
+    val description: String?,
+    val components: List<GitHubComponentDto>,
+    val incidents: List<GitHubIncidentDto>,
+    val fetchedAt: String?,
+    val error: String?,
+)
+
+/** A component that is not `operational`; [relevant]: one Agern depends on. */
+@Serializable data class GitHubComponentDto(val name: String, val status: String, val relevant: Boolean)
+
+/** An open incident; [url] only when it is an `https://` link. */
+@Serializable data class GitHubIncidentDto(val title: String, val status: String, val impact: String?, val updatedAt: String?, val url: String?)
+
+/** One kind of call as Agern sees it. */
+@Serializable
+data class GitHubKindDto(
+    val kind: String,
+    val label: String,
+    val last15m: GitHubCallCountsDto,
+    val last24h: GitHubCallCountsDto,
+    val lastError: GitHubLastErrorDto?,
+)
+
+/** [calls] counts every outcome, successes included. */
+@Serializable data class GitHubCallCountsDto(val calls: Int, val serverErrors: Int, val network: Int, val rateLimited: Int, val auth: Int)
+
+/** [errorClass]: `server_error`, `network`, `rate_limited` or `auth`; [message] is scrubbed. */
+@Serializable
+data class GitHubLastErrorDto(
+    val at: String,
+    @kotlinx.serialization.SerialName("class") val errorClass: String,
+    val status: Int?,
+    val requestId: String?,
+    val message: String,
+)
+
+/** [own]: null when the caller has no GitHub token. Other tokens appear only as a count and one anonymous minimum. */
+@Serializable data class GitHubRateLimitsDto(val own: GitHubOwnRateLimitsDto?, val otherTokens: Int, val lowestOther: GitHubRateLimitDto?)
+
+@Serializable data class GitHubOwnRateLimitsDto(val rest: GitHubRateLimitDto?, val graphql: GitHubRateLimitDto?)
+
+@Serializable data class GitHubRateLimitDto(val limit: Int, val remaining: Int, val resetAt: String, val observedAt: String)
+
 /** An image provider of the catalogue (`GET /api/config`); the web renders whatever is listed. */
 @Serializable data class ImageProviderInfoDto(
     val id: String, val label: String, val models: List<String>, val defaultModel: String, val supportsTransparency: Boolean,
@@ -666,8 +1064,15 @@ object RunStatus {
     const val QUEUED = "queued"; const val SPEC = "spec"; const val BUILDING = "building"
     const val REVIEWING = "reviewing"; const val APPROVING = "approving"; const val MERGED = "merged"
     const val NEEDS_HUMAN = "needs_human"; const val FAILED = "failed"; const val CANCELLED = "cancelled"
-    val ACTIVE = setOf(QUEUED, SPEC, BUILDING, REVIEWING, APPROVING, NEEDS_HUMAN)
-    val TERMINAL = setOf(MERGED, FAILED, CANCELLED)
+    /** Passed every reviewer under [MergePolicy.GITHUB]: the pull request waits on GitHub; Agern follows it. */
+    const val READY = "ready"
+    /**
+     * Approved, but the checks on the pull request's head commit have not passed yet: merges by itself when they do
+     * (docs/ARCHITECTURE.md §6 "Checks before a merge"). Survives a restart, like [NEEDS_HUMAN].
+     */
+    const val WAITING_FOR_CHECKS = "waiting_for_checks"
+    val ACTIVE = setOf(QUEUED, SPEC, BUILDING, REVIEWING, APPROVING, WAITING_FOR_CHECKS, NEEDS_HUMAN)
+    val TERMINAL = setOf(MERGED, FAILED, CANCELLED, READY)
     val ALL = ACTIVE + TERMINAL
 }
 
@@ -732,6 +1137,8 @@ object ReleaseIssueState {
 /** Why a release is paused. */
 object PauseReason {
     const val MANUAL = "manual"; const val USAGE_LIMIT = "usage_limit"; const val CREDENTIALS = "credentials"
+    /** The next issue could not start because GitHub or the Claude API could not be reached; it resumes by itself. */
+    const val NETWORK = "network"
 }
 
 object SessionStatus {

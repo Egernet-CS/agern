@@ -21,6 +21,7 @@ import dk.egernet.factory.github.GitHubClient
 import dk.egernet.factory.github.GitHubException
 import dk.egernet.factory.unprocessable
 import io.ktor.http.HttpStatusCode
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -97,6 +98,7 @@ class ReleaseBuilder(
                 e is GitHubException && e.status in setOf(401, 403, 404) ->
                     unprocessable("Your GitHub token cannot create branches in ${r.repo}.", "github_push_denied")
                 e is GitHubException -> ApiException(HttpStatusCode.BadGateway, "github_error", e.message ?: "GitHub error")
+                    .also { if (e.status >= 500) it.initCause(e) }
                 else -> e
             }
         }
@@ -146,7 +148,7 @@ class ReleaseBuilder(
         }
         publish(id)
         merger.commentCancelled(id, user)
-        for (run in io { runs.activeByRelease(id) }) cancelRun(user, run.id)
+        for (run in io { runs.activeByRelease(id) }) cancelRun(user, run.id, byRelease = true)
     }
 
     /** A held or skipped issue of release [id], or 409 / 404 (the checks of [retry]). */
@@ -182,7 +184,7 @@ class ReleaseBuilder(
         val oldRunRecord = before.runId?.let { io { runs.get(it) } }
         val mode = if (oldRunRecord == null) {
             if (requested != null && requested != RetryMode.START_OVER && requested != RetryMode.RECOMMENDED) {
-                if (requested !in RetryMode.ALL) throw dk.egernet.factory.badRequest("mode must be one of step, continue, start_over, recommended")
+                if (requested !in RetryMode.ALL) throw dk.egernet.factory.badRequest("mode must be one of update, step, continue, start_over, recommended")
                 throw conflict("Issue #$number has no run to continue or retry a step of", "retry_mode_unavailable")
             }
             RetryMode.START_OVER
@@ -203,6 +205,10 @@ class ReleaseBuilder(
                 RetryMode.START_OVER -> io { store.setIssue(id, number, ReleaseIssueState.WAITING, null, null) }
                 RetryMode.CONTINUE -> io {
                     store.setIssue(id, number, ReleaseIssueState.WAITING, "Retry: continues from the commits of run ${issue.runId}", issue.runId, RetryMode.CONTINUE)
+                }
+                RetryMode.UPDATE -> io {
+                    val target = oldRunRecord?.baseBranch ?: r.branch ?: "release/${r.name}"
+                    store.setIssue(id, number, ReleaseIssueState.WAITING, "Retry: updates run ${issue.runId} with `$target` and merges it", issue.runId, RetryMode.UPDATE)
                 }
                 else -> io {
                     store.setIssue(id, number, ReleaseIssueState.WAITING, "Retry: the failed step of run ${issue.runId}", issue.runId, RetryMode.STEP)
@@ -225,13 +231,20 @@ class ReleaseBuilder(
     }
 
     /** Cancels runs whose issue left a release (taken out or moved). */
+    /**
+     * Starts a sync run of [r] as [owner] (docs/ARCHITECTURE.md §6 "Bringing a release up to date"); called by
+     * [ReleaseMerger.startSync] under the release's mutex.
+     */
+    suspend fun startSyncRun(owner: UserRecord, r: ReleaseRecord, defaultBranch: String): dk.egernet.factory.db.RunRecord =
+        orchestrator.startSync(owner, r, defaultBranch)
+
     suspend fun cancelRuns(user: UserRecord, runIds: List<UUID>) {
         for (runId in runIds) if (io { runs.get(runId) }?.status in RunStatus.ACTIVE) cancelRun(user, runId)
     }
 
-    private suspend fun cancelRun(user: UserRecord, runId: UUID) {
+    private suspend fun cancelRun(user: UserRecord, runId: UUID, byRelease: Boolean = false) {
         try {
-            orchestrator.cancel(user, runId)
+            orchestrator.cancel(user, runId, byRelease)
         } catch (e: ApiException) {
             log.info("Run {} of a release was not cancelled: {}", runId, e.message)
         }
@@ -280,11 +293,12 @@ class ReleaseBuilder(
                     val skip = io { skipReason(r, next.number, client) }
                     if (skip != null) {
                         io { store.setIssue(id, next.number, ReleaseIssueState.SKIPPED, skip, null) }
+                        io { store.clearNetwork(id) }
                         publish(id)
                         continue
                     }
                     val previous = if (next.retryMode != null) next.runId?.let { io { runs.get(it) } } else null
-                    if (previous != null && next.retryMode == RetryMode.STEP && previous.status == RunStatus.MERGED) {
+                    if (previous != null && (next.retryMode == RetryMode.STEP || next.retryMode == RetryMode.UPDATE) && previous.status == RunStatus.MERGED) {
                         // Approved and merged by its owner while it waited.
                         io { store.setIssue(id, next.number, ReleaseIssueState.MERGED, null, previous.id) }
                         publish(id)
@@ -293,6 +307,8 @@ class ReleaseBuilder(
                     val branch = r.branch ?: "release/${r.name}"
                     val run = when {
                         previous != null && next.retryMode == RetryMode.STEP -> orchestrator.retryStep(owner, previous)
+                        // "Update and merge" in the issue's turn, on the same run.
+                        previous != null && next.retryMode == RetryMode.UPDATE -> orchestrator.update(owner, previous.id)
                         previous != null && next.retryMode == RetryMode.CONTINUE -> {
                             // A continuation keeps the target of the run it continues; its member branch exists already.
                             val expected = Orchestrator.ExpectedTarget(previous.targetRepo)
@@ -305,6 +321,7 @@ class ReleaseBuilder(
                         }
                     }
                     io { store.setIssue(id, next.number, ReleaseIssueState.RUNNING, null, run.id) }
+                    io { store.clearNetwork(id) }
                     publish(id)
                     return
                 } catch (e: ApiException) {
@@ -312,9 +329,13 @@ class ReleaseBuilder(
                         pauseForCredentials(r.id)
                         return
                     }
-                    holdUnstarted(id, next.number, e.message, next.runId.takeIf { next.retryMode != null })
+                    val waited = if (Transient.isTransient(e)) networkPause(r, next, e) ?: return else ""
+                    holdUnstarted(id, next.number, e.message + waited, next.runId.takeIf { next.retryMode != null })
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
-                    holdUnstarted(id, next.number, e.message ?: e.javaClass.simpleName, next.runId.takeIf { next.retryMode != null })
+                    val waited = if (Transient.isTransient(e)) networkPause(r, next, e) ?: return else ""
+                    holdUnstarted(id, next.number, Transient.describe(e) + waited, next.runId.takeIf { next.retryMode != null })
                 }
             }
         }
@@ -364,7 +385,8 @@ class ReleaseBuilder(
             throw when {
                 e.status == 422 -> memberBranchExists(branch, repo)
                 e.status in setOf(401, 403, 404) -> unprocessable("Your GitHub token cannot create branches in $repo.", "github_push_denied")
-                else -> ApiException(HttpStatusCode.BadGateway, "github_error", e.message ?: "GitHub error")
+                // A GitHub 5xx keeps its cause, so a release waits for GitHub instead of holding the issue.
+                else -> ApiException(HttpStatusCode.BadGateway, "github_error", e.message ?: "GitHub error").also { if (e.status >= 500) it.initCause(e) }
             }
         }
         store.insertRepo(r.id, repo, dir, sub, base)
@@ -375,10 +397,68 @@ class ReleaseBuilder(
         "Branch $branch already exists in $org/$repo; delete it or rename the release.", "release_branch_exists",
     )
 
+    /**
+     * The next issue [next] of [r] could not start because GitHub or the Claude API could not be reached ([e]): the
+     * release pauses with reason `network` until the next try (docs/ARCHITECTURE.md §6 "Transient failures"), the
+     * issue stays `waiting` with its linked run and retry mode, and null is returned. When the release has waited for
+     * [Config.networkRetryMaxMs] (or waiting is off), nothing pauses and the text to append to the hold note is returned.
+     * Called under the release lock.
+     */
+    private suspend fun networkPause(r: ReleaseRecord, next: dk.egernet.factory.db.ReleaseIssueRecord, e: Exception): String? {
+        if (cfg.networkRetryMaxMs <= 0) return ""
+        val now = Instant.now()
+        val since = r.networkSince ?: now
+        if (!now.isBefore(since.plusMillis(cfg.networkRetryMaxMs))) {
+            return " Gave up after waiting for the network for ${Orchestrator.humanDuration(now.toEpochMilli() - since.toEpochMilli())}."
+        }
+        val attempts = r.networkAttempts + 1
+        val delays = cfg.networkRetryDelaysMs.ifEmpty { listOf(60_000L) }
+        val resumeAt = now.plusMillis(delays[minOf(attempts, delays.size) - 1])
+        val detail = startFailure(e)
+        log.info("Release {}: could not start #{} for lack of network (attempt {}); next try at {}: {}", r.id, next.number, attempts, resumeAt, detail)
+        io {
+            store.noteNetworkFailure(r.id, since, attempts)
+            store.setIssue(r.id, next.number, ReleaseIssueState.WAITING, NETWORK_ISSUE_NOTE, next.runId, next.retryMode)
+        }
+        io { store.pause(r.id, PauseReason.NETWORK, "Could not start #${next.number}: $detail", resumeAt) }
+        publish(r.id)
+        return null
+    }
+
+    /** Why a run could not start, for notes: an [ApiException]'s own sentence, else the exception named with its class. */
+    private fun startFailure(e: Exception): String = (if (e is ApiException) e.message else Transient.describe(e)).take(400)
+
+    /**
+     * "Give up" on a release waiting for the network (paused with reason `network`): the issue that could not start is
+     * held as before this change, the streak ends, and the release resumes with the next issue. 409
+     * `release_not_waiting_for_network` otherwise. Permission checks are the caller's.
+     */
+    suspend fun giveUpNetwork(user: UserRecord, id: UUID) {
+        lock(id).withLock {
+            val r = io { store.get(id) } ?: throw dk.egernet.factory.notFound("Release not found")
+            if (r.status != ReleaseStatus.PAUSED || r.pauseReason != PauseReason.NETWORK) {
+                throw conflict("The release is not waiting for the network", "release_not_waiting_for_network")
+            }
+            val next = r.issues.firstOrNull { it.state == ReleaseIssueState.WAITING }
+            if (next != null) {
+                val detail = r.pauseNote?.substringAfter(": ", "")?.takeIf { it.isNotBlank() } ?: "GitHub or the Claude API could not be reached."
+                holdUnstarted(
+                    id, next.number, "${detail.take(400).trimEnd()} Gave up waiting for the network (by @${user.username}).",
+                    next.runId.takeIf { next.retryMode != null },
+                )
+            }
+            io { store.clearNetwork(id) }
+            io { store.resume(id) }
+        }
+        publish(id)
+        advance(id)
+    }
+
     /** [keepRun]: the run a retry continued or resumed, kept linked so the issue can be retried again. */
     private suspend fun holdUnstarted(id: UUID, number: Int, reason: String, keepRun: UUID? = null) {
         log.warn("Release {}: could not start a run for #{}: {}", id, number, reason)
         io { store.setIssue(id, number, ReleaseIssueState.HELD, "Could not start a run: ${reason.take(500)}", keepRun) }
+        io { store.clearNetwork(id) }
         publish(id)
     }
 
@@ -395,7 +475,7 @@ class ReleaseBuilder(
             try {
                 settle(outcome)
             } catch (e: Exception) {
-                log.warn("Release run {} could not be settled: {}", outcome.run.id, e.message)
+                log.warn("Release run {} could not be settled: {}", outcome.run.id, Transient.describe(e))
             }
         }
     }
@@ -406,6 +486,11 @@ class ReleaseBuilder(
      */
     suspend fun settle(outcome: RunOutcome) {
         val releaseId = outcome.run.releaseId ?: return
+        if (outcome.run.isSync) {
+            // A sync run builds no issue: its outcome only changes how the release evaluates (and is published).
+            merger.evaluate(releaseId)
+            return
+        }
         lock(releaseId).withLock {
             val ref = io { store.issueByRun(outcome.run.id) } ?: return
             val run = io { runs.get(outcome.run.id) } ?: return
@@ -413,7 +498,7 @@ class ReleaseBuilder(
             when (ref.state) {
                 ReleaseIssueState.RUNNING -> when (run.status) {
                     RunStatus.MERGED -> io { store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.MERGED, null, run.id) }
-                    RunStatus.NEEDS_HUMAN -> io { store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.HELD, note, run.id) }
+                    RunStatus.NEEDS_HUMAN -> autoUpdateOrHold(ref.releaseId, ref.number, run, note)
                     RunStatus.FAILED, RunStatus.CANCELLED -> when {
                         outcome.usageLimit != null && run.status == RunStatus.FAILED -> {
                             io { store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.WAITING, USAGE_LIMIT_ISSUE_NOTE, run.id, autoRetryMode(run)) }
@@ -442,6 +527,37 @@ class ReleaseBuilder(
         }
         publish(releaseId)
         advance(releaseId)
+    }
+
+    /**
+     * A running issue whose run needs a human: in a `building` release, a run whose merge was refused only for a
+     * conflict with `release/<name>` is updated automatically, once (its first update round), and the issue stays
+     * `running`; otherwise, or when the update cannot start, the issue is held with the run's reason. Called under the
+     * release lock.
+     */
+    private suspend fun autoUpdateOrHold(releaseId: UUID, number: Int, run: dk.egernet.factory.db.RunRecord, note: String) {
+        val release = io { store.get(releaseId) }
+        if (release?.status != ReleaseStatus.BUILDING || !run.updateAvailable || run.updateRounds != 0) {
+            io { store.setIssue(releaseId, number, ReleaseIssueState.HELD, note, run.id) }
+            return
+        }
+        val target = run.baseBranch ?: release.branch ?: "release/${release.name}"
+        try {
+            val owner = io { users.byId(run.ownerId) } ?: throw IllegalStateException("The run's owner no longer exists")
+            orchestrator.update(owner, run.id, dk.egernet.factory.db.UpdateTrigger.RELEASE)
+            io { store.setIssue(releaseId, number, ReleaseIssueState.RUNNING, "Updating with `$target` (automatic)", run.id) }
+            log.info("Release {}: #{} is updated automatically with {}", releaseId, number, target)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log.warn("Release {}: the automatic update of #{} could not start: {}", releaseId, number, e.message)
+            io {
+                store.setIssue(
+                    releaseId, number, ReleaseIssueState.HELD,
+                    "$note Automatic update could not start: ${startFailure(e)}".take(1000), run.id,
+                )
+            }
+        }
     }
 
     /**
@@ -476,6 +592,8 @@ class ReleaseBuilder(
             when (run?.status) {
                 RunStatus.MERGED -> store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.MERGED, null, run.id)
                 RunStatus.NEEDS_HUMAN -> store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.HELD, run.error ?: "Run failed", run.id)
+                // Approved and waiting for its checks: the orchestrator resumes the wait, and the run settles afterwards.
+                RunStatus.WAITING_FOR_CHECKS -> Unit
                 else -> store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.WAITING, RESTART_NOTE, ref.runId, autoRetryMode(run))
             }
         }
@@ -487,7 +605,7 @@ class ReleaseBuilder(
                     publish(id)
                     advance(id)
                 } catch (e: Exception) {
-                    log.warn("Release {} could not continue after restart: {}", id, e.message)
+                    log.warn("Release {} could not continue after restart: {}", id, Transient.describe(e))
                 }
             }
             resumeDue()
@@ -499,7 +617,7 @@ class ReleaseBuilder(
     suspend fun resumeDue(now: Instant = Instant.now()) {
         for (id in io { store.dueForResume(now) }) {
             if (io { store.resume(id) }) {
-                log.info("Release {} resumes automatically after the usage limit", id)
+                log.info("Release {} resumes automatically", id)
                 publish(id)
                 advance(id)
             }
@@ -513,7 +631,7 @@ class ReleaseBuilder(
             try {
                 resumeDue()
             } catch (e: Exception) {
-                log.warn("Automatic release resume failed: {}", e.message)
+                log.warn("Automatic release resume failed: {}", Transient.describe(e))
             }
         }
     }
@@ -523,6 +641,7 @@ class ReleaseBuilder(
         const val USAGE_LIMIT_ISSUE_NOTE = "Interrupted by the Claude usage limit; it is built again"
         const val CREDENTIALS_ISSUE_NOTE = "Interrupted because Claude rejected the owner's credential; it is built again"
         const val RESTART_NOTE = "Interrupted by a server restart; it is built again"
+        const val NETWORK_ISSUE_NOTE = "Waiting for the network; it starts when GitHub and the Claude API can be reached again"
         private val TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm 'UTC'").withZone(ZoneOffset.UTC)
 
         /** The pause note and automatic resume time for a usage limit seen at [now]. */

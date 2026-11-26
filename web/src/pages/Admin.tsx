@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, Navigate } from 'react-router-dom';
-import { api, ApiError, type McpToken, type RunningSandbox, type Settings, type SoftwareRequest, type StageRole, type User } from '../api';
+import { api, ApiError, runRef, type McpToken, type RunningSandbox, type Settings, type SoftwareRequest, type StageRole, type User } from '../api';
 import { shortHash, shortImage } from '../components/sandbox/SandboxBits';
 import { McpTokenTable, RevokeMcpTokenDialog } from '../components/ui/McpTokens';
 import { Dialog, ErrorBox, Loading, Notice } from '../components/ui/ui';
@@ -256,7 +256,7 @@ function SandboxesCard() {
             </div>
           </dl>
           <p className="muted small sbx-slots-note">
-            Every container that runs commands takes one slot: a run’s default image and each platform it tests on. Services do not take a slot, but use memory.
+            Every container that runs commands takes one slot: a run’s default image, each platform it tests on, and its review sandbox. Services do not take a slot, but use memory.
           </p>
           <h3 className="sd-h">
             Running <span className="muted">{o.sandboxes.length}</span>
@@ -271,13 +271,13 @@ function SandboxesCard() {
                     <span className="sbx-run-title">
                       {s.visible ? (
                         <Link to={`/p/${s.repo}/runs/${s.runId}`}>
-                          <span className="mono muted">#{s.issueNumber}</span> {s.issueTitle}
+                          <span className="mono muted">{runRef(s)}</span> {s.issueTitle}
                         </Link>
                       ) : (
-                        <span className="mono">run {s.runId.slice(0, 8)} · #{s.issueNumber}</span>
+                        <span className="mono">run {s.runId.slice(0, 8)} · {runRef(s)}</span>
                       )}
                     </span>
-                    <button type="button" className="btn btn--sm btn--ghost btn--danger" onClick={() => (setErr(null), setTarget(s))} aria-label={`Stop the sandbox of run #${s.issueNumber} in ${s.repo}`}>
+                    <button type="button" className="btn btn--sm btn--ghost btn--danger" onClick={() => (setErr(null), setTarget(s))} aria-label={`Stop the sandbox of run ${runRef(s)} in ${s.repo}`}>
                       Stop
                     </button>
                   </div>
@@ -289,15 +289,15 @@ function SandboxesCard() {
                   </div>
                   <ul className="sbx-run-containers" aria-label="Containers">
                     {s.containers.map((c) => (
-                      <li key={c.platform}>
-                        <span className="sbx-plat">{c.platform}</span> <code title={c.image}>{shortImage(c.image)}</code>
+                      <li key={`${c.kind}-${c.platform}`}>
+                        <span className="sbx-plat">{c.kind === 'review' ? 'review' : c.platform}</span> <code title={c.image}>{shortImage(c.image)}</code>
                       </li>
                     ))}
                     {s.containers.length === 0 && <li className="muted small">no command container right now</li>}
                   </ul>
                   <div className="sbx-run-spec">
                     {s.services.length > 0 && <span className="muted small">services {s.services.join(', ')}</span>}
-                    {s.platforms.length > s.containers.filter((c) => c.platform !== 'default').length && (
+                    {s.platforms.length > s.containers.filter((c) => c.kind !== 'review' && c.platform !== 'default').length && (
                       <span className="muted small">
                         platforms not started: {s.platforms.filter((p) => !s.containers.some((c) => c.platform === p)).join(', ')}
                       </span>
@@ -341,11 +341,11 @@ function SandboxesCard() {
           ))}
         </ul>
       )}
-      <Dialog open={!!target} onClose={() => setTarget(null)} title={`Stop the sandbox of run #${target?.issueNumber ?? ''}?`}>
+      <Dialog open={!!target} onClose={() => setTarget(null)} title={`Stop the sandbox of run ${target ? runRef(target) : ''}?`}>
         <div className="form">
           <p>
-            Its containers and network are removed now (cache volumes are kept), and a command running in it is killed. The run itself continues: the builder’s next sandbox command
-            creates a fresh sandbox and runs the setup script again.
+            Its containers and network are removed now, and so is the run’s review sandbox if it has one (cache volumes are kept); a command running in either is killed. The run
+            itself continues: the next sandbox command of the builder or a UI reviewer creates a fresh sandbox and runs the setup script again.
           </p>
           {target && (
             <p className="muted small">

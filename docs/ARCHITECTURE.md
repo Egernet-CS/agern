@@ -55,6 +55,7 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_2FA` | `required` | `required` or `off`; `off` is accepted only when `FACTORY_AUTH=dev` (sole provider), otherwise the server refuses to start |
 | `FACTORY_PAM_SERVICE` | `chkpasswd` (macOS) / `login` (other) | PAM service used by the `os` provider |
 | `FACTORY_ADMINS` | empty | Comma list of usernames that are admins |
+| `FACTORY_LDAP_REQUIRED_GROUP`, `FACTORY_LDAP_GROUP_MEMBER_ATTRIBUTE`, `FACTORY_LDAP_GROUP_MEMBER_VALUE` | —, `member`, `dn` | LDAP group check (§4): one group DN or several separated by `;` (any one admits); the group attribute that lists members (`uniqueMember`, `memberUid`, …); whether it holds the user's DN (`dn`) or login name (`uid`). Unset: no check. Recommended whenever the directory is wider than the team |
 | `FACTORY_LDAP_URL`, `FACTORY_LDAP_USER_DN_TEMPLATE`, `FACTORY_LDAP_BASE_DN`, `FACTORY_LDAP_USER_FILTER`, `FACTORY_LDAP_BIND_DN`, `FACTORY_LDAP_BIND_PASSWORD` | — | LDAP. Either a DN template (`uid={0},ou=people,dc=x`) or search-then-bind |
 | `FACTORY_DEV_USERS` | — | `alice:pw,bob:pw`. Only read when `dev` is in `FACTORY_AUTH`. Never for production |
 | `FACTORY_DATA_DIR` | `./data` | Workspaces and per-user homes |
@@ -66,9 +67,13 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_MAX_AGENTS_PER_USER` | `8` | Concurrent agent processes per user |
 | `FACTORY_CHAT_IDLE_MINUTES` | `30` | Idle chat processes are stopped and resumed on next input |
 | `FACTORY_STAGE_TIMEOUT_MINUTES` | `60` | Wall-clock limit for one pipeline stage agent (1–1440). A spec-writer or builder is warned at 80 % of it; on timeout the agent is stopped, the stage is `failed` and the run `failed` with an error that says so (§6 "Time limit") |
-| `FACTORY_RELEASE_CHECKS_SETTLE_SECONDS` | `120` | How long the head commit of a release pull request must have had no checks at all before "no checks" counts as green for an automatic release (0–3600; §6 "Checks"). Measured from when Agern first saw that head commit, persisted across restarts |
+| `FACTORY_MAX_UPDATE_ROUNDS` | `2` | Update rounds ("Update and merge", §6 "Retrying a run") a run may use after its approved merge was refused because its target moved (0–10, whole number; `0` switches the feature off and keeps the old refusal texts). Copied to the run when it is created. Anything else is a startup error |
+| `FACTORY_NETWORK_RETRY_HOURS` | `24` | How long a run or a release start waits for the network (GitHub, the Claude API) before it fails or holds the issue (0–168, whole hours; `0` switches waiting off, §6 "Transient failures"). Anything else is a startup error |
+| `FACTORY_RELEASE_CHECKS_SETTLE_SECONDS` | `120` | How long the head commit of a pull request must have had no checks at all before "no checks" counts as green, for an automatic release (§6 "Checks") and before a run is merged (§6 "Checks before a merge") (0–3600). Measured from when Agern first saw that head commit (for a run: when Agern pushed it, else its first evaluation), persisted across restarts |
+| `FACTORY_RUN_CHECKS_WAIT_MINUTES` | `60` | How long an approved run waits in `waiting_for_checks` for the checks on its pull request's head commit before it goes to `needs_human` (1–1440; §6 "Checks before a merge") |
 | `FACTORY_AGENT_PATH` | the server's `PATH` | `PATH` value handed to agent and git processes (the only value taken from the server environment) |
 | `FACTORY_GITHUB_API_URL` | `https://api.github.com` | GitHub REST base URL (GitHub Enterprise: `https://host/api/v3`) |
+| `FACTORY_GITHUB_STATUS_URL` | githubstatus.com, or off | GitHub's official status summary shown on the GitHub status page (§6 "GitHub status"). Unset: `https://www.githubstatus.com/api/v2/summary.json` when `FACTORY_GITHUB_API_URL` is `https://api.github.com` and the fake GitHub is off, otherwise off (GitHub Enterprise, development). `off` or empty switches it off; any other value must be an `http://` or `https://` URL, else a startup error |
 | `FACTORY_ATTACHMENT_MAX_MB` | `20` | Largest single chat attachment (1–512) |
 | `FACTORY_ATTACHMENT_MAX_MESSAGE_MB` | `50` | All attachments of one message together (1–512, at least the per-file limit) |
 | `FACTORY_ATTACHMENT_MAX_COUNT` | `10` | Attachments per message (1–20) |
@@ -88,7 +93,13 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_SANDBOX_MAX_CONCURRENT` | `2` | Containers that run commands that may exist at the same time, over all runs (1–100): a run's sandbox takes one slot and each platform container it creates one more (sidecars take none). A builder that would exceed it first gives up its run's own idle containers, else gets a "busy" answer |
 | `FACTORY_SANDBOX_MAX_PLATFORMS` | `4` | Platforms a definition may name besides its default image (0–20; `0` forbids them) |
 | `FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES` | `30` | Default and maximum time for one sandbox command (1–1440), also capped by `FACTORY_STAGE_TIMEOUT_MINUTES` |
-| `FACTORY_DEV_FAKE_GITHUB` | `false` | Development only, requires `FACTORY_AUTH=dev`: in-memory fake GitHub (org with `demo-app`, `private-lab` and the workspace `demo-workspace` with its members `demo-ws-app` (base branch `dev`), `demo-ws-tools` and `demo-ws-lab` (only alice can read it); issues #1–#5 of `demo-workspace` carry one, no, several and an inaccessible member's label; the submodule workspace `demo-shop` whose `.gitmodules` declares `services/api` (`demo-shop-api`, SSH URL), `web` (`demo-shop-web`, relative URL, `branch = main`), `tools/cli` (`demo-ws-tools`, whose label no issue of `demo-shop` carries, so it is missing until Agern creates it) and `vendor/icons` (another organization, context only), with issues #1–#2 labelled `demo-shop-api` and `demo-shop-web` and #3 without a member label (a run of `demo-shop` itself); tokens `fake-<login>` = classic with `repo`, `read:org`; `fake-<login>~<scope>,…` = only those scopes), local `git init` instead of clones, pushes skipped |
+| `FACTORY_DEPLOY` | `ssh` | `ssh` or `off`: per-project SSH deploy targets for chat agents (§5 "Deploy targets"). `off`: chats get no deploy tools, the status says `enabled: false` and a target check answers 409 `deploy_disabled`; keys and approvals can still be managed. `fake` (development and end-to-end tests only, accepted only with `FACTORY_DEV_FAKE_GITHUB`): a transport that only pretends to connect and run commands |
+| `FACTORY_DEPLOY_EXEC_TIMEOUT_MINUTES` | `30` | Default and maximum time for one deploy command or copy (1–1440) |
+| `FACTORY_DEPLOY_MAX_COPY_MB` | `512` | Largest file `factory_deploy_copy` uploads (1–10240); also the largest archive a sandbox VM deploy uploads |
+| `FACTORY_SANDBOX_VM` | `ssh` | `ssh` or `off`: per-project sandbox VMs for run builders and human previews (§5 "Sandbox VMs"). `off`: runs decide `disabled`, builders get no sandbox VM tools, a preview and a check answer 409 `sandbox_vm_disabled`; definitions can still be approved. `fake` (development and end-to-end tests only, accepted only with `FACTORY_DEV_FAKE_GITHUB`): the deploy targets' fake transport |
+| `FACTORY_SANDBOX_VM_EXEC_TIMEOUT_MINUTES` | `30` | Default and maximum time for one sandbox VM command and for one whole deploy (1–1440), also capped by `FACTORY_STAGE_TIMEOUT_MINUTES`; included in the MCP tool timeouts (§5) |
+| `FACTORY_SANDBOX_VM_PREVIEW_MINUTES` | `120` | How long a human preview holds a sandbox VM (5–1440) |
+| `FACTORY_DEV_FAKE_GITHUB` | `false` | Development only, requires `FACTORY_AUTH=dev`: in-memory fake GitHub (org with `demo-app`, `private-lab` and the workspace `demo-workspace` with its members `demo-ws-app` (base branch `dev`), `demo-ws-tools` and `demo-ws-lab` (only alice can read it); issues #1–#5 of `demo-workspace` carry one, no, several and an inaccessible member's label; the submodule workspace `demo-shop` whose `.gitmodules` declares `services/api` (`demo-shop-api`, SSH URL), `web` (`demo-shop-web`, relative URL, `branch = main`), `tools/cli` (`demo-ws-tools`, whose label no issue of `demo-shop` carries, so it is missing until Agern creates it) and `vendor/icons` (another organization, context only), with issues #1–#2 labelled `demo-shop-api` and `demo-shop-web` and #3 without a member label (a run of `demo-shop` itself); tokens `fake-<login>` = classic with `repo`, `read:org`; `fake-<login>~<scope>,…` = only those scopes), local `git init` instead of clones, pushes skipped (a sync run's fast-forward push moves the local release branch instead); `<dataDir>/fake-github-checks/<repo>/<branch>.json` sets the checks of a branch's head and, with `"conflict": true`, makes its pull requests conflict (§6 "Releasing", "Fake-GitHub mode") |
 
 ## 4. Identity and secrets
 
@@ -105,7 +116,23 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
   bearers from one client address within 15 minutes block personal tokens from that address (429).
 - `os`: a user account on the machine the factory runs on (PAM on Linux; on macOS PAM or
   `dscl . -authonly`). The password must never appear in a process argument list.
-- `ldap`: bind against the directory.
+- `ldap`: bind against the directory. Without `FACTORY_LDAP_REQUIRED_GROUP` any successful bind is
+  a login, so everyone in the directory can log in; set the group check whenever the directory is
+  wider than the team.
+  - The group check runs after the user's own bind, on the same connection and as the user, in both
+    the DN-template and the search-then-bind mode: an LDAP compare of each configured group's member
+    attribute against the user's DN (`dn`) or login name as typed (`uid`). The first group that
+    answers true admits the user ("any of"). No search and no service account are involved, so no
+    extra secret lies on the host; this is why it is preferred over a filter with a service account.
+  - It fails closed: compare false, a missing group, insufficient access or a connection error all
+    refuse the login, with exactly the answer of a wrong password (401 `invalid_credentials`,
+    `login_failed` audit row, throttle). Only the server log says why
+    (`ldap: <user> is not in <group>`, `ldap: cannot check <group> for <user>: <result code>`).
+  - It is evaluated at every password login, without caching. Removing someone from the group shuts
+    them out at their next login; sessions that already exist last up to 14 days.
+  - Prerequisite: the directory's ACLs must let authenticated users compare (or read) the member
+    attribute of the configured group entries.
+  - `FACTORY_ADMINS` is unchanged; an admin must pass the group check like anyone else.
 - `dev`: static users from `FACTORY_DEV_USERS`, for local development and tests. The server logs a
   loud warning at startup when it is enabled.
 
@@ -140,6 +167,14 @@ Sessions are server-side rows in PostgreSQL referenced by an opaque random id in
 All three are stored encrypted with AES-256-GCM under `FACTORY_MASTER_KEY` (random 12-byte nonce per
 value, username as associated data). They are never returned by any API, never logged, and never
 written to disk in plaintext.
+
+**Project deploy keys.** Each project can have one Ed25519 key pair for its deploy targets (§5 "Deploy targets")
+and its sandbox VM (§5 "Sandbox VMs"), generated by an admin in the server process. The private key is stored only in `deploy_keys.private_key_enc`,
+encrypted with the same `SecretBox` and the associated data `deploy-key:<repo>` (so a ciphertext cannot be moved to
+another project's row). It is decrypted in memory only for the length of one SSH connection and never appears in a
+file, a process argument or environment, a log line, a transcript event, a tool answer, an API response or a DTO.
+Only the public key line, its fingerprint, the creator and the time are shown. Rotating replaces the pair in one
+statement; the old private key is gone at once.
 
 **The ownership rule.** An agent process always runs with the credentials of the user who started
 it — the *owner*. There is no API through which user A can cause a process to start with user B's
@@ -221,7 +256,7 @@ Launch rules:
   `$FACTORY_DATA_DIR/homes/<username>` so Claude session files are per user.
 - MCP timeouts: `MCP_TOOL_TIMEOUT` (the CLI's wall-clock limit per tool call) and
   `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (its limit for a call that sends no response or progress; default
-  300,000 for HTTP servers) are both set to `max(stage limit, sandbox command limit) + 60 s`, in
+  300,000 for HTTP servers) are both set to `max(stage limit, sandbox command limit, sandbox VM command limit) + 60 s`, in
   milliseconds as decimal strings (default 3,660,000), for chats and every stage, so a long sandbox command
   is never abandoned by the client while the server still runs it. Names and units were read from the
   bundled code of Claude Code 2.1.328 (the CLI may clamp the value to its own maximum). The CLI also has a
@@ -478,7 +513,9 @@ A project can describe a container in which its builds and tests run: its own to
 services such as a database, resource limits and a clean environment, without an admin installing
 anything on the host, and test on more than one image (*platforms*). This is issue #25's "model (a)":
 **the agent process keeps running on the host as before** and gets MCP tools that run commands inside
-its run's sandbox. Project authors: [SANDBOXES.md](SANDBOXES.md).
+its run's sandbox. The spec-writer plans the sandbox's use (a *Verification* section in the spec), the
+builder runs commands in it, and the `ux` and `ui-design` reviewers get a separate, read-only *review
+sandbox* in which they start the app (below). Project authors: [SANDBOXES.md](SANDBOXES.md).
 
 **What a sandbox is not (yet).** It is *not* a security boundary against the agent. The agent runs
 with permissions bypassed as the same OS user that owns the rootless containers, so it can reach
@@ -550,18 +587,29 @@ the default branch's file (the sandbox page and the approval endpoint read it th
 the release could never be approved and would silently cost the rest of the release its sandbox. Nothing merged into a
 release branch can therefore change the sandbox of the release's later runs; a release that needs another toolchain gets
 it through a change to the default branch and a new approval. With no file, an invalid one or an unapproved one the run proceeds
-**without** a sandbox, exactly as before; it does not fail. The builder's transcript starts with a
-`system` event saying why (`warn`), or which image it has (`info`), and its task prompt says the same in
-one paragraph.
+**without** a sandbox, exactly as before; it does not fail. The spec-writer's and the builder's transcripts start with a
+`system` event saying why (`warn`), or which image it has (`info`), and their task prompts say the same in
+one paragraph (the spec-writer's: plan the sandbox's use in the spec's Verification section, or — without one — do not
+ask for a sandbox and write no Verification section that needs one). Whether a project has a sandbox stays an admin's
+decision: no tool of any agent can create, change, approve or revoke a definition or an approval.
 
-**Who gets the tools.** Only the builder (initial build and fix rounds), and only when
-`FACTORY_SANDBOX` is not `off`: it gets `factory_sandbox_info`, `factory_sandbox_exec` and `factory_sandbox_wait` (§7) on top of
-the stage tools. The spec-writer, the four reviewers (the `code` reviewer included) and the approver get
-neither: they are read-only, and a shared sandbox with the worktree mounted read-write would let them
-change it, so in this step they review as before, on the host. (A read-only or overlay-mounted sandbox
-for the `code` reviewer is possible later.) Chats have no sandbox. A tool call acts on the sandbox of the
-run its bearer token belongs to, so an agent can never reach another run's sandbox through the tools
-(command handles included: they are looked up only in that run).
+**Who gets the tools.** Only when `FACTORY_SANDBOX` is not `off`; with it off no stage gets a sandbox tool,
+note or prompt paragraph.
+
+| Stage | Tools (§7) | When |
+|---|---|---|
+| spec-writer | `factory_sandbox_info` only (`access: "plan"`) | always (also for a run without an approved definition: it then says why there is none) |
+| builder (build and fix rounds) | info, exec, wait on the **build sandbox** | always; without an approved definition they answer that there is none |
+| `ux`, `ui-design` in pipeline review rounds | info, exec, wait on the **review sandbox** only | the run's decision is `approved` |
+| `security`, `code`, approver, advisor, chats, follow-up reviewers at `needs_human`, personal tokens | none | — |
+
+The server fixes a token's *sandbox scope* (`plan`, `build`, `review`; `McpGrant.sandboxScope`) when it issues the
+grant; tool arguments never choose it. A build-scoped call can only address the build sandbox of the token's run, a
+review-scoped call only its review sandbox, and a plan-scoped `exec` or `wait` is refused. Command handles are looked
+up only in the sandbox of the token's scope and run, so a reviewer can never wait for (or reach) a builder's command,
+nor an agent another run's. This is what the tools guarantee: no reviewer *tool call* reaches the builder's
+read-write container. It is not a boundary against an agent process on the host (see above). A sandbox for the `code`
+reviewer, the approver or follow-up reviews is possible later.
 
 **Lifecycle.** One sandbox per run, created lazily by the builder's first `factory_sandbox_exec` and
 shared by all builder rounds of the run. Creation, in order: a private network `agern-run-<runId>`; one
@@ -576,8 +624,8 @@ containers also `agern.platform=<name>`). The sandbox is
 removed (all containers and network, never the cache volumes) as soon as no builder round can follow: before
 the approver starts, before the run goes to `needs_human`, and before it is marked `failed` (stage error,
 stage time limit) or `cancelled`. A `needs_human` run keeps its worktree (§6 "Worktrees and branches") but has no
-sandbox, and nothing creates one again: only a builder can, and none follows. Names and labels use the run id,
-never the run's branch name.
+sandbox, and nothing creates one again: only a builder or a pipeline review round can, and none follows. Names and
+labels use the run id, never the run's branch name.
 
 *Sandbox before worktree.* The sandbox bind-mounts the run's worktree, so its containers are always removed
 before the worktree is deleted: the worktree clean-up of every ended run (merged, failed, time limit, cancelled,
@@ -600,6 +648,39 @@ Caches are **per platform**: the same paths, in volumes `agern-cache-<repo>-<fir
 SHA-256(<platform> NUL <path>)>`, because another image's tools (another JDK, another libc, other native
 npm modules) cannot be assumed to share a cache safely. `platform` omitted or `default` is the top-level
 image. Commands stay one at a time per run, whichever container they run in.
+
+**Review sandbox.** The `ux` and `ui-design` reviewers of an approved run start the app in a container of their own,
+so an app that needs the project's toolchain or its database can be looked at and screenshotted (§6 "Screenshots"):
+
+- *Shape.* One per run at a time, built from the run's approved definition: the default image only (no platforms), its
+  own network `agern-review-<runId>`, its own service containers `agern-review-<runId>-<service>` (service name as
+  network alias, readiness checks as above) and the command container `agern-review-<runId>`, with the same
+  environment, `user`, limits, security options and default cache volumes as the build sandbox's default container.
+  Labels: `agern.run`, `agern.repo` and `agern.role=review|review-service|review-network`.
+- *Mounts.* The run's worktree is bind-mounted **read-only** at `/workspace` (still the working directory): every write
+  below it fails. The only writable host directory is `<run directory>/.agern-run/review/` (the agents' working
+  directory, i.e. the workspace root of a workspace run), mounted at `/run/agern-review` — `/run` cannot hold a cache
+  path, so it never collides with one. The server creates it git-ignored and never through a symlink
+  (`ImageService.ensureRunDir`, `SafeFiles`); when it cannot, the sandbox is made without it and
+  `factory_sandbox_info` says so.
+- *Creation and sharing.* Lazily, by the first review-scoped `factory_sandbox_exec` of a round, in the same order as
+  the build sandbox (network, services, cache volumes, container, readiness checks, `prepare-user.sh`, setup as root).
+  After setup only the user's home is handed over (`/workspace` is read-only). Both UI reviewers of the round use the
+  same container — two first calls create it once — and commands stay one at a time: foreground calls queue, a
+  background command refuses the others. Reviewers start a long-running app detached inside a foreground command with
+  all streams redirected (`nohup … > /tmp/app.log 2>&1 < /dev/null &`), which `podman exec` returns from. A failed
+  creation, readiness check or setup removes what was created and frees the slot; a later call tries again.
+- *Logs.* Lifecycle messages and every command's full log go to the transcript of the reviewer that made the call
+  (`payload.sandbox.review: true`, text starting `Review sandbox`); the setup log to the one that triggered creation.
+  The first successful creation sets `Run.sandbox.reviewUsed`.
+- *Removal.* When every reviewer of the round has ended — also when one failed, timed out or the run was cancelled —
+  and so before the next builder round, the approver or `needs_human`; and by every path that removes the build
+  sandbox (`release`, worktree clean-up, reapers, shutdown, an admin's stop). Containers and network go, never cache
+  volumes, and `.agern-run/review/` is deleted. A running command dies with it; its waits end with an error. Each
+  round creates a fresh one, so a fix round never looks at a stale app. Once the run's sandbox was released, no review
+  sandbox can be created for it (a creation racing the release ends with everything removed and its slot freed). At
+  server start the reaper removes every `agern-review-*` container and network it finds: a review round never
+  survives a restart.
 
 **Readiness of services.** A service may name a `ready.command`; after starting the services the server
 runs it with `sh -c` inside the service's container (`exec --workdir /`, each attempt at most 10 s) once
@@ -632,7 +713,8 @@ mapping can take longer to start: rootless storage may copy the image's layers o
 services and their readiness commands, cache paths, setup, the user and limits within the caps. Never
 `--privileged`, never host network/pid/ipc/userns, no added capabilities (Podman's default rootless set), no devices,
 `no-new-privileges`, a PID limit of 4096, `--memory-swap` equal to `--memory`. The run's worktree is
-bind-mounted read-write at `/workspace` (the working directory); nothing else from the host is mounted.
+bind-mounted read-write at `/workspace` (the working directory); nothing else from the host is mounted (the review
+sandbox: the worktree read-only, plus its output directory, above).
 Inside the rootless user namespace the container's root is the service user — with `user`, the user's uid
 is — so files the build writes in `/workspace` belong to that user on the host. Limits apply per container
 (sidecars and platform containers get the same limits as the sandbox). The exact command lines (`podman` or
@@ -654,6 +736,14 @@ run --detach --name agern-run-<id> --label agern.run=<id> --label agern.repo=<re
 run … --name agern-run-<id>--<platform> … --label agern.role=platform --label agern.platform=<platform>
     …(as the sandbox container, with the platform's cache volumes)… <platform image> -c "<keep-alive>"   # platform, on first use
     # with `user: <n>`, both kinds also get, after --network:  --userns keep-id:uid=<n>,gid=<n> --user 0:0
+network create --label agern.run=<id> --label agern.repo=<repo> --label agern.role=review-network agern-review-<id>
+run … --name agern-review-<id>-<svc> … --label agern.role=review-service --label agern.service=<svc>
+    --network agern-review-<id> --network-alias <svc> …(as a service)… <service image>        # review sandbox services
+run --detach --name agern-review-<id> --label agern.run=<id> --label agern.repo=<repo> --label agern.role=review
+    --network agern-review-<id> …(limits, user mapping as the sandbox container)… --workdir /workspace --entrypoint sh [--env K=V …]
+    --mount type=bind,source=<worktree>,target=/workspace,readonly=true
+    [--mount type=bind,source=<run dir>/.agern-run/review,target=/run/agern-review]
+    [--mount type=volume,source=<volume>,target=<path> …] <image> -c "<keep-alive>"      # review sandbox
 exec --workdir / agern-run-<id>-<svc> sh -c <ready.command>                                      # readiness check, until exit 0
 logs --tail 30 agern-run-<id>-<svc>                                                              # when it never passes
 exec --workdir /workspace <container> sh -c <prepare-user.sh> agern-user <n> <name or ''> [<cache path> …]   # with `user`, as root
@@ -665,6 +755,7 @@ restart --time 0 <container>                                       # after a com
 rm --force --ignore --volumes agern-run-<id> [agern-run-<id>--<platform> …] [agern-run-<id>-<svc> …]   # anonymous volumes (an image's VOLUME) too
 rm --force --ignore --volumes agern-run-<id>--<platform>           # a run's idle container, to free its slot (below)
 network rm --force agern-run-<id>
+rm --force --ignore --volumes agern-review-<id> [agern-review-<id>-<svc> …]  ;  network rm --force agern-review-<id>   # end of a review round
 ps --all --filter label=agern.run --format '{{.Names}}	{{index .Labels "agern.run"}}'          # reaper
 network ls --filter label=agern.run --format json                                               # reaper (name, labels)
 image inspect --format '{{json .Config.ExposedPorts}}' <service image>                          # ports for factory_sandbox_info
@@ -705,24 +796,31 @@ started it, when it ends; when the builder's stage ends without waiting, the com
 its limit or the sandbox is released, and a fix round of the same run can still wait for it. A release or an admin
 stop ends a running command's waits at once with the same errors a foreground call gets.
 
-**Stopped by an admin.** An admin can remove a run's sandbox while the run is active (`DELETE
-/api/admin/sandboxes/{runId}`, the admin page's "Stop"): its containers — platform containers and services
-included — and network are removed at once (cache volumes are kept) and its slots are freed. The run itself is not touched: a command running at that moment ends with
-a tool error saying the sandbox was stopped, a `system` warn event in the builder's transcript says who stopped it,
-and the builder's next `factory_sandbox_exec` creates a fresh sandbox (setup runs again) like the first one did.
+**Stopped by an admin.** An admin can remove a run's sandboxes while the run is active (`DELETE
+/api/admin/sandboxes/{runId}`, the admin page's "Stop"): the build sandbox's containers — platform containers and
+services included — and network, and the review sandbox if it exists, are removed at once (cache volumes are kept)
+and their slots are freed; 404 only when the run has neither. The run itself is not touched: a command running at that moment ends with
+a tool error saying the sandbox was stopped, a `system` warn event in the transcript of each sandbox's last user (the
+builder, a reviewer) says who stopped it, and the next `factory_sandbox_exec` creates a fresh sandbox (setup runs
+again) like the first one did.
 
 **Concurrency and memory.** `FACTORY_SANDBOX_MAX_CONCURRENT` counts *containers that run commands*, over all
 runs: a run's sandbox container takes a slot when created and each platform container one more; sidecars
 take none (they belong to the run's network, whatever container uses them). A slot is freed when its
-container is removed. This keeps the cap truthful about load — a run that tests on three images really
+container is removed. A review sandbox's container takes one slot too (its services none). This keeps the cap truthful about load — a run that tests on three images really
 runs three containers, each with the full per-container memory limit — without starving single-image runs.
 When a run needs a slot and none is free, it first removes its *own* other command containers, least
 recently used first (they are idle: one command at a time per run; files in `/workspace` stay, the setup
 runs again when that container is used next); a run that holds none is not queued: the tool answers at once
 that the sandboxes are busy and nothing ran; the agent may try again later (its prompt tells it not to fall
 back to installing a toolchain on the host). So even with a cap of 1 a run can test on every platform, one
-container at a time. The memory one run may use is the per-container limit × (its command containers +
-its services); the admin overview shows that sum per run (`memoryTotal`) and `inUse` counts slots.
+container at a time. A review sandbox that finds no free slot first removes the same run's idle build command
+containers, least recently used first — only while no build command runs or is being started (the build sandbox's
+lock is free) — with the same info event; if there is still none, the reviewer is told at once to review on the host
+without a sandbox (`The server's sandboxes are all in use (<n> of <n> containers). No review sandbox was created …`),
+and the review stage goes on: nothing queues or blocks. The memory one run may use is the per-container limit × (its
+command containers + its services, of both sandboxes); the admin overview shows that sum per run (`memoryTotal`) and
+`inUse` counts slots.
 
 **Network and credentials.** Each run's containers share a private network; sidecars are reachable by
 service name only from that run's containers (and not published on the host). Outbound network access is
@@ -731,6 +829,179 @@ step. Nothing of the owner's credentials is passed into a container — no GitHu
 credential, no git configuration — and git does not work inside the sandbox (the worktree's `.git` points
 outside the mount): agents commit on the host as before. Builds that need private package registries are
 out of scope for this step.
+
+### Deploy targets
+
+A chat agent can install what it built on machines outside Agern (a Raspberry Pi, a small server, a kiosk) without
+ever holding an SSH key. Modelled on sandboxes: Agern holds the key and makes the connection, the agent asks through
+MCP tools, and an admin approves the exact list of targets. Admins and project authors: [DEPLOY.md](DEPLOY.md).
+Package `dk.egernet.factory.deploy`.
+
+**Switch.** `FACTORY_DEPLOY` is `ssh` (default), `off` or `fake` (§3). The feature is on by default because nothing
+happens until an admin generates a key and approves a file. With `off` chats get no deploy tools, the status says
+`enabled: false`, keys and approvals still follow their rules and a check answers 409 `deploy_disabled`.
+
+**Key.** One Ed25519 pair per project (table `deploy_keys`, primary key `repo`), generated by an admin in the server
+process; the private key is `SecretBox`-encrypted with associated data `deploy-key:<repo>` (§4 "Project deploy
+keys"). The public key line is `ssh-ed25519 <base64> agern-deploy:<org>/<repo>`, its fingerprint OpenSSH style
+(`SHA256:<base64 without padding>`). Rotating (admin) replaces the pair atomically; operations that start afterwards
+use the new key; the approval is not affected. Agents run as the server's OS user (the v1 limitation of §5), so a key
+file or `ssh-agent` socket would be open to every agent: the connection is made in process with Apache MINA SSHD
+(Bouncy Castle for Ed25519), never with the `ssh`/`scp` binaries, and no value is ever put on a local command line.
+
+**Definition: `.agern/deploy.yml`**, read from the default branch with the caller's (for tools: the chat owner's)
+GitHub token:
+
+```yaml
+targets:
+  kiosk:                                   # name: ^[a-z][a-z0-9-]{0,30}$
+    host: kiosk.example.net                # DNS name (RFC 1123, ≤ 253 chars) or IPv4/IPv6 literal, no brackets
+    port: 22                               # optional, 1–65535, default 22
+    user: deploy                           # ^[A-Za-z_][A-Za-z0-9_.-]{0,31}$
+    hostKey: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI…   # exactly "<type> <base64>"
+    description: Kiosk in the lobby        # optional, one line, ≤ 200 chars
+```
+
+Validation (`DeployDefinitions.parse`) is strict like the sandbox's, every problem listed with its path: at most
+64 KiB, valid YAML, anchors and duplicate keys as for sandboxes, unknown keys at any level, `targets` required with
+1–20 entries, `host`, `user` and `hostKey` required. `hostKey`'s type is one of `ssh-ed25519`,
+`ecdsa-sha2-nistp256`, `ecdsa-sha2-nistp384`, `ecdsa-sha2-nistp521`, `ssh-rsa`; its base64 must decode to a key blob
+whose embedded type is the declared one; RSA needs ≥ 2048 bits; a third field (comment or host) is an error whose
+message shows `ssh-keyscan -t ed25519 <host>` without the first field.
+
+**Approval** works exactly as for sandboxes (table `deploy_approvals`, the same columns as `sandbox_approvals`):
+states `none`, `invalid`, `pending`, `approved`; an admin approves the SHA-256 of the exact content on the default
+branch (409 `deploy_definition_changed`, 422 `deploy_definition_invalid`, 404 no file, 403 non-admin); approving
+replaces the earlier approval and stores the content for the diff; revoke removes it. Any change of the file makes it
+`pending`, and then no target is usable, including untouched ones.
+
+**Tools** (§7): `factory_deploy_targets`, `factory_deploy_exec`, `factory_deploy_copy`, granted to chat sessions only
+(`AgentManager.startChat` adds `DeployManager.TOOLS` to `CHAT_TOOLS` for non-advisor chats when the switch is not
+`off`; `CHAT_TOOLS`, `PERSONAL_TOOLS` and `STAGE_TOOLS` do not contain them). `McpServer.callTool` also refuses them
+("Deploy tools are only available in a project chat") for a personal token, a run-bound grant, a grant without a
+session, or a session whose kind is not `chat`. Every call resolves the definition afresh: read the file, parse it,
+compare its hash with the approval, load the key. In a workspace project the workspace repository's own file, key and
+approval count.
+
+**Connections** (exec, copy, check): connect and authentication time out after 15 s each. The client offers only the
+host-key algorithms of the pinned key's type (`rsa-sha2-512`, `rsa-sha2-256` for `ssh-rsa`), so a server with several
+host keys presents the pinned one; the presented key must equal the pinned key byte for byte, otherwise the
+connection is dropped before authentication ("Host key of <target> does not match the pinned key (presented
+<fingerprint>)"). No trust on first use, no `known_hosts`, no fallback. Authentication is public key only with the
+project's key; a refusal names the key's fingerprint. An exec is one SSH exec request (the remote login shell
+interprets it): no PTY, stdin at EOF, no agent, port or X11 forwarding. A copy is SCP of one regular file with its
+permission bits. On a timeout the connection is closed (`timedOut: true`, `exitCode: -1`; the remote process may
+still run); a remote end without exit status (a signal) gives `exitCode: -1` and a `note`.
+
+**Concurrency and lifetime.** One operation at a time per (repo, target); a second is refused at once ("Another
+deploy operation is running on <target>; try again when it has finished"; the check answers 409 `deploy_busy`).
+Operations run in a job on the services' scope, so a dropped MCP client neither aborts one nor loses its record.
+Server shutdown closes the open connections.
+
+**Records.** Every exec and copy that got past argument validation — also one that failed to connect, failed the
+host-key check or was refused — publishes exactly one `system` event to the chat before the tool answers: `level`
+`info` on success, `warn` otherwise; `text` like ``Deploy [kiosk] `systemctl restart app`: exit 0 in 1.2 s``,
+`Deploy [kiosk] copy dist/app.tar.gz → /opt/app/: 1.2 MB in 0.8 s` or `Deploy [kiosk] …: could not connect: <reason>`;
+payload `deploy` (§8 `DeployLog`) with the full output up to 1,000,000 characters (the agent gets the last 20,000).
+The server logs one INFO line per operation (user, repo, target, kind, outcome, duration — never the command or the
+output) and every key generation, rotation, approval and revocation with the admin's username. Output from targets is
+visible to everyone who can watch the chat.
+
+**Runtime seam.** `DeployTransport` (blocking `check`, `exec`, `copy`; `DeployException(stage, message)` for connect,
+host-key and auth failures) is `MinaDeployTransport` in production and `DevFakeDeployTransport` with `fake`: it runs
+nothing (`echo`, `sleep`, `exit N`, `true`, `false`, otherwise "[fake deploy user@host] would run: …"), a copy reports
+the file's size, and hosts starting with `unreachable`, `badkey` or `noauth` fail at connect, host key or auth.
+
+### Sandbox VMs
+
+A run's builder can deploy its committed `HEAD` to one approved VM of the project (systemd, nginx, native databases)
+and run commands there; the owner of a run in `needs_human` can deploy it there for a human preview. Built on deploy
+targets: the same project key, transport and host-key pinning, but bound to runs instead of chats, and one run at a
+time per VM. Admins and project authors: [SANDBOX-VMS.md](SANDBOX-VMS.md). Package `dk.egernet.factory.sandboxvm`.
+
+**Switch.** `FACTORY_SANDBOX_VM` is `ssh` (default), `off` or `fake` (§3); `fake` uses `DevFakeDeployTransport`
+(§5 "Deploy targets"). `FACTORY_SANDBOX_VM_EXEC_TIMEOUT_MINUTES` bounds one command and one whole deploy,
+`FACTORY_SANDBOX_VM_PREVIEW_MINUTES` a preview, `FACTORY_DEPLOY_MAX_COPY_MB` the uploaded archive.
+
+**Definition: `.agern/sandbox-vm.yml`** (one VM), on the default branch:
+
+```yaml
+name: sandbox                    # optional, ^[a-z][a-z0-9-]{0,30}$, default "sandbox-vm"
+host: sandbox.example.net        # as deploy.yml
+port: 22                         # optional, 1–65535, default 22
+user: agern                      # as deploy.yml
+hostKey: ssh-ed25519 AAAA…       # as deploy.yml
+description: Staging VM          # optional, one line, ≤ 200 chars
+url: https://sandbox.example.net/   # optional; absolute http(s), ≤ 2000 chars, no whitespace or control chars
+checkout: tar xzf "$AGERN_ARCHIVE" -C /srv/app/src   # required, non-blank
+setup: sudo systemctl restart app   # optional
+ready: { command: curl -fsS http://127.0.0.1:8080/health, timeoutSeconds: 60 }   # optional; 1–600, default 60
+reset: /srv/app/bin/restore-test-db   # optional
+```
+
+Validation is strict like `DeployDefinitions` (64 KiB, YAML, anchors, aliases and duplicate keys refused, unknown keys
+at any level, every problem with its path); `checkout`, `setup`, `ready.command` and `reset` each ≤ 32 KiB, no NUL.
+
+**Approval** as for deploy targets (table `sandbox_vm_approvals`, the columns of `deploy_approvals`; states `none`,
+`invalid`, `pending`, `approved`; 409 `sandbox_vm_definition_changed`, 422 `sandbox_vm_definition_invalid`),
+independent of the deploy and sandbox approvals. The key is the project's deploy key (`deploy_keys`, §4); generating it
+uses `POST /api/projects/{repo}/deploy/key`, rotating is on the Deploy page only.
+
+**The run's decision.** When an issue run has created its worktree, the server reads `.agern/sandbox-vm.yml` from the
+same commit and repository as the sandbox definition (§5 "Sandboxes"; in a workspace run the target member) and stores
+`runs.sandbox_vm` (`Run.sandboxVm`, §8): `disabled`, `none`, `invalid` (with the errors), `unapproved` or `approved`
+(sha256, name, host, url). The read never throws. Release sync runs get no decision and no tools. **Every operation
+re-checks the approval**: a tool call, a preview or a reset runs only when the decision is `approved`, the repository's
+current approval has the same sha256 and the project has a key; the definition used is parsed from the approval's
+stored content, never from the worktree. Otherwise it is refused (approval revoked or changed since the run started,
+or no key, naming `<FACTORY_PUBLIC_URL>/p/<repo>/sandbox-vm`).
+
+**Leases** (table `sandbox_vm_leases`). A VM is `lowercase(host):port`, server-wide; at most one lease per VM, also
+across projects: kind `build` or `preview`, run, repo, definition sha256, last deployed sha, starter and expiry
+(preview), state `held` or `resetting`. `factory_sandbox_vm_deploy` or a preview takes it atomically; a VM held by
+another run or `resetting` is refused at once ("The sandbox VM <name> is in use by run <id> of <repo> since <time>
+(or: is being reset). Continue without it: …"); the holding run re-uses it. A `build` lease ends when the run's
+build/review loop ends, fails or is cancelled, and in worktree cleanup; a `preview` lease on release (owner or admin),
+expiry, the run ending or leaving `needs_human`, a failed preview deploy, an admin's force-release, or revocation.
+Ending never blocks or throws: state `resetting`; an operation in flight is cancelled ("The sandbox VM lease ended
+while the command ran."); `reset` runs once with the exec limit if defined, the approval still matches and the key
+exists; the row is deleted whatever `reset` did. A failed, timed-out or skipped reset is logged at `warn` and, for a
+`build` lease, recorded in the transcript of the builder session that used the VM last. Revoking the approval deletes
+the repository's leases without `reset`. At server start, `preview` leases of runs still in `needs_human` and not
+expired are kept (expiry re-armed); every other lease is ended asynchronously.
+
+**Deploy** (tool and preview; one deadline, min(exec limit, stage limit)): `git rev-parse HEAD` once; `git archive
+--format=tar.gz HEAD` of the run's worktree to a temporary file outside it, always deleted (uncommitted changes and
+submodule content are not included; `dirty` is `git status --porcelain` non-empty); SCP to `agern-sandbox-vm.tar.gz`
+in the user's home, mode 0600, at most `FACTORY_DEPLOY_MAX_COPY_MB`; `checkout`, then `setup`, one SSH exec each,
+stopping at a non-zero exit or timeout; then `ready` every 1 s until exit 0 or `timeoutSeconds` (a connection failure
+counts as a failed attempt). The lease records the sha after a successful checkout. Definition commands (also `reset`
+and the check's `ready`) are sent as `export AGERN_SHA='<sha or empty>' AGERN_RUN_ID='<uuid or empty>'
+AGERN_ARCHIVE="$HOME/agern-sandbox-vm.tar.gz"`, a newline and the command; the login shell must be POSIX. Connections
+are those of deploy targets (in-process MINA SSHD, pinned host key, public-key auth, 15 s connect and auth timeouts,
+no PTY, stdin at EOF).
+
+**Tools** (§7): `factory_sandbox_vm_info`, `_deploy`, `_exec`, `_wait`, for the `builder` stage of an issue run with
+decision `approved` and the switch not `off`; one operation at a time per lease, run on the application scope; the
+last 20 results kept while the lease lasts. After the first successful lease the decision records `used: true`. The
+builder's task prompts get a paragraph about the VM, `builder.md` a "Sandbox VM" section, the spec-writer one line.
+
+**Preview** (`POST`/`DELETE /api/runs/{id}/sandbox-vm/preview`, §8): owner or admin, `needs_human` only; takes a
+`preview` lease, sets the preview to `deploying`, deploys in the background and answers the run at once. Outcome
+`ready` (sha, url, `expiresAt` = now + preview minutes) or `failed` (failedStep, error, output tail ≤ 20,000 chars;
+the lease is ended). While `ready`, a new `POST` deploys the current `HEAD` again and renews the expiry; while
+`deploying` it answers 409 `sandbox_vm_busy`. Release and expiry make it `released` (`expired: true` at expiry). Every
+change re-publishes the run on the feed.
+
+**Check** (admin): connect, host key, auth; then, if defined, `ready.command` once with a 60 s limit. Stages
+`connect`, `host_key`, `auth`, `ready`, `ok`.
+
+**Records.** Every step, command and reset is one `system` event in the builder's transcript with payload `sandboxVm`
+(§8), `level` `warn` when it failed, `text` like `Sandbox VM [sandbox] deploy checkout: exit 0 in 1.2 s`. The server
+log gets one line per operation, never the command or its output. Output is visible to everyone who can see the
+project.
+
+**Migration** `V30__sandbox_vm.sql`: tables `sandbox_vm_approvals` and `sandbox_vm_leases`, column `runs.sandbox_vm`.
 
 ## 6. The pipeline
 
@@ -741,8 +1012,10 @@ issue → spec-writer (opus) → builder (opus) ─┬→ security  (opus)   ┐
                               │              └→ code      (sonnet) ┘
                               └── any CHANGES: resume builder (max 2 rounds)
                                              all PASS → approver (opus)
-                                                          ├ APPROVE  → merge to main
+                                                          ├ APPROVE  → checks → merge to main
                                                           └ ESCALATE → needs-human ← /factory approve
+   merge policy owner_approves: APPROVE and ESCALATE → needs-human ← /factory approve
+   merge policy github:         APPROVE and ESCALATE → ready (pull request left open; merged or closed on GitHub)
 ```
 
 "main" is the repository's default branch for a single run, and `release/<name>` for a release run (§6
@@ -754,12 +1027,16 @@ reaches the default branch only through the owner's approval of the release (§6
   the full test suite at most once, no stress loops or fix-verification cycles. What it learns goes into the
   spec's `## Findings` section (root causes marked confirmed/suspected, reproduction commands and failure
   rates, tried fixes marked verified/not verified, open questions), which it omits when there is nothing to report.
+  When the run has an approved sandbox it may plan its use in an optional `## Verification` section (between
+  `## Tests` and `## Out of scope`): the commands the builder runs in the sandbox and on which platforms, and for UI
+  changes how the UI reviewers start the app in the review sandbox and what they look at. It reads the sandbox with
+  `factory_sandbox_info` but cannot run anything in it, and never asks for a sandbox to be enabled or approved.
 - **builder** implements the spec on the run branch and commits; the build stage owns implementation and
   verification. `builder.md` tells it to start from the spec's Findings (reuse its reproduction commands and
   verified fixes before exploring on its own) and to verify the result itself. The orchestrator pushes the branch
   and opens a pull request after the first build. When the run has an approved sandbox (§5 "Sandboxes"),
-  the builder builds and tests in it through `factory_sandbox_exec`; the sandbox is removed when the
-  build/review loop ends, before the approver runs. Its task and fix prompts name the branch the pull request merges
+  the builder builds and tests in it through `factory_sandbox_exec` (running the spec's Verification commands there,
+  when it has some); the sandbox is removed when the build/review loop ends, before the approver runs. Its task and fix prompts name the branch the pull request merges
   into and the rule for migration versions (§6 "Database migrations").
 - **reviewers** run in parallel, cannot edit files (`--disallowedTools Edit,Write,NotebookEdit`),
   and answer through `--json-schema` with
@@ -771,7 +1048,9 @@ reaches the default branch only through the owner's approval of the release (§6
   the approver is `skipped` and the run goes to `needs_human`.
 - **Rounds** are numbered by fix rounds: `Run.round` and `Stage.round` are `0` for the initial
   build/review, `1..maxRounds` for fix rounds. The UI shows "build" for round 0 and "fix round N of
-  max" after.
+  max" after. Later rounds are follow-up reviews of conversation changes ("follow-up N", §6 "Conversation at needs
+  human") and update rounds ("update N", §6 "Retrying a run"); a round that a `run_updates` row names is an update
+  round, and follow-up numbers skip the update rounds in between.
 - **Time limit.** Every stage agent is stopped after `FACTORY_STAGE_TIMEOUT_MINUTES` (default 60) of
   wall-clock time (waiting for a free agent slot does not count). The stage becomes `failed` with
   summary "Timed out: …", and the run `failed` with error "<role> failed: Timed out: …" (failure kind
@@ -787,10 +1066,14 @@ reaches the default branch only through the owner's approval of the release (§6
     "continue from the commits" a stage that runs out of time no longer loses its work, which was the main cost of a
     limit that is too short for a large issue; a per-project override (e.g. in `.agern/`) can be added later if a real
     project needs one, and is a configuration change only (`AgentManager.runStageAgent` takes the limit from `Config`).
-- **approver** answers `{ "verdict": "APPROVE" | "ESCALATE", "summary": string }`. `APPROVE`
-  squash-merges the PR and closes the issue, unless its database migrations collide with the target's (§6 "Database
-  migrations"): then the run goes to `needs_human` instead. `ESCALATE` labels the issue `needs-human`, comments,
-  and waits for the owner's `/factory approve`.
+- **approver** answers `{ "verdict": "APPROVE" | "ESCALATE", "summary": string }`. Under the project's merge policy
+  `automatic` (the default, §6 "Merge policy") `APPROVE` squash-merges the PR and closes the issue once the checks on
+  the pull request's head commit allow it (§6 "Checks before a merge"), unless its database migrations collide with
+  the target's (§6 "Database migrations") or GitHub refuses the merge because the branch conflicts with its target or
+  is behind it: then the run goes to `needs_human` instead, and "Update and merge" (§6 "Retrying a run") can bring the
+  branch up to date with the target on the same run. `ESCALATE` labels the issue `needs-human`, comments, and waits
+  for the owner's `/factory approve`. Under the other policies the verdict is only a recommendation: `owner_approves`
+  always waits in `needs_human`, `github` ends the run `ready` and never merges.
 - **Whose models.** Every agent runs on its owner's Claude account, so model choices are personal. The
   global settings (`chatModel`, `pipelineModels`, `maxFixRounds`) are the admin's *defaults* — the models
   shown above unless an admin changes them. Each user may override any of them for themselves
@@ -835,17 +1118,22 @@ reaches the default branch only through the owner's approval of the release (§6
     echoes falls back to closing stdin at the first `result`.)
   - The stage time limit is unchanged and not extended by messages; cancel works as before.
 - Orchestration is a deterministic state machine in the server, not something an LLM decides. On
-  server restart, unfinished runs are marked `failed` with a clear reason (v1); a building release then builds
-  the interrupted issue again (§6 "Releases").
+  server restart, unfinished runs — a run waiting for the network included — are marked `failed` with a clear reason
+  (v1; resuming a run in place after a restart is not built); a building release then builds the interrupted issue
+  again (§6 "Releases"). `needs_human` runs survive, and so do `waiting_for_checks` runs: their wait is resumed with
+  its original deadline (§6 "Checks before a merge"). While the server runs, a failure that comes from the environment
+  rather than the work does not fail the run: it waits and retries (§6 "Transient failures").
 - **Worktrees and branches.** Rule: **every run has its own branch** (`…-<first 8 hex digits of the run id>`, §5)
   and its own worktree `runs/<runId>`, so no run ever reuses, resets or force-pushes the branch, pull request or
   worktree of an earlier run — a leftover can never collide with a new run. At most one run per issue is active
-  (`queued` … `approving`, `needs_human`); a second start is 409 `active_run_exists`.
+  (`queued` … `approving`, `waiting_for_checks`, `needs_human`); a second start is 409 `active_run_exists`. `ready`
+  (§6 "Merge policy") is not active: the issue may get a new run.
   - *When a run ends* its worktree is removed before its final status is shown: `merged` (approver or owner
     approve) also deletes the local branch; `failed` (any stage, the time limit, no commits, set-up errors) and
     `cancelled` (also from `needs_human`, or through a release) delete the local branch unless it holds commits
     found on no other branch and no remote-tracking branch (never pushed), which are kept rather than lost. A
-    `needs_human` run is still alive and keeps its worktree until it is approved or cancelled. Submodule commits
+    `needs_human` run is still alive and keeps its worktree until it is approved or cancelled. `ready` (merge policy
+    `github`) removes the worktree like an unmerged end; the pushed branch and the open pull request stay. Submodule commits
     found on no remote-tracking branch of their submodule are saved as git bundles first (§6 "Submodule pointers").
   - *GitHub:* the remote branch and the open pull request of a failed or cancelled run are left untouched — they
     may hold useful commits, and only a human decides to close them. The issue gets a comment "run … failed: <reason>"
@@ -864,9 +1152,79 @@ reaches the default branch only through the owner's approval of the release (§6
     "Sandbox before worktree"), the same is done for every clone on disk. The worktree of a live run, `needs_human`
     included, is never touched. A run's sandbox, which bind-mounts its worktree, is always removed first.
 
+#### Checks before a merge
+
+Every run merge — the approver's `APPROVE`, the owner's approval (button, `/factory approve`, `factory_approve_run`)
+and the step retry of a failed merge — goes through one gate (issue #100). Single, release and workspace runs behave
+alike. Decided by these rules alone, never by an agent.
+
+1. The database migration and submodule guards run first (§6 "Database migrations", "Submodule pointers").
+2. The pull request is read. Not open on GitHub (merged or closed there) or not found: `needs_human`, `failedStep`
+   `merge`, "Pull request <ref> is no longer open on GitHub (<merged|closed>), so Agern did not merge it."
+3. The checks on its current **head commit** are evaluated with the rules of releases (§6 "Releasing", "Checks"):
+   commit statuses, check runs and GitHub Actions workflow runs; `failed` > `pending` > `passed` > `none`, and "no
+   checks" is `awaiting` until the head commit has been known for `FACTORY_RELEASE_CHECKS_SETTLE_SECONDS`. For a run
+   the head is first seen when Agern pushes it (the pipeline's push and the follow-up review's push record the
+   worktree HEAD and the time), else at the first evaluation that sees it; persisted, so a restart does not restart
+   the period.
+4. By state:
+   - **`passed` or `none`**: squash-merged with the merge API's expected `sha` set to the evaluated commit. GitHub's
+     409 (the head moved meanwhile) evaluates the new head (step 2) instead; a merge never happens for another commit
+     than the one whose checks were evaluated. Other merge failures: `needs_human` with `failedStep` `merge`, as before.
+   - **`pending` or `awaiting`**: the run goes to `waiting_for_checks` (error cleared) and a job (cancelled by "Cancel
+     run") evaluates again from step 1 every 30 s, on the pull request's then-current head: a new head gets a fresh
+     settle period and fresh checks. Nobody approves again; it merges as soon as they pass. The run is published when
+     the checks' state, commit or detail changes.
+   - **`failed`**: no merge; `needs_human` with `failureKind` `checks` and `failedStep` `merge`. The reason names every
+     failed check (a Markdown link when GitHub gave an `https://` URL) and the short SHA; when a conclusion is
+     `startup_failure`, `cancelled`, `timed_out` or `stale` it adds "Some checks did not run to completion (for example
+     a startup failure or a cancellation on GitHub's side). Re-run them on GitHub, then approve again." It goes on the
+     issue (the needs-human comment) and on the pull request ("**Agern: not merged.** …").
+   - **`unknown`**: a read GitHub refused (401/403/404) is `needs_human` at once (`failureKind` `checks`): "Could not
+     read the checks of <ref>: <message>. The run owner's GitHub token needs read access to commit statuses, checks and
+     Actions." Other read errors (5xx, I/O, also of the pull request) are waited through like `pending`.
+5. **Time limit.** After `FACTORY_RUN_CHECKS_WAIT_MINUTES` (default 60) in `waiting_for_checks`, counted from the first
+   transition into it of this merge attempt (a head move does not restart it), the run goes to `needs_human`
+   (`failureKind` `checks`, `failedStep` `merge`): "Checks on `<sha7>` of <ref> did not finish within <n> minutes
+   (<detail>). Approve again to wait again, or merge anyway on the run page."
+6. A later approval or merge retry of a `needs_human` run starts again at step 1 on the then-current head; nothing of
+   an earlier evaluation is reused. A `needs_human` run never starts merging by itself.
+
+*The owner's approval* evaluates once before it answers: merged or `needs_human` as before, or the run is answered in
+`waiting_for_checks` and its job goes on; the advisor ends, and a release run settles, only when that job reaches
+`merged` or `needs_human`. `/factory approve` and `factory_approve_run` then answer "Run <id> is waiting for checks on
+`<sha7>` (<detail>); it merges by itself when they pass." Who approved (the owner, or the approver agent) is stored, so
+the merge comment is right after a wait or a restart.
+
+*Waiting.* `waiting_for_checks` is active (one active run per issue, lists, cancel, the worktree is kept) but a restart
+does not fail it: the server resumes the wait at start with the original deadline, and it does not count as in
+progress for `/api/internal/activity`. The advisor and "Review again" are refused while waiting (409
+`run_not_waiting`). A waiting release run keeps its issue `running`; the release builds nothing else meanwhile.
+
+*Merge anyway.* The run's owner — nobody else, admins included — can merge although the checks have not passed:
+`POST /api/runs/{id}/merge-anyway` with `{ headSha }`, the commit whose checks they saw, from the web UI's confirmation
+dialog that names the checks. There is deliberately no MCP tool, MCP argument or `/factory` command for it, so no agent
+can override the checks. Allowed from `needs_human` or `waiting_for_checks` when the run has a pull request and its
+recorded checks are `failed`, `pending`, `awaiting` or `unknown` (else 409 `run_not_overridable`), and only for
+`headSha` equal to the recorded checks' commit (else 409 `checks_changed`); from `needs_human` the conversation gate of
+an approval applies (409 `review_required` / `review_in_progress` / `agent_busy`). A waiting job is stopped first (a
+run that turned out merged meanwhile is answered as is). The guards still run; the pull request is then squash-merged
+with expected `sha` `headSha`, without evaluating the checks — a head that moved since is not merged (`needs_human`:
+"The pull request's head changed since you confirmed; approve again to evaluate the new commit."). The decision is
+recorded on the run (`checks.overriddenBy`, `checks.overriddenAt`), on the pull request ("**Agern:** @<login> merged
+this pull request although its checks had not passed on `<sha7>` (<detail>).") and on the issue (the merged comment
+ends "(approved by @<login>, despite checks: <detail>)").
+
+*Untrusted.* Check names, details and URLs come from GitHub: they are escaped as Markdown text in comments and
+reasons, a URL is used as a link only when it starts with `https://`, and the UI renders them as text.
+
 #### Retrying a run
 
-A failed run can be retried in three ways (issue #53), depending on where it stopped:
+A run can be retried in four ways (issues #53 and #120), depending on where it stopped:
+
+- **Update and merge** (`update`): the work is finished (spec, build, reviews, approver `APPROVE`) and only the merge
+  was refused because the target moved on (see the paragraph "Update and merge" below). The same run gets an update
+  round; no new spec and no fresh build.
 
 - **Retry the failed step** (`step`): the builder finished, and a mechanical step after it failed — the push, the
   pull request creation, or the merge (also the merge into a release branch). Only that step is retried, **on the same
@@ -881,8 +1239,11 @@ A failed run can be retried in three ways (issue #53), depending on where it sto
   the approver's decision when the approver had approved, else as the owner's — which is what the owner's approval
   also does. It goes through the same gate as the approval: changes from the conversation must have been reviewed
   (409 `review_required` / `review_in_progress` / `agent_busy`, §6 "Conversation at needs human"), and the merge
-  checks the database migrations first (§6 "Database migrations"). A migration conflict is not a failed step: it
-  clears `failedStep`, so the run offers no step retry until its branch is fixed.
+  checks the database migrations first (§6 "Database migrations") and then the checks on the pull request's head
+  commit (§6 "Checks before a merge"). A migration conflict is not a failed step: it sets `failureKind`
+  `migration_conflict` and clears `failedStep`, so the run offers no step retry, but `update` while update rounds are
+  left; a merge refused for a conflict with the target (`merge_conflict`) keeps `failedStep` `merge`, so both the step
+  retry and `update` are offered.
 - **Continue from the commits** (`continue`): a **new run** whose worktree starts at the tip of the failed run's
   branch (local branch, else the remote one, fetched), on its own new branch (§6 "Worktrees and branches"). It reuses
   the failed run's spec (the spec-writer stage is `skipped` with summary "Spec reused from run <id>"; a failed run
@@ -898,8 +1259,66 @@ A failed run can be retried in three ways (issue #53), depending on where it sto
 - **Start over** (`start_over`): a new run from scratch, as before this feature; the old branch, pull request and
   local branch are left as they are (§6 "Worktrees and branches").
 
+*Update and merge* (issue #120, the merge-time part of #35). *Available* (`RunRecord.updateAvailable`, also
+`updateAvailable` on `Run` and on a release issue) when the run is `needs_human`, its `failureKind` is
+`migration_conflict` or `merge_conflict`, it has a branch and a pull request, and `updateRounds < maxUpdateRounds`.
+`merge_conflict` is recorded when a squash merge fails with GitHub 405 or 409 and the pull request then reads as open
+with `mergeable` false or `mergeable_state` `dirty` or `behind` (while `mergeable` is null it is read up to 4 more
+times, `mergeablePollMillis` apart; an error while reading means no conflict, and the failure stays a plain failed
+merge step). `FACTORY_MAX_UPDATE_ROUNDS` (default 2) is copied to `runs.max_update_rounds` when the run is created;
+`runs.update_rounds` counts the rounds started. Update rounds do not use fix rounds (`maxRounds`). *Start*
+(`Orchestrator.update`, under the run's talk lock): 409 `retry_mode_unavailable` when the run is not updatable,
+`review_in_progress` while a follow-up review runs, `agent_busy` while the advisor answers, `run_worktree_missing`
+when the worktree is gone (unreviewed conversation changes do not block it: the round reviews the whole branch). The
+transition `needs_human` → `building` with `update_rounds + 1` is one conditional SQL update, so of two concurrent
+starts one gets 409 `retry_mode_unavailable`; the advisor process is stopped as before a follow-up review. *The round*
+runs as the run's job (Cancel works) with the owner's identity, in round = highest stage round + 1, and records a
+`run_updates` row (`running`):
+1. the `needs-human` label goes, the issue gets "**Agern:** updating run `<id>` with `<target>` and merging again
+   (update round n of max[, automatic in release `<name>`]). Reason: <first line of the refusal>";
+2. the migration problems and a renumbering plan (`MigrationCheck.plan`) are computed as the merge gate sees them;
+3. Agern merges the target into the branch in the run's worktree under the clone lock (`GitOps.mergeBase`): fetch,
+   then a real `git merge --no-edit` with the owner's git identity — never a rebase, a reset of pushed commits or a
+   force push, so the later push is a fast-forward. `up_to_date`, `merged` (clean, committed) or `conflict` (left
+   mid-merge with the conflicted files); a worktree with uncommitted changes to tracked files fails the round. The row
+   records the target and its commit, the head before, the incoming first-parent subjects (at most 50), the conflicts
+   and the migration problems;
+4. the sandbox decision is made again exactly as at the run's start and released when the builder ends;
+5. new stages for the round — builder, the four reviewers and a new approver — and the builder resumes the latest
+   builder conversation (`--resume`, fresh with issue and spec when there is no Claude session) with the update
+   prompt (§6 "Database migrations");
+6. the worktree is checked: a merge still in progress or unmerged paths ("the builder left the merge unfinished"),
+   uncommitted tracked changes, the target commit not in `HEAD`, or no new commit although something conflicted, fail
+   the round. Else the row gets the head after and the builder's commits (at most 20);
+7. push (with the network wait), then the migration check again on the pushed branch: remaining problems fail the
+   round (kind `migration_conflict`); else the row is `resolved`;
+8. the four reviewers ("after update round n: `<target>` was merged into the branch and the builder resolved the
+   conflicts; review the whole change, with attention to what the update changed"); any `CHANGES` → `needs_human`
+   "Reviewers request changes after update round n: <roles>." with the approver `skipped` and no fix round;
+9. the approver (its prompt adds "Update rounds used: n of max; the last one merged `<target>` into the branch.");
+   `APPROVE` merges through every gate (migrations, submodule pointers, squash merge, network wait), `ESCALATE` →
+   `needs_human`. A merge refused again records the conflict kind again, so `update` is offered while rounds remain.
+
+*Failure* of the round (a stage failure, the time limit, the usage limit, git, the checks of steps 3, 6 and 7, a push
+that gave up) does not fail the run: open stages close, the sandbox goes, and when nothing was pushed the worktree is
+restored to the head before the round (`merge --abort`, `reset --hard` to that commit, which is the pushed head), with
+the failure kind and step restored. After the push the kind is `migration_conflict` for remaining migration problems,
+else cleared; a run with an advisor whose reviewed commit is not `HEAD` needs its review again. The row becomes
+`failed`, and the run `needs_human` with "Update round n of max with `<target>` did not finish: <why>." plus "
+Conflicting files: …" (at most 10) and " Migrations: …" when there were any, " Pull request #p was not merged.", and
+either ' "Update and merge" can try again (k round(s) left), or resolve it on the pull request's branch and approve
+again.' or " The limit of max update round(s) is reached: …, or build the issue again from the current `<target>`
+(in a release: Retry)." A cancel ends the row `cancelled`; a restart fails the run (`restart`) and its `running` row
+("Interrupted by a server restart"); the existing `continue` retry then applies. *Shown*: `Run.updates` (number, round,
+limit, trigger `owner`/`release`, target, reason, status, merge status, target commit, incoming subjects, conflicts,
+migration problems, the builder's commits, error, times, and a server-composed `summary` line), the run page's
+"Updates" section and "update N" rounds, and the release issue's `updateSummary`. Texts from the repository are data:
+delimited in the prompt, sanitised and capped in comments, plain text in the web UI.
+
 *Recommendation.* The options endpoint answers each mode with `available` and a one-line `detail`, plus the
-`recommended` mode and a one-line `reason`. Rules, in order: `step` when a step retry is possible; `start_over` when
+`recommended` mode and a one-line `reason`. Options are listed in the order `update`, `step`, `continue`,
+`start_over`. Rules, in order: `update` when it is available ("The work is finished; only the merge into `<target>`
+was refused: <error>"); `step` when a step retry is possible; `start_over` when
 `continue` is not possible (the branch has no commits of its own, or it is found neither locally nor on the remote);
 `start_over` for a cancelled run (continuing stays available); `start_over` when the builder made no commits
 (`blocked`, it reported why); `continue` for the interruptions `time_limit`, `usage_limit`, `restart` and
@@ -912,13 +1331,19 @@ other failure whose branch has commits. Commits are counted in the owner's clone
 `ECONNREFUSED`, `ENOTFOUND`, `ETIMEDOUT`, `ConnectException`, or is an I/O exception), `restart` (failed by a server
 restart: "Server restarted while the run was in progress; retry it to continue or start over."), `blocked` (no
 commits), `step` (with `failedStep`), `other`; and, on a `needs_human` run whose merge was refused,
-`submodule_commit_missing` (with `failedStep` `merge`, §6 "Submodule pointers"). `FailureKind.INTERRUPTED` (the four kinds of the recommendation rule)
-is the seam for issue #57 (transient failures pause and retry automatically), which is not built here.
+`submodule_commit_missing` (with `failedStep` `merge`, §6 "Submodule pointers"), `checks` (with `failedStep`
+`merge`: the checks failed, did not finish in time or could not be read, §6 "Checks before a merge"),
+`migration_conflict` (no `failedStep`) and `merge_conflict` (with `failedStep` `merge`), the two that make "Update and
+merge" available (`FailureKind.UPDATABLE`). `FailureKind.INTERRUPTED` holds the four kinds of the recommendation rule.
+A run fails with `api_unreachable` only after it waited for the network and gave up, reached the limit, or when
+waiting is switched off (§6 "Transient failures").
 
 *Who.* Options: anyone who can see the run (404 otherwise). Retry: the run's owner only — admins included in the
 refusal (403), as for every action that makes agents run on the owner's credentials (§4) — and the owner needs a
 Claude credential (422 `claude_credential_required`). A single run must be `failed` or `cancelled` (409
-`run_not_retryable`); a release run is retried through its release (409 `release_run`). A mode that is not available
+`run_not_retryable`), except that a `needs_human` run accepts `update` (or `recommended` when that is `update`) and
+nothing else; a release run is retried through its release (409 `release_run`). The automatic update of a release
+runs as the release's owner, who owns its runs. A mode that is not available
 is 409 `retry_mode_unavailable`; an unknown one is 400.
 
 *Default.* A request without a mode (no body, `{}`, or `mode` null) means `start_over`: the release issue retry
@@ -930,16 +1355,160 @@ agree. `recommended` asks for the server's recommendation explicitly; the web UI
 `waiting` at its position with its old run still linked and `retryMode` set (note "Retry: continues from the commits of
 run <id>" / "Retry: the failed step of run <id>"), and the build reaches it in its turn; `advance` then starts a
 continuing run (`continue`) or resumes the old run's failed step (`step`, the issue is `running` with the **same** run)
-instead of a fresh run. For `continue` an old run that is still active (`needs_human`) is cancelled first. If the old
-run was approved and merged by its owner while the issue waited, a `step` issue becomes `merged`. If the retry cannot
+instead of a fresh run. `update` does the same with note "Retry: updates run <id> with `<target>` and merges it":
+`advance` starts the update round on the same run (the issue is `running` with it), and the old run is never
+cancelled. For `continue` an old run that is still active (`needs_human`) is cancelled first. If the old
+run was approved and merged by its owner while the issue waited, a `step` or `update` issue becomes `merged`. If the retry cannot
 start, the issue is `held` with "Could not start a run: …" and keeps the old run linked, so it can be retried again.
 When a release builds an issue again by itself after an interruption — the usage limit, a rejected credential, a
 restart — it continues from the interrupted run's commits when `continue` is recommended for that run, else it starts
 over.
 
+#### Transient failures
 
-Run `status`: `queued`, `spec`, `building`, `reviewing`, `approving`, `merged`, `needs_human`,
-`failed`, `cancelled`.
+A failure that comes from the environment rather than the work (issue #57) does not fail a run or hold a release
+issue: the run waits for the network and tries the failed operation again.
+
+*Transient* (`pipeline/Transient.kt`), checked along the exception's cause chain (at most 10 levels): an
+`IOException` (also as the cause of an `UncheckedIOException`) that is not a `FileSystemException` or
+`FileNotFoundException` — `ConnectException`, `UnknownHostException`, `SocketTimeoutException`, `HttpTimeoutException`,
+`SSLException`, …; an `UnresolvedAddressException`; a GitHub answer 500–599; git output naming the network ("Could not
+resolve host", "Failed to connect to", "Connection timed out/refused/reset", "Network is unreachable", "No route to
+host", "Temporary failure in name resolution", "Operation timed out", "The requested URL returned error: 5xx", "remote
+end hung up unexpectedly", "early EOF", "RPC failed", TLS handshake errors, "git <cmd> timed out") unless it also says
+the push was refused (permission, protected branch, non-fast-forward); a stage agent that failed with the "API
+unreachable" text of `FailureKind.looksUnreachable` and was not stopped at the time limit, not on a usage limit and not
+for a rejected credential. Never transient: a builder without commits, a reviewer or approver without a valid verdict,
+a stage time-out, a usage limit, a rejected credential, GitHub 4xx, a refused push, a cancel.
+
+*What waits.* The run's set-up (repository and issue from GitHub, clone, worktree or workspace checkout — retried as a
+whole after removing what the failed attempt checked out), every stage agent, the "spec ready" comment, the push, the
+pull request (`findOpenPull` / `createPull`) and the pipeline's own merge after the approver approved: its first
+reading of the pull request and its squash merge (before each retry the pull request is read: merged meanwhile — e.g.
+the failed answer was lost — counts as merged; §6 "Checks before a merge"). A checks read that fails is not a network
+wait: the run waits in `waiting_for_checks` and reads again. The owner's Approve, a step retry's merge, a
+`waiting_for_checks` poll's merge, follow-up reviews and advisors do not wait.
+
+*Waiting.* The run keeps its status, worktree, sandbox, branch and stages (a waiting stage stays `running`); its
+`waiting` is `{reason: 'network', since, nextAttemptAt, attempt, detail}`. One wait per run is shared by everything
+that fails meanwhile (the four reviewers): a failure that arrives during a wait joins it and is not another attempt.
+The delay before attempt *n*+1 is 1, 2, 5, 10, 15 minutes, then 15 minutes each time; "Retry now" (owner or admin)
+ends the sleep at once. The first success of a retried operation ends the streak; the next failure starts a new one.
+A waiting run holds no agent slot and no stage time: each attempt of a stage gets the full time limit. The stage
+agent's transcript gets "Lost the connection: <detail>. Waiting for the network; next try at <time> (attempt <n>)."
+where <n> is the attempt that comes next. The run (and its release) is published when a wait starts and ends.
+
+*Retrying a stage.* The next attempt is a new session of the same stage row (its parent: the failed attempt's
+session). When the failed attempt reported a Claude session id it runs with `--resume` and the prompt "Message from
+Agern: the connection to the Claude API was lost while you were working and is available again. Continue the task from
+where you stopped; your working directory is as you left it. End with the final answer the task asks for."; otherwise
+the stage runs again with its original prompt. A resume that fails without ever starting (no `init`, no result) is
+followed at once by one fresh attempt with the original prompt. Reviewers that already gave a verdict are not run
+again.
+
+*Limit and give up.* When a new wait would start `FACTORY_NETWORK_RETRY_HOURS` (default 24) after `since`, the run
+fails as it would have without waiting — kind `api_unreachable`, or `step` with `failedStep` `push` / `pull_request` —
+with " Gave up after waiting for the network for <duration> (<n> attempts)." after the reason. "Give up" (owner or
+admin) fails it the same way with " Gave up waiting for the network (by @<user>, after <n> attempt(s))."; the worktree
+and sandbox are removed, the issue gets the failure comment and a release run settles as failed. For the pipeline's
+merge, giving up or the limit ends as any failed merge does: `needs_human` with `failedStep` `merge`. With the limit
+`0` nothing waits. Cancelling works during a wait. A terminal or `needs_human` run never has `waiting`.
+
+*Releases.* While its running run waits, a release stays `building` with the issue `running` (the issue carries the
+run's `waiting`), starts nothing else and holds nothing. When the next issue cannot start for a transient reason
+(anything that fails between the skip check and the run's creation), the release is `paused` with reason `network`,
+note "Could not start #<n>: <detail>", `resumeAt` (the next try, same backoff), `since` and `attempt`; the issue stays
+`waiting` ("Waiting for the network; it starts when GitHub and the Claude API can be reached again") with its linked
+run and retry mode. The resume ticker resumes it at `resumeAt`; `since` and `attempt` are stored and survive resumes
+and restarts, and reset when a run starts, an issue is skipped or held, or the release is cancelled. After the limit
+the issue is held as before ("Could not start a run: <detail> Gave up after waiting for the network for <duration>.")
+and the build goes on. "Retry now" is the owner's Resume; "Give up" (owner or admin) holds the issue ("… Gave up
+waiting for the network (by @<user>).") and goes on with the next one. A due scheduled release whose start fails
+transiently stays `scheduled` without a start failure and is started at a later tick.
+
+*Logs and notes* name exceptions as `<Class>: <message>` (or the class alone; ` (caused by <Class>[: <message>])` for a
+wrapper), never `null`: the release re-evaluation and its ticker (a non-transient failure there is logged with its
+stack trace), the release builder's notes and logs, the run failure log, and the scheduler. A run's error keeps an
+exception's own message and is the class name when it has none.
+
+#### GitHub status
+
+When GitHub has problems, Agern shows it on the GitHub status page (issue #99): GitHub's official status combined with
+what Agern itself sees, and a verdict "working", "degraded" or "down" *for Agern* — GitHub can fail for Agern while
+githubstatus.com says "All Systems Operational".
+
+*Recording* (`github/GitHubHealth.kt`, in memory, lost on restart). `HttpGitHub` sends every request — paged requests
+and `getFileBytes` included — through one function that records one outcome per exchange; `CliGitOps` records every
+`clone`, `fetch` and `push` (the first argument that is no option and not the value of a `-c`) when it is not
+`localOnly`. Not recorded: `submodule update` and the fetch of `remoteHasCommit` (other hosts possible), the fake
+GitHub, calls that agents make themselves, webhooks, and the official status fetch. Classes: `ok` (any answer below
+500 that is none of the following — 404 and 422 included — and git exit 0); `server_error` (HTTP 500–599, git "The
+requested URL returned error: 5xx"); `network` (an `IOException` — timeouts, refused connections, DNS, TLS — or an
+`UnresolvedAddressException`, a git timeout, git output `Transient.isNetworkGitMessage` accepts); `rate_limited`
+(429; 403 with `x-ratelimit-remaining: 0`, a `retry-after` header or a message containing "rate limit"; git `returned
+error: 429`); `auth` (401, any other 403; git "Authentication failed", "could not read Username", `returned error:
+401/403`); `other` (git only: any other non-zero exit, e.g. a refused push — a call, never a failure). Kinds, from
+the path without the API base, query and `/repos/{org}/{repo}` (first match): `graphql` (`/graphql`), `issues`
+(`/issues…`, `/labels…`), `pulls`, `releases`, `actions`, `checks` (`/commits/{sha}/status`, `/commits/{sha}/check-runs`,
+`/check-runs…`, `/check-suites…`, `/statuses…`), `contents`, `git_data` (`/git/…`), `repos` (anything else under
+`/repos/…`, and `/orgs/…`), `other` (`/user`, `/rate_limit`, …), plus `git` for the git CLI. Storage per kind: a ring
+of 1440 one-minute buckets with a counter per class (exact counts for 24 h, bounded memory; a bucket is in a window of
+N minutes when its minute start is later than now − N minutes) and the last error `{at, class, status, requestId,
+message}` (shown for 24 h). Nothing else: no bodies, tokens, URLs, paths or users. Recording is thread-safe and never
+throws into the caller.
+
+*Error texts and scrubbing.* HTTP: `HTTP <status>[: <GitHub's message>]`; exception: `<SimpleClassName>[: <message>]`;
+git: the last `fatal:`/`error:` line, else the last non-empty line, else `git <cmd> timed out`. Every stored or
+returned text passes `GitHubHealth.scrub`: control characters and whitespace runs become one space; credentials
+(`ghp_…`/`gho_…`/…, `github_pat_…`, the value after `Bearer`/`Basic`, a secret-looking value after `token`, an
+`Authorization:` header's value, URL userinfo) become `[redacted]`; URLs keep only scheme and host
+(`https://github.com/…`); `<org>/<name>` becomes `<org>/[repository]`; IPv4 literals, bracketed IPv6 literals,
+`localhost` and host names ending in `.local`, `.internal`, `.lan`, `.corp`, `.home.arpa` or `.localdomain` (with any
+port) become `[address]`; absolute paths under `/home/`, `/var/`, `/tmp/`, `/srv/`, `/opt/`, `/root/`, `/data/`,
+`/mnt/`, `/usr/`, `/etc/` or `/Users/` become `[path]`; at most 200 characters (`…` when cut). The request id
+(`x-github-request-id`) is kept only when it matches `[A-Za-z0-9:._-]{1,100}`.
+
+*Verdict* (every request, all kinds, last 5 minutes; F = `server_error` + `network`, S = `ok`): `down` when F ≥ 3 and
+S = 0; `degraded` when F ≥ 2, or when the official status is `ok` and a relevant component (API Requests, Issues, Pull
+Requests, Actions, Git Operations, Webhooks) is not operational; `working` otherwise (also without calls, and when the
+official status is unreachable or off). Rate-limit, auth and other outcomes never change it. Reasons: "All <F> GitHub
+calls by Agern failed in the last 5 minutes (<n> server errors, <m> timeouts or network errors).", "<F> of <T> GitHub
+calls by Agern failed in the last 5 minutes (…)." (followed by the official sentence when both apply), "GitHub reports
+problems with <names>.", "Agern's calls to GitHub are succeeding." or "Agern has made no GitHub calls in the last 15
+minutes.".
+
+*Official status* (`github/GitHubStatusPage.kt`). The server fetches `FACTORY_GITHUB_STATUS_URL` (`GET`, `Accept:
+application/json`, `User-Agent: agern`, no credentials, 5 s connect and request timeout, at most 1 MiB), caches the
+result — failures too — for 60 s and lets concurrent requests share one fetch; the browser never contacts
+githubstatus.com. Kept: `status.indicator` (`none`/`minor`/`major`/`critical`, else `unknown`) and `description`;
+components that are not `operational` (at most 50, relevant ones first, `relevant` flag); incidents that are not
+`resolved`/`postmortem` (at most 20; `url` only for an `https://` shortlink of at most 500 characters). Strings lose
+control characters and are cut (names 200, description 300). `state`: `ok`, `unreachable` (network error, timeout,
+non-2xx, oversized or unparsable; `error` is a scrubbed text such as `HTTP 503`) or `disabled` (no URL).
+
+*Rate limits and privacy.* From every answer with `x-ratelimit-limit`/`-remaining`/`-reset` the recorder keeps
+`{limit, remaining, resetAt, observedAt}` per token fingerprint (first 16 hex characters of SHA-256 of the token; the
+token is never stored, the fingerprint never leaves the server) and resource (`x-ratelimit-resource`, default
+`core`); at most 200 fingerprints (least recently observed evicted), dropped after 24 h without an observation. The
+caller's own limits come from `GET /rate_limit` with their token (`resources.core` → REST, `resources.graphql`;
+cached 60 s per user; falling back to the header observations of their fingerprint; recorded as kind `other`). Other
+tokens appear only as a count of fingerprints with a current `core` observation and the lowest remaining/limit among
+them — no fingerprint, login or user id.
+
+*Error messages.* A GitHub answer ≥ 500 throws `GitHubException` (with `requestId`) whose message is built in one place
+(`GitHubFailure.serverError`): "GitHub failed: <what> returned HTTP <status>[ (request id <id>)][: <GitHub's message,
+scrubbed>]. This is a problem at GitHub, not with Agern or your token. See the GitHub status page in Agern
+(/github-status)." — so API 502 `github_error` answers, MCP tool errors, run failure reasons, network-wait details and
+release notes all carry it. The fake GitHub's 5xx knobs use the same text with request id `FAKE:0000:0000`. Messages
+below 500 are unchanged. In `FactoryService.gh` and `ReleaseService.gh` an `IOException` (not `FileSystemException` /
+`FileNotFoundException`) or `UnresolvedAddressException` becomes 502 `github_unreachable` "GitHub could not be reached
+(<Class>[: <scrubbed message>]). This is a network or GitHub problem, not a problem with your token. See the GitHub
+status page in Agern (/github-status)." with the exception as its cause (still transient); over MCP a tool error
+instead of JSON-RPC "Internal error". A `GitException` whose output classifies as `server_error` or `network`, and a
+git timeout, end with " GitHub or the network failed; see the GitHub status page in Agern (/github-status).".
+
+Run `status`: `queued`, `spec`, `building`, `reviewing`, `approving`, `waiting_for_checks` (approved; merges by itself
+when the checks pass, §6 "Checks before a merge"), `merged`, `needs_human`, `failed`, `cancelled`.
 
 Stage `role`: `spec-writer`, `builder`, `security`, `ux`, `ui-design`, `code`, `approver`.
 Stage `status`: `pending`, `running`, `done`, `failed`, `skipped`.
@@ -1049,8 +1618,8 @@ token:
    that fails (e.g. the default branch moved and changed the same gitlink) is retried once: a new commit on the new
    tip, the branch force-moved, the same pull request merged again. Bumps of different submodules do not conflict.
    After the second failure the pull request is left open: ``… could not be merged (<GitHub's message>); it is left
-   open for a human.`` (A future merge mode without automatic merge would stop after opening it: ``… is open for a
-   human to merge.``)
+   open for a human.`` A run of merge policy `github` whose pull request was merged on GitHub (§6 "Merge policy") stops
+   after opening the bump pull request: ``… is open for a human to merge.``
 
 Each outcome is a comment on the workspace issue and a `system` event (`info`, or `warn` when nothing was bumped) in
 the run's latest stage transcript. A bump that throws is logged and reported the same way (``**Agern: submodule
@@ -1086,6 +1655,72 @@ Not in this step: runs that change several members at once, runs of the workspac
 repository itself in a workspace defined by `.agern/workspace.yml`, choosing the member in Agern, members outside the
 organization (such submodules are context only).
 
+### Merge policy
+
+Many teams require that a person reviews and merges every pull request. An admin sets a **merge policy** per project
+(`PUT /api/projects/{repo}/settings`, §8); without a stored setting it is `automatic`. For a workspace project the
+policy is the workspace repository's, never a member's.
+
+| Policy | After the approver | Who merges |
+|---|---|---|
+| `automatic` | `APPROVE` merges, `ESCALATE` → `needs_human` (as above) | the approver agent, or the owner's approval |
+| `owner_approves` | always `needs_human` | only the run owner's approval |
+| `github` | `ready` (terminal) | never Agern: the team, on GitHub |
+
+- **Snapshot.** `Orchestrator.create` stores the policy in force on the run (`runs.merge_policy`, `Run.mergePolicy`);
+  it never changes afterwards (also not for a step retry). A new run created by a retry takes the project's current
+  policy; a release run always stores `automatic` (releases below); runs from before the setting are `automatic`.
+  Changing the setting never affects existing runs.
+- **The approver's prompt** carries one paragraph per policy: `automatic` "Merge policy: automatic. `APPROVE`
+  squash-merges the pull request and closes the issue immediately, without a human looking at it; `ESCALATE` asks the
+  run owner to decide." (a release run: "… into the release branch `<branch>` immediately … (the issue stays open until
+  the release is merged) …"); `owner_approves` "Merge policy: the run owner approves every merge. You cannot merge:
+  your verdict is a recommendation to the owner. …"; `github` "Merge policy: merged on GitHub by the team. Agern never
+  merges this pull request: your verdict is a recommendation that is posted for the human reviewers. …". The role
+  prompt (`approver.md`) no longer promises an immediate merge; the schema is unchanged.
+- **`owner_approves`.** The stage records the verdict; then `needs_human` with the reason ``The approver recommends
+  merging: <summary> This project requires the run owner's approval before every merge.`` (`APPROVE`) or ``The
+  approver escalated: <summary>``. The owner's approval (button, `/factory approve`, `factory_approve_run`) merges as
+  today ("(approved by @owner)"; a submodule pointer bump is merged too). Anyone else gets 403, admins included; the
+  owner may approve their own run (a second-person rule is not built). Everything else at `needs_human` is unchanged.
+- **`github`.** With either verdict, in this order: the project's `reviewers`/`teamReviewers` are requested on the
+  pull request (`POST /repos/{o}/{r}/pulls/{n}/requested_reviewers`, in the pull request's repository, with the
+  owner's token; the owner's own login is left out because GitHub refuses the author; a failure never fails the run);
+  the issue gets ``**Agern: ready for review.** Pull request <url> passed all reviewers. Approver's assessment
+  (<VERDICT>): <summary>`` + ``This project merges on GitHub: review and merge the pull request there. Agern does not
+  merge it and follows it until it is merged or closed.`` + `` Reviewers requested: @a, team `x`.`` or `` Requesting
+  reviewers failed: <message>.`` (a workspace member run: the same text on the pull request too); the `needs-human`
+  label is removed; the worktree is removed; the run becomes `ready` (error and failure cleared, `endedAt` set). The
+  issue stays open and nothing is merged. Agern's pull requests are never drafts, so "ready for review" needs no
+  GitHub call. When reviewers still request changes after the last fix round the run goes to `needs_human` as usual;
+  its comment then ends ``This project merges on GitHub: the pull request can be reviewed and merged there; Agern
+  does not merge it.`` and the conversation and "review again" work, but there is no approval.
+- **`ready`** is terminal: not active (a new run of the issue may start; its pull request body lists the open one),
+  cancel answers 409 "Run is already ready", retry 409 `run_not_retryable`, the worktree reapers treat it as ended.
+- **No path merges a `github` run.** `Orchestrator.approve` answers 409 `merge_on_github` ("This project merges on
+  GitHub: Agern does not merge. Review and merge pull request <url> on GitHub.") after the 404 and 403 checks and
+  before the status check; `/factory approve` and `factory_approve_run` show that message; a step retry of a merge is
+  refused the same way, and so is "Merge anyway" (`POST /api/runs/{id}/merge-anyway`). As defence in depth every
+  evaluation before a merge (`mergeStep`, and the merge of "Merge anyway") itself refuses a `github` run and an
+  `owner_approves` run without a human approver (logged as an error; the run goes to `needs_human` with ``Not merged: this run's merge
+  policy (<policy>) does not allow it.``).
+- **Follower.** Every 60 s (`Orchestrator.followMillis`, started with the other tickers) one round reads, with the
+  run owner's token, the pull request of every run that is `ready`, or `needs_human` under `github`:
+  - open: nothing; a failed read (no owner, no token, GitHub error, not found): logged, tried again next round;
+  - merged: `merged`, `mergedOnGitHub: true`, `mergedBy` = GitHub's `merged_by.login` (null if not reported), the
+    `needs-human` label removed; a submodule workspace run opens its pointer bump pull request and leaves it for a
+    human. Agern does not close the issue (`Closes #N` does that on GitHub) and posts nothing else;
+  - closed without merge: `cancelled` with ``Pull request <ref> was closed on GitHub without being merged.``.
+  From `ready` the change is a conditional update that keeps `endedAt`; a `needs_human` run is ended like a cancel
+  (follow-up review stopped, advisor ended, sandbox and worktree removed, open stages closed) unless an approval or a
+  cancel won the race. The rest of #22 (outside merges of other policies) is not built.
+- **Releases.** Release runs are exempt (they merge into `release/<name>` as `automatic`); the policy applies to the
+  release's merge into the default branch, read live. `owner_approves` and `github` refuse automatic release mode
+  (§6 "Release mode"). `github` also refuses Agern's release approval (HTTP, `/factory release approve`,
+  `factory_approve_release`: 409 `merge_on_github`, "… Review and merge the release pull request on GitHub."), and the
+  ready announcement on the release pull request ends "This project merges on GitHub: review and merge this pull
+  request there; Agern follows it." The periodic reconcile already finishes a release merged on GitHub.
+
 ### Database migrations
 
 Two branches built independently can each add a Flyway migration with "the next free version". The files have
@@ -1118,25 +1753,53 @@ branch is never changed, renamed or removed (Flyway checks applied migrations by
   clone, a branch missing, git failing) is logged and blocks nothing: CI is the strict gate.
   - *A run's pull request*, before every squash merge (the approver's `APPROVE`, the owner's approval of a
     `needs_human` run and the step retry of a failed merge, single and release runs alike), compares the run's branch with its target. On a problem
-    nothing is merged and the run goes to `needs_human` through the usual path (label, comment, error), with the
-    reason "Database migration conflict with `<target>`: <problems>. Pull request #<n> was not merged. Migrations
-    already on `<target>` must stay unchanged, and a new migration needs a version above all of them. Fix the
-    migration on the pull request's branch and approve again, or build the issue again from the current `<target>`
-    (in a release: Retry)." In a release, the issue thereby becomes `held` with that note (§6 "Releases",
-    "Outcomes"); approving the run again checks again.
+    nothing is merged and the run goes to `needs_human` through the usual path (label, comment, error) with
+    `failureKind` `migration_conflict`, and the reason "Database migration conflict with `<target>`: <problems>.
+    Pull request #<n> was not merged. Migrations already on `<target>` must stay unchanged, and a new migration needs
+    a version above all of them. " followed by the way forward (`MigrationCheck.runReason`): while update rounds are
+    left 'Use "Update and merge" to have Agern merge `<target>` into the branch and let the builder renumber the
+    migration (update round k of max), or fix the migration on the pull request's branch and approve again.'; at the
+    limit "The limit of max update round(s) is reached: fix the migration on the pull request's branch and approve
+    again, or build the issue again from the current `<target>` (in a release: Retry)."; with
+    `FACTORY_MAX_UPDATE_ROUNDS=0` "Fix the migration on the pull request's branch and approve again, or build the
+    issue again from the current `<target>` (in a release: Retry)." A merge refused by GitHub for a conflict reads
+    "Merging pull request #<n> failed: <why>. The branch conflicts with `<target>` or is behind it. " with the same
+    three endings about resolving the conflicts. In a release, the issue thereby becomes `held` with that note (after
+    the automatic update round, §6 "Releases", "Outcomes"); approving the run again checks again. Runs held for a
+    migration conflict before V31 get the kind from the migration, so they are offered the update too.
+  - *The update round* (§6 "Retrying a run", "Update and merge") computes a renumbering plan (`MigrationCheck.plan`,
+    pure): per migration root, every added migration that the problems flag is renumbered in order of (version,
+    path), counting up from the highest of the target's versions and of the run's added ones that keep theirs; the
+    next version increments the last digit group and keeps zero padding and separators (`25`→`26`, `009`→`010`,
+    `1_9`→`1_10`, `1.2`→`1.3`). Each entry names the file, its new version and name, and the target's file that keeps
+    its version (the one with the same version, else the target's highest); the plan also has the first free version
+    per root and the target migrations the run changed or removed.
   - *A ready release* compares `release/<name>` with the default branch at every re-evaluation once its pull request
     is open (it becomes ready, "Check again", the periodic re-evaluation, before an approval). Its issues are already
     merged into the release branch, so none can be held: the release stays `ready` with the notice "Database migration
-    conflict with `<default>`: <problems>. The release is not merged. Fix the migrations on `release/<name>` (merge
-    `<default>` into it; a new migration needs a version above every migration on `<default>`, and existing ones must
-    stay unchanged), then use "Check again".", is not announced as ready to release, is not merged automatically, and
+    conflict with `<default>`: <problems>. The release is not merged. A new migration needs a version above every
+    migration on `<default>`, and existing ones must stay unchanged. Use "Bring up to date" on the release page (or
+    `/factory release sync <name>`), or fix the migrations on `release/<name>` and use "Check again"." (a member
+    repository of a release of several repositories: "… Fix the migrations on `release/<name>` (merge `<default>` into
+    it), then use "Check again"."), is not announced as ready to release, is not merged automatically, and
     approval answers 409 `release_migration_conflict` with the notice and " Nothing was merged." (§6 "Releasing"). The
     next re-evaluation without a problem clears the notice.
 - **The builder's prompt.** `builder.md` and the build, continue (§6 "Retrying a run") and fix prompts tell the builder to take a new migration's
   version from the branch its pull request merges into (named in the prompt, fetched first), above every migration
   there, never to change one that exists there, and to check again before finishing, in every fix round and after
   any rebase or merge of that branch. A release run is told that its version must also be above every migration on
-  the default branch, which the release is merged into later.
+  the default branch, which the release is merged into later. The prompt of an update round says that the work was
+  approved but pull request #p could not be merged into `<target>` because it moved on, that this is update round n
+  of at most max and not a fix round, what Agern merged (commit, number of commits) and either the conflicted files
+  (at most 30; resolve, `git add`, `git commit`; do not abort, rebase or reset), "The merge was clean and is
+  committed." or that nothing was merged; the incoming commit subjects in a `<merged_commits>` block labelled as data;
+  for migrations the problems, "Migrations that are on `<target>` keep their version and content: never rename, edit
+  or delete them. Renumber your own migration instead (`git mv`):", one line per plan entry ("`<old>` → version v
+  (`<new name>`); `<kept>` on `<target>` keeps version w."), "The next free version on `<target>` is v.", and a
+  `git checkout <baseRef> -- <path>` line for every target migration to restore; the usual migration and sandbox
+  lines; to build, test and commit without pushing, rebasing, amending or forcing; the refusal (at most 1500
+  characters); the issue and spec only when the conversation is not resumed; and how to end. `builder.md` has a
+  paragraph on update rounds.
 
 ### Submodule pointers
 
@@ -1275,6 +1938,14 @@ other roles do not get the tool.
   everything it started. The summary always says how many it attached, that the change has no UI, or — only after a
   real attempt — the command it ran and the error it got. Missing screenshots are never a reason for `CHANGES` and
   never fail the stage.
+- **Review sandbox:** in a run with an approved sandbox the reviewers start the app in the round's read-only review
+  sandbox (§5 "Sandboxes") instead of on the host, following the spec's Verification section if there is one: started
+  detached with all streams redirected (never `background: true`), checked first whether the other UI reviewer
+  already started it, the tree copied to `/tmp` inside the container when the app must write into it. They capture to
+  `/run/agern-review/<file>` inside the container, read `.agern-run/review/<file>` on the host and attach it with
+  `factory_attach_screenshot { path: ".agern-run/review/<file>" }` — the flow and checks below are unchanged — and
+  need not stop the app: the sandbox is removed when the round ends. When it is busy or cannot be created they review
+  on the host as before.
 - **Preview recipe:** a project can describe how to start its UI for review in `.agern/preview.md` (free text:
   command, port, how to log in, useful pages). Agern's own is in the repository: the web frontend's mock mode
   (`cd web && npm ci && npm run dev:mock -- --host 127.0.0.1 --port <free port> --strictPort`) runs against simulated
@@ -1350,9 +2021,13 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   `automatic`, checked), `released_automatically`, `checks_state`, `checks_sha`, `checks_detail`, `checks_failure_sha`,
   `auto_merge_failed_sha`, `checks_head_seen_at`) and `release_issues` (`release_id`, `repo`, `issue_number`, `position`, `issue_title`, `issue_kind`,
   `added_by`, `added_at`, `state`, `run_id` = the issue's latest release run, `note`, and since V16 `retry_mode`
-  (`continue` | `step` | null, checked; §6 "Retrying a run")). `runs` carry `release_id`
+  (`continue` | `step` | `update` (V31) | null, checked; §6 "Retrying a run")). `runs` carry `release_id`
   (`ON DELETE SET NULL`) and `base_branch` (null = the default branch); for retries (V16) `continues_run_id` (→
-  `runs`, `ON DELETE SET NULL`), `spec`, `builder_summary`, `failure_kind` and `failed_step`. Several releases may exist per project.
+  `runs`, `ON DELETE SET NULL`), `spec`, `builder_summary`, `failure_kind` and `failed_step`; for update rounds (V31)
+  `update_rounds` and `max_update_rounds`, with one `run_updates` row per round (`run_id` → `runs` `ON DELETE
+  CASCADE`, `number` unique per run, `round`, `max_rounds`, `trigger` `owner` | `release`, `target`, `reason`,
+  `status` `running` | `resolved` | `failed` | `cancelled`, `merge_status`, `target_sha`, `head_before`, `head_after`,
+  `incoming_count`, JSON lists `incoming`, `conflicts`, `migrations`, `commits`, `error`, `started_at`, `ended_at`). Several releases may exist per project.
   Creating one creates no branch, no run and makes no GitHub write.
 - **States.** Release `status`: `planning` (shown as "in preparation"), `scheduled`, `building`, `paused`, `ready`
   (shown as "ready to release"), `released`, `cancelled`. *Planned* means `planning` or `scheduled` (a scheduled
@@ -1463,7 +2138,9 @@ release mode (#41). Single runs are unaffected and still merge into the default 
     (`release_empty`, `release_branch_exists`, `github_push_denied`, …) is a start failure with its message; if the
     branch cannot be created the claim rolls back to `scheduled` first, so the failure is recorded. 409
     `release_already_building` (another release took the slot by "start now" in the meantime) is not a failure:
-    the release stays `scheduled` and waits behind it. Still `scheduled` after the call is a start failure ("The
+    the release stays `scheduled` and waits behind it. Neither is a transient failure (§6 "Transient failures": GitHub
+    5xx or a connection error, e.g. while creating `release/<name>`): the release stays `scheduled` and due, a warning
+    is logged and the next tick tries again. Otherwise, still `scheduled` after the call is a start failure ("The
     release did not start."); any other exception is logged and one with "Internal error while starting the
     release; see the server log." Tests may substitute the starter.
   - *Start failure*: back to `planning` (owner, time and waiting cleared) with `start_failed_at/_owner/_reason`
@@ -1499,19 +2176,29 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   into `<default branch>`." Release runs use the same per-user agent slots as all pipeline agents.
 - **Outcomes.** A run that ends `merged` makes its issue `merged`; `needs_human`, `failed` or `cancelled` (also
   through the run's own cancel) makes it `held` with the run's error as note (or "Run failed"). Then the next issue
-  starts. The orchestrator reports every settled release run (end of its pipeline, approve, cancel — not a
+  starts. A run that waits for its checks (`waiting_for_checks`, §6 "Checks before a merge") keeps its issue `running`,
+  and the release builds nothing else meanwhile; failed checks hold the issue like any other `needs_human`, so a broken
+  issue is caught at its own run rather than at the release pull request. One exception: in a `building` release, a
+  run that ends `needs_human` only because its merge was refused for a conflict with `release/<name>` (it is updatable
+  and has used no update round) is updated automatically, once, before the release stops on it: the update round
+  starts at once (trigger `release`) and the issue stays `running` with the same run and note "Updating with
+  `<target>` (automatic)". When that round ends `needs_human`, the issue is `held` with the run's error; no second
+  automatic round starts. If the update cannot start, the issue is `held` with "<run error> Automatic update could
+  not start: <message>". Paused, cancelled and ready releases and single runs are never updated automatically. The orchestrator reports every settled release run (end of its pipeline, approve, cancel — not a
   cancelled coroutine) through a callback that the builder dispatches asynchronously; settling is idempotent and
   ignores runs no longer linked to an issue.
 - **Held issues.** The owner can approve the held run (`POST /api/runs/{id}/approve`, `/factory approve`): when it
   merges the issue becomes `merged`, if the merge fails it stays `held` with the new reason (a branch that is behind
   is merged by GitHub's squash merge; a conflict fails; database migrations that collide with the release branch's
-  are refused before the merge, §6 "Database migrations"). The owner can retry it, or anyone allowed can take it out.
+  are refused before the merge, §6 "Database migrations"). The owner can retry it — with "Update and merge" as the
+  recommended way when its run is updatable (button next to Retry and Remove) — or anyone allowed can take it out.
 - **Retry** (`POST /api/releases/{id}/issues/{number}/retry`, owner only): the release must be `building`,
   `paused` or `ready` (409 `release_not_building`; a `ready` one becomes `building` again, 409
   `release_already_building` while another release of the project builds), the issue `held` or `skipped` (409 `release_issue_not_held`). It becomes
   `waiting` at its position with note and run link cleared; a linked run that is still active (`needs_human`) is
-  cancelled; the build continues. That is the default (`start_over`); with `{ "mode": "continue" | "step" }` the issue
-  is continued from its run's commits or its run's failed step is retried, in its turn (§6 "Retrying a run").
+  cancelled; the build continues. That is the default (`start_over`); with `{ "mode": "continue" | "step" | "update" }`
+  the issue is continued from its run's commits, its run's failed step is retried, or its run is updated and merged,
+  in its turn (§6 "Retrying a run").
 - **Pause** (owner or admin): `building` → `paused`, reason `manual`, note "Paused by <username>" (else 409
   `release_not_building`). The running run is not stopped: it finishes, its outcome is recorded, and no further
   issue starts. **Resume** (owner only, needs a Claude credential): `paused` → `building` (else 409
@@ -1544,13 +2231,17 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   morning: "**Agern:** release `<name>` is paused. <note> It resumes by itself at <time> and builds this issue
   again; the owner can also resume it on <release page URL>". A ticker (every 30 s) resumes releases whose `resumeAt` has passed; if the
   limit is still reached it pauses again the same way. The owner may resume by hand.
+- **Network.** A release whose next issue cannot start because GitHub or the Claude API cannot be reached is `paused`
+  with reason `network` and resumes by itself (§6 "Transient failures"). Pause reasons: `manual`, `usage_limit`,
+  `credentials`, `network`.
 - **Rejected or missing Claude credential.** When the owner's credential is rejected (the existing detection) or
   missing when a run should start, the issue goes back to `waiting` and the release is `paused` with reason
   `credentials`, note "Claude rejected the owner's credential; update it in Settings and resume." and no
   `resumeAt`. (An owner without a GitHub token pauses it the same way, with a note saying so.) If the release is
   already `paused` or `cancelled` when such a failure arrives, only the issue changes.
 - **Restart.** Interrupted runs are failed as before (§6). Then each `running` release issue is settled from its
-  run: `merged` → `merged`, `needs_human` → `held`, anything else → `waiting` ("Interrupted by a server restart; it is
+  run: `merged` → `merged`, `needs_human` → `held`, `waiting_for_checks` → stays `running` (the wait is resumed and the
+  run settles afterwards), anything else → `waiting` ("Interrupted by a server restart; it is
   built again"; continued from the run's commits when it has any); every `building` release continues, paused releases stay paused, and a due `resumeAt` is honoured.
   A run that failed in the instant before a restart, before its outcome was recorded, is rebuilt rather than held.
   A `building` release found with nothing left to build becomes `ready`. Every `ready` release is re-evaluated (its
@@ -1613,14 +2304,108 @@ release mode (#41). Single runs are unaffected and still merge into the default 
 - **Conflicts.** If the default branch moved (another release or a single run merged) and the release branch no
   longer merges cleanly, `mergeState` is `conflict`, the release stays `ready`, the release page says so, and the
   pull request gets one comment "**Agern:** `release/<name>` no longer merges cleanly into `<default>`. Agern will not
-  merge it. Resolve the conflicts on the release branch, then use "Check again" on the release page: <URL>". Approval
-  answers 409 `release_conflict` and changes nothing. The owner decides: resolve the conflict on the release branch
-  (e.g. merge the default branch into it and push) and "Check again", or cancel. Agern does not resolve conflicts
-  itself (issue #35); nothing here prevents that from being added as another way forward from this state.
+  merge it. Use "Bring up to date" on the release page (or `/factory release sync <name>`), or resolve the conflicts
+  on the release branch and use "Check again": <URL>" (a release of several repositories keeps "Resolve the conflicts
+  on the release branch, then use "Check again" on the release page: <URL>"). Approval answers 409 `release_conflict`
+  and changes nothing. The owner decides: bring it up to date (below), resolve the conflict on the release branch by
+  hand (e.g. merge the default branch into it and push) and "Check again", or cancel.
 - **Database migrations.** A release branch whose migrations collide with the default branch's (e.g. another release
   merged the same version first) stays `ready` with the notice of §6 "Database migrations", without the ready
-  announcement and without an automatic merge; approval answers 409 `release_migration_conflict`. The owner fixes the
-  release branch (merge the default branch into it, renumber the release's new migration) and uses "Check again".
+  announcement and without an automatic merge; approval answers 409 `release_migration_conflict`. The owner brings
+  it up to date (below), or fixes the release branch by hand (merge the default branch into it, renumber the release's
+  new migration) and uses "Check again".
+- **Bringing a release up to date** (issue #63). A `ready` release of one repository whose branch conflicts with,
+  is behind, or has migrations colliding with the default branch can be brought up to date by an agent run that
+  merges the default branch into `release/<name>`. Nothing is ever merged into the default branch by it, and nothing
+  is force-pushed.
+  - *Model.* Every full evaluation of a `ready` single-repository release (also one without a pull request yet) and
+    the periodic reconcile of a manual one compare `release/<name>` with the target in the owner's clone
+    (`GitOps.compareBranches`, which also counts `behind`: `git rev-list --count <head>..<base>`) and store
+    `releases.behind_by` (commits on the target not on the release branch; `NULL`: not known) and
+    `releases.migration_conflict` (`MigrationCheck` found problems). A comparison that cannot be made is logged and
+    leaves both unchanged; leaving `ready` resets them. `syncNeeded` = `ready`, not several repositories, a branch,
+    and (`mergeState = conflict` or `behindBy > 0` or `migrationConflict`). `Release.sync` describes the release's
+    latest sync run: `running` (queued, building, reviewing), `done` (merged), `failed` (failed or cancelled, nothing
+    pushed) or `unreviewed` (failed or cancelled after it pushed: `runs.sync_pushed_sha` is set). It is derived from
+    the run rather than stored in `releases.notice`, which every evaluation overwrites.
+  - *Starting* (`POST /api/releases/{id}/sync`, `/factory release sync <name>`; no MCP tool), in this order: 404
+    when the release is not visible; 409 `release_not_ready` unless started and `ready`; 403 unless the caller is the
+    release owner or an admin; 409 `release_sync_unsupported` for several repositories ("Bringing a release of several
+    repositories up to date is not supported yet; merge the base branch into `release/<name>` in each repository by
+    hand."); 422 `claude_credential_required`; the caller's GitHub token (as for every GitHub action); 409
+    `release_sync_merge_commits_disallowed` when the repository (read with the caller's token) forbids merge commits
+    ("<repo> does not allow merge commits, and a release branch that contains a merge commit cannot be rebased; allow
+    merge commits in the repository's GitHub settings first." — `methodFor` would otherwise leave no usable method).
+    Then, under the release's mutex (so a start and an approval serialise): still `ready` (409 `release_not_ready`),
+    no sync run in progress (409 `release_sync_running`, "Release "<name>" is already being brought up to date (run
+    <id>)."; also enforced by an advisory lock in `RunStore.createSync`), and `syncNeeded` (409 `release_up_to_date`,
+    "`release/<name>` is not behind `<target>` and has no conflicts. Use "Check again" if that changed."). **The run
+    belongs to the caller** and uses only the caller's Claude credential and GitHub token: an admin who presses the
+    button runs it as the admin, never on the release owner's credentials. `/factory release sync <name>` answers
+    `Bringing release "<name>" up to date with <target>: run <id> merges <target> into release/<name>, resolves
+    conflicts and renumbers migrations. Nothing is merged into <target>.`
+  - *The sync run* is a row of `runs` with `kind = 'sync'` (every other run: `issue`), `issue_number = 0`, title
+    "Bring release/<name> up to date with <target>", `base_branch = release/<name>`, the local working branch
+    `factory/sync-<name>-<run8>` (never pushed under that name), the caller's `maxFixRounds`, no pull request. Its
+    stages: builder and the four reviewers; spec-writer and approver `skipped` ("Not used when bringing a release up to
+    date"). Statuses `queued` → `building` → `reviewing` → `merged` | `failed` | `cancelled` (shown as "up to date"
+    when merged). Sync runs belong to no issue: they are left out of `activeRunFor`/`activeRunsByIssue` and the
+    one-active-run-per-issue check, never block issue runs, but count as active runs of the project. Their agent
+    sessions have no issue number and the titles `<role> · sync <name>`. The pipeline:
+    1. *Set-up* (retried as a whole on transient failures): a worktree on the working branch at the up-to-date tip of
+       `release/<name>`, the default branch fetched, submodules updated, the start commit remembered. The sandbox
+       decision is the default branch's, as for release runs; no image hand-over.
+    2. *Builder* (steerable): merge with `git merge --no-ff <defaultRef>`, never rebase, reset, amend or rewrite and
+       never push; resolve keeping both sides' behaviour and check semantic combinations; renumber every migration the
+       release adds above the default branch's highest (never touching one that is there; `scripts/check-migrations.sh
+       <defaultRef>` must pass where it exists); build and test (the sandbox when there is one); when it cannot be done
+       safely, put the branch back (`git merge --abort` / `git reset --hard <start>`) and say what is left; end with a
+       summary per conflicted file, the renumbered migrations and the checks. The `<release>` block (name, description,
+       merged issues) is data.
+    3. *Verification by the server* before any push (`GitOps.mergeState`, `GitOps.compareWorktree`): the start commit
+       (in a fix round: the commit pushed last) and `<defaultRef>` are ancestors of `HEAD`; no merge in progress, no
+       unmerged paths, no uncommitted changes to tracked files; `MigrationCheck.problems` of `HEAD` against
+       `<defaultRef>` is empty. Otherwise the builder stage and the run fail (`failureKind` `other`): "Could not bring
+       `release/<name>` up to date with `<target>`: <reason>. Nothing was pushed." plus " The agent said: <first
+       paragraph, ≤ 1000 characters>"; reasons in this order: "the branch no longer contains the release branch's
+       commits (history was rewritten)", "`<target>` was not merged into it", "the merge is not finished (unmerged
+       paths, a merge in progress or uncommitted changes)", "database migration conflict: <problems>", and "its
+       database migrations could not be compared with `<target>`" (fails closed). A failing builder stage ends the
+       same way. `HEAD` equal to the start commit: "Already up to date; nothing to push", reviewers skipped, `merged`.
+    4. *Push*: `git push origin HEAD:refs/heads/release/<name>` with neither `--force` nor `--force-with-lease`
+       (`GitOps.pushFastForward`; in fake-GitHub mode the local branch is moved by compare-and-swap, only as a
+       fast-forward). Transient failures wait for the network; a rejection fails the run: "Pushing to
+       `release/<name>` was refused because the branch changed meanwhile: <git output>. Nothing was pushed; use "Bring
+       up to date" again." After a push: `sync_pushed_sha`, the release is re-evaluated in the background
+       (`onReleaseBranchPushed` → `ReleaseMerger.evaluateLater`), and the release pull request gets "**Agern:** merged
+       `<target>` into `release/<name>` (commit `<sha7>`, started by @<login>) to bring the release up to date.
+       Reviewers are looking at the conflict resolution: <run page>".
+    5. *Review*: the four reviewers, read-only, review only the merge (`git show --remerge-diff` and `--cc` of each
+       merge commit in `git rev-list --merges <start>..HEAD`, `git log -p <merge>..HEAD`): both sides kept, semantic
+       combinations, migrations renumbered and none of the default branch's touched. No screenshot note or UI warning.
+    6. *Fix rounds* on `CHANGES` up to `maxRounds`: the builder conversation is resumed ("commit fixes on top; never
+       amend, rebase or reset: the merge is already pushed"), then verification, push and review again. `CHANGES` at
+       the limit fail the run: "Reviewers still request changes on the merge of `<target>` into `release/<name>`
+       after N fix round(s): <roles>. The merge is already on `release/<name>` (commit `<sha7>`); look at the findings
+       before releasing."
+    7. *End*: all `PASS` → worktree and working branch removed, `merged`. Every ending re-evaluates and publishes the
+       release (`ReleaseBuilder.settle`); a run that ends `failed` or `cancelled` after a push comments on the release
+       pull request "**Agern:** the review of the merge of `<target>` into `release/<name>` (commit `<sha7>`) did not
+       pass or did not finish: <first line of the error>. <run page>". Nothing is labelled and nothing is commented on
+       an issue.
+    Cancel: the run's owner or an admin, and cancelling the release cancels it (whoever started it). Retry: 409
+    `sync_run` ("A run that brings a release up to date is not retried; use "Bring up to date" on the release
+    again."), and every retry option is unavailable with that reason. A restart fails it with "Server restarted while
+    the release branch was being brought up to date; use "Bring up to date" again."
+  - *Holds.* While the latest sync run is `running`, approval answers 409 `release_sync_running` ("Release "<name>"
+    is being brought up to date (run <id>); wait for it to finish or cancel it.", checked under the mutex) and an
+    automatic release is not merged (its notice is left alone). While it is `unreviewed`, an automatic release is not
+    merged and gets the notice "The merge of `<target>` into `<branch>` (run <id>) was pushed but its review did not
+    pass or did not finish, so the release is not merged automatically. Look at the run, then approve by hand.";
+    manual approval is allowed. `failed`, `done` or no sync run: as before. After a sync the release branch contains a
+    merge commit, so it is merged with a merge commit instead of by rebasing (`methodFor`). The release is published
+    when a sync run starts, pushes and ends; `/factory releases` adds under a `ready` release "Sync: running (run
+    <id>)", "Sync: failed, nothing pushed: <error>" or "Sync: pushed but not fully reviewed: <error>".
 - **Approval** (`POST /api/releases/{id}/approve`, `/factory release approve <name>`, `factory_approve_release`):
   **only the owner**; everyone else, admins included, gets 403 `forbidden` ("Only <owner>, who started this release,
   can do this"); a caller who cannot see the project gets 404 first. Admins may still cancel (they stop, never
@@ -1714,18 +2499,23 @@ release mode (#41). Single runs are unaffected and still merge into the default 
     @<owner> (the release was set to automatic)." instead of "Approved by @<owner>.".
   - *Exactly once.* Automatic merges, approvals, checks and the periodic re-evaluation all run under the release's
     mutex and finish through the one conditional `ready` → `released` update, so concurrent triggers merge once.
-  - *Human approval required (#24, not implemented).* `ReleaseModePolicy.allowsAutomatic(repo)` is the seam (today
-    every project allows it). A project that requires a human approval must refuse automatic: creating or switching a
-    release to automatic answers 409 `release_mode_not_allowed`, and an automatic release made before the project
-    became strict is not merged automatically (notice "This project requires a human approval: …"); the owner
-    approves it by hand. #24 only has to supply the policy from the project setting.
+  - *Human approval required (§6 "Merge policy").* `ReleaseModePolicy.allowsAutomatic(repo)` is true only for a
+    project whose merge policy is `automatic` (read live). Otherwise creating or switching a release to automatic
+    answers 409 `release_mode_not_allowed`, and an automatic release made before the project became strict is not
+    merged automatically (notice "This project requires a human approval: …"); the owner approves it by hand — or,
+    under `github`, merges the release pull request on GitHub.
 - **Checks.** Each re-evaluation that reads an open pull request also reads the checks on its head commit with the
   owner's token: the combined commit status (`GET /repos/{o}/{r}/commits/{sha}/status`, the latest status per
-  context) and the latest check runs (`GET …/commits/{sha}/check-runs?filter=latest`, GitHub Actions and other
-  apps). `checksState`: `failed` if any status is `failure`/`error` or any completed check run did not end
-  `success`, `neutral` or `skipped` (so `failure`, `cancelled`, `timed_out`, `action_required`, `stale` fail);
-  otherwise `pending` if any status is `pending` or any check run is not `completed`; otherwise `passed`, or `none`
-  when there are no statuses and no check runs at all (GitHub reports `state: pending` with `total_count: 0` then —
+  context), the latest check runs (`GET …/commits/{sha}/check-runs?filter=latest`, GitHub Actions and other
+  apps) and the GitHub Actions workflow runs of the head commit (`GET /repos/{o}/{r}/actions/runs?head_sha=…`, the
+  latest run per workflow and event): a workflow run that is queued but never started, or that ended in
+  `startup_failure`, has no check runs at all. `checksState`: `failed` if any status is `failure`/`error`, any
+  completed check run or workflow run did not end `success`, `neutral` or `skipped` (so `failure`, `cancelled`,
+  `timed_out`, `action_required`, `stale`, `startup_failure` fail); otherwise `pending` if any status is `pending` or
+  any check run or workflow run is not `completed`; otherwise `passed` (a passing workflow run is one passed check),
+  or `none` when there are no statuses, check runs or workflow runs at all. A token that may not read Actions: the
+  workflow runs are left out (logged) and the rest decides. These rules are shared with the checks before a run is
+  merged (§6 "Checks before a merge"), one function for both (GitHub reports `state: pending` with `total_count: 0` then —
   that is not pending). **Settle period:** GitHub Actions and other CI register their checks only some seconds after
   the push or pull request event, so a head commit with no checks right after Agern opened the pull request (or the
   branch moved) says nothing yet. "No checks" is therefore `awaiting` ("No checks yet; waiting for them to appear
@@ -1867,8 +2657,9 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   merge settings; deleting a branch closes its open pull requests, as on GitHub; commit statuses and check runs per
   head branch (`setStatus`, `setCheckRun`; none: no checks), and a failure to read them. In development
   (`FACTORY_DEV_FAKE_GITHUB`) `<dataDir>/fake-github-checks/<repo>/<branch>.json` (`{"statuses": {"ci": "pending"},
-  "checkRuns": [{"name", "status", "conclusion"}]}`) sets the checks of a branch while the server runs; the e2e suite
-  uses it.
+  "checkRuns": [{"name", "status", "conclusion"}]}`) sets the checks of a branch while the server runs, and
+  `"conflict": true` makes its pull requests conflict (reported and refused on merge like `conflicting`) while the
+  file says so; the e2e suite uses both.
 
 ### Generated images
 
@@ -2022,11 +2813,61 @@ Tools: `factory_list_issues`, `factory_get_issue`, `factory_create_issue`, `fact
 `factory_list_runs`, `factory_get_run`, `factory_approve_run`, `factory_cancel_run`,
 `factory_send_to_agent`, `factory_request_software`, `factory_list_releases`, `factory_create_release`,
 `factory_assign_issues`, `factory_unassign_issues`, `factory_approve_release`. Personal tokens get these
-(`PERSONAL_TOOLS`, see above). Pipeline-stage agents get only `factory_get_issue`
+(`PERSONAL_TOOLS`, see above). `factory_approve_run` ("Merge a run that waits in needs_human. Only the run's owner may
+do this. The merge waits for the checks on the pull request's head commit: passed checks merge at once, pending ones
+leave the run waiting_for_checks until they pass, failed ones leave it in needs_human.") takes `runId` and an
+optional boolean `update`: `true` starts "Update and merge" exactly as `/factory approve <runId> update` (§6 "Retrying
+a run"); without it the run is merged as it is, and the answer ends with "Update and merge is available: /factory
+approve <id> update" when the run can be updated. No tool and no argument merges despite the checks (§6 "Checks
+before a merge"). `factory_approve_run` and `factory_approve_release` are both refused (tool error with the
+`merge_on_github` message) for a project that merges on GitHub (§6 "Merge policy"). Pipeline-stage agents get only `factory_get_issue`
 and `factory_request_software`; with sandboxes switched on (`FACTORY_SANDBOX` not `off`) the builder also
-gets `factory_sandbox_info`, `factory_sandbox_exec` and `factory_sandbox_wait`; the `ux` and `ui-design` reviewers also get
-`factory_attach_screenshot`. The chat agent, the spec-writer and the builder also get `factory_generate_image`. The advisor (§6 "Conversation at needs human") gets the same two stage tools, bound to its
-run, and nothing else: no approve, cancel, start, release, sandbox, screenshot or image tool.
+gets `factory_sandbox_info`, `factory_sandbox_exec` and `factory_sandbox_wait`, the spec-writer `factory_sandbox_info`
+only, and the `ux` and `ui-design` reviewers of pipeline review rounds of an approved run the three sandbox tools for
+the review sandbox; the builder of a run with an approved sandbox VM also gets the four `factory_sandbox_vm_*` tools
+(below); the `ux` and `ui-design` reviewers also get `factory_attach_screenshot`. The chat agent, the spec-writer and the builder also get `factory_generate_image`. The advisor (§6 "Conversation at needs human") gets the same two stage tools, bound to its
+run, and nothing else: no approve, cancel, start, release, sandbox, sandbox VM, screenshot, image or deploy tool.
+
+Deploy tools (§5 "Deploy targets"), chat agents only and only when `FACTORY_DEPLOY` is not `off`. They are not in
+`CHAT_TOOLS`, `PERSONAL_TOOLS` or `STAGE_TOOLS` (`AgentManager.startChat` adds `DeployManager.TOOLS` for non-advisor
+chats) and are never extra tools of a stage; `callTool` refuses them with `Deploy tools are only available in a project
+chat` for a personal token, a run-bound grant, a grant without a session and a session that is not a chat. Every call
+reads `.agern/deploy.yml` from the default branch with the chat owner's token, checks it against the approval and
+loads the key. Refusals are tool errors with one sentence each: switched off, no file, invalid (with the errors), not
+approved (naming `<FACTORY_PUBLIC_URL>/p/<repo>/deploy`), no key (an admin must generate it on the Deploy page),
+unknown target (listing the valid names), busy target.
+- `factory_deploy_targets {}` → JSON `{ available, state, reason, targets: [{ name, host, port, user, description }],
+  publicKeyFingerprint, limits: { execTimeoutSeconds, maxCopyBytes, outputTailChars } }`. A missing or unapproved file
+  is `available: false` with the reason, not an error.
+- `factory_deploy_exec { target, command, timeoutSeconds? }` → `{ target, exitCode, output, truncated, durationMs,
+  timedOut }` (plus `note` after a timeout or a signal). `command` non-blank, ≤ 32,768 characters, no NUL;
+  `timeoutSeconds` a positive whole number, capped at `FACTORY_DEPLOY_EXEC_TIMEOUT_MINUTES`. `output` is stdout and
+  stderr interleaved as received, the last 20,000 characters. A non-zero exit code is a normal answer; a timeout gives
+  `timedOut: true`, `exitCode: -1`.
+- `factory_deploy_copy { target, path, dest }` → `{ target, dest, bytes, durationMs }`. `path` relative to the chat's
+  working directory (`Workspaces.mainDir(owner, repo)`) or absolute inside it; its real path (symlinks resolved) must
+  lie inside, be a regular file and at most `FACTORY_DEPLOY_MAX_COPY_MB` (streamed, never loaded into memory).
+  Directories are refused ("pack it into an archive first"). `dest` matches `^[A-Za-z0-9._/@%+=:,~-]{1,4096}$` and
+  does not start with `-`; an existing directory or a trailing `/` keeps the file's name; the file keeps its mode.
+
+Sandbox VM tools (§5 "Sandbox VMs"), the `builder` stage of an issue run whose `sandboxVm` decision is `approved`,
+and only when `FACTORY_SANDBOX_VM` is not `off`. `callTool` refuses them for everyone else (chats, personal tokens,
+the advisor, spec-writer, reviewers, approver) with `Sandbox VM tools are only available to a run's builder`. Every call
+re-checks the approval and the key; refusals (not approved, approval changed or revoked, no key, VM busy) are tool
+errors with one sentence each.
+- `factory_sandbox_vm_info {}` → `{ available, state, reason, name, host, port, user, description, url, commands
+  (which of checkout, setup, ready, reset exist), lease: { heldByThisRun, heldByOther: { runId, repo, since } | null,
+  resetting }, deployedSha, command: { handle, running, elapsedMs } | null, limits: { execTimeoutSeconds,
+  outputTailChars, toolCallTimeoutSeconds }, note }`. Not an error when unavailable.
+- `factory_sandbox_vm_deploy { background? }` → `{ handle, ok, sha, dirty, url, steps: [{ step, ok, exitCode,
+  timedOut, durationMs }], failedStep, output, truncated, durationMs }`. Takes the lease if needed. A failing step is
+  `ok: false` (the lease stays); refusals and connect, host-key or auth failures are tool errors.
+- `factory_sandbox_vm_exec { command, timeoutSeconds?, background? }` → `{ handle, exitCode, output, truncated,
+  durationMs, timedOut, note? }`. Requires the lease ("Call factory_sandbox_vm_deploy first."); `command` non-blank,
+  ≤ 32,768 characters, no NUL; one SSH exec, no PTY, no stdin. A timeout closes the connection: `exitCode: -1`,
+  `timedOut: true` and a note that the remote process may still run.
+- `factory_sandbox_vm_wait { handle?, waitSeconds? }` → the operation's answer, or `running: true`; as
+  `factory_sandbox_wait`, over the last 20 results of the lease.
 
 Image tool (§6 "Generated images"), chat, spec-writer and builder only:
 - `factory_generate_image { prompt, purpose, size?, format?, count?, transparentBackground?, issueNumber? }` —
@@ -2049,8 +2890,10 @@ Screenshot tool (§6 "Screenshots"), `ux` and `ui-design` reviewers only:
   `The file is empty`, `Only PNG, JPEG, GIF or WebP images are accepted`, `This stage already has <n> screenshots
   (the maximum)`.
 
-Sandbox tools (§5 "Sandboxes"), builder only; they act on the sandbox of the token's run, and a token
-without a run (a chat) is refused:
+Sandbox tools (§5 "Sandboxes", "Who gets the tools"); they act on the sandbox of the token's run and scope — the
+build sandbox for the builder, the review sandbox for the `ux` and `ui-design` reviewers, nothing to run for the
+spec-writer (`exec` and `wait` with a plan scope are refused: `The spec-writer cannot run commands in the sandbox; …`)
+— and a token without a run (a chat) is refused:
 - `factory_sandbox_info {}` → JSON `{ available, state, reason }` and, when the run has a sandbox,
   `image`, `created` (the default container exists), `workdir: "/workspace"`, `user: { name, uid, note }`
   (only with `user`), `platforms: [{ name, image, setup, created }]` and, when there are any,
@@ -2059,11 +2902,20 @@ without a run (a chat) is refused:
   no check, `servicesNote` (it may still be starting); `caches`, `env` (names only), `setup` (boolean),
   `limits: { cpus, memory, execTimeoutSeconds, outputTailChars, toolCallTimeoutSeconds }`,
   `capacity: { inUse, max, heldByThisRun }` and, while a command runs, `command: { handle, running: true, elapsedMs }`.
+  For the spec-writer it adds `access: "plan"` and a `note` (it cannot run commands; the builder does; the UI reviewers
+  get a separate read-only review sandbox) and never creates anything. For a reviewer it describes the review
+  sandbox: no `platforms`/`platformNote`, plus `access: "review"`, `readOnly: true`, `outputDir: { container:
+  "/run/agern-review", host: ".agern-run/review" }` (or `null` with an `outputNote`) and a `note` on the read-only
+  `/workspace`, the output directory, starting an app detached and the other UI reviewer; `created`, `command` and
+  `capacity` refer to the review sandbox.
 - `factory_sandbox_exec { command, timeoutSeconds?, platform?, background? }` → JSON `{ handle, exitCode, output,
   truncated, durationMs, timedOut }` plus `platform` when the definition has platforms (`exitCode` −1 when timed out;
   `output` is the tail). `platform` omitted or `default`: the top-level image. With `background: true` (after the
   same validation and, if needed, creation) → `{ handle, running: true, timeoutSeconds, note }` plus `platform` at
-  once. No sandbox for the run, an unknown platform, busy, a failed creation, readiness check or setup, an empty
+  once. In the review sandbox `platform` other than `default` is refused (`The review sandbox has only the default
+  image; leave platform out.`), and without a free slot the answer is `The server's sandboxes are all in use (<n> of
+  <n> containers). No review sandbox was created and nothing was run. Review without it, on the host, as your role
+  instructions describe; do not wait for a slot.` No sandbox for the run, an unknown platform, busy, a failed creation, readiness check or setup, an empty
   command, a non-positive timeout, `background` that is not a boolean (`background must be true or false`) and a
   command while a background one runs (`A command is still running in this run's sandbox (handle cmd-…, started
   <n> s ago). Wait for it with factory_sandbox_wait before starting another.`) come back as tool errors.
@@ -2100,12 +2952,16 @@ message is queued for the agent's next step, never that it was already applied.
 
 Chat input starting with `/factory` is handled by the server and not sent to Claude (with attachments it
 is rejected with 422 `attachments_not_allowed`; they stay unsent so the owner can send them in a normal message):
-`/factory run <issue>`, `/factory status`, `/factory approve [runId]`, `/factory cancel <runId>`,
-`/factory retry <runId> [step|continue|over|recommended]` (owner only; without a mode it lists the options, the
-recommendation and its reason; a release run is retried through its release),
+`/factory run <issue>`, `/factory status`, `/factory approve [runId] [update]` (refused with the `merge_on_github`
+message for a run of merge policy `github`, §6 "Merge policy"; a plain approval merges as it is and, when the run can
+be updated, ends with the line "Update and merge is available: /factory approve <id> update"; with `update` it does
+what `/factory retry <runId> update` does), `/factory cancel <runId>`,
+`/factory retry <runId> [update|step|continue|over|recommended]` (owner only; without a mode it lists the options, the
+recommendation and its reason; a release run is retried through its release: "Release "<name>": #n is waiting to be
+updated and merged."; a single run answers "Run <id>: updating with <target> and merging (update round k of max)."),
 `/factory releases`, `/factory release create <name> [description…]`, `/factory release add <name> <issue>…`,
-`/factory release remove <issue>…`, `/factory release approve <name>`, `/factory release mode <name>
-manual|automatic`, `/factory help`. The reply is appended to the transcript as a `system` event.
+`/factory release remove <issue>…`, `/factory release approve <name>`, `/factory release sync <name>`,
+`/factory release mode <name> manual|automatic`, `/factory help`. The reply is appended to the transcript as a `system` event.
 Release commands act in the chat's project as its owner: `releases` lists each release with its status ("in
 preparation" with the issue count, plus " (scheduled start failed: <reason>)" after a failed scheduled start;
 "scheduled for <ISO time, UTC> by <owner>" plus ", waiting for release "<name>"" when due and waiting; for started ones "building", "paused" or "cancelled", "k of n merged", the owner
@@ -2118,7 +2974,13 @@ start), `scheduled for <ISO time, UTC> by <username>` (plus `, waiting for relea
 (`building`, `paused`). Scheduling has no command or tool. Issue tokens accept `5`, `#5` and `#5,`; an unknown release name gets a reply naming the existing
 ones; a missing or invalid argument gets a one-line usage reply. Renaming, deleting and reordering are web-only.
 `release approve <name>` approves a ready release (owner only, §6 "Releasing"; without a name: "Usage: /factory
-release approve <name>") and answers like `factory_approve_release`; refusals are shown as their message. In
+release approve <name>") and answers like `factory_approve_release`; refusals are shown as their message.
+`release sync <name>` brings a ready release up to date (owner or admin, §6 "Releasing", "Bringing a release up to
+date"; without a name: "Usage: /factory release sync <name>") and answers `Bringing release "<name>" up to date with
+<target>: run <id> merges <target> into release/<name>, resolves conflicts and renumbers migrations. Nothing is merged
+into <target>.`; under a `ready` release `releases` adds the line "Sync: …" of its latest sync run (not when done).
+`retry <runId>` of a sync run answers "A run that brings a release up to date is not retried; …"; `status` lists a
+sync run as `sync <title>`. In
 `releases`, ready and released releases show "ready to release" / "released", the pull request URL, and for ready
 ones " — N held" or " — conflicts with <default>" when that applies, plus a notice line when there is one. An
 automatic release that is not finished shows ", releases automatically when ready", a released one ", released
@@ -2156,7 +3018,13 @@ type Project = { name: string; fullName: string; description: string | null; pri
   defaultBranch: string; language: string | null; openIssues: number; pushedAt: string | null;
   htmlUrl: string; activeAgents: number; activeRuns: number;
   iconUrl: string | null;      // `/api/projects/<repo>/icon?v=<version>`; null: no icon (§8 "Project icons")
-  workspace: Workspace | null }; // §5 "Workspace projects"; filled by GET /api/projects/{repo} only (null in the list)
+  workspace: Workspace | null;  // §5 "Workspace projects"; filled by GET /api/projects/{repo} only (null in the list)
+  settings: ProjectSettings };  // §6 "Merge policy"; defaults without a stored row, in the list and the detail
+
+type MergePolicy = 'automatic' | 'owner_approves' | 'github';
+type ProjectSettings = { mergePolicy: MergePolicy;   // default 'automatic'
+  reviewers: string[];         // GitHub logins requested on a `github` run's pull request
+  teamReviewers: string[] };   // team slugs of the organisation, likewise
 
 type Workspace = { path: '.agern/workspace.yml' | '.gitmodules'; valid: boolean; // .gitmodules: members from the submodules
   errors: string[];            // every problem, with its path; [] when valid
@@ -2182,7 +3050,11 @@ type ReleaseIssue = { number: number; title: string; kind: IssueKind;   // title
   note: string | null;                      // why it is held or skipped, or that it will be built again
   prNumber: number | null; prUrl: string | null;     // that run's pull request into the release branch
   retryMode: 'continue' | 'step' | null;    // a waiting issue retried from runId (§6 "Retrying a run")
-  targetRepo: string | null; targetDir: string | null };  // the member its run targets; null: project repository / no run
+  targetRepo: string | null; targetDir: string | null;  // the member its run targets; null: project repository / no run
+  waiting: RunWait | null };                // while running and its run waits for the network (§6 "Transient failures")
+type RunWait = { reason: 'network'; since: string; nextAttemptAt: string;  // ISO instants
+  attempt: number;                          // failed attempts of the current streak (≥ 1)
+  detail: string };                         // what failed (≤ 500 characters)
 type ReleaseRepo = { repo: string; directory: string | null;   // null: the project repository
   submodule: boolean; baseBranch: string | null; branch: string;
   state: 'none' | 'open' | 'merged';        // its release pull request
@@ -2200,7 +3072,8 @@ type Release = { id: string; repo: string; name: string; description: string;
   owner: { username: string; displayName: string } | null;   // who scheduled or started it
   branch: string | null;                    // 'release/<name>' once started
   startedAt: string | null; endedAt: string | null;
-  pause: { reason: 'manual' | 'usage_limit' | 'credentials'; note: string | null; resumeAt: string | null } | null;
+  pause: { reason: 'manual' | 'usage_limit' | 'credentials' | 'network'; note: string | null; resumeAt: string | null;
+    since: string | null; attempt: number | null } | null;  // since/attempt: reason 'network' (the streak of failed starts)
   scheduledAt: string | null;               // ISO instant; set exactly while scheduled
   waitingFor: { id: string; name: string } | null;          // only while scheduled and due
   startFailure: { at: string; owner: { username: string; displayName: string }; reason: string } | null;
@@ -2217,7 +3090,16 @@ type Release = { id: string; repo: string; name: string; description: string;
   releasedAutomatically: boolean;           // merged by Agern for the owner (automatic mode)
   checks: { state: 'unknown' | 'awaiting' | 'none' | 'pending' | 'passed' | 'failed';   // on the pull request's head commit
             detail: string | null; sha: string | null } | null;           // null until there is a pull request
-  repositories: ReleaseRepo[] };            // §6 "Several repositories"; [] unless multi-repository
+  mergePolicy: MergePolicy;                 // the project's current policy (§6 "Merge policy")
+  repositories: ReleaseRepo[];              // §6 "Several repositories"; [] unless multi-repository
+  behindBy: number | null;                  // commits on targetBranch not on the release branch, as last compared
+  migrationConflict: boolean;               // its migrations collide with targetBranch's (last evaluation)
+  syncNeeded: boolean;                      // "Bring up to date" is offered (§6 "Bringing a release up to date")
+  sync: ReleaseSync | null };               // its latest sync run
+
+type ReleaseSync = { runId: string; state: 'running' | 'done' | 'failed' | 'unreviewed';
+  by: { username: string; displayName: string }; startedAt: string; endedAt: string | null;
+  pushedSha: string | null; error: string | null };
 
 type StageRole = 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
 type SessionKind = 'chat' | 'advisor' | StageRole;   // advisor: the agent a run's owner talks to at needs_human
@@ -2256,7 +3138,8 @@ type Screenshot = { id: string; caption: string;   // caption: one line, untrust
   createdAt: string };
 
 type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; issueKind: IssueKind;
-  status: 'queued' | 'spec' | 'building' | 'reviewing' | 'approving' | 'merged' | 'needs_human' | 'failed' | 'cancelled';
+  status: 'queued' | 'spec' | 'building' | 'reviewing' | 'approving' | 'waiting_for_checks' | 'merged' | 'needs_human' | 'failed' | 'cancelled'
+    | 'ready';               // terminal: passed under merge policy `github`, the pull request waits on GitHub (§6 "Merge policy")
   round: number;             // fix rounds so far (0 = initial build)
   maxRounds: number;         // the starting user's effective maxFixRounds, fixed when the run is created
   branch: string | null; prNumber: number | null; prUrl: string | null;
@@ -2264,6 +3147,7 @@ type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; 
   error: string | null; createdAt: string; updatedAt: string; endedAt: string | null;
   stages: Stage[];
   sandbox: RunSandbox | null;  // the run's sandbox decision (§5 "Sandboxes"); null until the workspace is ready / older runs
+  sandboxVm: RunSandboxVm | null;  // the run's sandbox VM decision and preview (§5 "Sandbox VMs"); null without a decision
   releaseId: string | null;  // the release this run builds an issue for (null: a single run, or the release was deleted)
   baseBranch: string | null;  // the branch it starts from and merges into; null = the default branch; a workspace run: the member's base
   targetRepo: string | null;       // a workspace run: the member repository it changes (§6 "Workspace runs"); null otherwise
@@ -2271,9 +3155,22 @@ type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; 
   conversation: RunConversation;  // always present; default { sessionId: null, review: 'none', followUpFrom: null }
   continuesRunId: string | null;   // the failed run this one continues from its commits (§6 "Retrying a run")
   continuedByRunId: string | null; // the newest run that continues this one
-  failureKind: 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | 'submodule_commit_missing' | null;
+  failureKind: 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | 'submodule_commit_missing' | 'checks' | null;
   failedStep: 'push' | 'pull_request' | 'merge' | null;  // the step after the builder that failed
-  warnings: { round: number; roles: StageRole[]; text: string }[] };  // the stages' warnings per round, oldest first
+  mergePolicy: MergePolicy;        // the project's policy when the run started; never changes
+  mergedOnGitHub: boolean;         // merged on GitHub outside Agern (followed `github` runs)
+  mergedBy: string | null;         // the GitHub login that merged it there, when GitHub reports it
+  waiting: RunWait | null;  // while it sleeps before retrying an operation that lost the network; it keeps its status
+  warnings: { round: number; roles: StageRole[]; text: string }[];  // the stages' warnings per round, oldest first
+  checks: RunChecks | null;  // the checks last evaluated before a merge (§6 "Checks before a merge"); null until then
+  kind: 'issue' | 'sync';         // sync: brings a release up to date; issueNumber 0, no issue (§6 "Releasing")
+  syncPushedSha: string | null };  // a sync run: the commit it last pushed to its release branch
+
+type RunChecks = { state: 'awaiting' | 'pending' | 'passed' | 'failed' | 'none' | 'unknown';
+  sha: string; detail: string;                // the head commit they were read for; e.g. "Failed: build, lint"
+  items: { name: string; state: 'failed' | 'pending'; conclusion: string | null; url: string | null }[];  // not passed; at most 50; url only https://
+  waitingSince: string | null; deadline: string | null;   // set only while waiting_for_checks
+  overriddenBy: string | null; overriddenAt: string | null };  // the owner merged anyway
 
 type RetryOptions = { runId: string;       // '' for a release issue without a run
   recommended: 'step' | 'continue' | 'start_over'; reason: string;   // one line
@@ -2292,8 +3189,9 @@ type RunSandbox = { state: 'disabled' | 'none' | 'invalid' | 'unapproved' | 'app
   sha256: string | null;     // of the definition on the base commit, when there is one
   image: string | null;
   platforms: string[];       // the definition's platforms ('approved' only; [] for older runs)
-  platformsUsed: string[] }; // where the builder ran commands, 'default' and platform names in first-use order
+  platformsUsed: string[];   // where the builder ran commands, 'default' and platform names in first-use order
                              // (filled only when there are platforms)
+  reviewUsed: boolean };     // a review sandbox of the run was created (the ux and ui-design reviewers used it)
 
 type SandboxDefinition = { image: string; setup: string | null; env: Record<string, string>;
   services: { name: string; image: string; env: Record<string, string>;
@@ -2322,10 +3220,11 @@ type RunningSandbox = { runId: string; repo: string;
   owner: { username: string; displayName: string };
   image: string; services: string[]; sha256: string;      // the approved definition's hash
   createdAt: string; cpus: number; memory: string;         // per-container limits it runs with
-  containers: { platform: string; image: string; createdAt: string }[];  // command containers now: 'default' and/or platforms
+  containers: { platform: string; image: string; createdAt: string;      // command containers now: 'default' and/or
+    kind: 'build' | 'review' }[];                                        // platforms (build), the review sandbox's (review, 'default')
   platforms: string[];       // the definition's platforms, existing or not
   slots: number;             // slots of FACTORY_SANDBOX_MAX_CONCURRENT held: one per container
-  memoryTotal: string };     // memory × (containers + services): what the run may use together
+  memoryTotal: string };     // memory × (containers + services of both sandboxes): what the run may use together
 type SandboxOverview = { enabled: boolean; runtime: 'off' | 'podman' | 'fake';
   inUse: number;             // slots in use: command containers over all runs
   limits: { maxCpus: number; maxMemory: string; maxConcurrent: number; execTimeoutMinutes: number; registries: string[];
@@ -2333,6 +3232,73 @@ type SandboxOverview = { enabled: boolean; runtime: 'off' | 'podman' | 'fake';
   sandboxes: RunningSandbox[] };                          // the sandboxes that exist right now, oldest first
 type PendingSandbox = { repo: string; sha256: string; image: string;
   approvedSha256: string | null };                         // the approved older version, or null when none ever was
+
+// Deploy targets (§5 "Deploy targets")
+type DeployTarget = { name: string; host: string; port: number; user: string;
+  hostKeyType: string;       // e.g. 'ssh-ed25519'
+  hostKeyFingerprint: string;  // 'SHA256:…' of the pinned host key
+  description: string | null };
+type DeployApproval = { sha256: string; content: string; approvedBy: { username: string; displayName: string }; approvedAt: string };
+type DeployKey = { publicKey: string;  // 'ssh-ed25519 <base64> agern-deploy:<org>/<repo>'; the private key is never sent
+  fingerprint: string;       // 'SHA256:<base64 without padding>'
+  createdBy: { username: string; displayName: string }; createdAt: string };
+type DeployStatus = { repo: string;
+  enabled: boolean;          // FACTORY_DEPLOY is not off
+  mode: 'ssh' | 'fake' | 'off';
+  path: '.agern/deploy.yml'; branch: string;               // read from the default branch
+  state: 'none' | 'invalid' | 'pending' | 'approved';      // as SandboxStatus
+  sha256: string | null; content: string | null;
+  errors: string[];          // state 'invalid'
+  targets: DeployTarget[];   // when valid
+  approval: DeployApproval | null;                         // possibly of other content (diff)
+  approvers: { username: string; displayName: string }[];
+  key: DeployKey | null };   // null: no key generated yet
+type DeployCheck = { target: string; ok: boolean;
+  stage: 'connect' | 'host_key' | 'auth' | 'ok';           // the step that failed, or 'ok'
+  message: string; durationMs: number };
+
+// Sandbox VMs (§5 "Sandbox VMs"); Kotlin RunSandboxVmDto, SandboxVmPreviewDto, SandboxVmDto, SandboxVmLeaseDto,
+// SandboxVmStatusDto, SandboxVmCheckDto
+type RunSandboxVm = { state: 'disabled' | 'none' | 'invalid' | 'unapproved' | 'approved';
+  reason: string;
+  sha256: string | null;
+  name: string | null; host: string | null; url: string | null;   // 'approved' only
+  used: boolean;             // the builder deployed to the VM at least once
+  previewMinutes: number;    // FACTORY_SANDBOX_VM_PREVIEW_MINUTES
+  preview: SandboxVmPreview | null };                      // the latest human preview; null when nobody started one
+type SandboxVmPreview = { state: 'deploying' | 'ready' | 'failed' | 'released';
+  sha: string | null; url: string | null;
+  startedBy: { username: string; displayName: string } | null; startedAt: string | null;
+  expiresAt: string | null;  // 'ready': until when it holds the VM
+  endedAt: string | null;    // 'released' / 'failed'
+  expired: boolean;          // released because the time ran out
+  failedStep: 'connect' | 'upload' | 'checkout' | 'setup' | 'ready' | null;
+  error: string | null;
+  output: string | null };   // 'failed': tail of the failed step's output, ≤ 20,000 characters
+type SandboxVm = { name: string; host: string; port: number; user: string;
+  hostKeyType: string; hostKeyFingerprint: string; description: string | null; url: string | null;
+  checkout: string; setup: string | null; ready: { command: string; timeoutSeconds: number } | null; reset: string | null };
+type SandboxVmLease = { kind: 'build' | 'preview'; state: 'held' | 'resetting';
+  since: string; expiresAt: string | null;
+  visible: boolean;          // false when the viewer cannot see the holder's project: runId, repo, issueNumber are null
+  runId: string | null; repo: string | null; issueNumber: number | null };
+type SandboxVmStatus = { repo: string;
+  enabled: boolean;          // FACTORY_SANDBOX_VM is not off
+  mode: 'ssh' | 'fake' | 'off';
+  path: '.agern/sandbox-vm.yml'; branch: string;           // read from the default branch
+  state: 'none' | 'invalid' | 'pending' | 'approved';      // as SandboxStatus
+  sha256: string | null; content: string | null;
+  errors: string[];
+  vm: SandboxVm | null;      // when valid
+  approval: SandboxApproval | null;                        // possibly of other content (diff)
+  approvers: { username: string; displayName: string }[];
+  key: DeployKey | null;     // the project's deploy key (shared with deploy targets)
+  lease: SandboxVmLease | null;                            // keyed by host:port, so possibly another project's run
+  previewMinutes: number };
+type SandboxVmCheck = { ok: boolean;
+  stage: 'connect' | 'host_key' | 'auth' | 'ready' | 'ok';
+  message: string; durationMs: number;
+  exitCode: number | null; output: string | null };       // stage 'ready': the readiness command's result
 
 type Attachment = { id: string; name: string;   // name: sanitised (no path, control/bidi characters or leading dots; ≤ 120 chars)
   mediaType: string;                 // decided by sniffing the bytes: image/png|jpeg|gif|webp, application/pdf, application/zip,
@@ -2353,7 +3319,8 @@ type Event = { seq: number; sessionId: string; ts: string;
 //          A message to a running pipeline agent (§6) adds: messageId: string, origin: 'direct' | 'chat',
 //          viaSessionId?: string   // the forwarding chat session when origin is 'chat'
 //  claude: one raw stream-json object from the CLI ({type:'system'|'assistant'|'user'|'result'|'stream_event', …})
-//  system: { level: 'info' | 'warn' | 'error', text: string, messageId?: string, sandbox?: SandboxLog }
+//  system: { level: 'info' | 'warn' | 'error', text: string, messageId?: string, sandbox?: SandboxLog, deploy?: DeployLog,
+//            sandboxVm?: SandboxVmLog }
 //          messageId: the agent picked that message up (info) or stopped before it did (warn)
 //  images: { requestId, provider, providerLabel, model, prompt, purpose, issueNumber?,   // one factory_generate_image
 //            images: [{ id, mediaType, width, height, size }] }                          // call (§6 "Generated images")
@@ -2365,7 +3332,16 @@ type Event = { seq: number; sessionId: string; ts: string;
 //              updatedFrom: string | null }    // the previous HEAD, only for 'updated'
 //          sandbox: the full log of a sandbox setup script or command (§5 "Sandboxes"):
 //            { kind: 'setup' | 'exec', command, exitCode, timedOut, durationMs, output, outputTruncated,
-//              platform: string | null }   // null when the definition has no platforms, else 'default' or the platform
+//              platform: string | null,    // null when the definition has no platforms, else 'default' or the platform
+//              review?: true }             // ran in the read-only review sandbox (ux and ui-design reviewers)
+//          deploy: one factory_deploy_exec / factory_deploy_copy of a chat (§5 "Deploy targets"), also a failed one:
+//            { kind: 'exec' | 'copy', target, host, port, user, command?, path?, dest?, bytes?,
+//              exitCode: number | null, timedOut, durationMs, output, outputTruncated,
+//              error: string | null }  // connect, host-key or auth failure; never any key material
+//          sandboxVm: one sandbox VM deploy step, command or reset in a builder's transcript (§5 "Sandbox VMs"):
+//            { kind: 'deploy' | 'exec' | 'reset', step: 'upload' | 'checkout' | 'setup' | 'ready' | null,
+//              vm, host, port, user, command: string | null, sha: string | null,
+//              exitCode: number | null, timedOut, durationMs, output, outputTruncated, error: string | null }
 
 type AgentMessage = { status: 'queued';          // always: picked up at the agent's next step (§6)
   messageId: string; sessionId: string; runId: string | null;
@@ -2395,6 +3371,23 @@ type ClaudeUsage = { credentialKind: 'oauth_token' | 'api_key' | null;
   windows: UsageWindow[];                         // ordered by type; [] unless credentialKind is 'oauth_token'
   spend: { todayUsd: number; monthUsd: number; day: string; month: string } };   // 'YYYY-MM-DD', 'YYYY-MM'
 
+type GitHubStatus = {                                       // GET /api/github/status (§6 "GitHub status")
+  verdict: { state: 'working' | 'degraded' | 'down'; reason: string };
+  generatedAt: string;
+  official: { state: 'ok' | 'unreachable' | 'disabled';
+    indicator: 'none' | 'minor' | 'major' | 'critical' | 'unknown' | null;   // null unless state = ok
+    description: string | null;
+    components: { name: string; status: string; relevant: boolean }[];       // non-operational only
+    incidents: { title: string; status: string; impact: string | null; updatedAt: string | null; url: string | null }[];
+    fetchedAt: string | null; error: string | null };                         // error only for unreachable
+  kinds: { kind: string; label: string; last15m: GitHubCallCounts; last24h: GitHubCallCounts;
+    lastError: { at: string; class: 'server_error' | 'network' | 'rate_limited' | 'auth';
+      status: number | null; requestId: string | null; message: string } | null }[];   // [] with brief
+  rateLimits: { own: { rest: GitHubRateLimit | null; graphql: GitHubRateLimit | null } | null;  // null: no token
+    otherTokens: number; lowestOther: GitHubRateLimit | null } | null };     // null with brief
+type GitHubCallCounts = { calls: number; serverErrors: number; network: number; rateLimited: number; auth: number };
+type GitHubRateLimit = { limit: number; remaining: number; resetAt: string; observedAt: string };
+
 type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   requestedBy: string; sessionId: string | null;
   status: 'pending' | 'installed' | 'denied'; note: string | null; createdAt: string; resolvedAt: string | null };
@@ -2413,7 +3406,8 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | Method & path | Body → Response | Notes |
 |---|---|---|
 | `GET /api/health` | → `{ status: 'ok', version, name: 'agern' }` | no auth; the web UI shows `version` in the user menu |
-| `GET /api/internal/activity` | → `{ idle, activeRuns, busyAgents, version }` | no auth, **host-local only**: answered only when the TCP peer is a loopback address and no proxy header (`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP`) is present; anyone else gets the generic 404. `activeRuns`: runs in `queued`/`spec`/`building`/`reviewing`/`approving` (a restart fails them); `busyAgents`: sessions `starting`/`running` (pipeline agents, chats mid-turn). `needs_human` runs and chats between turns survive a restart and do not count. Used by the upgrade timer (§9) |
+| `GET /api/internal/activity` | → `{ idle, activeRuns, busyAgents, version }` | no auth, **host-local only**: answered only when the TCP peer is a loopback address and no proxy header (`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP`) is present; anyone else gets the generic 404. `activeRuns`: runs in `queued`/`spec`/`building`/`reviewing`/`approving` (a restart fails them; `waiting_for_checks` runs are resumed after a restart and do not count); `busyAgents`: sessions `starting`/`running` (pipeline agents, chats mid-turn). `needs_human` runs and chats between turns survive a restart and do not count. Used by the upgrade timer (§9) |
+| `GET /api/github/status` | → `GitHubStatus` | any logged-in user (no GitHub token needed; 401 otherwise). The same for every user except `rateLimits.own`. `?brief=1` (or `true`): `kinds` is `[]`, `rateLimits` null and no `/rate_limit` call is made — the shell's banner poll (§6 "GitHub status") |
 | `GET /api/auth/providers` | → `{ providers: string[], org: string, twoFactor: boolean }` | no auth |
 | `POST /api/auth/login` | `{ username, password }` → `LoginStep` | sets cookie (pending until 2FA passes) |
 | `POST /api/auth/totp` | `{ code }` → `LoginStep` | pending session; `code` is a TOTP code or a recovery code; 423 when locked |
@@ -2449,13 +3443,14 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `GET /api/projects/{repo}` | → `Project` | with `workspace` (read with the caller's token; members' `accessible` per caller) |
 | `PUT /api/projects/{repo}/icon` | raw image bytes (PNG, JPEG, WebP, GIF or SVG) → `Project` | admin (403 before the body is read; 404 when the admin cannot see the project). Sets or replaces the icon; 400 `empty_icon`, 413 `icon_too_large`, 415 `unsupported_icon_type`, 422 `invalid_icon` (also every refused SVG) / `icon_dimensions_too_large`; see "Project icons" below |
 | `POST /api/projects/{repo}/icon/from-repository` | `{path}` → `Project` | admin (403; 404 as above). Sets the icon from a file on the repository's default branch, read once with the admin's own GitHub token; 400 `bad_request` for an invalid path, 404 `icon_file_not_found`, then the upload's 400/413/415/422; see "Project icons" below |
+| `PUT /api/projects/{repo}/settings` | `{ mergePolicy, reviewers?, teamReviewers? }` → `Project` | admin (403; 404 when the admin cannot see the project). 400 unknown `mergePolicy`, an entry that is not a GitHub login (`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$`) or team slug (`^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$`, the message names it), or more than 15 per list. Entries are trimmed, one leading `@` stripped, empty ones dropped and duplicates removed case-insensitively; omitted lists are empty. Applies to runs started from now on (§6 "Merge policy") |
 | `DELETE /api/projects/{repo}/icon` | → `Project` | admin (403; 404 as above); removes the icon (also when there is none), `iconUrl: null` |
 | `GET /api/projects/{repo}/icon?v=<version>` | → image bytes (`image/png`, `image/jpeg`, `image/webp`, `image/gif` or `image/svg+xml`) | anyone who can see the project; 404 when not visible or no icon is set |
 | `GET /api/projects/{repo}/issues?state=open\|closed\|all` | → `Issue[]` | pull requests excluded |
 | `GET /api/projects/{repo}/issues/{number}` | → `Issue` (with `body`) | |
 | `POST /api/projects/{repo}/issues` | `{ title, body, kind }` → `Issue` | |
 | `GET /api/projects/{repo}/releases` | → `Release[]` | newest first (`createdAt` desc), each with its issues in order |
-| `POST /api/projects/{repo}/releases` | `{ name, description?, mode? }` → 201 `Release` | 400 invalid name, description or mode (`manual` default, `automatic`); 409 `release_name_taken`; 409 `release_mode_not_allowed` (#24 seam). Starts nothing |
+| `POST /api/projects/{repo}/releases` | `{ name, description?, mode? }` → 201 `Release` | 400 invalid name, description or mode (`manual` default, `automatic`); 409 `release_name_taken`; 409 `release_mode_not_allowed` (the project's merge policy is not `automatic`, §6 "Merge policy"). Starts nothing |
 | `GET /api/releases/{id}` | → `Release` | 404 unknown or invisible |
 | `PUT /api/releases/{id}` | `{ name, description }` → `Release` | rename or edit; same validation as create. Started: owner or admin, and a different name → 409 `release_name_locked`; released: 409 `release_not_editable`. Editing a ready release updates its pull request's body |
 | `DELETE /api/releases/{id}` | → 204 | removes the plan and its assignments; the issues are untouched on GitHub. `scheduled` → 409 `release_scheduled`; `building`/`paused`/`ready` → 409 `release_active`; `released` → 409 `release_not_editable`; `cancelled`: owner or admin, the branch stays and its runs keep existing with `releaseId` null |
@@ -2463,30 +3458,48 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `PUT /api/releases/{id}/schedule` | `{ startAt: string }` → `Release` | set (`planning`, caller becomes owner) or change (`scheduled`, owner or admin, owner unchanged) the scheduled start. In order: 404 invisible; 400 "startAt must be an ISO-8601 time" (an instant with `Z` or offset), "The start time must be in the future", "The start time is too far ahead (at most a year)" (> 366 days); set: 422 `claude_credential_required`, 403 without a GitHub token; change: 403 "Only <owner> or an admin can change this schedule"; other states: 409 `release_not_schedulable`. Stored at millisecond precision |
 | `DELETE /api/releases/{id}/schedule` | → `Release` | cancel: back to `planning`, `owner`/`scheduledAt`/`waitingFor` null, `startFailure` kept. 409 `release_not_scheduled` when not scheduled (also once the start has begun), else 403 unless owner or admin |
 | `POST /api/releases/{id}/pause` | → `Release` | owner or admin; `building` → `paused` (else 409 `release_not_building`); the running issue finishes |
-| `POST /api/releases/{id}/resume` | → `Release` | owner only; `paused` → `building` (else 409 `release_not_paused`); 422 `claude_credential_required` |
+| `POST /api/releases/{id}/resume` | → `Release` | owner only; `paused` → `building` (else 409 `release_not_paused`); 422 `claude_credential_required`. For reason `network` this is "Retry now" |
+| `POST /api/releases/{id}/network/give-up` | → `Release` | owner or admin; only `paused` with reason `network` (else 409 `release_not_waiting_for_network`): holds the issue that could not start and goes on with the next one (§6 "Transient failures") |
 | `POST /api/releases/{id}/cancel` | → `Release` | owner or admin; `building`/`paused`/`ready` → `cancelled` (else 409 `release_not_building`; released: 409 `release_not_editable`); cancels the release's active runs; a release pull request is left open with a comment |
-| `POST /api/releases/{id}/approve` | → `Release` | owner only (admins included in the refusal: 403); merges the ready release's pull request (rebase, or a merge commit where rebase merging is disabled; never squash), closes its merged issues and deletes `release/<name>` (§6 "Releasing"). 409 `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`, `release_migration_conflict`, `release_submodule_commit_missing`, `release_submodule_check_failed`, `release_merge_method_unavailable`, `release_merge_failed`; nothing changes on GitHub with any of them; a multi-repository release merges its member pull requests first and answers 409 `release_partially_merged` with the per-repository report when it stops after a merge (§6 "Several repositories") |
+| `POST /api/releases/{id}/approve` | → `Release` | owner only (admins included in the refusal: 403); 409 `merge_on_github` when the project merges on GitHub (§6 "Merge policy"); merges the ready release's pull request (rebase, or a merge commit where rebase merging is disabled; never squash), closes its merged issues and deletes `release/<name>` (§6 "Releasing"). 409 `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`, `release_migration_conflict`, `release_submodule_commit_missing`, `release_submodule_check_failed`, `release_merge_method_unavailable`, `release_merge_failed`, `release_sync_running` (while a sync run of it is in progress); nothing changes on GitHub with any of them; a multi-repository release merges its member pull requests first and answers 409 `release_partially_merged` with the per-repository report when it stops after a merge (§6 "Several repositories") |
 | `PUT /api/releases/{id}/mode` | `{ mode: 'manual' \| 'automatic' }` → `Release` | §6 "Release mode": `planning` anyone; `scheduled`/started: automatic owner only, manual owner or admin (403); 400 missing or unknown mode; 409 `release_not_editable` (released), `release_closed` (cancelled), `release_mode_not_allowed`. A `ready` release is re-evaluated in the background (switched to automatic and green, it is merged) |
+| `POST /api/releases/{id}/sync` | → `Release` | "Bring up to date" (§6 "Bringing a release up to date"): owner or admin; 404 not visible, 409 `release_not_ready`, 403, 409 `release_sync_unsupported`, 422 `claude_credential_required`, GitHub token as everywhere, 409 `release_sync_merge_commits_disallowed`, then under the mutex 409 `release_not_ready`, `release_sync_running`, `release_up_to_date`; starts a sync run owned by the caller and answers the release |
 | `POST /api/releases/{id}/check` | → `Release` | owner only; `ready` only (409 `release_not_ready`): re-reads the pull request (opens it when the release is complete and has none, replaces one closed without merging, finishes the release when it was merged on GitHub) and its mergeability |
 | `GET /api/releases/{id}/issues/{number}/retry` | → `RetryOptions` | anyone who can see the release; the issue must be `held`/`skipped` (409 `release_issue_not_held`); the options of its linked run, or only `start_over` when it has none |
-| `POST /api/releases/{id}/issues/{number}/retry` | `{ mode?: … }` (body optional) → `Release` | no body or no mode = `start_over`, as before; `continue`/`step`/`recommended` as in §6 "Retrying a run" (409 `retry_mode_unavailable`); owner only; release `building`/`paused`/`ready` (else 409 `release_not_building`; released: 409 `release_not_editable`), issue `held`/`skipped` (else 409 `release_issue_not_held`); it is built again (a `ready` release builds again: 409 `release_already_building` while another release of the project builds); a partly released release: 409 `release_partially_merged` |
+| `POST /api/releases/{id}/issues/{number}/retry` | `{ mode?: … }` (body optional) → `Release` | no body or no mode = `start_over`, as before; `continue`/`step`/`update`/`recommended` as in §6 "Retrying a run" (409 `retry_mode_unavailable`); owner only; release `building`/`paused`/`ready` (else 409 `release_not_building`; released: 409 `release_not_editable`), issue `held`/`skipped` (else 409 `release_issue_not_held`); it is built again (a `ready` release builds again: 409 `release_already_building` while another release of the project builds); a partly released release: 409 `release_partially_merged` |
 | `POST /api/projects/{repo}/releases/assign` | `{ issueNumbers: number[], releaseId: string \| null }` → `Release[]` | assigns or moves the issues to that release of `{repo}` (404 otherwise), or takes them out with `releaseId: null` (numbers in no release are ignored, no GitHub calls). 1–100 positive numbers, duplicates collapsed (400 otherwise; an invalid `releaseId` is 400). Every issue is fetched with the caller's token: unknown → 404 "Issue #n not found", closed → 409 `issue_closed`; in a workspace project routed as a run (409 `workspace_invalid`, `member_label_missing`, `member_label_ambiguous`, 403 `member_not_accessible`); all-or-nothing; a partly released target: 409 `release_partially_merged`. Target `building`/`paused`/`ready`: owner only, appended as `waiting` (a `ready` target builds again: 409 `release_already_building` while another release of the project builds); target `cancelled`: 409 `release_closed`; target `released`: 409 `release_not_editable`. An issue leaving a `building`/`paused`/`ready` release: owner or admin, and only `waiting`, `held` or `skipped` (else 409 `release_issue_started`); leaving a `cancelled` one: owner or admin; leaving a `released` one: 409 `release_not_editable`. A still active run of an issue that leaves is cancelled. Answers all releases of the project after the change |
 | `PUT /api/releases/{id}/issues/order` | `{ issueNumbers: number[] }` → `Release` | the new complete order; anything but exactly the current issues → 409 `release_issues_changed`, nothing changes. `building`/`paused`/`ready`: owner only, and every issue that is not `waiting` keeps its index (409 `release_issue_started`); `cancelled`: 409 `release_closed`; `released`: 409 `release_not_editable` |
 | `GET /api/projects/{repo}/sandbox` | → `SandboxStatus` | anyone who can see the project; the file is read with the caller's token from the default branch |
 | `POST /api/projects/{repo}/sandbox/approval` | `{ sha256 }` → `SandboxStatus` | admin (403 otherwise; 404 when the admin cannot see the project or there is no file). Approves exactly the content with that hash, replacing the project's earlier approval; 400 malformed hash, 409 `sandbox_definition_changed` when the file now has another hash, 422 `sandbox_definition_invalid` |
 | `DELETE /api/projects/{repo}/sandbox/approval` | → `SandboxStatus` | admin; removes the project's approval (also when there is none). Runs already started keep their decision |
+| `GET /api/projects/{repo}/deploy` | → `DeployStatus` | anyone who can see the project; `.agern/deploy.yml` is read with the caller's token from the default branch (§5 "Deploy targets") |
+| `POST /api/projects/{repo}/deploy/approval` | `{ sha256 }` → `DeployStatus` | admin (404 first when the project is invisible, then 403). As the sandbox approval: 400 malformed hash, 404 no file, 409 `deploy_definition_changed`, 422 `deploy_definition_invalid` |
+| `DELETE /api/projects/{repo}/deploy/approval` | → `DeployStatus` | admin; removes the approval (also when there is none); the tools stop at once |
+| `POST /api/projects/{repo}/deploy/key` | → `DeployStatus` | admin; generates the project's Ed25519 key pair. 409 `deploy_key_exists` when there is one |
+| `POST /api/projects/{repo}/deploy/key/rotate` | → `DeployStatus` | admin; replaces the pair atomically (the old private key is deleted). 404 when there is none |
+| `GET /api/projects/{repo}/sandbox-vm` | → `SandboxVmStatus` | anyone who can see the project (§5 "Sandbox VMs") |
+| `POST /api/projects/{repo}/sandbox-vm/approval` | `{ sha256 }` → `SandboxVmStatus` | admin; as the deploy approval: 409 `sandbox_vm_definition_changed`, 422 `sandbox_vm_definition_invalid` |
+| `DELETE /api/projects/{repo}/sandbox-vm/approval` | → `SandboxVmStatus` | admin; removes the approval and deletes the repository's leases without `reset` |
+| `POST /api/projects/{repo}/sandbox-vm/check` | → `SandboxVmCheck` | admin. Connects, verifies the host key, authenticates, then runs `ready.command` once (60 s) if defined. 409 `sandbox_vm_disabled`, `sandbox_vm_not_approved`, `sandbox_vm_key_missing`. Connection problems are `200` with `ok: false` |
+| `DELETE /api/projects/{repo}/sandbox-vm/lease` | → `SandboxVmStatus` | admin; ends the VM's lease (`reset` runs). 404 when there is none |
+| `POST /api/projects/{repo}/deploy/targets/{name}/check` | → `DeployCheck` | admin. Connects, verifies the host key, authenticates and disconnects; runs no command. 409 `deploy_disabled` (`FACTORY_DEPLOY=off`), `deploy_not_approved`, `deploy_key_missing`, `deploy_busy` (an operation runs on the target); 404 unknown target. Connection problems are `200` with `ok: false` |
 | `GET /api/projects/{repo}/runs` | → `Run[]` | newest first |
 | `POST /api/projects/{repo}/workspace/labels` | → `{ created: string[]; missing: string[] }` | creates the missing member labels with the caller's token (§5 "Member labels"); 403 `labels_forbidden`, 409 `not_a_workspace` / `workspace_invalid`, 404 when the caller cannot see the project |
 | `POST /api/projects/{repo}/runs` | `{ issueNumber }` → `Run` | needs Claude credential; 409 if the issue has an active run; a workspace project: 409 `workspace_invalid`, `member_label_missing`, `member_label_ambiguous`, 403 `member_not_accessible` (§6 "Workspace runs") |
-| `GET /api/runs?active=true&status=<s>` | → `Run[]` | across visible repos, newest first (max 200). `active=true`: not finished, i.e. `queued`, `spec`, `building`, `reviewing`, `approving` or `needs_human`. `status`: only these statuses, repeatable and/or comma list (`?status=needs_human`); unknown status → 400. Both given: both apply |
+| `GET /api/runs?active=true&status=<s>` | → `Run[]` | across visible repos, newest first (max 200). `active=true`: not finished, i.e. `queued`, `spec`, `building`, `reviewing`, `approving`, `waiting_for_checks` or `needs_human`. `status`: only these statuses, repeatable and/or comma list (`?status=needs_human`); unknown status → 400. Both given: both apply |
 | `GET /api/runs/{id}` | → `Run` | |
 | `GET /api/runs/{id}/screenshots/{sid}` | → image bytes | anyone who may see the run (404 otherwise, and for a screenshot of another run). Served with the sniffed type, `nosniff`, a sandboxing CSP, `Cross-Origin-Resource-Policy: same-origin`, `Cache-Control: private, max-age=31536000, immutable` and `Content-Disposition: inline` (`screenshot-<role>-<id8>.<ext>`). There is no upload or delete route |
-| `POST /api/runs/{id}/approve` | → `Run` | owner only, only in `needs_human`; 409 `review_in_progress`, `agent_busy`, `review_required` (§6 "Conversation at needs human") |
+| `POST /api/runs/{id}/approve` | → `Run` | owner only, only in `needs_human`; 409 `merge_on_github` for a run of merge policy `github`, whatever its status (after 404 and 403; §6 "Merge policy"); 409 `review_in_progress`, `agent_busy`, `review_required` (§6 "Conversation at needs human"); evaluates the checks on the pull request's head first and answers the run merged, `needs_human` or `waiting_for_checks` (§6 "Checks before a merge") |
+| `POST /api/runs/{id}/merge-anyway` | `{ headSha }` → `Run` | owner only (403); 409 `merge_on_github` for a run of merge policy `github`; merges although the checks on `headSha` have not passed, bound to that commit; 409 `run_not_overridable` (not `needs_human`/`waiting_for_checks`, no pull request, or checks not blocking), `checks_changed` (`headSha` is not the recorded checks' commit), and from `needs_human` `review_required` / `review_in_progress` / `agent_busy`; web only, no MCP tool or chat command (§6 "Checks before a merge") |
 | `POST /api/runs/{id}/conversation` | `{ text }` → 202 `{ status: 'accepted', sessionId }` | owner only (403 for everyone else, admins too), only in `needs_human` (409 `run_not_waiting`). Talks to the run's advisor; the first message creates its session. 400 blank / too long, 409 `review_in_progress`, 409 `agent_busy`, 422 `claude_credential_required`, 409 `too_many_agents`, 409 `run_worktree_missing` |
 | `POST /api/runs/{id}/review` | → `Run` | "Review again": owner only (403 admins too), only in `needs_human`; starts a follow-up review of changes from the conversation. 409 `review_in_progress`, `agent_busy`, `nothing_to_review` (no conversation, or nothing changed since the last completed review); 422 `claude_credential_required` |
 | `POST /api/runs/{id}/cancel` | → `Run` | owner or admin |
-| `GET /api/runs/{id}/retry` | → `RetryOptions` | anyone who can see the run; how it can be retried and what is recommended (§6 "Retrying a run") |
-| `POST /api/runs/{id}/retry` | `{ mode?: 'step' \| 'continue' \| 'start_over' \| 'recommended' }` (body optional) → `Run` | owner only (admins included: 403), single runs that are `failed` or `cancelled` (409 `run_not_retryable`; a release run: 409 `release_run`); no mode = `start_over`; 409 `retry_mode_unavailable`, `active_run_exists`; 400 unknown mode; 422 `claude_credential_required`. Answers the run now at work: the same run for `step`, a new one otherwise |
+| `POST /api/runs/{id}/sandbox-vm/preview` | → `Run` | owner or admin (403; 404 when the run is not visible); deploys the run's `HEAD` to its sandbox VM for a human, in the background, and answers at once with the preview `deploying` (§5 "Sandbox VMs"). 409 `run_not_waiting` (not `needs_human`), `sandbox_vm_disabled`, `sandbox_vm_not_approved`, `sandbox_vm_key_missing`, `sandbox_vm_busy` (another lease, or this preview is `deploying`) |
+| `DELETE /api/runs/{id}/sandbox-vm/preview` | → `Run` | owner or admin; ends the preview's lease (`reset` runs), the preview becomes `released`. 404 when there is no active preview |
+| `POST /api/runs/{id}/network/retry` | → `Run` | owner or admin; a run waiting for the network tries again now (§6 "Transient failures"); 409 `run_not_waiting_for_network` |
+| `POST /api/runs/{id}/network/give-up` | → `Run` | owner or admin; the waiting run fails now and is returned once failed; 409 `run_not_waiting_for_network` |
+| `GET /api/runs/{id}/retry` | → `RetryOptions` | anyone who can see the run; how it can be retried and what is recommended (§6 "Retrying a run"); for a sync run every option is unavailable with the reason "A run that brings a release up to date is not retried; …" |
+| `POST /api/runs/{id}/retry` | `{ mode?: 'update' \| 'step' \| 'continue' \| 'start_over' \| 'recommended' }` (body optional) → `Run` | owner only (admins included: 403), single runs that are `failed` or `cancelled` (409 `run_not_retryable`; a release run: 409 `release_run`; a sync run: 409 `sync_run`), or `needs_human` with `update` (the same run, now `building`; 409 `run_not_retryable` for another mode); no mode = `start_over`; 409 `retry_mode_unavailable`, `active_run_exists`; 400 unknown mode; 422 `claude_credential_required`. Answers the run now at work: the same run for `step` and `update`, a new one otherwise |
 | `GET /api/projects/{repo}/sessions?kind=chat` | → `AgentSession[]` | |
 | `POST /api/projects/{repo}/sessions` | `{ model? }` → `AgentSession` | new chat; needs Claude credential; without `model` the owner's effective `chatModel` |
 | `GET /api/agents?active=true` | → `AgentSession[]` | all kinds, across visible repos. `active=true`: `live` (a process exists, e.g. a chat idling between turns) or `starting`/`running` |
@@ -2543,6 +3556,12 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
   `release_merge_method_unavailable`, `release_partially_merged`, `release_not_editable` (409).
 - Sandbox approval: stale hash → 409 `sandbox_definition_changed`; invalid definition → 422
   `sandbox_definition_invalid`.
+- Deploy targets: stale hash → 409 `deploy_definition_changed`; invalid definition → 422
+  `deploy_definition_invalid`; 409 `deploy_key_exists`, `deploy_disabled`, `deploy_not_approved`,
+  `deploy_key_missing`, `deploy_busy`.
+- Sandbox VMs: stale hash → 409 `sandbox_vm_definition_changed`; invalid definition → 422
+  `sandbox_vm_definition_invalid`; 409 `sandbox_vm_disabled`, `sandbox_vm_not_approved`, `sandbox_vm_key_missing`,
+  `sandbox_vm_busy`.
 - "Needs Claude credential" → 422 `claude_credential_required`; too many agents → 409
   `too_many_agents`; issue already has an active run → 409 `active_run_exists`; workspace projects (§6 "Workspace
   runs"): 409 `workspace_invalid`, `member_label_missing`, `member_label_ambiguous`,
@@ -2798,7 +3817,11 @@ and `E2E_DB_HOST`/`E2E_DB_HOST_PORT`. A container is fine there: the no-Docker r
 One worker and no retries — the specs share one server and build on each other's state, and a flaky
 check would block Agern's automatic release merges, which wait for every check (§6 "Releases"). Gradle,
 npm and Playwright's Chromium headless shell are cached; on failure the HTML report and the traces are
-uploaded as the artifact `playwright-report`. `publish-main` needs every job.
+uploaded as the artifact `playwright-report`. A coroutine of `Services.scope` that fails logs its exception at
+ERROR (it never reaches the thread's default handler); in the server tests `TestWorld.close()` then fails the test
+that owns those services, so the failure is reported by its culprit instead of poisoning a later test. When the
+server job fails, its Gradle test report and XML results are uploaded as the artifact `server-test-report`.
+`publish-main` needs every job.
 
 **Release artifact.** One self-contained `agern.jar` (server with the built frontend embedded on
 the classpath) — the host needs only Java 17 and PostgreSQL. `FACTORY_WEB_DIR` overrides the
@@ -2946,10 +3969,28 @@ talks to Podman as `agern` (`runuser`), and `agern.env` is parsed as data.
 Routes: `/login`, `/` (projects), `/p/:repo` (issues · CLI chat · agents), `/p/:repo/runs/:runId`
 (pipeline diagram with live stages; selecting a stage shows that agent's transcript),
 `/p/:repo/releases/:releaseId` (a release's plan and build, below),
-`/p/:repo/sandbox` (the project's sandbox definition and its approval, below), `/agents` (everything running), `/settings` (own credentials, and "Models & cost": the user's own model per
+`/p/:repo/sandbox` (the project's sandbox definition and its approval, below), `/p/:repo/deploy` (the project's
+deploy targets, key and approval, below), `/p/:repo/sandbox-vm` (the project's sandbox VM, its approval, key
+and lease, below), `/agents` (everything running), `/settings` (own credentials, and "Models & cost": the user's own model per
 role and fix rounds, with presets — *Default* clears every choice, *Economy* picks Sonnet for chat and spec,
 Haiku for the four reviewers and one fix round), `/admin` ("Factory settings": the default models and the
 default and maximum fix rounds; installing software stays admin-only).
+
+**GitHub status.** `/github-status` (every logged-in user; user-menu item "GitHub status" between "Credentials &
+security" and "Sign out", suffixed " — degraded" / " — down" while GitHub is not working) shows, polled every 60 s
+with a Refresh button: the verdict (`data-verdict`, heading, glyph and explanation of what it means for runs, chats and
+releases, the reason and "Updated …"); GitHub's official status (description, non-operational components with the
+relevant ones first, open incidents with "Details on githubstatus.com"; a warning when githubstatus.com could not be
+reached; a muted line when it is off; a note when the verdict is not working while GitHub says all is well); "What
+Agern sees", a table per kind with calls, 5xx, timeouts/network, rate limited and auth for the last 15 minutes and 24
+hours and the last error (message, HTTP status, request id, time), scrolling sideways inside its own container; and
+the rate limits of the caller's token and, anonymously, of the other tokens in use. The shell polls
+`GET /api/github/status?brief=1` on mount and every 60 s (one poll for the menu item and the banner). While the verdict
+is degraded or down, a one-line `role="status"` banner between the top bar and `<main>` (`GitHubBanner`, not on
+`/github-status`) says "GitHub is degraded/down for Agern." with a "See GitHub status" link and a Dismiss button.
+Dismissing stores the verdict in `sessionStorage` (`agern.githubBanner.dismissed`): hidden while the verdict stays the
+same, shown again for the other non-working verdict; the stored value is removed when a poll reports `working`. The
+banner is `flex: none`, so the project page's app shell stays one viewport tall.
 
 **Claude usage.** For users with a Claude credential, the top bar shows a compact indicator before the active-agents
 count on every page (`UsageIndicator`, a link to `/settings#models`, `data-level` `none` | `ok` | `high` | `limit` |
@@ -3118,7 +4159,8 @@ Releasing on the release page (§6 "Releasing"). A `ready` release shows the sec
 the link "#<prNumber>" to the pull request (new tab) and `release/<name> → <targetBranch>`, or "No pull request
 yet."; a `role="status"` line — complete and clean "Ready to release. Merges cleanly into <target>."; complete and
 unknown "Ready to release. Mergeability has not been confirmed yet."; conflict "`release/<name>` no longer merges
-cleanly into <target>. Agern will not merge it. Resolve the conflicts on the release branch, then check again.";
+cleanly into <target>. Agern will not merge it. Bring it up to date, or resolve the conflicts on the release branch
+and check again.";
 incomplete "Incomplete: N issue(s) are held (#a, #b). Approve or retry their runs, or move them out, before
 releasing."; empty "Nothing was merged into the release branch, so there is nothing to release."; no usable merge
 method "This repository only allows squash merges. …" — and, when it can be approved, a muted line naming the merge
@@ -3135,6 +4177,32 @@ in `ready` (adding builds again); there is no Pause. Each issue with a run pull 
 "Released <time ago> by <owner> · pull request #n" (or "Merged on GitHub <time ago> · …"), the method in words, the
 default branch's commit (7 characters) and that the issues were closed and the branch deleted. The note "This release
 is a plan…" is shown only while planning.
+
+Bringing a release up to date on the release page (§6 "Releasing", "Bringing a release up to date"), only for a
+single-repository `ready` release (a release of several repositories shows nothing of this): when the branch does not
+conflict but is behind, a muted line "`release/<name>` is N commit(s) behind <target>." below the status line.
+Directly below the status line (the conflict notice's button, not repeated in the actions row) the release owner and
+admins get "Bring up to date" when `syncNeeded` and no sync run is `running`, disabled while any action of the page is
+busy; everyone else then sees "Only <owner> or an admin can bring it up to date.". It opens the dialog "Bring
+release/<name> up to date?": "An agent run merges <target> into release/<name> with a merge commit (no rebase, no
+force-push), resolves the conflicts, renumbers this release's own database migrations above <target>'s, runs the
+project's checks and pushes release/<name>. Reviewers then look at the conflict resolution. Nothing is merged into
+<target>. It runs with your Claude credential and GitHub token." plus, when the release would be rebased, "Afterwards
+the release is merged with a merge commit instead of by rebasing."; "Cancel" (focused) and "Bring up to date"; Escape
+closes; an error closes it and shows in the page's alert line. The latest sync run shows as: `running` — a
+`role="status"` line "Bringing release/<name> up to date with <target> (started by <user>)." with "Open the run", and
+"Approve and release" is disabled ("Check again" stays); `failed` — a `role="alert"` block "Could not bring it up to
+date. <error>" with the link (the button is offered again while `syncNeeded`); `unreviewed` — a `role="alert"` block
+"<target> was merged into release/<name> (commit <sha7>), but the review of the merge did not pass or did not finish.
+<error> Look at the run before releasing." with the link; `done` — a muted "Brought up to date with <target> <time
+ago> by <user>." with the link. It updates live from `release` frames.
+
+A sync run (`Run.kind = 'sync'`) never shows `#0`: lists show `sync` where they show `#<n>` (run header and document
+title, agents band, home page strip, project runs list, admin sandbox rows and dialog) and its title "Bring
+release/<name> up to date with <target>"; its first diagram node is "sync" with the release branch, and its detail
+shows the release (name, `release/<name>` → target, a link to the release page, the pushed commit) instead of reading
+an issue. Its status pill reads "up to date" when merged; the diagram shows spec-writer and approver skipped, the
+outcome node "push release/<name>" and never a human approval. There is no Retry; Cancel as for other runs.
 
 Release mode on the release page (§6 "Release mode"): except when released or cancelled, the header shows the mode —
 for whoever may change it a select labelled "Release mode" ("Manual approval" / "Automatic"; "Automatic" is disabled
@@ -3168,6 +4236,42 @@ rules as for building). The mock seeds `web-shop` with a ready and clean release
 (`cart-fixes`), an incomplete one (`payments`), a released one (`1.1`) and a cancelled one (`promo`), and implements
 approve and check with the server's rules and error codes.
 
+**Merge policy** (§6 "Merge policy"). The project page shows everyone a row under the header, "Merge policy:
+<label> — <explanation>": "Automatic — the approver agent may merge.", "Owner approves — every merge waits for the run
+owner's approval in Agern.", "Merge on GitHub — Agern never merges; the team reviews and merges pull requests on
+GitHub." plus "Reviewers requested: @a, team x." when configured. Admins get a "Change" button that opens a dialog: a
+radio group (`fieldset`, legend "Merge policy") with the three policies and their explanations, for "Merge on GitHub"
+the inputs "Reviewers (GitHub logins, comma-separated)" and "Team reviewers (team slugs, comma-separated)", the note
+"Applies to runs started from now on; running runs keep their policy.", Cancel and Save ("Saving…" while saving). A
+server error stays in the dialog (`role="alert"`); Escape closes it and focus returns to "Change". The run header
+lists "merge policy" for single runs whose policy is not `automatic`. `owner_approves` at `needs_human` shows the note
+"This project requires the run owner's approval before every merge." (the approver's recommendation is the
+needs-human banner; with `APPROVE` Approve merges in one click, with `ESCALATE` the confirmation applies); others
+still read "Waiting for <owner> to approve.". A `ready` run shows the status note (`role="status"`, not an alert)
+"Ready for review on GitHub. This project merges on GitHub: Agern does not merge. Review and merge <PR link>; this
+page updates when it is merged or closed." and no Approve, Cancel or Retry. A `github` run at `needs_human` has no
+Approve button but the note "This project merges on GitHub: Agern does not merge this run. The pull request can be
+reviewed and merged there."; "Talk to the agent" and Cancel remain. A run merged on GitHub reads "Merged on GitHub by
+@<login>" (or "Merged on GitHub"). The `ready` pill reuses the pass tone. In the diagram a `github` run's merge node is
+"merge on GitHub": at `ready` pending with "PR #n · waiting on GitHub" (the human node skipped), merged on GitHub done
+with "merged on GitHub"; an `owner_approves` run that merged shows the human node "approved by owner" whatever the
+approver said. On the release page a `github` project replaces "Approve and release" with "This project merges on
+GitHub: review and merge the release pull request there.", and a non-automatic policy disables the automatic mode
+(the release mode select and the "New release" dialog: "this project requires a human approval"). The mock implements
+the setting, the snapshot and the outcomes at approval (no follower).
+
+**Checks before a merge** (§6 "Checks before a merge"). A `waiting_for_checks` run shows a status notice (`role="status"`):
+"Waiting for checks on `<sha7>`. <detail>. The pull request is merged automatically when they pass; Agern stops waiting at
+<local time>.", with the pending checks below it as links (new tab) when GitHub gave an `https://` URL. The owner sees
+"Merge anyway…" and "Cancel run"; others "Waiting for checks; it merges by itself." A `needs_human` run whose checks
+block the merge shows the reason in the error banner and gives the owner "✓ Approve & merge" (evaluates again) and
+"Merge anyway…". That dialog ("Merge without passing checks?", the shared `Dialog`: focus trap, Escape, "Don't merge"
+focused) lists each check that has not passed with "failed (<conclusion>)" or "pending" (else the detail), the
+approver's reason when it escalated, and what merging does; errors (`checks_changed`, `review_required`, …) appear in
+the page's `form-error` alert. After an overridden merge a muted line reads "Merged by <user> despite checks: <detail>".
+The diagram's merge node is `running` "waiting for checks", `failed` "checks not passed", or noted "despite checks";
+outcome nodes add their sub and note to their accessible label. The status pill reads "waiting for checks".
+
 **Retrying a run** (§6 "Retrying a run"). The run page of a `failed` or `cancelled` run shows the owner a "Retry…"
 button; "Retry #n" on the release page opens the same dialog ("Retry run <short id>?" / "Retry #n?"). It loads the
 options, shows "Recommended: <label>. <reason>" and one radio per mode — "Retry the failed step", "Continue from the
@@ -3177,6 +4281,21 @@ dialog. After a retry of a single run the page shows the run now at work (the sa
 one); a release run's retry goes through the release and opens the release page. The run header lists "continues
 run <short id>" and "continued by run <short id>" as links when set. The mock implements the options (no step retries)
 and both retries.
+
+**Waiting for the network** (§6 "Transient failures"). While `run.waiting` is set, the run page shows a banner
+(`role="status"`) between the header and the error box: "**Waiting for the network** since <date and time> (<time
+ago>). <detail> Next try at <time> (attempt <attempt + 1>)."; the status pill keeps the run's status and is followed by
+"waiting for network". The owner and admins get "Retry now" (disabled, "Retrying…", while it runs) and "Give up…",
+which confirms in "Give up waiting?" ("The run fails now, as it would have without waiting. Its worktree is removed;
+the branch and any pull request stay on GitHub, and you can retry the run afterwards.", buttons "Keep waiting" —
+focused — and "Give up"); others see the text only. Errors go to the page's alert line; "Cancel run" stays. On the
+release page, a release paused with reason `network` reads "Waiting for the network since <time>. <note> Next try at
+<time>.", its Resume button is labelled "Retry now", and the owner or an admin gets "Give up on #<n>…" (confirmation
+"Issue #<n> is held and the release goes on with the next issue. You can retry it later."). A building release whose
+running issue's run waits reads "#<n> <title> is waiting for the network since <time>; next try at <time>.", the issue
+row shows the same as a note next to its run link, and the owner or an admin gets "Retry now" and "Give up…" acting on
+that run (the run page's confirmation). The texts come from `lib/networkWait.ts` (unit-tested); times tick with
+`useNow`. The mock never waits: its endpoints answer 409 with the documented codes after the permission checks.
 
 On the run page of a release run the merge node is titled "merge to release" and the header shows the base branch
 linking to the release page (plain text when the release was deleted); single runs still say "merge to main".
@@ -3226,10 +4345,11 @@ confirmation names every image with its role (default, platform, service) and sh
 and says plainly that they will run on the factory host for
 every run of the project — and "Revoke…" (confirmation); others see who can approve. The page and the row follow
 `sandbox_approval` frames. The run page shows one line under the run's facts: "sandbox" with the image and the approved
-definition's hash prefix and, when the definition has platforms, each platform (marked ✓ once commands ran in it), or
+definition's hash prefix and, when the definition has platforms, each platform (marked ✓ once commands ran in it),
+then "review sandbox ✓" when the UI reviewers ran the app in a review sandbox (`reviewUsed`), or
 "none — <why>" (switched off, no definition, not approved, invalid), and a link to the
-sandbox page. In a builder's transcript every `system` event with `payload.sandbox` is a collapsible command block
-(the platform as a chip when `platform` is set, `$ command` or "setup script", exit code or "timed out", duration,
+sandbox page. In a builder's or UI reviewer's transcript every `system` event with `payload.sandbox` is a collapsible command block
+(a `review` chip when `review` is set — screen readers hear "Review sandbox command:" —, the platform as a chip when `platform` is set, `$ command` or "setup script", exit code or "timed out", duration,
 "truncated"; failures in red): opened, it shows the
 last 200 lines of the output in the terminal style with "Show all N lines", the full script or multi-line command, and
 nothing of the output is rendered while closed. The `factory_sandbox_exec` and `factory_sandbox_wait` tool calls
@@ -3238,10 +4358,58 @@ themselves are summarised as "Exit N in X s · full log below" (or "Timed out �
 arguments show the handle or "latest command". The admin page has a "Sandboxes" card: runtime, containers in use of the maximum (with a note that
 every container that runs commands takes a slot and services take none), the per-container caps, the platform cap, the
 command time limit and the registries; the running sandboxes (run, project, owner, run status, age, each existing
-container as platform chip + image, services, platforms not created yet, slots held, per-container limits and the memory
-the run may use in all, definition hash) with "Stop" (confirmation: the containers go, the run continues and its next sandbox
-command creates a new one); and the projects waiting for an approval, linking to their sandbox pages. The card reloads
+container as platform chip + image — the review sandbox's as a `review` chip —, services, platforms not created yet,
+slots held, per-container limits and the memory the run may use in all, definition hash) with "Stop" (confirmation:
+the containers go, the review sandbox's too, the run continues and its next sandbox command creates a new one); and the projects waiting for an approval, linking to their sandbox pages. The card reloads
 (debounced) on every `sandboxes` frame and otherwise every 60 s. The software
 requests card notes that build and test tools can go in the project's `.agern/sandbox.yml` instead of on the host.
+
+**Deploy targets.** The project page has a "Deploy" section after the Sandbox section, for every project: one row
+linking to `/p/:repo/deploy` with a state pill and one line (`No deploy targets`, `Invalid`, `Waiting for approval`,
+`Changed since approval`, `n target(s) approved`, plus ` · no key yet` without a key); loading and error (Retry) as
+the Sandbox section. The Deploy page (`Deploy · <repo> · Agern`) follows the sandbox page's structure: crumbs, heading,
+state pill, explanation and, for admins, "Approve…" (pending) and "Revoke…" (an approval exists); a notice when
+`enabled` is false (`FACTORY_DEPLOY=off`) or the mode is `fake` ("commands only pretend to run"); the key card —
+without a key "No deploy key yet" with "Generate key" for admins ("Only an admin can generate the key" for others);
+with one the public key line read-only in monospace, a "Copy public key" button, the fingerprint, "created by … <time
+ago>", the hint to add it to `~/.ssh/authorized_keys` of a dedicated, unprivileged user, a collapsed "Lock the key
+down" block with a `restrict,command="…"` example line, and "Rotate key…" for admins (confirmation: the old key is
+deleted at once, deployments fail until the new public key is on every target; `Cancel` autofocused, `Rotate key` as
+danger); the state notice (none with an example file, invalid with the errors, pending, changed with the line diff,
+approved by whom and when); the targets (name, `user@host:port`, description, host key type and fingerprint) with a
+"Check" button per target for admins when approved and a key exists ("Checking…" while it runs, the result inline in
+`role="status"`: "Reachable, host key matches, key accepted (0.4 s)" or the failing step); and the raw file in a
+`<details>` with its short hash. "Approve…" lists every target with its host key fingerprint and says that everyone
+who can open a chat in the project can then have its agent run any command on these machines as the listed user; a
+409 `deploy_definition_changed` shows "file changed, review again" and reloads. Mutations show the returned status and
+a `role="status"` confirmation, errors `role="alert"`. The page reloads on feed reconnect (no feed frame of its own).
+In a chat transcript every `system` event with `payload.deploy` is a collapsible block like the sandbox's: target,
+`command` or `path → dest`, outcome (exit code, timed out or the error) and duration; opened, the output with the
+same truncation note. The toggle is named `Deploy command on <target>: <first line>` or `Deploy copy to <target>:
+<path>`. The `factory_deploy_exec` and `factory_deploy_copy` tool calls are summarised as `target: command` and
+`target: path → dest`, and their JSON answers are folded as for `factory_sandbox_exec`. The mock implements every
+deploy call in memory (one approved target, a key; generate, rotate, approve, revoke and check work).
+
+**Sandbox VMs.** Components in `web/src/components/sandboxvm/` (the run line, the preview panel, the transcript block),
+the page `web/src/pages/SandboxVm.tsx`, styles in `web/src/styles/sandbox.css`. The project page has a "Sandbox VM"
+row like the Deploy section (state pill and a one-line summary linking to `/p/:repo/sandbox-vm`), hidden when the state
+is `none`. The Sandbox VM page (modelled on the Deploy page) shows the states (no file, invalid with the errors,
+waiting for approval, changed since approval with the line diff, approved); the VM's details and commands; the key
+block (public key with a copy button and fingerprint, or "No key yet" with "Generate key" for admins calling
+`generateDeployKey`, and a link to the Deploy page for rotation); "Approve…" (lists `user@host:port`, the fingerprint
+and every command and says what approval allows) and "Revoke…" dialogs with `Cancel` focused through `data-autofocus`;
+"Check" with its result; the lease ("In use by run … since …", "Release…" for admins); a collapsed "Recommended VM
+setup" block; loading and error states as on the Deploy page. The run page shows, below the sandbox line and only when
+`sandboxVm.state` is not `none` or `disabled`, a line "sandbox VM <name> · definition <hash>" (plus "· used ✓") or
+"none — <reason>" with a "settings" link to `/p/<targetRepo ?? repo>/sandbox-vm`. The preview panel appears when the
+state is `approved` and the run is `needs_human`, or when a preview exists: idle ("Try it on the sandbox VM", owner or
+admin only, with the note that the VM is shared for up to `previewMinutes`), deploying (`role="status"`, buttons
+disabled), ready ("Open <url> ↗" with `target="_blank" rel="noreferrer"`, "Held until …", "Deploy again", "Release the
+VM"), failed (`role="alert"` with the step and error, the output in a collapsed `<details>`, "Try again") and released
+(the idle state plus "Released …" or "The preview ended after N minutes."). Request errors are shown inline with
+`role="alert"`; viewers who are neither owner nor admin see the state and link but no buttons. In a transcript every
+`system` event with `payload.sandboxVm` (`sandboxVmLogOf` in `components/chat/model.ts`) renders like a deploy block
+with a "sandbox VM" chip; the four tool calls are summarised next to the deploy ones. The mock (`web/src/mock/sandboxVm.ts`)
+implements every sandbox VM call.
 
 Artwork is served from `web/public/art/` (see `art/README.md`).

@@ -199,6 +199,24 @@ class ConfigTest {
     }
 
     @Test
+    fun `GitHub status URL defaults, off, explicit and invalid`() {
+        assertEquals("https://www.githubstatus.com/api/v2/summary.json", Config.fromEnv(base).githubStatusUrl)
+        assertEquals(null, Config.fromEnv(base + ("FACTORY_GITHUB_STATUS_URL" to "off")).githubStatusUrl)
+        assertEquals(null, Config.fromEnv(base + ("FACTORY_GITHUB_STATUS_URL" to "OFF")).githubStatusUrl)
+        assertEquals(null, Config.fromEnv(base + ("FACTORY_GITHUB_STATUS_URL" to "")).githubStatusUrl)
+        assertEquals("http://status.example.com/s.json", Config.fromEnv(base + ("FACTORY_GITHUB_STATUS_URL" to "http://status.example.com/s.json")).githubStatusUrl)
+        assertFailsWith<IllegalArgumentException> { Config.fromEnv(base + ("FACTORY_GITHUB_STATUS_URL" to "ftp://x/y")) }
+        assertFailsWith<IllegalArgumentException> { Config.fromEnv(base + ("FACTORY_GITHUB_STATUS_URL" to "githubstatus.com")) }
+        // GitHub Enterprise and the fake GitHub: off unless set explicitly.
+        assertEquals(null, Config.fromEnv(base + ("FACTORY_GITHUB_API_URL" to "https://ghe.example.com/api/v3")).githubStatusUrl)
+        assertEquals(null, Config.fromEnv(base + mapOf("FACTORY_AUTH" to "dev", "FACTORY_DEV_FAKE_GITHUB" to "1")).githubStatusUrl)
+        assertEquals(
+            "https://status.example.com/x",
+            Config.fromEnv(base + mapOf("FACTORY_GITHUB_API_URL" to "https://ghe.example.com/api/v3", "FACTORY_GITHUB_STATUS_URL" to "https://status.example.com/x")).githubStatusUrl,
+        )
+    }
+
+    @Test
     fun `a specific non-loopback bind address also listens on loopback for MCP`() {
         fun needs(host: String) = Config.fromEnv(base + ("FACTORY_HOST" to host)).needsLoopbackListener
         assertFalse(needs("0.0.0.0"))

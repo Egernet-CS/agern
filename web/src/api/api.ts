@@ -13,17 +13,23 @@ import type {
   CredentialKind,
   FactoryEvent,
   FeedFrame,
+  GitHubStatus,
   Issue,
   LoginStep,
   IssueKind,
   Project,
+  ProjectSettings,
   Release,
   ReleaseMode,
   Run,
   RetryMode,
   RetryOptions,
   RunStatus,
+  DeployCheck,
+  DeployStatus,
   PendingSandbox,
+  SandboxVmCheck,
+  SandboxVmStatus,
   SandboxOverview,
   SandboxStatus,
   Settings,
@@ -45,6 +51,8 @@ export type ChannelHandlers<T> = {
 /** The whole HTTP + WebSocket surface of docs/ARCHITECTURE.md §8. */
 export interface Api {
   health(): Promise<{ status: 'ok'; version: string; name: string }>;
+  /** GitHub as Agern sees it (any logged-in user). `brief`: verdict and official status only (kinds [], rateLimits null). */
+  githubStatus(opts?: { brief?: boolean }): Promise<GitHubStatus>;
   providers(): Promise<{ providers: string[]; org: string; twoFactor: boolean }>;
   login(username: string, password: string): Promise<LoginStep>;
   totp(code: string): Promise<LoginStep>;
@@ -89,6 +97,8 @@ export interface Api {
   setProjectIcon(repo: string, file: File): Promise<Project>;
   /** Sets the project's icon from an image file on its default branch (copied once). Admin only; answers the updated project. */
   setProjectIconFromRepository(repo: string, path: string): Promise<Project>;
+  /** Sets the project's merge policy and its reviewers. Admin only; answers the updated project. */
+  setProjectSettings(repo: string, settings: ProjectSettings): Promise<Project>;
   /** Removes the project's icon (also when none is set). Admin only; answers the updated project. */
   deleteProjectIcon(repo: string): Promise<Project>;
   issues(repo: string, state?: 'open' | 'closed' | 'all'): Promise<Issue[]>;
@@ -120,6 +130,11 @@ export interface Api {
   pauseRelease(id: string): Promise<Release>;
   /** Owner only; 409 `release_not_paused`, 422 `claude_credential_required`. */
   resumeRelease(id: string): Promise<Release>;
+  /**
+   * Owner or admin; 409 `release_not_waiting_for_network` unless paused with reason `network`. Holds the issue that could
+   * not start and goes on with the next one.
+   */
+  giveUpReleaseNetwork(id: string): Promise<Release>;
   /** Owner or admin; 409 `release_not_building`. Stops the running issue; what was merged stays on the branch. */
   cancelRelease(id: string): Promise<Release>;
   /**
@@ -138,6 +153,12 @@ export interface Api {
   approveRelease(id: string): Promise<Release>;
   /** Owner only: "Check again" — re-reads (or opens) the release pull request and its mergeability. 409 `release_not_ready`. */
   checkRelease(id: string): Promise<Release>;
+  /**
+   * "Bring up to date" (owner or admin): starts a run that merges the default branch into `release/<name>`. 404 / 403;
+   * 409 `release_not_ready`, `release_sync_unsupported`, `release_sync_merge_commits_disallowed`, `release_sync_running`,
+   * `release_up_to_date`; 422 `claude_credential_required`.
+   */
+  syncRelease(id: string): Promise<Release>;
   /**
    * Manual or automatic release. Planned: anyone who can see the project; scheduled or started: automatic is the owner's
    * alone, manual also an admin's (403 otherwise). 409 `release_not_editable` (released) / `release_closed` (cancelled).
@@ -170,6 +191,53 @@ export interface Api {
    */
   stopSandbox(runId: string): Promise<SandboxOverview>;
 
+  /** The project's `.agern/deploy.yml` on its default branch, its approval and the project's public deploy key. */
+  deployStatus(repo: string): Promise<DeployStatus>;
+  /**
+   * Admin: approves exactly the content with this hash. 409 `deploy_definition_changed` when the file changed meanwhile,
+   * 422 `deploy_definition_invalid`, 404 when there is no file, 403 for non-admins.
+   */
+  approveDeploy(repo: string, sha256: string): Promise<DeployStatus>;
+  /** Admin: removes the project's deploy approval; no target is usable until a version is approved again. */
+  revokeDeployApproval(repo: string): Promise<DeployStatus>;
+  /** Admin: generates the project's Ed25519 key pair. 409 `deploy_key_exists` when there is one. */
+  generateDeployKey(repo: string): Promise<DeployStatus>;
+  /** Admin: replaces the key pair at once (the old private key is deleted). 404 when there is none. */
+  rotateDeployKey(repo: string): Promise<DeployStatus>;
+  /**
+   * Admin: connects to a target, verifies its host key and authenticates, then disconnects (runs no command). Connection
+   * problems are `ok: false`; 409 `deploy_not_approved`, `deploy_key_missing`, `deploy_busy` or `deploy_disabled`, 404 unknown target.
+   */
+  checkDeployTarget(repo: string, target: string): Promise<DeployCheck>;
+
+  /**
+   * The project's `.agern/sandbox-vm.yml` on its default branch, its approval, the project's public deploy key (shared with
+   * deploy targets; generated with `generateDeployKey`) and the VM's lease (anyone who can see the project).
+   */
+  getSandboxVm(repo: string): Promise<SandboxVmStatus>;
+  /**
+   * Admin: approves exactly the content with this hash. 409 `sandbox_vm_definition_changed` when the file changed meanwhile,
+   * 422 `sandbox_vm_definition_invalid`, 404 when there is no file, 403 for non-admins.
+   */
+  approveSandboxVm(repo: string, sha256: string): Promise<SandboxVmStatus>;
+  /** Admin: removes the approval; the repository's leases end at once (without `reset`). */
+  revokeSandboxVm(repo: string): Promise<SandboxVmStatus>;
+  /**
+   * Admin: connects, verifies the host key, authenticates and runs `ready.command` once. Connection problems are `ok: false`;
+   * 409 `sandbox_vm_disabled`, `sandbox_vm_not_approved` or `sandbox_vm_key_missing`.
+   */
+  checkSandboxVm(repo: string): Promise<SandboxVmCheck>;
+  /** Admin: ends the VM's lease (its `reset` runs). 404 when there is no lease. */
+  releaseSandboxVmLease(repo: string): Promise<SandboxVmStatus>;
+  /**
+   * Owner or admin of a run that needs a human: deploys its latest commit to the sandbox VM in the background and answers
+   * the run (preview `deploying`). 409 `run_not_waiting`, `sandbox_vm_disabled`, `sandbox_vm_not_approved`,
+   * `sandbox_vm_key_missing` or `sandbox_vm_busy`; 403 for others.
+   */
+  startSandboxVmPreview(runId: string): Promise<Run>;
+  /** Owner or admin: ends the run's preview (the VM's `reset` runs); the preview becomes `released`. 404 when none is active. */
+  releaseSandboxVmPreview(runId: string): Promise<Run>;
+
   projectRuns(repo: string): Promise<Run[]>;
   startRun(repo: string, issueNumber: number): Promise<Run>;
   /** Creates the missing member labels of a workspace project with the caller's token (403 `labels_forbidden`). */
@@ -178,7 +246,16 @@ export interface Api {
   runs(filter?: { active?: boolean; status?: RunStatus[] }): Promise<Run[]>;
   run(id: string): Promise<Run>;
   approveRun(id: string): Promise<Run>;
+  /**
+   * Owner only: merges although the checks on `headSha` have not passed (docs/ARCHITECTURE.md §6 "Checks before a
+   * merge"). 409 `run_not_overridable` / `checks_changed` / `review_required` / `review_in_progress` / `agent_busy`.
+   */
+  mergeAnywayRun(id: string, headSha: string): Promise<Run>;
   cancelRun(id: string): Promise<Run>;
+  /** "Retry now" for a run waiting for the network. Owner or admin (403); 409 `run_not_waiting_for_network`. */
+  retryRunNow(id: string): Promise<Run>;
+  /** "Give up" for a run waiting for the network: it fails now. Owner or admin (403); 409 `run_not_waiting_for_network`. */
+  giveUpRun(id: string): Promise<Run>;
   /**
    * Owner only (403 for everyone else, admins included): a message to the run's advisor while it needs a human. 409
    * `run_not_waiting` / `review_in_progress` / `agent_busy` / `too_many_agents` / `run_worktree_missing`, 422
