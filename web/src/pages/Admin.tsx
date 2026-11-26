@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, Navigate } from 'react-router-dom';
-import { api, ApiError, type McpToken, type RunningSandbox, type Settings, type SoftwareRequest, type StageRole, type User } from '../api';
+import { api, ApiError, runRef, type McpToken, type RunningSandbox, type Settings, type SoftwareRequest, type StageRole, type User } from '../api';
 import { shortHash, shortImage } from '../components/sandbox/SandboxBits';
 import { McpTokenTable, RevokeMcpTokenDialog } from '../components/ui/McpTokens';
 import { Dialog, ErrorBox, Loading, Notice } from '../components/ui/ui';
@@ -271,13 +271,13 @@ function SandboxesCard() {
                     <span className="sbx-run-title">
                       {s.visible ? (
                         <Link to={`/p/${s.repo}/runs/${s.runId}`}>
-                          <span className="mono muted">#{s.issueNumber}</span> {s.issueTitle}
+                          <span className="mono muted">{runRef(s)}</span> {s.issueTitle}
                         </Link>
                       ) : (
-                        <span className="mono">run {s.runId.slice(0, 8)} · #{s.issueNumber}</span>
+                        <span className="mono">run {s.runId.slice(0, 8)} · {runRef(s)}</span>
                       )}
                     </span>
-                    <button type="button" className="btn btn--sm btn--ghost btn--danger" onClick={() => (setErr(null), setTarget(s))} aria-label={`Stop the sandbox of run #${s.issueNumber} in ${s.repo}`}>
+                    <button type="button" className="btn btn--sm btn--ghost btn--danger" onClick={() => (setErr(null), setTarget(s))} aria-label={`Stop the sandbox of run ${runRef(s)} in ${s.repo}`}>
                       Stop
                     </button>
                   </div>
@@ -341,7 +341,7 @@ function SandboxesCard() {
           ))}
         </ul>
       )}
-      <Dialog open={!!target} onClose={() => setTarget(null)} title={`Stop the sandbox of run #${target?.issueNumber ?? ''}?`}>
+      <Dialog open={!!target} onClose={() => setTarget(null)} title={`Stop the sandbox of run ${target ? runRef(target) : ''}?`}>
         <div className="form">
           <p>
             Its containers and network are removed now, and so is the run’s review sandbox if it has one (cache volumes are kept); a command running in either is killed. The run

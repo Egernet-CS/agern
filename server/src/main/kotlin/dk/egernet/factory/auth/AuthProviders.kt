@@ -1,5 +1,6 @@
 package dk.egernet.factory.auth
 
+import com.unboundid.ldap.sdk.DN
 import com.unboundid.ldap.sdk.Filter
 import com.unboundid.ldap.sdk.RDN
 import com.unboundid.ldap.sdk.LDAPConnection
@@ -72,14 +73,35 @@ class DevAuthProvider(private val users: Map<String, String>) : AuthProvider {
 /**
  * LDAP bind. Either a DN template (`uid={0},ou=people,dc=x`) or search-then-bind
  * (optionally as FACTORY_LDAP_BIND_DN) under FACTORY_LDAP_BASE_DN with FACTORY_LDAP_USER_FILTER.
+ *
+ * Optional group check (FACTORY_LDAP_REQUIRED_GROUP, works in both modes): after the user's own bind,
+ * on the same connection and as that user, an LDAP compare asks each configured group in turn whether
+ * its member attribute (FACTORY_LDAP_GROUP_MEMBER_ATTRIBUTE) holds the user's DN or login name
+ * (FACTORY_LDAP_GROUP_MEMBER_VALUE). One match admits the user. Anything else, including a group that
+ * cannot be read, refuses the login exactly like a wrong password; only the server log says why.
  */
 class LdapAuthProvider(private val cfg: LdapConfig) : AuthProvider {
     override val name = "ldap"
+
+    private companion object {
+        val ATTRIBUTE_RE = Regex("^[A-Za-z][A-Za-z0-9-]*$")
+    }
 
     init {
         require(cfg.url != null) { "FACTORY_LDAP_URL is required for the ldap provider" }
         require(cfg.userDnTemplate != null || cfg.baseDn != null) {
             "Either FACTORY_LDAP_USER_DN_TEMPLATE or FACTORY_LDAP_BASE_DN is required for the ldap provider"
+        }
+        for (g in cfg.requiredGroups) {
+            require(g.isNotBlank() && DN.isValidDN(g) && !DN(g).isNullDN) {
+                "FACTORY_LDAP_REQUIRED_GROUP contains an invalid DN: '$g' (separate several groups with ';')"
+            }
+        }
+        require(cfg.groupMemberValue == "dn" || cfg.groupMemberValue == "uid") {
+            "FACTORY_LDAP_GROUP_MEMBER_VALUE must be 'dn' or 'uid', not '${cfg.groupMemberValue}'"
+        }
+        require(ATTRIBUTE_RE.matches(cfg.groupMemberAttribute)) {
+            "FACTORY_LDAP_GROUP_MEMBER_ATTRIBUTE is not a valid attribute name: '${cfg.groupMemberAttribute}'"
         }
     }
 
@@ -115,6 +137,7 @@ class LdapAuthProvider(private val cfg: LdapConfig) : AuthProvider {
                 if (e.resultCode == ResultCode.INVALID_CREDENTIALS) return null
                 throw e
             }
+            if (!inRequiredGroup(conn, userDn, username)) return null
             if (displayName == null) {
                 displayName = runCatching {
                     conn.getEntry(userDn, "displayName", "cn")?.let { it.getAttributeValue("displayName") ?: it.getAttributeValue("cn") }
@@ -123,6 +146,34 @@ class LdapAuthProvider(private val cfg: LdapConfig) : AuthProvider {
             return AuthResult(username, displayName ?: username)
         }
     }
+
+    /**
+     * True when no group is required, or when one of the required groups lists the user. Runs on [conn]
+     * while it is bound as the user, so no service account is involved. Fails closed: compareFalse and
+     * every LDAPException (no such object, insufficient access, no such attribute, connection errors)
+     * count as "not a member".
+     */
+    private fun inRequiredGroup(conn: LDAPConnection, userDn: String, username: String): Boolean {
+        if (cfg.requiredGroups.isEmpty()) return true
+        val value = if (cfg.groupMemberValue == "uid") username else userDn
+        val who = loggable(username)
+        for (group in cfg.requiredGroups) {
+            try {
+                if (conn.compare(group, cfg.groupMemberAttribute, value).compareMatched()) return true
+            } catch (e: LDAPException) {
+                log.warn("ldap: cannot check {} for {}: {}", group, who, e.resultCode)
+            }
+        }
+        if (cfg.requiredGroups.size == 1) {
+            log.warn("ldap: {} is not in {}", who, cfg.requiredGroups.single())
+        } else {
+            log.warn("ldap: {} is not in any of {}", who, cfg.requiredGroups.joinToString("; "))
+        }
+        return false
+    }
+
+    /** The provider can be called without AuthService's username rule; keep control characters out of the log. */
+    private fun loggable(username: String): String = username.filterNot { it.isISOControl() }.take(128)
 
     /** RFC 4514 escaping of an attribute value, via the SDK's RDN encoder. */
     private fun escapeDnValue(v: String): String = RDN("x", v).toString().substringAfter('=')

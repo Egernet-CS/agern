@@ -100,7 +100,8 @@ are the settings worth knowing about; their defaults suit a small team:
 \section{Adding users}\label{sec:users}
 
 Agern has no user database of its own to manage: whoever can sign in with an account of the
-machine (\texttt{os}) or of your directory (\texttt{ldap}) can use it. What a person then sees is
+machine (\texttt{os}) or of your directory (\texttt{ldap}) can use it; with a directory, you can
+limit this to the members of a group. What a person then sees is
 decided by their own GitHub token.
 
 \begin{enumerate}
@@ -116,6 +117,18 @@ FACTORY_LDAP_USER_DN_TEMPLATE=uid={0},ou=people,dc=example,dc=com
 \end{lstlisting}
     For search-then-bind, see the \texttt{FACTORY\_LDAP\_\ldots} lines in
     \file{/etc/agern/agern.env}. \texttt{FACTORY\_AUTH=os,ldap} tries both, in that order.
+
+    Without more, everyone in the directory can sign in. If the directory holds more people than
+    your team, set \envvar{FACTORY_LDAP_REQUIRED_GROUP} to the DN of a group (several separated by
+    \texttt{;}); only its members get in. Agern checks it as the signing-in user, so no service
+    account is needed, and a refused user sees the same message as for a wrong password:
+\begin{lstlisting}[style=conf]
+FACTORY_LDAP_REQUIRED_GROUP=cn=agern,ou=groups,dc=example,dc=com
+\end{lstlisting}
+    For \texttt{groupOfUniqueNames} set \envvar{FACTORY_LDAP_GROUP_MEMBER_ATTRIBUTE} to
+    \texttt{uniqueMember}; for \texttt{posixGroup} set it to \texttt{memberUid} and
+    \envvar{FACTORY_LDAP_GROUP_MEMBER_VALUE} to \texttt{uid}. Users must be allowed to read the
+    group's members. Removing someone from the group shuts them out at their next sign-in.
   \item \textbf{Admins}: add the user name to \envvar{FACTORY_ADMINS} and restart. Admins see the
     \ui{Admin} page, approve sandboxes and can stop or cancel anybody's agents, but never drive
     them.

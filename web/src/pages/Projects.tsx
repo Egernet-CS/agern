@@ -87,7 +87,7 @@ export function ProjectsPage() {
           {waiting.map((r) => (
             <Link key={r.id} to={`/p/${r.repo}/runs/${r.id}`} className="strip-item strip-item--warn">
               <span className="strip-k">needs human</span>
-              <span className="mono">{r.repo}#{r.issueNumber}</span> {r.issueTitle}
+              <span className="mono">{r.repo}{r.kind === 'sync' ? ' · sync' : `#${r.issueNumber}`}</span> {r.issueTitle}
               <span className="muted"> · {r.owner.username}</span>
             </Link>
           ))}

@@ -16,7 +16,8 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 
-class GitHubException(val status: Int, message: String) : RuntimeException(message)
+/** A GitHub answer that was not a success. [requestId]: GitHub's `x-github-request-id`, when it sent one. */
+class GitHubException(val status: Int, message: String, val requestId: String? = null) : RuntimeException(message)
 
 @Serializable
 data class GhUser(
@@ -97,10 +98,18 @@ data class GhPullInfo(
     val head: GhRef = GhRef(),
     val base: GhRef = GhRef(),
     @SerialName("merge_commit_sha") val mergeCommitSha: String? = null,
+    /** Who merged it; null while open or when GitHub does not report it. */
+    @SerialName("merged_by") val mergedBy: GhLogin? = null,
 )
 
-/** One commit status (`GET /repos/{o}/{r}/commits/{ref}/status`, the latest per context): [state] is `success`, `pending`, `failure` or `error`. */
-@Serializable data class GhCommitStatus(val context: String = "", val state: String = "pending")
+/**
+ * One commit status (`GET /repos/{o}/{r}/commits/{ref}/status`, the latest per context): [state] is `success`, `pending`,
+ * `failure` or `error`; [targetUrl] is where it links to (untrusted).
+ */
+@Serializable
+data class GhCommitStatus(
+    val context: String = "", val state: String = "pending", @SerialName("target_url") val targetUrl: String? = null,
+)
 
 /** The combined commit status. GitHub answers `state: pending` with [totalCount] 0 when there are no statuses at all. */
 @Serializable
@@ -115,46 +124,111 @@ data class GhCombinedStatus(
  * `requested`, `pending`); once completed, [conclusion] is `success`, `neutral`, `skipped`, `failure`, `cancelled`,
  * `timed_out`, `action_required` or `stale`.
  */
-@Serializable data class GhCheckRun(val name: String = "", val status: String = "queued", val conclusion: String? = null)
+@Serializable
+data class GhCheckRun(
+    val name: String = "", val status: String = "queued", val conclusion: String? = null,
+    @SerialName("html_url") val htmlUrl: String? = null,
+)
+
+/**
+ * One GitHub Actions workflow run (`GET /repos/{o}/{r}/actions/runs?head_sha=`). A run that is queued but not started,
+ * or that ended in `startup_failure`, has no check runs: only the workflow run shows it. [status] is `queued`,
+ * `in_progress`, `completed` (or `waiting`, `requested`, `pending`); once completed, [conclusion] is e.g. `success`,
+ * `failure`, `cancelled`, `startup_failure`, `timed_out`.
+ */
+@Serializable
+data class GhWorkflowRun(
+    val id: Long = 0, val name: String? = null, @SerialName("workflow_id") val workflowId: Long = 0, val event: String = "",
+    val status: String = "queued", val conclusion: String? = null, @SerialName("html_url") val htmlUrl: String? = null,
+)
+
+@Serializable
+private data class GhWorkflowRunPage(
+    @SerialName("total_count") val totalCount: Int = 0, @SerialName("workflow_runs") val workflowRuns: List<GhWorkflowRun> = emptyList(),
+)
 
 @Serializable
 private data class GhCheckRunPage(@SerialName("total_count") val totalCount: Int = 0, @SerialName("check_runs") val checkRuns: List<GhCheckRun> = emptyList())
 
-/** What the checks on one commit add up to (docs/ARCHITECTURE.md §6 "Releasing", "Checks"). */
-data class ChecksSummary(val state: String, val detail: String) {
+/** One check that has not passed: its [name], where it links to (untrusted) and, for a failed one, its conclusion. */
+data class CheckItem(val name: String, val url: String? = null, val conclusion: String? = null)
+
+/**
+ * What the checks on one commit add up to (docs/ARCHITECTURE.md §6 "Checks"); [failing] and [pending] name the checks
+ * behind a `failed` or `pending` state.
+ */
+data class ChecksSummary(
+    val state: String, val detail: String,
+    val failing: List<CheckItem> = emptyList(), val pending: List<CheckItem> = emptyList(),
+) {
     companion object {
         private val PASSING_CONCLUSIONS = setOf("success", "neutral", "skipped")
 
+        /** Conclusions of checks that did not run to completion: re-running them on GitHub may be all it takes. */
+        val INCOMPLETE_CONCLUSIONS = setOf("startup_failure", "cancelled", "timed_out", "stale")
+
         /**
-         * `failed` if any status is `failure`/`error` or any completed check run did not pass; else `pending` if any
-         * status is `pending` or any check run is not completed; else `passed`, or `none` when there are no checks.
+         * `failed` if any status is `failure`/`error`, any completed check run did not pass or any completed workflow run
+         * did not pass; else `pending` if any status is `pending` or any check run or workflow run is not completed; else
+         * `passed`, or `none` when there are no checks. Of [workflowRuns], only the latest (highest id) per workflow and
+         * event counts.
          */
-        fun of(status: GhCombinedStatus, runs: List<GhCheckRun>): ChecksSummary {
-            val failing = mutableListOf<String>()
-            val pending = mutableListOf<String>()
+        fun of(status: GhCombinedStatus, runs: List<GhCheckRun>, workflowRuns: List<GhWorkflowRun> = emptyList()): ChecksSummary {
+            val failing = mutableListOf<CheckItem>()
+            val pending = mutableListOf<CheckItem>()
             var passed = 0
             for (st in status.statuses) when (st.state) {
                 "success" -> passed++
-                "failure", "error" -> failing += st.context
-                else -> pending += st.context
+                "failure", "error" -> failing += CheckItem(st.context, st.targetUrl, st.state)
+                else -> pending += CheckItem(st.context, st.targetUrl)
             }
             for (run in runs) when {
-                run.status != "completed" -> pending += run.name
+                run.status != "completed" -> pending += CheckItem(run.name, run.htmlUrl)
                 run.conclusion in PASSING_CONCLUSIONS -> passed++
-                else -> failing += run.name
+                else -> failing += CheckItem(run.name, run.htmlUrl, run.conclusion ?: "unknown")
+            }
+            val latest = workflowRuns.groupBy { it.workflowId to it.event }.values.map { l -> l.maxBy { it.id } }.sortedBy { it.id }
+            for (wr in latest) {
+                val name = wr.name?.takeIf { it.isNotBlank() } ?: "workflow ${wr.workflowId}"
+                when {
+                    wr.status != "completed" -> pending += CheckItem(name, wr.htmlUrl)
+                    wr.conclusion in PASSING_CONCLUSIONS -> passed++
+                    else -> failing += CheckItem(name, wr.htmlUrl, wr.conclusion ?: "unknown")
+                }
             }
             // More statuses than were listed: the combined state still covers them.
             if (status.totalCount > status.statuses.size) when (status.state) {
-                "failure", "error" -> if (failing.isEmpty()) failing += "commit status"
-                "pending" -> if (pending.isEmpty()) pending += "commit status"
+                "failure", "error" -> if (failing.isEmpty()) failing += CheckItem("commit status", null, status.state)
+                "pending" -> if (pending.isEmpty()) pending += CheckItem("commit status")
             }
-            fun names(l: List<String>) = l.distinct().joinToString(", ").take(500)
+            fun names(l: List<CheckItem>) = l.map { it.name }.distinct().joinToString(", ").take(500)
+            fun distinct(l: List<CheckItem>) = l.distinctBy { it.name to it.conclusion }
             return when {
-                failing.isNotEmpty() -> ChecksSummary("failed", "Failed: ${names(failing)}")
-                pending.isNotEmpty() -> ChecksSummary("pending", "Pending: ${names(pending)}")
+                failing.isNotEmpty() -> ChecksSummary("failed", "Failed: ${names(failing)}", distinct(failing), distinct(pending))
+                pending.isNotEmpty() -> ChecksSummary("pending", "Pending: ${names(pending)}", pending = distinct(pending))
                 passed == 0 -> ChecksSummary("none", "No checks")
                 else -> ChecksSummary("passed", "$passed check${if (passed == 1) "" else "s"} passed")
             }
+        }
+
+        /**
+         * Reads the checks on [sha] of [repo] (commit statuses, check runs and GitHub Actions workflow runs) and sums them
+         * up with [of]: the one rule set for runs and releases. A refused or failed read of the statuses or check runs
+         * throws; a refused or failed read of the workflow runs alone is passed to [onWorkflowRunsError] and ignored (a
+         * token without Actions access still sees statuses and check runs). Blocking.
+         */
+        fun read(
+            client: GitHubClient, org: String, repo: String, sha: String, onWorkflowRunsError: (Exception) -> Unit = {},
+        ): ChecksSummary {
+            val status = client.combinedStatus(org, repo, sha)
+            val runs = client.checkRuns(org, repo, sha)
+            val workflowRuns = try {
+                client.workflowRuns(org, repo, sha)
+            } catch (e: Exception) {
+                onWorkflowRunsError(e)
+                emptyList()
+            }
+            return of(status, runs, workflowRuns)
         }
     }
 }
@@ -175,7 +249,11 @@ interface GitHubClient {
     fun closeIssue(org: String, repo: String, number: Int)
     fun findOpenPull(org: String, repo: String, branch: String): GhPull?
     fun createPull(org: String, repo: String, head: String, base: String, title: String, body: String): GhPull
-    fun squashMerge(org: String, repo: String, number: Int, title: String)
+    /**
+     * Squash-merges a pull request. [expectedHeadSha], when given, makes GitHub refuse (409) if the head branch moved
+     * since it was read; refusals surface as [GitHubException].
+     */
+    fun squashMerge(org: String, repo: String, number: Int, title: String, expectedHeadSha: String? = null)
     /** A file's raw content on [ref] (a branch name), or null when it does not exist there. */
     fun getFile(org: String, repo: String, path: String, ref: String): String?
     /** A file's raw bytes on [ref], at most [maxBytes] of them (the rest is not read); null when the file does not exist. */
@@ -186,6 +264,11 @@ interface GitHubClient {
     fun createBranch(org: String, repo: String, branch: String, sha: String)
     /** One pull request with its mergeability; null when it does not exist. */
     fun getPull(org: String, repo: String, number: Int): GhPullInfo?
+    /**
+     * Requests [reviewers] (GitHub logins) and [teamReviewers] (team slugs of [org]) on pull request [number]
+     * (`POST /repos/{o}/{r}/pulls/{n}/requested_reviewers`). Nothing is sent when both are empty.
+     */
+    fun requestReviewers(org: String, repo: String, number: Int, reviewers: List<String>, teamReviewers: List<String>)
     /** Replaces a pull request's title and body. */
     fun updatePull(org: String, repo: String, number: Int, title: String, body: String)
     /**
@@ -201,6 +284,8 @@ interface GitHubClient {
     fun combinedStatus(org: String, repo: String, sha: String): GhCombinedStatus
     /** The latest check runs of [sha] (at most a few hundred). */
     fun checkRuns(org: String, repo: String, sha: String): List<GhCheckRun>
+    /** The GitHub Actions workflow runs of head commit [sha] (at most 100, newest first). */
+    fun workflowRuns(org: String, repo: String, sha: String): List<GhWorkflowRun>
     /** Whether commit [sha] exists in [repo] (`GET /repos/{o}/{r}/commits/{sha}`: 404 and 422 mean it does not). */
     fun commitExists(org: String, repo: String, sha: String): Boolean
     /** The commit the gitlink (submodule pointer) at [path] points at on [ref]; null when [path] is no gitlink there. */
@@ -228,6 +313,11 @@ interface GitHubClient {
      * already exists (422 `already_exists`); other refusals surface as [GitHubException] (403/404: no permission).
      */
     fun createLabel(org: String, repo: String, name: String, color: String, description: String): Boolean
+    /**
+     * This token's REST (`core`) and GraphQL limits from `GET /rate_limit`; null when GitHub has rate limiting off
+     * (GitHub Enterprise) or the implementation does not know them.
+     */
+    fun rateLimit(): GhRateLimits? = null
 }
 
 /** The merge methods [GitHubClient.mergePull] accepts: never `squash`. */
@@ -241,13 +331,24 @@ interface GitHub {
     val isFake: Boolean get() = false
 }
 
-class HttpGitHub(private val apiUrl: String = "https://api.github.com", private val webUrl: String = "https://github.com") : GitHub {
+/**
+ * GitHub's REST API. Every exchange goes through one function that reports its outcome to [health] (docs/ARCHITECTURE.md
+ * §6 "GitHub status"), when given.
+ */
+class HttpGitHub(
+    private val apiUrl: String = "https://api.github.com",
+    private val webUrl: String = "https://github.com",
+    private val health: GitHubHealth? = null,
+) : GitHub {
     private val http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).followRedirects(HttpClient.Redirect.NORMAL).build()
 
     override fun client(token: String): GitHubClient = Client(token)
     override fun cloneUrl(org: String, repo: String) = "$webUrl/$org/$repo.git"
 
     private inner class Client(private val token: String) : GitHubClient {
+        /** The token's fingerprint for the rate-limit observations; the token itself never reaches [health]. */
+        private val fingerprint: String? by lazy { if (health == null) null else GitHubHealth.fingerprint(token) }
+
         private fun enc(s: String) = URLEncoder.encode(s, Charsets.UTF_8).replace("+", "%20")
 
         private fun request(method: String, path: String, body: JsonObject? = null, accept: String = "application/vnd.github+json"): HttpRequest {
@@ -263,17 +364,51 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
             return b.build()
         }
 
+        /**
+         * The one place an HTTP exchange with GitHub happens: sends [req] and records the outcome (the answer's status,
+         * headers and [bodyMessage], or the exception, which is rethrown unchanged).
+         */
+        private fun <T> exchange(
+            req: HttpRequest, path: String, handler: HttpResponse.BodyHandler<T>, bodyMessage: (HttpResponse<T>) -> String?,
+        ): HttpResponse<T> {
+            val r = try {
+                http.send(req, handler)
+            } catch (e: Throwable) {
+                health?.recordHttpFailure(relative(path), e)
+                throw e
+            }
+            health?.let { h ->
+                val msg = if (r.statusCode() >= 400) runCatching { bodyMessage(r) }.getOrNull() else null
+                h.recordHttp(relative(path), r.statusCode(), { name -> r.headers().firstValue(name).orElse(null) }, msg, fingerprint)
+            }
+            return r
+        }
+
+        /** [path] without the API base when it is an absolute URL on it (pagination links). */
+        private fun relative(path: String): String {
+            val base = apiUrl.trimEnd('/')
+            return if (path.startsWith("$base/")) path.removePrefix(base) else path
+        }
+
         private fun send(method: String, path: String, body: JsonObject? = null, accept: String = "application/vnd.github+json"): HttpResponse<String> =
-            http.send(request(method, path, body, accept), HttpResponse.BodyHandlers.ofString())
+            exchange(request(method, path, body, accept), path, HttpResponse.BodyHandlers.ofString()) { messageOf(it.body()) }
 
         private fun ok(r: HttpResponse<String>, what: String): String {
             if (r.statusCode() in 200..299) return r.body()
-            throw failure(r.statusCode(), r.body(), what)
+            throw failure(r.statusCode(), r.body(), what, r.headers())
         }
 
-        private fun failure(status: Int, body: String, what: String): GitHubException {
+        /** GitHub's `message` of an error body; null when the body is no JSON object with a string `message`. */
+        private fun messageOf(body: String?): String? = runCatching {
+            ((AppJson.parseToJsonElement(body ?: return null) as? JsonObject)?.get("message") as? kotlinx.serialization.json.JsonPrimitive)
+                ?.takeIf { it.isString }?.content
+        }.getOrNull()
+
+        private fun failure(status: Int, body: String, what: String, headers: java.net.http.HttpHeaders): GitHubException {
+            val requestId = GitHubHealth.validRequestId(headers.firstValue(GitHubHealth.REQUEST_ID_HEADER).orElse(null))
+            if (status >= 500) return GitHubFailure.serverError(what, status, requestId, messageOf(body), health?.org ?: "")
             val msg = runCatching { AppJson.parseToJsonElement(body).let { (it as JsonObject)["message"].toString().trim('"') } }.getOrNull()
-            return GitHubException(status, "GitHub $what failed: $status ${msg ?: ""}".trim())
+            return GitHubException(status, "GitHub $what failed: $status ${msg ?: ""}".trim(), requestId)
         }
 
         private fun nextLink(r: HttpResponse<String>): String? =
@@ -366,21 +501,26 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
 
         override fun getFileBytes(org: String, repo: String, path: String, ref: String, maxBytes: Long): ByteArray? {
             val p = path.split('/').joinToString("/") { enc(it) }
-            val req = request("GET", "/repos/${enc(org)}/${enc(repo)}/contents/$p?ref=${enc(ref)}", accept = "application/vnd.github.raw+json")
-            val r = http.send(req, HttpResponse.BodyHandlers.ofInputStream())
+            val path = "/repos/${enc(org)}/${enc(repo)}/contents/$p?ref=${enc(ref)}"
+            val req = request("GET", path, accept = "application/vnd.github.raw+json")
+            // The body is a stream that is read only below: GitHub's message is not known when the exchange is recorded.
+            val r = exchange(req, path, HttpResponse.BodyHandlers.ofInputStream()) { null }
             // Closing the stream early drops the rest of the body: never more than the limit is read.
             return r.body().use { body ->
                 when (r.statusCode()) {
                     404 -> null
                     in 200..299 -> body.readNBytes(maxBytes.coerceIn(0, Int.MAX_VALUE.toLong() - 8).toInt())
-                    else -> throw failure(r.statusCode(), String(body.readNBytes(64 * 1024), Charsets.UTF_8), "GET contents")
+                    else -> throw failure(r.statusCode(), String(body.readNBytes(64 * 1024), Charsets.UTF_8), "GET contents", r.headers())
                 }
             }
         }
 
-        override fun squashMerge(org: String, repo: String, number: Int, title: String) {
+        override fun squashMerge(org: String, repo: String, number: Int, title: String, expectedHeadSha: String?) {
             ok(send("PUT", "/repos/${enc(org)}/${enc(repo)}/pulls/$number/merge",
-                buildJsonObject { put("merge_method", "squash"); put("commit_title", title) }), "merge pull request")
+                buildJsonObject {
+                    put("merge_method", "squash"); put("commit_title", title)
+                    if (expectedHeadSha != null) put("sha", expectedHeadSha)
+                }), "merge pull request")
         }
 
         /** A branch name in a URL path: each segment encoded, the `/` between them kept. */
@@ -402,6 +542,15 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
             val r = send("GET", "/repos/${enc(org)}/${enc(repo)}/pulls/$number")
             if (r.statusCode() == 404) return null
             return AppJson.decodeFromString(GhPullInfo.serializer(), ok(r, "GET pull request"))
+        }
+
+        override fun requestReviewers(org: String, repo: String, number: Int, reviewers: List<String>, teamReviewers: List<String>) {
+            if (reviewers.isEmpty() && teamReviewers.isEmpty()) return
+            ok(send("POST", "/repos/${enc(org)}/${enc(repo)}/pulls/$number/requested_reviewers",
+                buildJsonObject {
+                    putJsonArray("reviewers") { reviewers.forEach { add(it) } }
+                    putJsonArray("team_reviewers") { teamReviewers.forEach { add(it) } }
+                }), "request reviewers")
         }
 
         override fun updatePull(org: String, repo: String, number: Int, title: String, body: String) {
@@ -493,6 +642,22 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
                 buildJsonObject { put("sha", sha); put("force", force) }), "update branch")
         }
 
+        override fun rateLimit(): GhRateLimits? {
+            val r = send("GET", "/rate_limit")
+            if (r.statusCode() == 404) return null
+            val resources = (AppJson.parseToJsonElement(ok(r, "GET rate limit")) as? JsonObject)?.get("resources") as? JsonObject ?: return null
+            val now = java.time.Instant.now()
+            fun one(name: String): GhRateLimit? {
+                val o = resources[name] as? JsonObject ?: return null
+                fun n(k: String) = (o[k] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toLongOrNull()
+                val limit = n("limit") ?: return null
+                val remaining = n("remaining") ?: return null
+                val reset = n("reset") ?: return null
+                return GhRateLimit(limit.toInt(), remaining.toInt(), java.time.Instant.ofEpochSecond(reset), now)
+            }
+            return GhRateLimits(one("core"), one("graphql"))
+        }
+
         override fun checkRuns(org: String, repo: String, sha: String): List<GhCheckRun> {
             val out = mutableListOf<GhCheckRun>()
             var page = 1
@@ -504,6 +669,11 @@ class HttpGitHub(private val apiUrl: String = "https://api.github.com", private 
                 page++
             }
             return out
+        }
+
+        override fun workflowRuns(org: String, repo: String, sha: String): List<GhWorkflowRun> {
+            val r = send("GET", "/repos/${enc(org)}/${enc(repo)}/actions/runs?head_sha=${enc(sha)}&per_page=100")
+            return AppJson.decodeFromString(GhWorkflowRunPage.serializer(), ok(r, "GET workflow runs")).workflowRuns
         }
     }
 }

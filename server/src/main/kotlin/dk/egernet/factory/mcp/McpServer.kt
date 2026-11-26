@@ -97,7 +97,10 @@ class McpServer(
             schema(Triple("activeOnly", "boolean", "Only runs that are not finished"))),
         Tool("factory_get_run", "Get a pipeline run with its stages, verdicts and findings.",
             schema(Triple("runId", "string", "Run id"), required = listOf("runId"))),
-        Tool("factory_approve_run", "Merge a run that waits in needs_human. Only the run's owner may do this.",
+        Tool("factory_approve_run", "Merge a run that waits in needs_human. Only the run's owner may do this. The merge waits " +
+                "for the checks on the pull request's head commit: passed checks merge at once, pending ones leave the run " +
+                "waiting_for_checks until they pass, failed ones leave it in needs_human. Refused for projects that merge " +
+                "on GitHub (merge policy `github`): their pull requests are reviewed and merged there.",
             schema(Triple("runId", "string", "Run id"), required = listOf("runId"))),
         Tool("factory_cancel_run", "Cancel a pipeline run.",
             schema(Triple("runId", "string", "Run id"), required = listOf("runId"))),
@@ -330,7 +333,7 @@ class McpServer(
                 "factory_approve_run" -> {
                     val runId = uuid("runId")
                     if (grant.personal != null && factory.visibleRun(owner, runId).repo != repo) return toolError("Run belongs to another project")
-                    factory.approveRun(owner, runId).let { "Run ${it.id}: ${it.status}" + (it.error?.let { e -> " — $e" } ?: "") }
+                    FactoryService.approvedRunReply(factory.approveRun(owner, runId))
                 }
                 "factory_cancel_run" -> {
                     val runId = uuid("runId")

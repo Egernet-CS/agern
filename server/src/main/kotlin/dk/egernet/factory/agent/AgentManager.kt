@@ -146,7 +146,8 @@ data class StageAgentRequest(
     val role: String,
     val model: String,
     val runId: UUID,
-    val issueNumber: Int,
+    /** The run's issue; null for a run that belongs to no issue (a sync run). */
+    val issueNumber: Int?,
     val parentSessionId: UUID?,
     val workDir: Path,
     val systemPrompt: String,

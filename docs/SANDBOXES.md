@@ -35,6 +35,9 @@ clean environment, without anyone installing that toolchain on the factory host:
 - **a network boundary.** Outbound network is Podman's default, so package registries work — and so
   does the host's LAN. Nothing is restricted in this release.
 
+For the whole trust model (who can do what, what agents can do with the owner's GitHub token, what is
+merged without a human), see [README.md, "Security: read this first"](../README.md#security-read-this-first).
+
 Three stages use the sandbox. The spec writer reads its description (`factory_sandbox_info`) and plans
 its use in the spec's **Verification** section; it cannot run anything. The builder runs commands in it
 with the worktree read-write. The `ux` and `ui-design` reviewers get a separate, read-only **review
