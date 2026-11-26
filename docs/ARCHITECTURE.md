@@ -743,6 +743,8 @@ issue → spec-writer (opus) → builder (opus) ─┬→ security  (opus)   ┐
                                              all PASS → approver (opus)
                                                           ├ APPROVE  → merge to main
                                                           └ ESCALATE → needs-human ← /factory approve
+   merge policy owner_approves: APPROVE and ESCALATE → needs-human ← /factory approve
+   merge policy github:         APPROVE and ESCALATE → ready (pull request left open; merged or closed on GitHub)
 ```
 
 "main" is the repository's default branch for a single run, and `release/<name>` for a release run (§6
@@ -781,10 +783,12 @@ reaches the default branch only through the owner's approval of the release (§6
     "continue from the commits" a stage that runs out of time no longer loses its work, which was the main cost of a
     limit that is too short for a large issue; a per-project override (e.g. in `.agern/`) can be added later if a real
     project needs one, and is a configuration change only (`AgentManager.runStageAgent` takes the limit from `Config`).
-- **approver** answers `{ "verdict": "APPROVE" | "ESCALATE", "summary": string }`. `APPROVE`
-  squash-merges the PR and closes the issue, unless its database migrations collide with the target's (§6 "Database
-  migrations"): then the run goes to `needs_human` instead. `ESCALATE` labels the issue `needs-human`, comments,
-  and waits for the owner's `/factory approve`.
+- **approver** answers `{ "verdict": "APPROVE" | "ESCALATE", "summary": string }`. Under the project's merge policy
+  `automatic` (the default, §6 "Merge policy") `APPROVE` squash-merges the PR and closes the issue, unless its database
+  migrations collide with the target's (§6 "Database migrations"): then the run goes to `needs_human` instead.
+  `ESCALATE` labels the issue `needs-human`, comments, and waits for the owner's `/factory approve`. Under the other
+  policies the verdict is only a recommendation: `owner_approves` always waits in `needs_human`, `github` ends the run
+  `ready` and never merges.
 - **Whose models.** Every agent runs on its owner's Claude account, so model choices are personal. The
   global settings (`chatModel`, `pipelineModels`, `maxFixRounds`) are the admin's *defaults* — the models
   shown above unless an admin changes them. Each user may override any of them for themselves
@@ -834,12 +838,14 @@ reaches the default branch only through the owner's approval of the release (§6
 - **Worktrees and branches.** Rule: **every run has its own branch** (`…-<first 8 hex digits of the run id>`, §5)
   and its own worktree `runs/<runId>`, so no run ever reuses, resets or force-pushes the branch, pull request or
   worktree of an earlier run — a leftover can never collide with a new run. At most one run per issue is active
-  (`queued` … `approving`, `needs_human`); a second start is 409 `active_run_exists`.
+  (`queued` … `approving`, `needs_human`); a second start is 409 `active_run_exists`. `ready` (§6 "Merge policy") is
+  not active: the issue may get a new run.
   - *When a run ends* its worktree is removed before its final status is shown: `merged` (approver or owner
     approve) also deletes the local branch; `failed` (any stage, the time limit, no commits, set-up errors) and
     `cancelled` (also from `needs_human`, or through a release) delete the local branch unless it holds commits
     found on no other branch and no remote-tracking branch (never pushed), which are kept rather than lost. A
-    `needs_human` run is still alive and keeps its worktree until it is approved or cancelled. Submodule commits
+    `needs_human` run is still alive and keeps its worktree until it is approved or cancelled. `ready` (merge policy
+    `github`) removes the worktree like an unmerged end; the pushed branch and the open pull request stay. Submodule commits
     found on no remote-tracking branch of their submodule are saved as git bundles first (§6 "Submodule pointers").
   - *GitHub:* the remote branch and the open pull request of a failed or cancelled run are left untouched — they
     may hold useful commits, and only a human decides to close them. The issue gets a comment "run … failed: <reason>"
@@ -1043,8 +1049,8 @@ token:
    that fails (e.g. the default branch moved and changed the same gitlink) is retried once: a new commit on the new
    tip, the branch force-moved, the same pull request merged again. Bumps of different submodules do not conflict.
    After the second failure the pull request is left open: ``… could not be merged (<GitHub's message>); it is left
-   open for a human.`` (A future merge mode without automatic merge would stop after opening it: ``… is open for a
-   human to merge.``)
+   open for a human.`` A run of merge policy `github` whose pull request was merged on GitHub (§6 "Merge policy") stops
+   after opening the bump pull request: ``… is open for a human to merge.``
 
 Each outcome is a comment on the workspace issue and a `system` event (`info`, or `warn` when nothing was bumped) in
 the run's latest stage transcript. A bump that throws is logged and reported the same way (``**Agern: submodule
@@ -1079,6 +1085,71 @@ released." Its `defaultBranch` (release note, migration line) is the member's ba
 Not in this step: runs that change several members at once, runs of the workspace
 repository itself in a workspace defined by `.agern/workspace.yml`, choosing the member in Agern, members outside the
 organization (such submodules are context only).
+
+### Merge policy
+
+Many teams require that a person reviews and merges every pull request. An admin sets a **merge policy** per project
+(`PUT /api/projects/{repo}/settings`, §8); without a stored setting it is `automatic`. For a workspace project the
+policy is the workspace repository's, never a member's.
+
+| Policy | After the approver | Who merges |
+|---|---|---|
+| `automatic` | `APPROVE` merges, `ESCALATE` → `needs_human` (as above) | the approver agent, or the owner's approval |
+| `owner_approves` | always `needs_human` | only the run owner's approval |
+| `github` | `ready` (terminal) | never Agern: the team, on GitHub |
+
+- **Snapshot.** `Orchestrator.create` stores the policy in force on the run (`runs.merge_policy`, `Run.mergePolicy`);
+  it never changes afterwards (also not for a step retry). A new run created by a retry takes the project's current
+  policy; a release run always stores `automatic` (releases below); runs from before the setting are `automatic`.
+  Changing the setting never affects existing runs.
+- **The approver's prompt** carries one paragraph per policy: `automatic` "Merge policy: automatic. `APPROVE`
+  squash-merges the pull request and closes the issue immediately, without a human looking at it; `ESCALATE` asks the
+  run owner to decide." (a release run: "… into the release branch `<branch>` immediately … (the issue stays open until
+  the release is merged) …"); `owner_approves` "Merge policy: the run owner approves every merge. You cannot merge:
+  your verdict is a recommendation to the owner. …"; `github` "Merge policy: merged on GitHub by the team. Agern never
+  merges this pull request: your verdict is a recommendation that is posted for the human reviewers. …". The role
+  prompt (`approver.md`) no longer promises an immediate merge; the schema is unchanged.
+- **`owner_approves`.** The stage records the verdict; then `needs_human` with the reason ``The approver recommends
+  merging: <summary> This project requires the run owner's approval before every merge.`` (`APPROVE`) or ``The
+  approver escalated: <summary>``. The owner's approval (button, `/factory approve`, `factory_approve_run`) merges as
+  today ("(approved by @owner)"; a submodule pointer bump is merged too). Anyone else gets 403, admins included; the
+  owner may approve their own run (a second-person rule is not built). Everything else at `needs_human` is unchanged.
+- **`github`.** With either verdict, in this order: the project's `reviewers`/`teamReviewers` are requested on the
+  pull request (`POST /repos/{o}/{r}/pulls/{n}/requested_reviewers`, in the pull request's repository, with the
+  owner's token; the owner's own login is left out because GitHub refuses the author; a failure never fails the run);
+  the issue gets ``**Agern: ready for review.** Pull request <url> passed all reviewers. Approver's assessment
+  (<VERDICT>): <summary>`` + ``This project merges on GitHub: review and merge the pull request there. Agern does not
+  merge it and follows it until it is merged or closed.`` + `` Reviewers requested: @a, team `x`.`` or `` Requesting
+  reviewers failed: <message>.`` (a workspace member run: the same text on the pull request too); the `needs-human`
+  label is removed; the worktree is removed; the run becomes `ready` (error and failure cleared, `endedAt` set). The
+  issue stays open and nothing is merged. Agern's pull requests are never drafts, so "ready for review" needs no
+  GitHub call. When reviewers still request changes after the last fix round the run goes to `needs_human` as usual;
+  its comment then ends ``This project merges on GitHub: the pull request can be reviewed and merged there; Agern
+  does not merge it.`` and the conversation and "review again" work, but there is no approval.
+- **`ready`** is terminal: not active (a new run of the issue may start; its pull request body lists the open one),
+  cancel answers 409 "Run is already ready", retry 409 `run_not_retryable`, the worktree reapers treat it as ended.
+- **No path merges a `github` run.** `Orchestrator.approve` answers 409 `merge_on_github` ("This project merges on
+  GitHub: Agern does not merge. Review and merge pull request <url> on GitHub.") after the 404 and 403 checks and
+  before the status check; `/factory approve` and `factory_approve_run` show that message; a step retry of a merge is
+  refused the same way. As defence in depth `merge()` itself refuses a `github` run and an `owner_approves` run
+  without a human approver (logged as an error; the run goes to `needs_human` with ``Not merged: this run's merge
+  policy (<policy>) does not allow it.``).
+- **Follower.** Every 60 s (`Orchestrator.followMillis`, started with the other tickers) one round reads, with the
+  run owner's token, the pull request of every run that is `ready`, or `needs_human` under `github`:
+  - open: nothing; a failed read (no owner, no token, GitHub error, not found): logged, tried again next round;
+  - merged: `merged`, `mergedOnGitHub: true`, `mergedBy` = GitHub's `merged_by.login` (null if not reported), the
+    `needs-human` label removed; a submodule workspace run opens its pointer bump pull request and leaves it for a
+    human. Agern does not close the issue (`Closes #N` does that on GitHub) and posts nothing else;
+  - closed without merge: `cancelled` with ``Pull request <ref> was closed on GitHub without being merged.``.
+  From `ready` the change is a conditional update that keeps `endedAt`; a `needs_human` run is ended like a cancel
+  (follow-up review stopped, advisor ended, sandbox and worktree removed, open stages closed) unless an approval or a
+  cancel won the race. The rest of #22 (outside merges of other policies) is not built.
+- **Releases.** Release runs are exempt (they merge into `release/<name>` as `automatic`); the policy applies to the
+  release's merge into the default branch, read live. `owner_approves` and `github` refuse automatic release mode
+  (§6 "Release mode"). `github` also refuses Agern's release approval (HTTP, `/factory release approve`,
+  `factory_approve_release`: 409 `merge_on_github`, "… Review and merge the release pull request on GitHub."), and the
+  ready announcement on the release pull request ends "This project merges on GitHub: review and merge this pull
+  request there; Agern follows it." The periodic reconcile already finishes a release merged on GitHub.
 
 ### Database migrations
 
@@ -1708,11 +1779,11 @@ release mode (#41). Single runs are unaffected and still merge into the default 
     @<owner> (the release was set to automatic)." instead of "Approved by @<owner>.".
   - *Exactly once.* Automatic merges, approvals, checks and the periodic re-evaluation all run under the release's
     mutex and finish through the one conditional `ready` → `released` update, so concurrent triggers merge once.
-  - *Human approval required (#24, not implemented).* `ReleaseModePolicy.allowsAutomatic(repo)` is the seam (today
-    every project allows it). A project that requires a human approval must refuse automatic: creating or switching a
-    release to automatic answers 409 `release_mode_not_allowed`, and an automatic release made before the project
-    became strict is not merged automatically (notice "This project requires a human approval: …"); the owner
-    approves it by hand. #24 only has to supply the policy from the project setting.
+  - *Human approval required (§6 "Merge policy").* `ReleaseModePolicy.allowsAutomatic(repo)` is true only for a
+    project whose merge policy is `automatic` (read live). Otherwise creating or switching a release to automatic
+    answers 409 `release_mode_not_allowed`, and an automatic release made before the project became strict is not
+    merged automatically (notice "This project requires a human approval: …"); the owner approves it by hand — or,
+    under `github`, merges the release pull request on GitHub.
 - **Checks.** Each re-evaluation that reads an open pull request also reads the checks on its head commit with the
   owner's token: the combined commit status (`GET /repos/{o}/{r}/commits/{sha}/status`, the latest status per
   context) and the latest check runs (`GET …/commits/{sha}/check-runs?filter=latest`, GitHub Actions and other
@@ -2015,7 +2086,9 @@ streams, no sessions, no resumption).
 Tools: `factory_list_issues`, `factory_get_issue`, `factory_create_issue`, `factory_start_run`,
 `factory_list_runs`, `factory_get_run`, `factory_approve_run`, `factory_cancel_run`,
 `factory_send_to_agent`, `factory_request_software`, `factory_list_releases`, `factory_create_release`,
-`factory_assign_issues`, `factory_unassign_issues`, `factory_approve_release`. Personal tokens get these
+`factory_assign_issues`, `factory_unassign_issues`, `factory_approve_release`. `factory_approve_run` merges a run that
+waits in `needs_human` and `factory_approve_release` a ready release; both are refused (tool error with the
+`merge_on_github` message) for a project that merges on GitHub (§6 "Merge policy"). Personal tokens get these
 (`PERSONAL_TOOLS`, see above). Pipeline-stage agents get only `factory_get_issue`
 and `factory_request_software`; with sandboxes switched on (`FACTORY_SANDBOX` not `off`) the builder also
 gets `factory_sandbox_info`, `factory_sandbox_exec` and `factory_sandbox_wait`; the `ux` and `ui-design` reviewers also get
@@ -2094,7 +2167,8 @@ message is queued for the agent's next step, never that it was already applied.
 
 Chat input starting with `/factory` is handled by the server and not sent to Claude (with attachments it
 is rejected with 422 `attachments_not_allowed`; they stay unsent so the owner can send them in a normal message):
-`/factory run <issue>`, `/factory status`, `/factory approve [runId]`, `/factory cancel <runId>`,
+`/factory run <issue>`, `/factory status`, `/factory approve [runId]` (refused with the `merge_on_github` message for a
+run of merge policy `github`, §6 "Merge policy"), `/factory cancel <runId>`,
 `/factory retry <runId> [step|continue|over|recommended]` (owner only; without a mode it lists the options, the
 recommendation and its reason; a release run is retried through its release),
 `/factory releases`, `/factory release create <name> [description…]`, `/factory release add <name> <issue>…`,
@@ -2150,7 +2224,13 @@ type Project = { name: string; fullName: string; description: string | null; pri
   defaultBranch: string; language: string | null; openIssues: number; pushedAt: string | null;
   htmlUrl: string; activeAgents: number; activeRuns: number;
   iconUrl: string | null;      // `/api/projects/<repo>/icon?v=<version>`; null: no icon (§8 "Project icons")
-  workspace: Workspace | null }; // §5 "Workspace projects"; filled by GET /api/projects/{repo} only (null in the list)
+  workspace: Workspace | null;  // §5 "Workspace projects"; filled by GET /api/projects/{repo} only (null in the list)
+  settings: ProjectSettings };  // §6 "Merge policy"; defaults without a stored row, in the list and the detail
+
+type MergePolicy = 'automatic' | 'owner_approves' | 'github';
+type ProjectSettings = { mergePolicy: MergePolicy;   // default 'automatic'
+  reviewers: string[];         // GitHub logins requested on a `github` run's pull request
+  teamReviewers: string[] };   // team slugs of the organisation, likewise
 
 type Workspace = { path: '.agern/workspace.yml' | '.gitmodules'; valid: boolean; // .gitmodules: members from the submodules
   errors: string[];            // every problem, with its path; [] when valid
@@ -2211,6 +2291,7 @@ type Release = { id: string; repo: string; name: string; description: string;
   releasedAutomatically: boolean;           // merged by Agern for the owner (automatic mode)
   checks: { state: 'unknown' | 'awaiting' | 'none' | 'pending' | 'passed' | 'failed';   // on the pull request's head commit
             detail: string | null; sha: string | null } | null;           // null until there is a pull request
+  mergePolicy: MergePolicy;                 // the project's current policy (§6 "Merge policy")
   repositories: ReleaseRepo[] };            // §6 "Several repositories"; [] unless multi-repository
 
 type StageRole = 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
@@ -2250,7 +2331,8 @@ type Screenshot = { id: string; caption: string;   // caption: one line, untrust
   createdAt: string };
 
 type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; issueKind: IssueKind;
-  status: 'queued' | 'spec' | 'building' | 'reviewing' | 'approving' | 'merged' | 'needs_human' | 'failed' | 'cancelled';
+  status: 'queued' | 'spec' | 'building' | 'reviewing' | 'approving' | 'merged' | 'needs_human' | 'failed' | 'cancelled'
+    | 'ready';               // terminal: passed under merge policy `github`, the pull request waits on GitHub (§6 "Merge policy")
   round: number;             // fix rounds so far (0 = initial build)
   maxRounds: number;         // the starting user's effective maxFixRounds, fixed when the run is created
   branch: string | null; prNumber: number | null; prUrl: string | null;
@@ -2267,6 +2349,9 @@ type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; 
   continuedByRunId: string | null; // the newest run that continues this one
   failureKind: 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | 'submodule_commit_missing' | null;
   failedStep: 'push' | 'pull_request' | 'merge' | null;  // the step after the builder that failed
+  mergePolicy: MergePolicy;        // the project's policy when the run started; never changes
+  mergedOnGitHub: boolean;         // merged on GitHub outside Agern (followed `github` runs)
+  mergedBy: string | null;         // the GitHub login that merged it there, when GitHub reports it
   warnings: { round: number; roles: StageRole[]; text: string }[] };  // the stages' warnings per round, oldest first
 
 type RetryOptions = { runId: string;       // '' for a release issue without a run
@@ -2443,13 +2528,14 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `GET /api/projects/{repo}` | → `Project` | with `workspace` (read with the caller's token; members' `accessible` per caller) |
 | `PUT /api/projects/{repo}/icon` | raw image bytes (PNG, JPEG, WebP, GIF or SVG) → `Project` | admin (403 before the body is read; 404 when the admin cannot see the project). Sets or replaces the icon; 400 `empty_icon`, 413 `icon_too_large`, 415 `unsupported_icon_type`, 422 `invalid_icon` (also every refused SVG) / `icon_dimensions_too_large`; see "Project icons" below |
 | `POST /api/projects/{repo}/icon/from-repository` | `{path}` → `Project` | admin (403; 404 as above). Sets the icon from a file on the repository's default branch, read once with the admin's own GitHub token; 400 `bad_request` for an invalid path, 404 `icon_file_not_found`, then the upload's 400/413/415/422; see "Project icons" below |
+| `PUT /api/projects/{repo}/settings` | `{ mergePolicy, reviewers?, teamReviewers? }` → `Project` | admin (403; 404 when the admin cannot see the project). 400 unknown `mergePolicy`, an entry that is not a GitHub login (`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$`) or team slug (`^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$`, the message names it), or more than 15 per list. Entries are trimmed, one leading `@` stripped, empty ones dropped and duplicates removed case-insensitively; omitted lists are empty. Applies to runs started from now on (§6 "Merge policy") |
 | `DELETE /api/projects/{repo}/icon` | → `Project` | admin (403; 404 as above); removes the icon (also when there is none), `iconUrl: null` |
 | `GET /api/projects/{repo}/icon?v=<version>` | → image bytes (`image/png`, `image/jpeg`, `image/webp`, `image/gif` or `image/svg+xml`) | anyone who can see the project; 404 when not visible or no icon is set |
 | `GET /api/projects/{repo}/issues?state=open\|closed\|all` | → `Issue[]` | pull requests excluded |
 | `GET /api/projects/{repo}/issues/{number}` | → `Issue` (with `body`) | |
 | `POST /api/projects/{repo}/issues` | `{ title, body, kind }` → `Issue` | |
 | `GET /api/projects/{repo}/releases` | → `Release[]` | newest first (`createdAt` desc), each with its issues in order |
-| `POST /api/projects/{repo}/releases` | `{ name, description?, mode? }` → 201 `Release` | 400 invalid name, description or mode (`manual` default, `automatic`); 409 `release_name_taken`; 409 `release_mode_not_allowed` (#24 seam). Starts nothing |
+| `POST /api/projects/{repo}/releases` | `{ name, description?, mode? }` → 201 `Release` | 400 invalid name, description or mode (`manual` default, `automatic`); 409 `release_name_taken`; 409 `release_mode_not_allowed` (the project's merge policy is not `automatic`, §6 "Merge policy"). Starts nothing |
 | `GET /api/releases/{id}` | → `Release` | 404 unknown or invisible |
 | `PUT /api/releases/{id}` | `{ name, description }` → `Release` | rename or edit; same validation as create. Started: owner or admin, and a different name → 409 `release_name_locked`; released: 409 `release_not_editable`. Editing a ready release updates its pull request's body |
 | `DELETE /api/releases/{id}` | → 204 | removes the plan and its assignments; the issues are untouched on GitHub. `scheduled` → 409 `release_scheduled`; `building`/`paused`/`ready` → 409 `release_active`; `released` → 409 `release_not_editable`; `cancelled`: owner or admin, the branch stays and its runs keep existing with `releaseId` null |
@@ -2459,7 +2545,7 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `POST /api/releases/{id}/pause` | → `Release` | owner or admin; `building` → `paused` (else 409 `release_not_building`); the running issue finishes |
 | `POST /api/releases/{id}/resume` | → `Release` | owner only; `paused` → `building` (else 409 `release_not_paused`); 422 `claude_credential_required` |
 | `POST /api/releases/{id}/cancel` | → `Release` | owner or admin; `building`/`paused`/`ready` → `cancelled` (else 409 `release_not_building`; released: 409 `release_not_editable`); cancels the release's active runs; a release pull request is left open with a comment |
-| `POST /api/releases/{id}/approve` | → `Release` | owner only (admins included in the refusal: 403); merges the ready release's pull request (rebase, or a merge commit where rebase merging is disabled; never squash), closes its merged issues and deletes `release/<name>` (§6 "Releasing"). 409 `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`, `release_migration_conflict`, `release_submodule_commit_missing`, `release_submodule_check_failed`, `release_merge_method_unavailable`, `release_merge_failed`; nothing changes on GitHub with any of them; a multi-repository release merges its member pull requests first and answers 409 `release_partially_merged` with the per-repository report when it stops after a merge (§6 "Several repositories") |
+| `POST /api/releases/{id}/approve` | → `Release` | owner only (admins included in the refusal: 403); 409 `merge_on_github` when the project merges on GitHub (§6 "Merge policy"); merges the ready release's pull request (rebase, or a merge commit where rebase merging is disabled; never squash), closes its merged issues and deletes `release/<name>` (§6 "Releasing"). 409 `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`, `release_migration_conflict`, `release_submodule_commit_missing`, `release_submodule_check_failed`, `release_merge_method_unavailable`, `release_merge_failed`; nothing changes on GitHub with any of them; a multi-repository release merges its member pull requests first and answers 409 `release_partially_merged` with the per-repository report when it stops after a merge (§6 "Several repositories") |
 | `PUT /api/releases/{id}/mode` | `{ mode: 'manual' \| 'automatic' }` → `Release` | §6 "Release mode": `planning` anyone; `scheduled`/started: automatic owner only, manual owner or admin (403); 400 missing or unknown mode; 409 `release_not_editable` (released), `release_closed` (cancelled), `release_mode_not_allowed`. A `ready` release is re-evaluated in the background (switched to automatic and green, it is merged) |
 | `POST /api/releases/{id}/check` | → `Release` | owner only; `ready` only (409 `release_not_ready`): re-reads the pull request (opens it when the release is complete and has none, replaces one closed without merging, finishes the release when it was merged on GitHub) and its mergeability |
 | `GET /api/releases/{id}/issues/{number}/retry` | → `RetryOptions` | anyone who can see the release; the issue must be `held`/`skipped` (409 `release_issue_not_held`); the options of its linked run, or only `start_over` when it has none |
@@ -2475,7 +2561,7 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `GET /api/runs?active=true&status=<s>` | → `Run[]` | across visible repos, newest first (max 200). `active=true`: not finished, i.e. `queued`, `spec`, `building`, `reviewing`, `approving` or `needs_human`. `status`: only these statuses, repeatable and/or comma list (`?status=needs_human`); unknown status → 400. Both given: both apply |
 | `GET /api/runs/{id}` | → `Run` | |
 | `GET /api/runs/{id}/screenshots/{sid}` | → image bytes | anyone who may see the run (404 otherwise, and for a screenshot of another run). Served with the sniffed type, `nosniff`, a sandboxing CSP, `Cross-Origin-Resource-Policy: same-origin`, `Cache-Control: private, max-age=31536000, immutable` and `Content-Disposition: inline` (`screenshot-<role>-<id8>.<ext>`). There is no upload or delete route |
-| `POST /api/runs/{id}/approve` | → `Run` | owner only, only in `needs_human`; 409 `review_in_progress`, `agent_busy`, `review_required` (§6 "Conversation at needs human") |
+| `POST /api/runs/{id}/approve` | → `Run` | owner only, only in `needs_human`; 409 `merge_on_github` for a run of merge policy `github`, whatever its status (after 404 and 403; §6 "Merge policy"); 409 `review_in_progress`, `agent_busy`, `review_required` (§6 "Conversation at needs human") |
 | `POST /api/runs/{id}/conversation` | `{ text }` → 202 `{ status: 'accepted', sessionId }` | owner only (403 for everyone else, admins too), only in `needs_human` (409 `run_not_waiting`). Talks to the run's advisor; the first message creates its session. 400 blank / too long, 409 `review_in_progress`, 409 `agent_busy`, 422 `claude_credential_required`, 409 `too_many_agents`, 409 `run_worktree_missing` |
 | `POST /api/runs/{id}/review` | → `Run` | "Review again": owner only (403 admins too), only in `needs_human`; starts a follow-up review of changes from the conversation. 409 `review_in_progress`, `agent_busy`, `nothing_to_review` (no conversation, or nothing changed since the last completed review); 422 `claude_credential_required` |
 | `POST /api/runs/{id}/cancel` | → `Run` | owner or admin |
@@ -3165,6 +3251,30 @@ offered as targets in the issues panel's selects or the release page's "Add an o
 rules as for building). The mock seeds `web-shop` with a ready and clean release (`1.2`), a conflicting one
 (`cart-fixes`), an incomplete one (`payments`), a released one (`1.1`) and a cancelled one (`promo`), and implements
 approve and check with the server's rules and error codes.
+
+**Merge policy** (§6 "Merge policy"). The project page shows everyone a row under the header, "Merge policy:
+<label> — <explanation>": "Automatic — the approver agent may merge.", "Owner approves — every merge waits for the run
+owner's approval in Agern.", "Merge on GitHub — Agern never merges; the team reviews and merges pull requests on
+GitHub." plus "Reviewers requested: @a, team x." when configured. Admins get a "Change" button that opens a dialog: a
+radio group (`fieldset`, legend "Merge policy") with the three policies and their explanations, for "Merge on GitHub"
+the inputs "Reviewers (GitHub logins, comma-separated)" and "Team reviewers (team slugs, comma-separated)", the note
+"Applies to runs started from now on; running runs keep their policy.", Cancel and Save ("Saving…" while saving). A
+server error stays in the dialog (`role="alert"`); Escape closes it and focus returns to "Change". The run header
+lists "merge policy" for single runs whose policy is not `automatic`. `owner_approves` at `needs_human` shows the note
+"This project requires the run owner's approval before every merge." (the approver's recommendation is the
+needs-human banner; with `APPROVE` Approve merges in one click, with `ESCALATE` the confirmation applies); others
+still read "Waiting for <owner> to approve.". A `ready` run shows the status note (`role="status"`, not an alert)
+"Ready for review on GitHub. This project merges on GitHub: Agern does not merge. Review and merge <PR link>; this
+page updates when it is merged or closed." and no Approve, Cancel or Retry. A `github` run at `needs_human` has no
+Approve button but the note "This project merges on GitHub: Agern does not merge this run. The pull request can be
+reviewed and merged there."; "Talk to the agent" and Cancel remain. A run merged on GitHub reads "Merged on GitHub by
+@<login>" (or "Merged on GitHub"). The `ready` pill reuses the pass tone. In the diagram a `github` run's merge node is
+"merge on GitHub": at `ready` pending with "PR #n · waiting on GitHub" (the human node skipped), merged on GitHub done
+with "merged on GitHub"; an `owner_approves` run that merged shows the human node "approved by owner" whatever the
+approver said. On the release page a `github` project replaces "Approve and release" with "This project merges on
+GitHub: review and merge the release pull request there.", and a non-automatic policy disables the automatic mode
+(the release mode select and the "New release" dialog: "this project requires a human approval"). The mock implements
+the setting, the snapshot and the outcomes at approval (no follower).
 
 **Retrying a run** (§6 "Retrying a run"). The run page of a `failed` or `cancelled` run shows the owner a "Retry…"
 button; "Retry #n" on the release page opens the same dialog ("Retry run <short id>?" / "Retry #n?"). It loads the
