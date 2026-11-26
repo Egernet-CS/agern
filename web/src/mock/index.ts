@@ -1,7 +1,10 @@
 // Mock implementation of the Api interface. Enabled with VITE_MOCK=1 (npm run dev:mock).
 // Scenarios via ?mock=default|fresh|noclaude|observer|loggedout|nosandbox|usage-none|usage-high|usage-limit (remembered per tab;
 // nosandbox: FACTORY_SANDBOX=off; usage-*: alice's Claude usage without data, at 86 % or at a reached limit).
+// GitHub status: ?mock=github-degraded (several 5xx on issues and releases while GitHub's own page says all is well) and
+// ?mock=github-down (only network errors, githubstatus.com unreachable); any other scenario: GitHub is working.
 import { ApiError, type Api, type Channel } from '../api/api';
+import { githubStatus } from './githubStatus';
 import * as images from './images';
 
 /**
@@ -242,6 +245,7 @@ const byNewest = <T extends { createdAt: string }>(a: T, b: T) => b.createdAt.lo
 
 export const mockApi: Api = {
   health: () => ok(() => ({ status: 'ok' as const, version: '0.1.0-mock', name: 'agern' })),
+  githubStatus: (opts) => ok(() => githubStatus(me(), !!opts?.brief)),
   providers: () => ok(() => ({ providers: ['os', 'ldap', 'dev'], org: ORG, twoFactor: true })),
   login: (username, password) =>
     ok((): LoginStep => {

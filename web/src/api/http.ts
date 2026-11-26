@@ -104,6 +104,7 @@ function openSocket<T>(path: string, handlers: ChannelHandlers<T>): Channel {
 
 export const httpApi: Api = {
   health: () => get('/api/health'),
+  githubStatus: (opts) => get('/api/github/status' + (opts?.brief ? '?brief=1' : '')),
   providers: () => get('/api/auth/providers'),
   login: (username, password) => post('/api/auth/login', { username, password }),
   totp: (code) => post('/api/auth/totp', { code }),

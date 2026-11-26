@@ -3459,3 +3459,180 @@ html.app-locked #root {
   gap: 2px;
   overflow-wrap: anywhere;
 }
+
+/* ------------------------------------------------------------------ GitHub status (page and shell banner) */
+.gh-banner {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 24px;
+  border-bottom: 1px solid rgba(255, 177, 74, 0.45);
+  background: linear-gradient(90deg, rgba(255, 170, 70, 0.12), var(--surface) 70%);
+  color: var(--text-2);
+  font-size: 0.9rem;
+}
+.gh-banner--down {
+  border-bottom-color: rgba(255, 100, 100, 0.45);
+  background: var(--fail-wash);
+}
+.gh-banner-glyph {
+  flex: none;
+  font-weight: 700;
+  color: var(--text);
+}
+.gh-banner-text {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+}
+.gh-banner-text a {
+  font-weight: 600;
+  text-decoration: underline;
+}
+.gh-banner-close {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--text-2);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.gh-banner-close:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+.gh-banner-close:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+@media (max-width: 640px) {
+  .gh-banner {
+    padding: 8px 14px;
+  }
+}
+
+.gh-verdict {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  padding: 18px 20px;
+  margin: 0 0 24px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--line-2);
+  background: var(--surface);
+}
+.gh-verdict--working {
+  border-color: var(--pass);
+  background: var(--pass-wash);
+}
+.gh-verdict--degraded {
+  border-color: rgba(255, 177, 74, 0.45);
+  background: linear-gradient(90deg, rgba(255, 170, 70, 0.1), var(--surface) 60%);
+}
+.gh-verdict--down {
+  border-color: rgba(255, 100, 100, 0.45);
+  background: var(--fail-wash);
+}
+.gh-verdict-glyph {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 2px solid currentColor;
+  font-weight: 700;
+  font-size: 1.1rem;
+}
+.gh-verdict--working .gh-verdict-glyph {
+  color: var(--pass);
+}
+.gh-verdict--degraded .gh-verdict-glyph {
+  color: var(--amber-hi);
+}
+.gh-verdict--down .gh-verdict-glyph {
+  color: var(--fail);
+}
+.gh-verdict-title {
+  font-size: 1.3rem;
+  margin: 2px 0 6px;
+}
+.gh-verdict-explain {
+  margin: 0 0 6px;
+  color: var(--text-2);
+}
+.gh-section {
+  margin: 0 0 28px;
+}
+.gh-h2 {
+  font-size: 1.1rem;
+  margin: 0 0 10px;
+}
+.gh-h3 {
+  font-size: 0.95rem;
+  margin: 14px 0 6px;
+}
+.gh-official-desc {
+  margin: 0 0 8px;
+}
+.gh-list {
+  margin: 0 0 10px;
+  padding-left: 20px;
+}
+.gh-list li {
+  margin: 4px 0;
+  overflow-wrap: anywhere;
+}
+.gh-table-wrap {
+  max-width: 100%;
+}
+.gh-table th[scope='row'] {
+  font: inherit;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text);
+  white-space: nowrap;
+}
+.gh-table tr:last-child th {
+  border-bottom: 0;
+}
+.gh-table .gh-group {
+  border-left: 1px solid var(--line);
+}
+.gh-table tbody td:nth-child(2),
+.gh-table tbody td:nth-child(7) {
+  border-left: 1px solid var(--line);
+}
+.gh-fail {
+  font-weight: 700;
+  color: var(--text);
+  text-decoration: underline dotted;
+}
+.gh-last-error {
+  min-width: 260px;
+  max-width: 420px;
+  overflow-wrap: anywhere;
+}
+.gh-last-error > span {
+  display: block;
+}
+.gh-limits {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 14px;
+  margin: 0;
+}
+.gh-limits dt {
+  color: var(--text-3);
+}
+.gh-limits dd {
+  margin: 0;
+}
+.gh-status {
+  min-width: 0;
+}

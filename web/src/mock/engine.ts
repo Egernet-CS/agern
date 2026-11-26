@@ -47,7 +47,7 @@ export const uid = () =>
 
 // ---------------------------------------------------------------- users & scenario
 
-const scenario = (() => {
+export const scenario = (() => {
   const q = new URLSearchParams(location.search).get('mock');
   try {
     if (q) sessionStorage.setItem('agern-mock', q);
