@@ -166,7 +166,7 @@ class ReleaseMerger(
             try {
                 tick()
             } catch (e: Exception) {
-                log.warn("Periodic release re-evaluation failed: {}", e.message)
+                log.warn("Periodic release re-evaluation failed: {}", Transient.describe(e))
             }
         }
     }
@@ -183,7 +183,9 @@ class ReleaseMerger(
                 }
                 if (before?.copy(updatedAt = Instant.EPOCH) != after?.copy(updatedAt = Instant.EPOCH)) publish(id)
             } catch (e: Exception) {
-                log.warn("Release {} could not be re-evaluated: {}", id, e.message)
+                // A lost network is expected to pass: one line. Anything else gets its stack trace.
+                if (Transient.isTransient(e)) log.warn("Release {} could not be re-evaluated: {}", id, Transient.describe(e))
+                else log.warn("Release {} could not be re-evaluated: {}", id, Transient.describe(e), e)
             }
         }
     }

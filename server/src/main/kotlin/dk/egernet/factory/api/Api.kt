@@ -673,6 +673,9 @@ private fun Route.runRoutes(s: Services) {
         call.respond(s.factory.mergeAnywayRun(u, id, req.headSha))
     }
     post("/runs/{id}/cancel") { call.respond(s.factory.cancelRun(call.requireUser(s), uuidParam("id"))) }
+    // A run waiting for the network (docs/ARCHITECTURE.md §6 "Transient failures").
+    post("/runs/{id}/network/retry") { call.respond(s.factory.retryRunNow(call.requireUser(s), uuidParam("id"))) }
+    post("/runs/{id}/network/give-up") { call.respond(s.factory.giveUpRun(call.requireUser(s), uuidParam("id"))) }
     // The conversation while a run needs a human (docs/ARCHITECTURE.md §6 "Conversation at needs human").
     post("/runs/{id}/conversation") {
         val u = call.requireUser(s)
@@ -753,6 +756,10 @@ private fun Route.releaseRoutes(s: Services) {
     post("/releases/{id}/resume") {
         val u = call.requireUser(s)
         call.respond(s.releaseDto(u, s.releases.resume(u, uuidParam("id"))))
+    }
+    post("/releases/{id}/network/give-up") {
+        val u = call.requireUser(s)
+        call.respond(s.releaseDto(u, s.releases.giveUpNetwork(u, uuidParam("id"))))
     }
     post("/releases/{id}/cancel") {
         val u = call.requireUser(s)

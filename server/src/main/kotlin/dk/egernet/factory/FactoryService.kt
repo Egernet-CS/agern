@@ -290,6 +290,18 @@ class FactoryService(
         return runs.toDto(orchestrator.cancel(user, runId))
     }
 
+    /** "Retry now" for a run waiting for the network (docs/ARCHITECTURE.md §6 "Transient failures"); owner or admin. */
+    suspend fun retryRunNow(user: UserRecord, runId: UUID): RunDto {
+        visibleRun(user, runId)
+        return runs.toDto(orchestrator.retryNow(user, runId))
+    }
+
+    /** "Give up" for a run waiting for the network: it fails now; owner or admin. Returns it once it has failed. */
+    suspend fun giveUpRun(user: UserRecord, runId: UUID): RunDto {
+        visibleRun(user, runId)
+        return runs.toDto(orchestrator.giveUp(user, runId))
+    }
+
     /** How a run can be retried (docs/ARCHITECTURE.md §6 "Retrying a run"); anyone who can see it may ask. */
     suspend fun retryOptions(user: UserRecord, runId: UUID): RetryOptionsDto {
         val run = visibleRun(user, runId)

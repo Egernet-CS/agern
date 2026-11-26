@@ -330,6 +330,8 @@ fun testConfig(dataDir: Path, twoFactor: Boolean = true, devUsers: Map<String, S
     dataDir = dataDir,
     twoFactorRequired = twoFactor,
     chatIdleMinutes = 30,
+    // Waiting for the network is off in tests, so failures keep their meaning; tests of the wait switch it on.
+    networkRetryMaxMs = 0,
 )
 
 /** A clock whose instant the test sets and advances. */

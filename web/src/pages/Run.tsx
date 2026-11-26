@@ -8,6 +8,7 @@ import { approverEscalation, buildNodes, humanSelectable, isFollowUp, latestStag
 import { Prompt } from '../components/chat/Prompt';
 import { PipelineDiagram } from '../components/pipeline/PipelineDiagram';
 import { RetryDialog } from '../components/ui/RetryDialog';
+import { GIVE_UP_RUN_TEXT, GiveUpDialog, NetworkWaitBanner } from '../components/ui/NetworkWait';
 import { Dialog, Empty, ErrorBox, KindBadge, Loading, RunStatusPill, Verdict } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
@@ -34,7 +35,8 @@ export function RunPage() {
   const run = useLiveRun(runQ.data);
   const sessions = useLiveSessions(sessQ.data, (s) => s.runId === runId);
   const sessionMap = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions]);
-  const [busy, setBusy] = useState<'approve' | 'cancel' | 'merge-anyway' | null>(null);
+  const [busy, setBusy] = useState<'approve' | 'cancel' | 'retry-now' | 'give-up' | 'merge-anyway' | null>(null);
+  const [confirmGiveUp, setConfirmGiveUp] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [confirmApprove, setConfirmApprove] = useState(false);
   const [confirmMergeAnyway, setConfirmMergeAnyway] = useState(false);
@@ -103,16 +105,14 @@ export function RunPage() {
   const canMergeAnyway =
     isOwner && run.prNumber !== null && checksBlock && (run.status === 'waiting_for_checks' || run.status === 'needs_human');
 
-  const act = async (kind: 'approve' | 'cancel' | 'merge-anyway') => {
+  const act = async (kind: 'approve' | 'cancel' | 'retry-now' | 'give-up' | 'merge-anyway') => {
     setBusy(kind);
     setErr(null);
     try {
       const r =
-        kind === 'approve'
-          ? await api.approveRun(run.id)
-          : kind === 'merge-anyway'
-            ? await api.mergeAnywayRun(run.id, checks?.sha ?? '')
-            : await api.cancelRun(run.id);
+        kind === 'merge-anyway'
+          ? await api.mergeAnywayRun(run.id, checks?.sha ?? '')
+          : await { approve: api.approveRun, cancel: api.cancelRun, 'retry-now': api.retryRunNow, 'give-up': api.giveUpRun }[kind](run.id);
       runQ.setData(() => r);
     } catch (e) {
       setErr((e as Error).message);
@@ -121,6 +121,7 @@ export function RunPage() {
       setConfirmCancel(false);
       setConfirmApprove(false);
       setConfirmMergeAnyway(false);
+      setConfirmGiveUp(false);
     }
   };
   const mergeAnywayButton = canMergeAnyway && (
@@ -128,6 +129,7 @@ export function RunPage() {
       Merge anyway…
     </button>
   );
+  const waiting = active && run.status !== 'needs_human' ? run.waiting ?? null : null;
 
   return (
     <div className="page page--wide runpage">
@@ -142,6 +144,7 @@ export function RunPage() {
           </h1>
           <KindBadge kind={run.issueKind} />
           <RunStatusPill status={run.status} />
+          {waiting && <span className="rh-waiting small">waiting for network</span>}
         </div>
         <dl className="rh-meta">
           <div><dt>owner</dt><dd>{run.owner.displayName || run.owner.username}{isOwner ? ' (you)' : ''}</dd></div>
@@ -210,6 +213,16 @@ export function RunPage() {
           )}
         </div>
       </header>
+      {waiting && (
+        <NetworkWaitBanner
+          wait={waiting}
+          now={now}
+          retrying={busy === 'retry-now'}
+          disabled={busy !== null}
+          onRetry={isOwner || me.isAdmin ? () => void act('retry-now') : undefined}
+          onGiveUp={isOwner || me.isAdmin ? () => setConfirmGiveUp(true) : undefined}
+        />
+      )}
       {run.error && (
         <div className="run-error" role="alert">
           <Markdown text={`**${run.status === 'needs_human' ? 'Needs a human:' : 'Error:'}** ${run.error}`} />
@@ -266,6 +279,14 @@ export function RunPage() {
           if (next.id === run.id) runQ.setData(() => next);
           else navigate(`/p/${repo}/runs/${next.id}`);
         }}
+      />
+
+      <GiveUpDialog
+        open={confirmGiveUp && waiting !== null}
+        text={GIVE_UP_RUN_TEXT}
+        busy={busy === 'give-up'}
+        onClose={() => setConfirmGiveUp(false)}
+        onConfirm={() => void act('give-up')}
       />
 
       <Dialog open={confirmApprove && escalation !== null} onClose={() => setConfirmApprove(false)} title="Merge against the approver's advice?">

@@ -155,6 +155,20 @@ export type ReleaseIssue = {
   targetRepo: string | null;
   /** That member's directory in the workspace; null like `targetRepo`. */
   targetDir: string | null;
+  /** While the issue is `running` and its run waits for the network: that run's wait. */
+  waiting?: RunWait | null;
+};
+
+/**
+ * A run that lost the network (GitHub or the Claude API) and waits before it tries again (docs/ARCHITECTURE.md §6
+ * "Transient failures"). `attempt`: failed attempts so far (≥ 1); `detail`: what failed. Instants are ISO-8601.
+ */
+export type RunWait = {
+  reason: 'network';
+  since: string;
+  nextAttemptAt: string;
+  attempt: number;
+  detail: string;
 };
 
 /** The state of one repository's release pull request in a multi-repository release. */
@@ -186,7 +200,7 @@ export type ReleaseRepo = {
   accessible: boolean;
 };
 
-export type ReleasePauseReason = 'manual' | 'usage_limit' | 'credentials';
+export type ReleasePauseReason = 'manual' | 'usage_limit' | 'credentials' | 'network';
 
 /** A named plan of issues for one project (docs/ARCHITECTURE.md §6 "Releases"). */
 export type Release = {
@@ -208,7 +222,14 @@ export type Release = {
   startedAt: string | null;
   endedAt: string | null;
   /** Set while `paused`. */
-  pause: { reason: ReleasePauseReason; note: string | null; resumeAt: string | null } | null;
+  pause: {
+    reason: ReleasePauseReason;
+    note: string | null;
+    resumeAt: string | null;
+    /** Reason `network`: when the current streak of failed starts began, and how many failed. */
+    since?: string | null;
+    attempt?: number | null;
+  } | null;
   /** ISO instant of the scheduled start; set exactly while `scheduled`. */
   scheduledAt: string | null;
   /** The release this one waits behind: only while `scheduled` and its time has come. */
@@ -481,6 +502,8 @@ export type Run = {
   targetDirectory?: string | null;
   /** The checks on the pull request's head commit as last evaluated before a merge; null until the first evaluation. */
   checks?: RunChecks | null;
+  /** Set while the run waits for the network before trying again; it keeps its status meanwhile. */
+  waiting?: RunWait | null;
 };
 
 /** One check that has not passed. Name and URL come from GitHub (untrusted); `url` is only ever an `https://` URL. */

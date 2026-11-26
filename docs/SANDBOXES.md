@@ -35,6 +35,9 @@ clean environment, without anyone installing that toolchain on the factory host:
 - **a network boundary.** Outbound network is Podman's default, so package registries work — and so
   does the host's LAN. Nothing is restricted in this release.
 
+For the whole trust model (who can do what, what agents can do with the owner's GitHub token, what is
+merged without a human), see [README.md, "Security: read this first"](../README.md#security-read-this-first).
+
 Only the builder uses the sandbox. The spec writer, the reviewers and the approver read the code on the
 host as before. Projects without an (approved, valid) file keep working exactly as before, on the host.
 

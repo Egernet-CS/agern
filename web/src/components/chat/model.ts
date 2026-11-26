@@ -78,6 +78,15 @@ function compactJson(v: unknown, max = 220): string {
 }
 
 /** Attachment refs of a `user` event, defensively (only well-formed entries). */
+/**
+ * The displayed width (CSS px) of a transcript thumbnail of `width`×`height`, fitted into `maxW`×`maxH` without upscaling,
+ * so its box can be reserved before the image loads. Null when the size is unknown.
+ */
+export function fitWidth(width: number | null | undefined, height: number | null | undefined, maxW = 220, maxH = 160): number | null {
+  if (width == null || height == null || !Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+  return Math.max(1, Math.round(width * Math.min(1, maxW / width, maxH / height)));
+}
+
 export function attachmentsOf(v: unknown): Attachment[] {
   if (!Array.isArray(v)) return [];
   return v.filter((a): a is Attachment => isObj(a) && typeof a.id === 'string' && typeof a.name === 'string').map((a) => ({
