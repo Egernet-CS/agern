@@ -101,6 +101,11 @@ The PDF lands in `build/manual/agern-manual-<version>.pdf`, the screenshots in
   readiness check, caches, a non-root user, and extra *platform* images to test on. After an admin
   approves the file, each run's builder builds and tests in its own rootless Podman container. Off by
   default; see [`docs/SANDBOXES.md`](docs/SANDBOXES.md) (this repository has its own, `.agern/sandbox.yml`).
+- **Deploy targets without handing out keys.** A project lists the machines it runs on (a Raspberry Pi,
+  a small server) in `.agern/deploy.yml` with their pinned host keys; an admin approves the file and
+  puts the project's public key, generated and held by Agern, on each target. A chat agent asked to
+  deploy then runs commands and copies files through Agern's MCP tools — it never sees the key, and
+  every command and its output is recorded in the chat. See [`docs/DEPLOY.md`](docs/DEPLOY.md).
 - **Native and small.** One self-contained `agern.jar` (server with the frontend embedded), Java 17
   and a natively installed PostgreSQL. No Docker needed for Agern itself.
 
@@ -352,7 +357,7 @@ can also run locally; `--deb` needs `dpkg-deb`) and publishes a GitHub Release w
 server/      Kotlin + Ktor backend          web/        React + TypeScript frontend
 packaging/   installer, agern CLI, service units, deb/ (Debian package)
 scripts/     release.sh, package.sh, main-version.sh, manual.sh (builds the manual)
-docs/        architecture and API contract, INSTALL-LINUX.md, SANDBOXES.md (for project authors),
+docs/        architecture and API contract, INSTALL-LINUX.md, SANDBOXES.md and DEPLOY.md (for project authors),
              manual/ (the getting-started manual, LaTeX)
 art/         Blender sources of the artwork
 ```
