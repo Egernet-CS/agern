@@ -169,6 +169,13 @@ export const httpApi: Api = {
   pendingSandboxes: () => get('/api/admin/sandboxes/pending'),
   stopSandbox: (runId) => del(`/api/admin/sandboxes/${enc(runId)}`),
 
+  deployStatus: (repo) => get(`/api/projects/${enc(repo)}/deploy`),
+  approveDeploy: (repo, sha256) => post(`/api/projects/${enc(repo)}/deploy/approval`, { sha256 }),
+  revokeDeployApproval: (repo) => del(`/api/projects/${enc(repo)}/deploy/approval`),
+  generateDeployKey: (repo) => post(`/api/projects/${enc(repo)}/deploy/key`),
+  rotateDeployKey: (repo) => post(`/api/projects/${enc(repo)}/deploy/key/rotate`),
+  checkDeployTarget: (repo, target) => post(`/api/projects/${enc(repo)}/deploy/targets/${enc(target)}/check`),
+
   projectRuns: (repo) => get(`/api/projects/${enc(repo)}/runs`),
   startRun: (repo, issueNumber) => post(`/api/projects/${enc(repo)}/runs`, { issueNumber }),
   createMemberLabels: (repo) => post(`/api/projects/${enc(repo)}/workspace/labels`, {}),

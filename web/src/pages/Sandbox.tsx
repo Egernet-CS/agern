@@ -263,7 +263,7 @@ function StateNotice({ st }: { st: SandboxStatus }) {
   }
 }
 
-function DiffCard({ before, after, approvedSha, sha }: { before: string; after: string; approvedSha: string; sha: string | null }) {
+export function DiffCard({ before, after, approvedSha, sha }: { before: string; after: string; approvedSha: string; sha: string | null }) {
   const hunks = useMemo(() => foldUnchanged(lineDiff(before, after)), [before, after]);
   const added = hunks.reduce((n, h) => n + (h.kind === 'lines' ? h.lines.filter((l) => l.op === 'add').length : 0), 0);
   const removed = hunks.reduce((n, h) => n + (h.kind === 'lines' ? h.lines.filter((l) => l.op === 'del').length : 0), 0);

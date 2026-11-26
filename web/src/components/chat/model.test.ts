@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { FactoryEvent } from '../../api/types';
-import { buildTranscript, fitWidth, sandboxLogOf, toolArgs, toolSummary } from './model.ts';
+import { buildTranscript, deployLogOf, fitWidth, sandboxLogOf, toolArgs, toolSummary } from './model.ts';
 
 const exec = 'mcp__factory__factory_sandbox_exec';
 const wait = 'mcp__factory__factory_sandbox_wait';
@@ -104,4 +104,57 @@ test('fitWidth is null when the size is unknown', () => {
   for (const [w, h] of [[null, 10], [10, null], [0, 10], [10, 0], [-5, 10], [10, -1], [Number.NaN, 10], [Infinity, 10], [undefined, undefined]] as const) {
     assert.equal(fitWidth(w, h), null, `${w}×${h}`);
   }
+});
+
+const system = (seq: number, payload: unknown) => ({ seq, sessionId: 's', ts: '2026-01-01T00:00:00Z', type: 'system', payload }) as FactoryEvent;
+
+test('a deploy command in a system event is parsed into its log', () => {
+  const deploy = {
+    kind: 'exec', target: 'kiosk', host: 'kiosk.example.net', port: 22, user: 'deploy', command: 'systemctl restart app',
+    exitCode: 0, timedOut: false, durationMs: 1200, output: 'ok\n', outputTruncated: false, error: null,
+  };
+  const { items } = buildTranscript([system(1, { level: 'info', text: 'Deploy [kiosk] `systemctl restart app`: exit 0 in 1.2 s', deploy })], []);
+  assert.equal(items.length, 1);
+  const item = items[0];
+  assert.ok(item.k === 'system');
+  assert.deepEqual(item.deploy, { ...deploy, path: undefined, dest: undefined, bytes: undefined });
+  assert.equal(item.sandbox, undefined);
+});
+
+test('deploy copies and failures keep their fields; a missing exit code is null', () => {
+  const copy = deployLogOf({ kind: 'copy', target: 'kiosk', host: 'h', port: 2222, user: 'u', path: 'dist/app.tar.gz', dest: '/opt/app/', bytes: 1234, exitCode: null, timedOut: false, durationMs: 800, output: '', outputTruncated: false, error: null });
+  assert.equal(copy?.kind, 'copy');
+  assert.equal(copy?.path, 'dist/app.tar.gz');
+  assert.equal(copy?.dest, '/opt/app/');
+  assert.equal(copy?.bytes, 1234);
+  assert.equal(copy?.exitCode, null);
+  const failed = deployLogOf({ kind: 'exec', target: 'kiosk', host: 'h', port: 22, user: 'u', command: 'true', exitCode: null, timedOut: false, durationMs: 15000, output: '', outputTruncated: false, error: 'could not connect: timed out' });
+  assert.equal(failed?.error, 'could not connect: timed out');
+  assert.equal(failed?.exitCode, null);
+});
+
+test('malformed deploy payloads are ignored', () => {
+  assert.equal(deployLogOf(undefined), undefined);
+  assert.equal(deployLogOf('exec'), undefined);
+  assert.equal(deployLogOf({ kind: 'exec', target: 'kiosk' }), undefined, 'an exec without command');
+  assert.equal(deployLogOf({ kind: 'copy', target: 'kiosk', path: 'a' }), undefined, 'a copy without dest');
+  assert.equal(deployLogOf({ kind: 'shell', target: 'kiosk', command: 'x' }), undefined, 'an unknown kind');
+  assert.equal(deployLogOf({ kind: 'exec', target: 7, command: 'x' }), undefined, 'a target that is not a string');
+  // Wrong field types fall back to safe values.
+  const odd = deployLogOf({ kind: 'exec', target: 'kiosk', command: 'x', exitCode: 'zero', port: 'ssh', output: 5, timedOut: 'yes' });
+  assert.equal(odd?.exitCode, null);
+  assert.equal(odd?.port, 22);
+  assert.equal(odd?.output, '');
+  assert.equal(odd?.timedOut, false);
+});
+
+test('deploy tool calls are summarised by target, command or copy', () => {
+  const dexec = 'mcp__factory__factory_deploy_exec';
+  const dcopy = 'mcp__factory__factory_deploy_copy';
+  assert.equal(toolArgs(dexec, { target: 'kiosk', command: 'systemctl restart app' }), 'kiosk: systemctl restart app');
+  assert.equal(toolArgs(dcopy, { target: 'kiosk', path: 'dist/app.tar.gz', dest: '/opt/app/' }), 'kiosk: dist/app.tar.gz → /opt/app/');
+  assert.equal(toolSummary(dexec, result({ target: 'kiosk', exitCode: 3, output: '', truncated: false, durationMs: 1500, timedOut: false })), 'Exit 3 in 1.5 s · full log below');
+  assert.equal(toolSummary(dexec, result({ target: 'kiosk', exitCode: -1, output: '', truncated: false, durationMs: 5000, timedOut: true })), 'Timed out in 5.0 s · full log below');
+  assert.equal(toolSummary(dcopy, result({ target: 'kiosk', dest: '/opt/app/app.tar.gz', bytes: 2048, durationMs: 800 })), 'Copied 2,048 bytes in 0.8 s');
+  assert.equal(toolSummary(dexec, { text: 'Deploy targets are not approved', isError: true, images: 0 }), null);
 });

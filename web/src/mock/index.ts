@@ -4,6 +4,7 @@
 // GitHub status: ?mock=github-degraded (several 5xx on issues and releases while GitHub's own page says all is well) and
 // ?mock=github-down (only network errors, githubstatus.com unreachable); any other scenario: GitHub is working.
 import { ApiError, type Api, type Channel } from '../api/api';
+import * as deploy from './deploy';
 import { githubStatus } from './githubStatus';
 import * as images from './images';
 
@@ -449,6 +450,12 @@ export const mockApi: Api = {
       return i;
     }),
 
+  deployStatus: (repo) => ok(() => deploy.deployStatus(repo, project(repo).defaultBranch)),
+  approveDeploy: (repo, sha256) => ok(() => (project(repo), deploy.approveDeploy(repo, sha256, me()))),
+  revokeDeployApproval: (repo) => ok(() => (project(repo), deploy.revokeDeployApproval(repo, me()))),
+  generateDeployKey: (repo) => ok(() => (project(repo), deploy.generateDeployKey(repo, me()))),
+  rotateDeployKey: (repo) => ok(() => (project(repo), deploy.rotateDeployKey(repo, me()))),
+  checkDeployTarget: (repo, target) => ok(() => (project(repo), deploy.checkDeployTarget(repo, target, me()))),
   sandboxStatus: (repo) => ok(() => sandboxStatus(repo, project(repo).defaultBranch)),
   approveSandbox: (repo, sha256) => ok(() => (project(repo), approveSandbox(repo, sha256, me()))),
   revokeSandboxApproval: (repo) => ok(() => (project(repo), revokeSandboxApproval(repo, me()))),

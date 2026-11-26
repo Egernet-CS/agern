@@ -1,5 +1,5 @@
 // Starts a throwaway Agern server for the end-to-end suite: fake GitHub, fake Claude CLI, dev users,
-// 2FA required, fake sandboxes (FACTORY_SANDBOX=fake), a fresh database in the development PostgreSQL (docker-compose.dev.yml), a free port,
+// 2FA required, fake sandboxes (FACTORY_SANDBOX=fake) and deploy targets (FACTORY_DEPLOY=fake), a fresh database in the development PostgreSQL (docker-compose.dev.yml), a free port,
 // a temporary data directory and a frontend built into a temporary directory (web/dist is not touched).
 //
 //   node e2e/server.mjs            start it and keep it running (Ctrl-C stops it and drops the database)
@@ -96,6 +96,9 @@ export async function startServer({ log = false } = {}) {
     // Sandboxes with the in-memory development runtime; files under <dataDir>/fake-github/<repo>/ are on the fake
     // GitHub's default branches (e.g. .agern/sandbox.yml, written by the sandbox spec).
     FACTORY_SANDBOX: 'fake',
+    // Deploy targets that only pretend to connect (.agern/deploy.yml, written by the deploy spec): hosts starting with
+    // unreachable / badkey / noauth fail at that step.
+    FACTORY_DEPLOY: 'fake',
     FACTORY_WEB_DIR: webDir,
     // The fake GitHub has no CI that registers checks late: "no checks" is green at once (the default waits 120 s).
     FACTORY_RELEASE_CHECKS_SETTLE_SECONDS: '0',

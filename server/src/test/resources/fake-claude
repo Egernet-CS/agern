@@ -19,6 +19,10 @@ Behaviour
                                  (estimated_tokens 100, 200, ... 1500), one every 0.2 s, like newer CLIs
     - text containing "fake:heartbeat" -> before the reply, runs a Bash tool call ("sleep 4") for ~4 s, sending a
                                  tool_progress heartbeat (elapsed_time_seconds 0, 0, 1, ... 3) every 0.5 s while it runs
+    - text containing "fake:deploy" -> calls the MCP tools factory_deploy_targets and then factory_deploy_exec (command
+                                 "echo deployed" on the first listed target, else "kiosk") like a real agent (tool_use +
+                                 tool_result events) and appends "Deploy targets: <answer>" and "Deploy exec: <answer>"
+                                 to the reply, each marked " (error)" when the tool answered with an error
     - "forward <runId> <role>: <message>" -> passes <message> to that run's agent through the MCP tool
                                  factory_send_to_agent and reports the tool's answer
     - "file issue: <title>" -> creates a bug issue with that title through the MCP tool
@@ -353,6 +357,26 @@ def mcp_init():
     mcp_call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake-claude", "version": "0"}}, 1)
 
 
+def fake_deploy():
+    """fake:deploy: factory_deploy_targets, then factory_deploy_exec "echo deployed" on the first target (else "kiosk").
+    Returns the lines for the reply."""
+    try:
+        mcp_init()
+    except Exception as e:  # noqa
+        return "MCP call failed: %s" % e
+    targets, targets_error = mcp_tool_roundtrip("factory_deploy_targets", {}, 2)
+    name = "kiosk"
+    try:
+        listed = json.loads(targets).get("targets") or []
+        if listed:
+            name = listed[0]["name"]
+    except Exception:  # noqa
+        pass
+    answer, exec_error = mcp_tool_roundtrip("factory_deploy_exec", {"target": name, "command": "echo deployed"}, 3)
+    return "Deploy targets%s: %s\nDeploy exec%s: %s" % (
+        " (error)" if targets_error else "", targets, " (error)" if exec_error else "", answer)
+
+
 def generate_fake_image(text, req_id=2):
     """fake:image[=<n>] [#<issue>]: calls factory_generate_image with purpose "app icon". Returns (answer, is_error)."""
     m = re.search(r"fake:image=(\d+)", text)
@@ -614,6 +638,8 @@ def chat_mode():
         if "fake:image" in content and mcp_config:
             answer, _ = generate_fake_image(content)
             reply += "\nImage tool: " + answer
+        if "fake:deploy" in content and mcp_config:
+            reply += "\n" + fake_deploy()
         if "slow" in content and not forward:
             chunks = ["%d " % i for i in range(1, 41)]
             ok, sent = stream_text("".join(chunks), chunk_delay=0.25, chunks=chunks,

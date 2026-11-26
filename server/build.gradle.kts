@@ -42,10 +42,17 @@ dependencies {
     // YAML for `.agern/sandbox.yml` (Apache-2.0; pulls in snakeyaml-engine-kmp and okio, both Apache-2.0)
     implementation("com.charleskorn.kaml:kaml:0.67.0")
 
+    // SSH client for deploy targets, in process so the private key never leaves the JVM (Apache-2.0). Bouncy Castle
+    // (MIT-style Bouncy Castle licence) is the provider MINA SSHD uses for ed25519 keys.
+    implementation("org.apache.sshd:sshd-core:2.20.1")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.86")
+
     testImplementation(kotlin("test"))
     testImplementation("io.ktor:ktor-server-test-host:$ktorVersion")
     testImplementation("io.ktor:ktor-client-websockets:$ktorVersion")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
+    // The embedded SSH server's SCP side in MinaDeployTransportTest (Apache-2.0); the client speaks SCP itself.
+    testImplementation("org.apache.sshd:sshd-scp:2.20.1")
     testImplementation("io.zonky.test:embedded-postgres:2.1.0")
     testImplementation(enforcedPlatform("io.zonky.test.postgres:embedded-postgres-binaries-bom:16.6.0"))
     // Linux on arm64 is not among embedded-postgres' default binaries (e.g. Agern's own sandbox on an arm64 host).

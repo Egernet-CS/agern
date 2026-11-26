@@ -61,6 +61,8 @@ data class Config(
     val imageLimits: ImageLimits = ImageLimits(),
     /** FACTORY_SANDBOX*: per-run build/test sandboxes (docs/ARCHITECTURE.md §5 "Sandboxes"). */
     val sandbox: SandboxConfig = SandboxConfig(),
+    /** FACTORY_DEPLOY*: per-project SSH deploy targets (docs/DEPLOY.md, docs/ARCHITECTURE.md §5 "Deploy targets"). */
+    val deploy: DeployConfig = DeployConfig(),
     /**
      * FACTORY_RELEASE_CHECKS_SETTLE_SECONDS: how long a pull request's head commit must have had no checks at all before
      * "no checks" counts as green, for an automatic release and before a run is merged (CI registers its checks some
@@ -84,9 +86,10 @@ data class Config(
 
     /**
      * The MCP tool-call and idle timeouts given to every agent (`MCP_TOOL_TIMEOUT`, `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`):
-     * longer than any call can take (no call outlives the stage; the first sandbox call adds creation and setup).
+     * longer than any call can take (no call outlives the stage; the first sandbox call adds creation and setup; a deploy
+     * command or copy adds its connection).
      */
-    val mcpToolTimeoutMs: Long get() = maxOf(stageTimeoutMs, sandbox.execTimeoutMs) + 60_000
+    val mcpToolTimeoutMs: Long get() = maxOf(stageTimeoutMs, sandbox.execTimeoutMs, deploy.execTimeoutMs) + 60_000
     /** Agents reach the MCP endpoint over loopback, never through the public URL. */
     val mcpUrl: String get() = "http://127.0.0.1:$port/mcp"
     val publicOrigin: String get() = originOf(publicUrl)
@@ -118,7 +121,7 @@ data class Config(
             "maxAgentsPerUser=$maxAgentsPerUser, chatIdleMinutes=$chatIdleMinutes, stageTimeoutMs=$stageTimeoutMs, networkRetryMaxMs=$networkRetryMaxMs, fakeGithub=$fakeGithub, " +
             "githubStatusUrl=${githubStatusUrl ?: "off"}, " +
             "attachments=${attachmentMaxCount}x${attachmentMaxBytes shr 20}MB/${attachmentMaxMessageBytes shr 20}MB, " +
-            "screenshots=${screenshotMaxCount}x${screenshotMaxBytes shr 20}MB, images=$imageLimits, sandbox=$sandbox)"
+            "screenshots=${screenshotMaxCount}x${screenshotMaxBytes shr 20}MB, images=$imageLimits, sandbox=$sandbox, deploy=$deploy)"
 
     companion object {
         fun defaultAgentPath(): String =
@@ -151,6 +154,8 @@ data class Config(
             if (fakeGithub) require("dev" in auth) { "FACTORY_DEV_FAKE_GITHUB requires 'dev' in FACTORY_AUTH" }
             val sandbox = SandboxConfig.fromEnv(::get)
             if (sandbox.mode == "fake") require(fakeGithub) { "FACTORY_SANDBOX=fake is a development mode and requires FACTORY_DEV_FAKE_GITHUB" }
+            val deploy = DeployConfig.fromEnv(::get)
+            if (deploy.mode == "fake") require(fakeGithub) { "FACTORY_DEPLOY=fake is a development mode and requires FACTORY_DEV_FAKE_GITHUB" }
 
             return Config(
                 port = get("FACTORY_PORT")?.toInt() ?: 8080,
@@ -214,6 +219,7 @@ data class Config(
                     maxEdge = intIn(get("FACTORY_IMAGE_MAX_EDGE"), "FACTORY_IMAGE_MAX_EDGE", 2048, 256..4096),
                 ),
                 sandbox = sandbox,
+                deploy = deploy,
                 releaseChecksSettleSeconds = get("FACTORY_RELEASE_CHECKS_SETTLE_SECONDS")?.let { v ->
                     (v.toLongOrNull() ?: throw IllegalArgumentException("FACTORY_RELEASE_CHECKS_SETTLE_SECONDS must be a whole number of seconds"))
                         .also { require(it in 0..3600) { "FACTORY_RELEASE_CHECKS_SETTLE_SECONDS must be between 0 and 3600" } }
@@ -429,6 +435,40 @@ data class SandboxConfig(
             bytes > 0 && bytes % (1L shl 20) == 0L -> "${bytes shr 20}m"
             bytes > 0 && bytes % (1L shl 10) == 0L -> "${bytes shr 10}k"
             else -> bytes.toString()
+        }
+    }
+}
+
+/** Deploy target settings (docs/ARCHITECTURE.md §3, docs/DEPLOY.md). */
+data class DeployConfig(
+    /**
+     * `ssh` (default: the tools exist, nothing happens until an admin generates a key and approves a file), `off` (no
+     * deploy tools) or `fake` (connects nowhere, only pretends; development and end-to-end tests with
+     * FACTORY_DEV_FAKE_GITHUB).
+     */
+    val mode: String = "ssh",
+    /** FACTORY_DEPLOY_EXEC_TIMEOUT_MINUTES: default and maximum for one command or copy. */
+    val execTimeoutMs: Long = 30 * 60_000L,
+    /** FACTORY_DEPLOY_MAX_COPY_MB: the largest file `factory_deploy_copy` sends. */
+    val maxCopyBytes: Long = 512L shl 20,
+) {
+    val enabled: Boolean get() = mode != "off"
+
+    override fun toString() = if (!enabled) "off" else "DeployConfig(mode=$mode, execTimeoutMs=$execTimeoutMs, maxCopyMB=${maxCopyBytes shr 20})"
+
+    companion object {
+        fun fromEnv(get: (String) -> String?): DeployConfig {
+            val mode = (get("FACTORY_DEPLOY") ?: "ssh").lowercase()
+            require(mode in setOf("ssh", "off", "fake")) { "FACTORY_DEPLOY must be 'ssh' or 'off' ('fake' in development)" }
+            val minutes = get("FACTORY_DEPLOY_EXEC_TIMEOUT_MINUTES")?.let {
+                it.toLongOrNull() ?: throw IllegalArgumentException("FACTORY_DEPLOY_EXEC_TIMEOUT_MINUTES must be a whole number of minutes")
+            } ?: 30
+            require(minutes in 1..24 * 60) { "FACTORY_DEPLOY_EXEC_TIMEOUT_MINUTES must be between 1 and 1440" }
+            val mb = get("FACTORY_DEPLOY_MAX_COPY_MB")?.let {
+                it.toLongOrNull() ?: throw IllegalArgumentException("FACTORY_DEPLOY_MAX_COPY_MB must be a whole number of megabytes")
+            } ?: 512
+            require(mb in 1..10_240) { "FACTORY_DEPLOY_MAX_COPY_MB must be between 1 and 10240" }
+            return DeployConfig(mode, minutes * 60_000L, mb shl 20)
         }
     }
 }

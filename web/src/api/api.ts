@@ -25,6 +25,8 @@ import type {
   RetryMode,
   RetryOptions,
   RunStatus,
+  DeployCheck,
+  DeployStatus,
   PendingSandbox,
   SandboxOverview,
   SandboxStatus,
@@ -186,6 +188,25 @@ export interface Api {
    * next sandbox command creates a fresh one. 404 when the run has no sandbox right now. Answers the new overview.
    */
   stopSandbox(runId: string): Promise<SandboxOverview>;
+
+  /** The project's `.agern/deploy.yml` on its default branch, its approval and the project's public deploy key. */
+  deployStatus(repo: string): Promise<DeployStatus>;
+  /**
+   * Admin: approves exactly the content with this hash. 409 `deploy_definition_changed` when the file changed meanwhile,
+   * 422 `deploy_definition_invalid`, 404 when there is no file, 403 for non-admins.
+   */
+  approveDeploy(repo: string, sha256: string): Promise<DeployStatus>;
+  /** Admin: removes the project's deploy approval; no target is usable until a version is approved again. */
+  revokeDeployApproval(repo: string): Promise<DeployStatus>;
+  /** Admin: generates the project's Ed25519 key pair. 409 `deploy_key_exists` when there is one. */
+  generateDeployKey(repo: string): Promise<DeployStatus>;
+  /** Admin: replaces the key pair at once (the old private key is deleted). 404 when there is none. */
+  rotateDeployKey(repo: string): Promise<DeployStatus>;
+  /**
+   * Admin: connects to a target, verifies its host key and authenticates, then disconnects (runs no command). Connection
+   * problems are `ok: false`; 409 `deploy_not_approved`, `deploy_key_missing`, `deploy_busy` or `deploy_disabled`, 404 unknown target.
+   */
+  checkDeployTarget(repo: string, target: string): Promise<DeployCheck>;
 
   projectRuns(repo: string): Promise<Run[]>;
   startRun(repo: string, issueNumber: number): Promise<Run>;

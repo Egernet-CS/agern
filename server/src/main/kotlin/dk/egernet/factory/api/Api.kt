@@ -608,6 +608,24 @@ private fun Route.projectRoutes(s: Services) {
         call.respond(s.sandboxes.approve(u, repo, req.sha256))
     }
     delete("/projects/{repo}/sandbox/approval") { call.respond(s.sandboxes.revoke(call.requireUser(s), repoParam())) }
+    // Deploy targets, their approval and the project's key (docs/DEPLOY.md, docs/ARCHITECTURE.md §8).
+    get("/projects/{repo}/deploy") { call.respond(s.deploys.status(call.requireUser(s), repoParam())) }
+    post("/projects/{repo}/deploy/approval") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        val req = call.receive<ApproveSandboxReq>()
+        if (!Regex("^[0-9a-fA-F]{64}$").matches(req.sha256.trim())) throw badRequest("sha256 must be 64 hex digits")
+        call.respond(s.deploys.approve(u, repo, req.sha256))
+    }
+    delete("/projects/{repo}/deploy/approval") { call.respond(s.deploys.revoke(call.requireUser(s), repoParam())) }
+    post("/projects/{repo}/deploy/key") { call.respond(s.deploys.generateKey(call.requireUser(s), repoParam())) }
+    post("/projects/{repo}/deploy/key/rotate") { call.respond(s.deploys.rotateKey(call.requireUser(s), repoParam())) }
+    post("/projects/{repo}/deploy/targets/{name}/check") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        val name = call.parameters["name"].orEmpty()
+        call.respond(s.deploys.check(u, repo, name))
+    }
     // Project icons (docs/ARCHITECTURE.md §8 "Project icons"): admins set them, everyone who sees the repo sees them.
     put("/projects/{repo}/icon") {
         val u = call.requireAdmin(s)

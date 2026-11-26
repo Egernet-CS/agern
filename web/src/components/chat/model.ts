@@ -1,6 +1,6 @@
 // Turns raw session events (incl. Claude Code stream-json) into renderable transcript items.
 // Everything here is defensive: unknown shapes become compact "unknown" items, never throws.
-import type { Attachment, CheckoutInfo, FactoryEvent, ImagesPayload, SandboxLog, SessionStatus } from '../../api/types';
+import type { Attachment, CheckoutInfo, DeployLog, FactoryEvent, ImagesPayload, SandboxLog, SessionStatus } from '../../api/types';
 
 export type ToolResult = { text: string; isError: boolean; images: number };
 
@@ -23,7 +23,7 @@ export type Item =
   | { k: 'tool'; id: string; name: string; input: unknown; inputPartial?: string; result?: ToolResult; streaming?: boolean; progress?: ToolProgress }
   | { k: 'init'; id: string; model: string; cwd: string | null; tools: number; mcp: { name: string; status: string }[] }
   | { k: 'result'; id: string; ok: boolean; subtype: string; costUsd: number | null; turns: number | null; durationMs: number | null; text: string | null }
-  | { k: 'system'; id: string; level: 'info' | 'warn' | 'error'; text: string; sandbox?: SandboxLog }
+  | { k: 'system'; id: string; level: 'info' | 'warn' | 'error'; text: string; sandbox?: SandboxLog; deploy?: DeployLog }
   | { k: 'status'; id: string; status: string }
   | { k: 'images'; id: string; images: ImagesPayload }
   | { k: 'unknown'; id: string; label: string; json: string };
@@ -109,6 +109,36 @@ export function sandboxLogOf(v: unknown): SandboxLog | undefined {
     outputTruncated: v.outputTruncated === true,
     platform: str(v.platform) ?? null,
     ...(v.review === true ? { review: true } : {}),
+  };
+}
+
+/** The `deploy` log of a system event (a chat's deploy command or copy), defensively (undefined unless well-formed). */
+export function deployLogOf(v: unknown): DeployLog | undefined {
+  if (!isObj(v) || typeof v.target !== 'string' || !v.target) return undefined;
+  const kind = v.kind === 'copy' ? 'copy' : v.kind === 'exec' ? 'exec' : null;
+  if (!kind) return undefined;
+  const command = str(v.command) ?? undefined;
+  const path = str(v.path) ?? undefined;
+  const dest = str(v.dest) ?? undefined;
+  if (kind === 'exec' && command === undefined) return undefined;
+  if (kind === 'copy' && (path === undefined || dest === undefined)) return undefined;
+  const exit = num(v.exitCode);
+  return {
+    kind,
+    target: v.target,
+    host: str(v.host) ?? '',
+    port: num(v.port) ?? 22,
+    user: str(v.user) ?? '',
+    command,
+    path,
+    dest,
+    bytes: num(v.bytes) ?? undefined,
+    exitCode: exit != null && Number.isInteger(exit) ? exit : null,
+    timedOut: v.timedOut === true,
+    durationMs: num(v.durationMs) ?? 0,
+    output: str(v.output) ?? '',
+    outputTruncated: v.outputTruncated === true,
+    error: str(v.error) || null,
   };
 }
 
@@ -212,7 +242,7 @@ export function buildTranscript(events: FactoryEvent[], partials: unknown[]): { 
           continue;
         }
         const level = s.level === 'warn' || s.level === 'error' ? s.level : 'info';
-        items.push({ k: 'system', id, level, text: str(s.text) ?? compactJson(p), sandbox: sandboxLogOf(s.sandbox) });
+        items.push({ k: 'system', id, level, text: str(s.text) ?? compactJson(p), sandbox: sandboxLogOf(s.sandbox), deploy: deployLogOf(s.deploy) });
         continue;
       }
       if (ev.type === 'status') {
@@ -402,6 +432,8 @@ export function toolArgs(name: string, input: unknown, partial?: string): string
   }
   if (name.endsWith('__factory_sandbox_exec')) out = s('command');
   if (name.endsWith('__factory_sandbox_wait')) out = s('handle')?.trim() || 'latest command';
+  if (name.endsWith('__factory_deploy_exec')) out = `${s('target') ?? '?'}: ${s('command') ?? ''}`;
+  if (name.endsWith('__factory_deploy_copy')) out = `${s('target') ?? '?'}: ${s('path') ?? '?'} → ${s('dest') ?? '?'}`;
   if (out == null) {
     const entries = Object.entries(input).filter(([, v]) => v !== undefined);
     out = entries
@@ -432,6 +464,17 @@ export function toolSummary(name: string, r: ToolResult): string | null {
         const secs = typeof j.durationMs === 'number' ? ` in ${(j.durationMs / 1000).toFixed(1)} s` : '';
         return `${j.timedOut ? 'Timed out' : `Exit ${j.exitCode}`}${secs} · full log below`;
       }
+    } catch {
+      /* not JSON: show the text */
+    }
+  }
+  if (name.endsWith('__factory_deploy_exec') || name.endsWith('__factory_deploy_copy')) {
+    // The agent gets JSON; the full record is the deploy block in the transcript.
+    try {
+      const j = JSON.parse(r.text) as { exitCode?: number; durationMs?: number; timedOut?: boolean; bytes?: number };
+      const secs = typeof j.durationMs === 'number' ? ` in ${(j.durationMs / 1000).toFixed(1)} s` : '';
+      if (typeof j.exitCode === 'number') return `${j.timedOut ? 'Timed out' : `Exit ${j.exitCode}`}${secs} · full log below`;
+      if (typeof j.bytes === 'number') return `Copied ${j.bytes.toLocaleString('en-GB')} bytes${secs}`;
     } catch {
       /* not JSON: show the text */
     }
