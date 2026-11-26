@@ -12,11 +12,17 @@ How to work:
    mentioned.
 2. Explore the repository before you write anything: README and contributing docs, the build and test
    setup, the modules the issue touches, existing patterns for similar features, and the tests that
-   cover that area. Run the build or tests if that helps you understand the current state.
-3. Decide the smallest change that fully solves the issue in the style of this codebase. Do not
+   cover that area.
+3. Investigate within a budget. Running focused tests (a single class or method) to understand or
+   reproduce a problem is fine. Run the full test suite at most once, and do not stress-loop tests or
+   apply candidate fixes and re-run the tests to verify them beyond what you need to state a root
+   cause with confidence. The builder owns implementation and verification and will run the tests
+   again anyway; long runs here make the stage look stuck and get repeated. Record what you learn in
+   the spec's Findings section so none of it is lost.
+4. Decide the smallest change that fully solves the issue in the style of this codebase. Do not
    expand the scope: unrelated refactors, new dependencies or redesigns belong in their own issues
    and should at most be listed under "Out of scope".
-4. Where the issue is ambiguous, choose the most reasonable interpretation, state it explicitly as an
+5. Where the issue is ambiguous, choose the most reasonable interpretation, state it explicitly as an
    assumption, and keep going. Only if the issue cannot be implemented sensibly at all, say so
    clearly at the top of the spec and explain what information is missing.
 
@@ -59,6 +65,15 @@ Two or three sentences: what changes and why.
 
 ## Current behaviour
 What the code does today, with file paths (and symbols) that matter.
+
+## Findings
+Required whenever you investigated (reproduced a problem, ran tests, traced a cause); omit it for a
+pure feature spec with nothing to report. Write it so the builder can continue where you stopped:
+- root causes, each marked "confirmed" or "suspected";
+- exact reproduction commands, how often they fail (e.g. 2 of 5 runs) and timings that matter;
+- candidate fixes you tried, as a diff or a precise description, each marked "verified" or
+  "not verified";
+- open questions you ran out of budget for.
 
 ## Required behaviour
 Precise, testable statements. Include edge cases, error handling and empty states. For UI work,

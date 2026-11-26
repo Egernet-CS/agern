@@ -1022,12 +1022,18 @@ issue → spec-writer (opus) → builder (opus) ─┬→ security  (opus)   ┐
 "Releases"): the run's worktree starts from that branch and its pull request merges into it. A release branch
 reaches the default branch only through the owner's approval of the release (§6 "Releasing").
 
-- **spec-writer** reads the issue and the repo and writes a spec; it is posted as an issue comment. When the run
-  has an approved sandbox it may plan its use in an optional `## Verification` section (between `## Tests` and
-  `## Out of scope`): the commands the builder runs in the sandbox and on which platforms, and for UI changes how the
-  UI reviewers start the app in the review sandbox and what they look at. It reads the sandbox with
+- **spec-writer** reads the issue and the repo and writes a spec; it is posted as an issue comment.
+  It investigates within a budget (`spec-writer.md`): focused tests to understand or reproduce a problem,
+  the full test suite at most once, no stress loops or fix-verification cycles. What it learns goes into the
+  spec's `## Findings` section (root causes marked confirmed/suspected, reproduction commands and failure
+  rates, tried fixes marked verified/not verified, open questions), which it omits when there is nothing to report.
+  When the run has an approved sandbox it may plan its use in an optional `## Verification` section (between
+  `## Tests` and `## Out of scope`): the commands the builder runs in the sandbox and on which platforms, and for UI
+  changes how the UI reviewers start the app in the review sandbox and what they look at. It reads the sandbox with
   `factory_sandbox_info` but cannot run anything in it, and never asks for a sandbox to be enabled or approved.
-- **builder** implements the spec on the run branch and commits. The orchestrator pushes the branch
+- **builder** implements the spec on the run branch and commits; the build stage owns implementation and
+  verification. `builder.md` tells it to start from the spec's Findings (reuse its reproduction commands and
+  verified fixes before exploring on its own) and to verify the result itself. The orchestrator pushes the branch
   and opens a pull request after the first build. When the run has an approved sandbox (§5 "Sandboxes"),
   the builder builds and tests in it through `factory_sandbox_exec` (running the spec's Verification commands there,
   when it has some); the sandbox is removed when the build/review loop ends, before the approver runs. Its task and fix prompts name the branch the pull request merges
