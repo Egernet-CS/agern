@@ -21,6 +21,7 @@ import dk.egernet.factory.FindingDto
 import dk.egernet.factory.REVIEWER_ROLES
 import dk.egernet.factory.SCREENSHOT_ROLES
 import dk.egernet.factory.RunStatus
+import dk.egernet.factory.MergePolicy
 import dk.egernet.factory.agent.AgentIdentity
 import dk.egernet.factory.agent.AgentManager
 import dk.egernet.factory.agent.EventBus
@@ -61,6 +62,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -136,6 +139,8 @@ class Orchestrator(
     private val workspaceDefs: dk.egernet.factory.workspace.WorkspaceService,
     /** The member repositories of releases: where a member release run's release is later merged (its base branch). */
     private val releaseStore: dk.egernet.factory.db.ReleaseStore? = null,
+    /** The projects' settings: the merge policy a run snapshots and the reviewers of policy `github`; null = defaults. */
+    private val projectSettings: dk.egernet.factory.db.ProjectSettingsStore? = null,
     /** Time source of the checks before a merge (settle period, wait limit); tests use a controllable clock. */
     private val clock: java.time.Clock = java.time.Clock.systemUTC(),
 ) {
@@ -150,6 +155,10 @@ class Orchestrator(
     private val org get() = cfg.githubOrg
 
     fun job(runId: UUID): Job? = jobs[runId]
+
+    /** The settings of project [repo] as stored now (defaults without a row). */
+    private fun settingsOf(repo: String): dk.egernet.factory.ProjectSettingsDto =
+        projectSettings?.get(repo) ?: dk.egernet.factory.ProjectSettingsDto()
 
     /**
      * How long a pull request's head commit must have had no checks before "no checks" counts as green before a merge
@@ -414,11 +423,14 @@ class Orchestrator(
         }
         // The starting user's own choices (else the admin defaults), fixed for this run: max rounds now, models per stage.
         val eff = preferences.effective(owner.id)
+        // The merge policy in force now, fixed for the run (docs/ARCHITECTURE.md §6 "Merge policy"). A release run merges
+        // into its release branch; the policy applies to the release's own merge instead.
+        val policy = if (releaseId != null) MergePolicy.AUTOMATIC else settingsOf(repo).mergePolicy
         val run = runs.createIfNoActive(
             repo, issueNumber, issue.title, issueKindFromLabels(issue.labels.map { it.name }), eff.maxFixRounds, owner.id, startedBySession,
             // A release run's base is always its release branch (in the member repository for a member issue).
             releaseId, (if (releaseId != null) baseBranch else null) ?: member?.first?.baseBranch ?: baseBranch, continuesFrom?.id, continuesFrom?.spec, member?.first?.repository,
-            member?.first?.directory, member?.second.orEmpty(),
+            member?.first?.directory, member?.second.orEmpty(), policy,
         ) ?: throw conflict("Issue #$issueNumber already has an active run", "active_run_exists")
         for (role in listOf("spec-writer", "builder") + REVIEWER_ROLES + "approver") runs.createStage(run.id, role, 0, eff.model(role))
         publish(run.id)
@@ -581,12 +593,15 @@ class Orchestrator(
     suspend fun retryStep(owner: UserRecord, run: RunRecord): RunRecord {
         if (owner.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
         if (run.status == RunStatus.NEEDS_HUMAN && run.failedStep == FailedStep.MERGE) {
+            if (run.mergePolicy == MergePolicy.GITHUB) throw mergeOnGitHub(run)
             if (run.prNumber == null) throw conflict("Run has no pull request to merge", "retry_mode_unavailable")
             // The same gate as an approval: changes from the conversation must have been reviewed.
             startMerging(run.id)
             publish(run.id)
             // The approver approved before the merge failed: merging again is its decision; otherwise it is the owner's.
-            val approverApproved = runs.stages(run.id).lastOrNull { it.role == "approver" }?.verdict == "APPROVE"
+            // Under any other policy than automatic the approver never decides: the owner retrying it does.
+            val approverApproved = run.mergePolicy == MergePolicy.AUTOMATIC &&
+                runs.stages(run.id).lastOrNull { it.role == "approver" }?.verdict == "APPROVE"
             launchJob(run.id) {
                 mergeWithChecks(run.id, approvedBy = if (approverApproved) null else owner.username)
                 finishMerge(run.id)
@@ -609,11 +624,13 @@ class Orchestrator(
     /**
      * Owner only, only in needs_human: squash-merge the PR and close the issue once the checks on its head commit allow
      * it (docs/ARCHITECTURE.md §6 "Checks before a merge"). The first evaluation happens before this answers: the run is
-     * then merged, needs a human again, or is `waiting_for_checks` with a job that merges it when they pass.
+     * then merged, needs a human again, or is `waiting_for_checks` with a job that merges it when they pass. Never for a
+     * run of policy `github` (409 `merge_on_github`, whatever its status; docs/ARCHITECTURE.md §6 "Merge policy").
      */
     suspend fun approve(user: UserRecord, runId: UUID): RunRecord {
         val run = runs.get(runId) ?: throw notFound("Run not found")
         if (run.ownerId != user.id) throw forbidden("Only the owner of this run can approve it")
+        if (run.mergePolicy == MergePolicy.GITHUB) throw mergeOnGitHub(run)
         if (run.status != RunStatus.NEEDS_HUMAN) throw conflict("Run is ${run.status}, not needs_human")
         if (run.prNumber == null) throw conflict("Run has no pull request to merge")
         startMerging(runId)
@@ -640,6 +657,7 @@ class Orchestrator(
     suspend fun mergeAnyway(user: UserRecord, runId: UUID, headSha: String): RunRecord {
         val run = runs.get(runId) ?: throw notFound("Run not found")
         if (run.ownerId != user.id) throw forbidden("Only the owner of this run can merge it")
+        if (run.mergePolicy == MergePolicy.GITHUB) throw mergeOnGitHub(run)
         if (headSha.isBlank()) throw badRequest("headSha must not be empty")
         requireOverridable(run, headSha)
         if (run.status == RunStatus.WAITING_FOR_CHECKS) {
@@ -708,25 +726,44 @@ class Orchestrator(
         }
     }
 
+    /** The refusal of every way to merge a run of policy `github` (409 `merge_on_github`). */
+    private fun mergeOnGitHub(run: RunRecord) = conflict(
+        "This project merges on GitHub: Agern does not merge. Review and merge pull request ${run.prUrl ?: "(none)"} on GitHub.",
+        "merge_on_github",
+    )
+
+    /**
+     * Ends a run that is not over yet, as cancel does: the pipeline or a follow-up review is cancelled and joined, the
+     * advisor (mid-turn included) is stopped for good and the sandbox released, so nothing works in the worktree after
+     * this. Then, unless [proceed] refuses the run as it is now (e.g. it ended meanwhile), the worktree is removed
+     * ([merged]: its branch is merged), [finish] sets the new status and open stages are closed. False when skipped.
+     */
+    private suspend fun endRun(runId: UUID, merged: Boolean, proceed: (RunRecord) -> Boolean, finish: () -> Unit): Boolean {
+        ending += runId
+        try {
+            jobs[runId]?.let { it.cancel(); it.join() }
+            runs.get(runId)?.advisorSessionId?.let { agents.stopAdvisor(it, ended = true) }
+            sandboxes.release(runId)
+            val after = runs.get(runId) ?: return false
+            if (!proceed(after)) return false
+            withContext(Dispatchers.IO) { cleanupWorktree(runId, merged) }
+            finish()
+        } finally {
+            ending -= runId
+        }
+        runs.closeOpenStages(runId)
+        return true
+    }
+
     /** Owner or admin. */
     suspend fun cancel(user: UserRecord, runId: UUID): RunRecord {
         val run = runs.get(runId) ?: throw notFound("Run not found")
         if (run.ownerId != user.id && !user.isAdmin) throw forbidden("Only the owner or an admin can cancel this run")
         if (run.status in RunStatus.TERMINAL) throw conflict("Run is already ${run.status}")
-        ending += runId
-        try {
-            // The pipeline or a follow-up review, then the advisor (mid-turn included): nothing works in the worktree after this.
-            jobs[runId]?.let { it.cancel(); it.join() }
-            runs.get(runId)?.advisorSessionId?.let { agents.stopAdvisor(it, ended = true) }
-            sandboxes.release(runId)
-            val after = runs.get(runId)!!
-            if (after.status in RunStatus.TERMINAL) return after
-            withContext(Dispatchers.IO) { cleanupWorktree(runId, merged = false) }
+        val ended = endRun(runId, merged = false, proceed = { it.status !in RunStatus.TERMINAL }) {
             runs.setStatus(runId, RunStatus.CANCELLED, "Cancelled by ${user.username}")
-        } finally {
-            ending -= runId
         }
-        runs.closeOpenStages(runId)
+        if (!ended) return runs.get(runId)!!
         val owner = users.byId(run.ownerId)!!
         withContext(Dispatchers.IO) {
             bestEffort { gh(owner).removeLabel(org, run.repo, run.issueNumber, "needs-human") }
@@ -1441,19 +1478,65 @@ class Orchestrator(
         setStatus(run.id, RunStatus.APPROVING)
         runs.setStageRound(run.id, "approver", round)
         run = runs.get(run.id)!!
-        val a = stage(run.id, "approver", round, owner, ctx, approvalPrompt(ctx, spec, lastReviews, round, maxRounds, run.prUrl), schema = Schemas.APPROVAL, disallowed = READ_ONLY_TOOLS)
+        val a = stage(run.id, "approver", round, owner, ctx, approvalPrompt(ctx, spec, lastReviews, round, maxRounds, run.prUrl, run.mergePolicy), schema = Schemas.APPROVAL, disallowed = READ_ONLY_TOOLS)
         val v = parseVerdict(a, setOf("APPROVE", "ESCALATE"))
         if (v == null) {
             finishStage(run.id, "approver", round, null, "No valid verdict in the agent's output", emptyList(), failed = true)
             throw StageFailed("The approver did not return a valid verdict")
         }
         finishStage(run.id, "approver", round, v.verdict, v.summary, emptyList())
-        if (v.verdict == "APPROVE") {
-            mergeWithChecks(run.id, approvedBy = null, waitForNetwork = true)
-            publish(run.id)
-        } else {
-            needsHuman(runs.get(run.id)!!, owner, "The approver escalated: ${v.summary}")
+        // What the verdict does follows the policy stored on the run, never the project's current one.
+        when (runs.get(run.id)!!.mergePolicy) {
+            MergePolicy.OWNER_APPROVES -> needsHuman(
+                runs.get(run.id)!!, owner,
+                if (v.verdict == "APPROVE") "The approver recommends merging: ${v.summary} This project requires the run owner's approval before every merge."
+                else "The approver escalated: ${v.summary}",
+            )
+            MergePolicy.GITHUB -> withContext(Dispatchers.IO) { readyForGitHub(runs.get(run.id)!!, owner, v) }
+            else -> if (v.verdict == "APPROVE") {
+                mergeWithChecks(run.id, approvedBy = null, waitForNetwork = true)
+                publish(run.id)
+            } else {
+                needsHuman(runs.get(run.id)!!, owner, "The approver escalated: ${v.summary}")
+            }
         }
+    }
+
+    /**
+     * Policy `github` after the approver (docs/ARCHITECTURE.md §6 "Merge policy"): requests the project's reviewers on
+     * the pull request (best effort, the owner's own login left out), posts the approver's assessment, removes the
+     * `needs-human` label, removes the worktree and ends the run `ready`. Nothing is merged and the issue stays open; the
+     * follower ([followOnce]) ends the run when the pull request is merged or closed on GitHub. Blocking.
+     */
+    private fun readyForGitHub(run: RunRecord, owner: UserRecord, v: Verdict) {
+        val client = gh(owner)
+        val pr = run.prNumber ?: run { needsHuman(run, owner, "There is no pull request to review."); return }
+        val settings = settingsOf(run.repo)
+        val own = owner.githubLogin
+        // GitHub refuses a review request from the pull request's author.
+        val logins = settings.reviewers.filter { own == null || !it.equals(own, ignoreCase = true) }
+        val teams = settings.teamReviewers
+        var note = ""
+        if (logins.isNotEmpty() || teams.isNotEmpty()) {
+            note = try {
+                client.requestReviewers(org, prRepo(run), pr, logins, teams)
+                " Reviewers requested: " + (logins.map { "@$it" } + teams.map { "team `$it`" }).joinToString(", ") + "."
+            } catch (e: Exception) {
+                log.warn("Run {}: requesting reviewers on {} failed: {}", run.id, prRef(run, pr), e.message)
+                " Requesting reviewers failed: ${(e.message ?: e.javaClass.simpleName).take(300)}."
+            }
+        }
+        val text = "**Agern: ready for review.** Pull request ${run.prUrl} passed all reviewers. Approver's assessment " +
+            "(${v.verdict}): ${v.summary}\n\nThis project merges on GitHub: review and merge the pull request there. Agern does " +
+            "not merge it and follows it until it is merged or closed.$note"
+        bestEffort { client.comment(org, run.repo, run.issueNumber, text) }
+        if (run.targetRepo != null) bestEffort { client.comment(org, prRepo(run), pr, text) }
+        bestEffort { client.removeLabel(org, run.repo, run.issueNumber, "needs-human") }
+        // The pushed branch and the open pull request stay; the local worktree is no longer needed.
+        cleanupWorktree(run.id, merged = false)
+        runs.setFailure(run.id, null, null)
+        runs.setStatus(run.id, RunStatus.READY, clearError = true)
+        publish(run.id)
     }
 
     /** What a run's set-up read and checked out (see [setUpRun]). */
@@ -1738,8 +1821,11 @@ class Orchestrator(
         bestEffort {
             client.comment(
                 org, run.repo, run.issueNumber,
-                "**Agern: needs a human.** $reason\n\nPull request: ${run.prUrl ?: "(none)"}\n\n" +
-                    "The run owner (@${owner.githubLogin ?: owner.username}) can merge it with `/factory approve ${run.id}` in the Agern chat or the Approve button on the run page.",
+                "**Agern: needs a human.** $reason\n\nPull request: ${run.prUrl ?: "(none)"}\n\n" + if (run.mergePolicy == MergePolicy.GITHUB) {
+                    "This project merges on GitHub: the pull request can be reviewed and merged there; Agern does not merge it."
+                } else {
+                    "The run owner (@${owner.githubLogin ?: owner.username}) can merge it with `/factory approve ${run.id}` in the Agern chat or the Approve button on the run page."
+                },
             )
         }
         runs.setStatus(run.id, RunStatus.NEEDS_HUMAN, reason)
@@ -1870,6 +1956,8 @@ class Orchestrator(
     private fun mergeStep(runId: UUID, rethrowTransient: Boolean = false, mergedMeanwhile: Boolean = false): MergeStep {
         val run = runs.get(runId) ?: return MergeStep.Done
         val owner = owner(run)
+        // Defence in depth (docs/ARCHITECTURE.md §6 "Merge policy"): the run's policy decides, whoever called.
+        if (policyRefuses(run, owner, run.mergeApprovedBy)) return MergeStep.Done
         val client = gh(owner)
         val pr = run.prNumber ?: run { needsHuman(run, owner, "There is no pull request to merge."); return MergeStep.Done }
         if (!guardsPass(run, owner, client, pr)) return MergeStep.Done
@@ -1941,6 +2029,17 @@ class Orchestrator(
             }
         }
         return MergeStep.Wait
+    }
+
+    /**
+     * The run's merge policy forbids this merge (docs/ARCHITECTURE.md §6 "Merge policy"): never under `github`, and under
+     * `owner_approves` only when a person approved it ([approvedBy] not null). Sends the run to needs_human. Blocking.
+     */
+    private fun policyRefuses(run: RunRecord, owner: UserRecord, approvedBy: String?): Boolean {
+        if (run.mergePolicy != MergePolicy.GITHUB && (run.mergePolicy != MergePolicy.OWNER_APPROVES || approvedBy != null)) return false
+        log.error("Run {}: refusing to merge under merge policy {} (approved by {})", run.id, run.mergePolicy, approvedBy)
+        needsHuman(run, owner, "Not merged: this run's merge policy (${run.mergePolicy}) does not allow it.")
+        return true
     }
 
     /** The migration and submodule guards before every merge; false when one sent the run to needs_human. Blocking. */
@@ -2066,6 +2165,7 @@ class Orchestrator(
         val run = runs.get(runId) ?: return
         val owner = owner(run)
         val client = gh(owner)
+        if (policyRefuses(run, owner, user.username)) return
         val pr = run.prNumber ?: run { needsHuman(run, owner, "There is no pull request to merge."); return }
         if (!guardsPass(run, owner, client, pr)) return
         val checks = run.checks
@@ -2117,16 +2217,94 @@ class Orchestrator(
         // Before the run counts as merged, so that its outcome is on the issue when the run settles; never fails the run.
         if (run.targetRepo != null && run.releaseId == null) {
             // Single runs merge on approval (the approver's or the owner's): the pointer bump follows the same way.
-            try {
-                bumpSubmodulePointer(run, client, pr, autoMerge = true)
-            } catch (e: Exception) {
-                log.warn("Run {}: bumping the submodule pointer failed: {}", run.id, e.message)
-                pointerNotice(run, client, "warn", "**Agern: submodule pointer not bumped.** Moving `${run.targetDir}` in " +
-                    "$org/${run.repo} to the merge of ${prRef(run, pr)} failed: ${e.message?.take(300)}. Bump it by hand.")
-            }
+            bumpPointerSafely(run, client, pr, autoMerge = true)
         }
         runs.setFailure(run.id, null, null)
         runs.setStatus(run.id, RunStatus.MERGED, clearError = true)
+    }
+
+    /** [bumpSubmodulePointer] that never fails: a failure is logged and reported on the issue and in the transcript. */
+    private fun bumpPointerSafely(run: RunRecord, client: GitHubClient, pr: Int, autoMerge: Boolean) {
+        try {
+            bumpSubmodulePointer(run, client, pr, autoMerge)
+        } catch (e: Exception) {
+            log.warn("Run {}: bumping the submodule pointer failed: {}", run.id, e.message)
+            pointerNotice(run, client, "warn", "**Agern: submodule pointer not bumped.** Moving `${run.targetDir}` in " +
+                "$org/${run.repo} to the merge of ${prRef(run, pr)} failed: ${e.message?.take(300)}. Bump it by hand.")
+        }
+    }
+
+    // ------------------------------------------------------------ following pull requests on GitHub (§6 "Merge policy")
+
+    /** How often [startFollower] runs a round of [followOnce]; tests shorten it or call [followOnce] directly. */
+    @Volatile var followMillis = 60_000L
+    private val followLock = Mutex()
+
+    /** Every [followMillis], one round of [followOnce], in the services' scope (stopping them cancels it). */
+    fun startFollower(): Job = scope.launch {
+        while (isActive) {
+            delay(followMillis)
+            try {
+                followOnce()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                log.warn("Following pull requests on GitHub failed: {}", e.message)
+            }
+        }
+    }
+
+    /**
+     * One round of the follower: every run that has a pull request and is `ready`, or `needs_human` under policy
+     * `github`, has its pull request read once with its owner's token. Merged → `merged` (on GitHub, by whom GitHub
+     * says); closed → `cancelled`; open or unreadable → unchanged (tried again next round). One run's failure never stops
+     * the round.
+     */
+    suspend fun followOnce() = followLock.withLock {
+        for (run in withContext(Dispatchers.IO) { runs.followable() }) {
+            try {
+                follow(run)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                log.warn("Following the pull request of run {} failed: {}", run.id, e.message)
+            }
+        }
+    }
+
+    private suspend fun follow(run: RunRecord) {
+        val pr = run.prNumber ?: return
+        val owner = users.byId(run.ownerId) ?: run { log.warn("Run {}: its owner no longer exists; not followed", run.id); return }
+        val client = access.client(owner) ?: run { log.info("Run {}: its owner has no GitHub token; not followed now", run.id); return }
+        val info = withContext(Dispatchers.IO) { client.getPull(org, prRepo(run), pr) }
+            ?: run { log.info("Run {}: pull request {} could not be read", run.id, prRef(run, pr)); return }
+        if (info.state == "open" && !info.merged) return
+        val merged = info.merged
+        val by = info.mergedBy?.login
+        val closedText = "Pull request ${prRef(run, pr)} was closed on GitHub without being merged."
+        val changed = when (run.status) {
+            RunStatus.READY -> withContext(Dispatchers.IO) {
+                if (merged) runs.readyToMerged(run.id, by) else runs.readyToCancelled(run.id, closedText)
+            }
+            RunStatus.NEEDS_HUMAN -> endRun(run.id, merged, proceed = { it.status == RunStatus.NEEDS_HUMAN }) {
+                if (merged) {
+                    runs.setMergedOnGitHub(run.id, by)
+                    runs.setFailure(run.id, null, null)
+                    runs.setStatus(run.id, RunStatus.MERGED, clearError = true)
+                } else {
+                    runs.setStatus(run.id, RunStatus.CANCELLED, closedText)
+                }
+            }
+            else -> false
+        }
+        if (!changed) return
+        log.info("Run {}: pull request {} was {} on GitHub", run.id, prRef(run, pr), if (merged) "merged" else "closed")
+        withContext(Dispatchers.IO) {
+            bestEffort { client.removeLabel(org, run.repo, run.issueNumber, "needs-human") }
+            // Agern did not merge it: the pointer bump is opened for a human, never merged.
+            if (merged && run.targetRepo != null && run.releaseId == null) bumpPointerSafely(run, client, pr, autoMerge = false)
+        }
+        publish(run.id)
     }
 
     /** Records the worktree HEAD Agern just pushed as the head first seen now (the checks' settle period counts from it). */
@@ -2514,9 +2692,12 @@ class Orchestrator(
             "first if the repository has one). Agern itself listens on port ${cfg.port} on this host: never start anything on " +
             "that port, never stop or call that server, and never use a production service.\n"
 
-    private fun approvalPrompt(c: RunContext, spec: String, reviews: Map<String, Verdict>, round: Int, maxRounds: Int, prUrl: String?) = buildString {
+    private fun approvalPrompt(
+        c: RunContext, spec: String, reviews: Map<String, Verdict>, round: Int, maxRounds: Int, prUrl: String?, policy: String,
+    ) = buildString {
         append("Decide whether the pull request for issue #${c.issue.number} in ${org}/${c.repo} may be squash-merged into `${c.targetBranch}`.\n")
         append(c.releaseNote)
+        append(policyParagraph(c, policy)).append('\n')
         append("Branch `${c.branch}`; pull request ${prUrl ?: "(none)"}; fix rounds used: $round of $maxRounds.\n")
         append(c.workspaceBlock)
         append("Inspect the change with `${c.git} diff ${c.baseRef}...HEAD`. You cannot edit files.\n\n")
@@ -2527,6 +2708,26 @@ class Orchestrator(
             append('\n')
         }
         append("</reviews>\n\nAnswer through the structured output: verdict `APPROVE` or `ESCALATE` and a summary.")
+    }
+
+    /** What the approver's verdict does under the run's merge [policy] (docs/ARCHITECTURE.md §6 "Merge policy"). */
+    private fun policyParagraph(c: RunContext, policy: String): String = when (policy) {
+        MergePolicy.OWNER_APPROVES ->
+            "Merge policy: the run owner approves every merge. You cannot merge: your verdict is a recommendation to the owner. " +
+                "`APPROVE` = you recommend merging; `ESCALATE` = you recommend not merging as it stands. Write the summary for the " +
+                "owner: what you checked, the risks, and what they should look at before merging."
+        MergePolicy.GITHUB ->
+            "Merge policy: merged on GitHub by the team. Agern never merges this pull request: your verdict is a recommendation " +
+                "that is posted for the human reviewers. `APPROVE` = you recommend merging; `ESCALATE` = you recommend that the " +
+                "reviewers look closely before merging. Write the summary for those reviewers."
+        else -> if (c.releaseName != null) {
+            "Merge policy: automatic. `APPROVE` squash-merges the pull request into the release branch `${c.targetBranch}` " +
+                "immediately, without a human looking at it (the issue stays open until the release is merged); `ESCALATE` asks " +
+                "the run owner to decide."
+        } else {
+            "Merge policy: automatic. `APPROVE` squash-merges the pull request and closes the issue immediately, without a human " +
+                "looking at it; `ESCALATE` asks the run owner to decide."
+        }
     }
 
     companion object {

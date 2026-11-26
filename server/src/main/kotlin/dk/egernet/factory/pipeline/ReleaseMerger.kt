@@ -39,9 +39,9 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Whether a project allows automatic releases (docs/ARCHITECTURE.md §6 "Release mode"). The seam for #24: a project
- * that requires a human approval refuses automatic here, both when the mode is set and before an automatic merge.
- * Until #24 exists every project allows it.
+ * Whether a project allows automatic releases (docs/ARCHITECTURE.md §6 "Release mode"): a project whose merge policy
+ * requires a human approval (§6 "Merge policy") refuses automatic here, both when the mode is set and before an
+ * automatic merge. The services derive it from the project settings; [ALLOW_ALL] is for tests.
  */
 fun interface ReleaseModePolicy {
     fun allowsAutomatic(repo: String): Boolean
@@ -74,6 +74,8 @@ class ReleaseMerger(
     private val scope: CoroutineScope,
     private val policy: ReleaseModePolicy = ReleaseModePolicy.ALLOW_ALL,
     private val clock: java.time.Clock = java.time.Clock.systemUTC(),
+    /** The project's current merge policy (docs/ARCHITECTURE.md §6 "Merge policy"); blocking. */
+    private val mergePolicyOf: (String) -> String = { dk.egernet.factory.MergePolicy.AUTOMATIC },
 ) {
     private val log = LoggerFactory.getLogger(ReleaseMerger::class.java)
     private val org get() = cfg.githubOrg
@@ -466,6 +468,8 @@ class ReleaseMerger(
         "**Agern: release `${r.name}` is ready to release.** ${r.merged.size} issue(s) merged. " + if (r.automatic) {
             "It is set to release automatically: Agern merges it for @${login(owner)} once it merges cleanly and all " +
                 "checks on this pull request have passed. It can be switched to manual approval on ${pageUrl(r)}."
+        } else if (mergePolicyOf(r.repo) == dk.egernet.factory.MergePolicy.GITHUB) {
+            "This project merges on GitHub: review and merge this pull request there; Agern follows it."
         } else {
             "@${login(owner)} can approve it on ${pageUrl(r)} or with `/factory release approve ${r.name}`."
         }

@@ -12,6 +12,8 @@ import type {
   IssueKind,
   PreferenceOverrides,
   Project,
+  ProjectSettings,
+  MergePolicy,
   Release,
   ReleaseChecks,
   ReleaseMode,
@@ -733,7 +735,7 @@ function findRun(idOrPrefix: string) {
 
 function setRunStatus(r: Run, status: Run['status'], ts: string) {
   r.status = status;
-  if (['merged', 'failed', 'cancelled'].includes(status)) {
+  if (['merged', 'failed', 'cancelled', 'ready'].includes(status)) {
     r.endedAt = ts;
     const issue = db.issues[r.repo]?.find((i) => i.number === r.issueNumber);
     if (issue) {
@@ -887,8 +889,17 @@ function pipeline(r: Run, plan: Plan, owner: User, startMs: number) {
     setRunStatus(r, 'approving', iso(t));
     runStage(r, 'approver', round, plan, t, owner, (t2, stage) => {
       if (fail()) return;
+      // Like the server: what the verdict does follows the policy stored on the run (ARCHITECTURE §6 "Merge policy").
+      if (r.mergePolicy === 'github') {
+        r.error = null;
+        setRunStatus(r, 'ready', iso(t2 + 1500));
+        return;
+      }
       if (stage.verdict === 'ESCALATE') r.error = `The approver escalated: ${stage.summary}`;
-      setRunStatus(r, stage.verdict === 'APPROVE' ? 'merged' : 'needs_human', iso(t2 + 1500));
+      else if (r.mergePolicy === 'owner_approves') {
+        r.error = `The approver recommends merging: ${stage.summary} This project requires the run owner's approval before every merge.`;
+      }
+      setRunStatus(r, stage.verdict === 'APPROVE' && r.mergePolicy !== 'owner_approves' ? 'merged' : 'needs_human', iso(t2 + 1500));
     });
   };
   spec();
@@ -978,6 +989,40 @@ export function setProjectIconFromRepository(repo: string, rawPath: string) {
   const url = REPOSITORY_IMAGES[repo]?.[path];
   if (!url) throw new MockError(404, 'icon_file_not_found', `No file \`${path}\` on the default branch`);
   replaceProjectIcon(repo, url);
+}
+
+const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+const TEAM_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/;
+
+/** The project's merge policy now (ARCHITECTURE §6 "Merge policy"). */
+export function policyOf(repo: string): MergePolicy {
+  return db.projects.find((x) => x.name === repo)?.settings.mergePolicy ?? 'automatic';
+}
+
+/** Validates and stores the project's settings like the server; the caller checked admin and visibility. */
+export function setProjectSettings(repo: string, body: Partial<ProjectSettings>) {
+  const p = db.projects.find((x) => x.name === repo);
+  if (!p) throw new MockError(404, 'not_found', `No repository ${repo} in ${ORG}.`);
+  if (!body.mergePolicy || !['automatic', 'owner_approves', 'github'].includes(body.mergePolicy)) {
+    throw new MockError(400, 'bad_request', 'mergePolicy must be one of automatic, owner_approves, github');
+  }
+  const list = (raw: string[] | undefined, re: RegExp, what: string, field: string) => {
+    const out: string[] = [];
+    for (const entry of raw ?? []) {
+      const e = entry.trim().replace(/^@/, '').trim();
+      if (!e) continue;
+      if (!re.test(e)) throw new MockError(400, 'bad_request', `${field}: '${e.slice(0, 100)}' is not a valid ${what}`);
+      if (!out.some((x) => x.toLowerCase() === e.toLowerCase())) out.push(e);
+    }
+    if (out.length > 15) throw new MockError(400, 'bad_request', `${field}: at most 15 entries`);
+    return out;
+  };
+  p.settings = {
+    mergePolicy: body.mergePolicy,
+    reviewers: list(body.reviewers, LOGIN_RE, 'GitHub login', 'reviewers'),
+    teamReviewers: list(body.teamReviewers, TEAM_RE, 'team slug', 'teamReviewers'),
+  };
+  for (const r of db.releases.values()) if (r.repo === repo) touchRelease(r);
 }
 
 export function deleteProjectIcon(repo: string) {
@@ -1102,6 +1147,10 @@ function makeRun(repo: string, issue: Issue, owner: User, createdMs: number, sta
     releaseId: release?.id ?? null,
     baseBranch: release ? `release/${release.name}` : null,
     conversation: { sessionId: null, review: 'none', followUpFrom: null },
+    // The policy in force now, fixed for the run; a release run merges into its release branch as `automatic`.
+    mergePolicy: release ? 'automatic' : policyOf(repo),
+    mergedOnGitHub: false,
+    mergedBy: null,
   };
   for (const role of ['spec-writer', 'builder', ...reviewers, 'approver'] as StageRole[]) pendingStage(r, role, 0);
   db.runs.set(r.id, r);
@@ -1209,6 +1258,9 @@ export function startRun(repo: string, issueNumber: number, owner: User, started
 
 export function approveRun(r: Run, by: User) {
   if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner can approve this run.');
+  if (r.mergePolicy === 'github') {
+    throw new MockError(409, 'merge_on_github', `This project merges on GitHub: Agern does not merge. Review and merge pull request ${r.prUrl ?? '(none)'} on GitHub.`);
+  }
   if (r.status !== 'needs_human') throw new MockError(409, 'conflict', 'Run is not waiting for a human.');
   const adv = r.conversation.sessionId ? db.sessions.get(r.conversation.sessionId) : undefined;
   if (r.conversation.review === 'running') throw new MockError(409, 'review_in_progress', 'Changes from the conversation are being reviewed; wait for the reviews.');
@@ -1347,6 +1399,7 @@ const RELEASE_NAME_RULE =
 
 /** Strictly increasing `updatedAt`, like the server's touch. */
 function touchRelease(r: Release) {
+  r.mergePolicy = policyOf(r.repo);
   const now = Date.now();
   r.updatedAt = iso(Math.max(now, Date.parse(r.updatedAt) + 1));
   feed({ type: 'release', repo: r.repo, release: r });
@@ -1390,6 +1443,7 @@ export function createRelease(
 ): Release {
   const { name, description } = validRelease(repo, body.name, body.description ?? '');
   const mode = validMode(body.mode);
+  if (mode === 'automatic') requireAutomaticAllowed(repo);
   const r: Release = {
     id: uid(),
     repo,
@@ -1419,6 +1473,7 @@ export function createRelease(
     releasedBy: null,
     mergeCommit: null,
     mode,
+    mergePolicy: policyOf(repo),
     releasedAutomatically: false,
     checks: null,
     repositories: [],
@@ -1475,6 +1530,7 @@ export function setReleaseMode(r: Release, rawMode: string, by: User) {
   if (r.status === 'released') notEditable(r);
   if (r.status === 'cancelled') throw new MockError(409, 'release_closed', 'The release is cancelled');
   if (r.status !== 'planning') guardRelease(r, by, mode === 'automatic' ? 'owner' : 'ownerOrAdmin');
+  if (mode === 'automatic') requireAutomaticAllowed(r.repo);
   if (r.mode === mode) return r;
   r.mode = mode;
   touchRelease(r);
@@ -1777,9 +1833,18 @@ export function checkRelease(r: Release, by: User) {
 }
 
 /** Owner-only approval: merges the release pull request (rebase, or a merge commit if it cannot be rebased), closes the issues, deletes the branch. */
+function requireAutomaticAllowed(repo: string) {
+  if (policyOf(repo) !== 'automatic') {
+    throw new MockError(409, 'release_mode_not_allowed', 'This project requires a human approval; its releases cannot be released automatically.');
+  }
+}
+
 export function approveRelease(r: Release, by: User) {
   if (r.status === 'planning' || r.status === 'scheduled') throw conflictOf(r);
   guardRelease(r, by, 'owner');
+  if (policyOf(r.repo) === 'github') {
+    throw new MockError(409, 'merge_on_github', 'This project merges on GitHub: Agern does not merge. Review and merge the release pull request on GitHub.');
+  }
   if (r.status !== 'ready') throw conflictOf(r);
   const held = r.issues.filter((i) => i.state === 'held');
   if (held.length)
@@ -2021,6 +2086,7 @@ function seed() {
     activeAgents: 0,
     activeRuns: 0,
     iconUrl: null,
+    settings: { mergePolicy: 'automatic', reviewers: [], teamReviewers: [] },
   });
   db.projects = [
     proj('web-shop', 'Storefront and checkout for egernet.dk', 'Kotlin', 9, 4),

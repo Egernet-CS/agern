@@ -133,7 +133,19 @@ export function buildNodes(run: Run, sessions: Map<string, AgentSession>): Recor
     round: currentRound,
   };
 
-  nodes.merge = { ...base('merge'), title: run.targetRepo && run.baseBranch ? `merge to ${run.baseBranch}` : run.baseBranch ? 'merge to release' : ROLE_TITLE.merge, state: run.status === 'merged' ? 'done' : TERMINAL_FAIL.includes(run.status) ? 'skipped' : 'pending', sub: run.prNumber ? `PR #${run.prNumber}` : null, tone: run.status === 'merged' ? 'pass' : null, verdict: run.status === 'merged' ? 'MERGED' : null, endedAt: run.status === 'merged' ? run.endedAt : null };
+  // Merge policy (ARCHITECTURE §6 "Merge policy"): `github` runs are merged on GitHub by the team, never by Agern.
+  const onGitHub = run.mergePolicy === 'github';
+  const mergedOnGitHub = run.status === 'merged' && !!run.mergedOnGitHub;
+  const prSub = run.prNumber ? `PR #${run.prNumber}` : null;
+  nodes.merge = {
+    ...base('merge'),
+    title: run.targetRepo && run.baseBranch ? `merge to ${run.baseBranch}` : run.baseBranch ? 'merge to release' : onGitHub ? 'merge on GitHub' : ROLE_TITLE.merge,
+    state: run.status === 'merged' ? 'done' : TERMINAL_FAIL.includes(run.status) ? 'skipped' : 'pending',
+    sub: mergedOnGitHub ? 'merged on GitHub' : run.status === 'ready' ? `${prSub ?? 'PR'} · waiting on GitHub` : prSub,
+    tone: run.status === 'merged' ? 'pass' : null,
+    verdict: run.status === 'merged' ? 'MERGED' : null,
+    endedAt: run.status === 'merged' ? run.endedAt : null,
+  };
   // Checks before the merge (docs/ARCHITECTURE.md §6 "Checks before a merge").
   if (run.status === 'waiting_for_checks') {
     nodes.merge = { ...nodes.merge, state: 'running', sub: 'waiting for checks' };
@@ -145,11 +157,13 @@ export function buildNodes(run: Run, sessions: Map<string, AgentSession>): Recor
   const approver = latestStage(run, 'approver');
   const review = run.conversation.review;
   const waitingSub = review === 'running' ? 'reviewing changes' : review === 'required' ? 'changes not reviewed' : 'waiting for owner';
-  const approvedByHuman = run.status === 'merged' && (approver?.verdict === 'ESCALATE' || approver?.status === 'skipped');
+  // Under `owner_approves` every merge is the owner's, also after an approver APPROVE; a merge on GitHub is nobody's in Agern.
+  const approvedByHuman =
+    run.status === 'merged' && !mergedOnGitHub && (run.mergePolicy === 'owner_approves' || approver?.verdict === 'ESCALATE' || approver?.status === 'skipped');
   nodes.human = {
     ...base('human'),
-    state: run.status === 'needs_human' ? 'running' : approvedByHuman ? 'done' : TERMINAL_FAIL.includes(run.status) || run.status === 'merged' ? 'skipped' : 'pending',
-    sub: run.status === 'needs_human' ? waitingSub : approvedByHuman ? 'approved by owner' : run.status === 'merged' ? 'not needed' : '/factory approve',
+    state: run.status === 'needs_human' ? 'running' : approvedByHuman ? 'done' : TERMINAL_FAIL.includes(run.status) || run.status === 'merged' || run.status === 'ready' ? 'skipped' : 'pending',
+    sub: run.status === 'needs_human' ? waitingSub : approvedByHuman ? 'approved by owner' : run.status === 'merged' || run.status === 'ready' ? 'not needed' : onGitHub ? 'review on GitHub' : '/factory approve',
     tone: run.status === 'needs_human' ? 'escalate' : approvedByHuman ? 'pass' : null,
     verdict: run.status === 'needs_human' ? 'WAITING' : approvedByHuman ? 'APPROVED' : null,
   };

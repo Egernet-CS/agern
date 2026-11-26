@@ -99,7 +99,8 @@ class McpServer(
             schema(Triple("runId", "string", "Run id"), required = listOf("runId"))),
         Tool("factory_approve_run", "Merge a run that waits in needs_human. Only the run's owner may do this. The merge waits " +
                 "for the checks on the pull request's head commit: passed checks merge at once, pending ones leave the run " +
-                "waiting_for_checks until they pass, failed ones leave it in needs_human.",
+                "waiting_for_checks until they pass, failed ones leave it in needs_human. Refused for projects that merge " +
+                "on GitHub (merge policy `github`): their pull requests are reviewed and merged there.",
             schema(Triple("runId", "string", "Run id"), required = listOf("runId"))),
         Tool("factory_cancel_run", "Cancel a pipeline run.",
             schema(Triple("runId", "string", "Run id"), required = listOf("runId"))),

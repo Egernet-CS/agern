@@ -1447,6 +1447,22 @@ html.app-locked #root {
 .ph-live {
   color: var(--amber-hi);
 }
+/* The project's merge policy (ARCHITECTURE §6 "Merge policy"): one line under the meta row. */
+.ph-policy {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  align-items: center;
+  margin-top: 8px;
+  font-size: 0.82rem;
+  color: var(--text-2);
+}
+.ph-policy-label {
+  color: var(--text-3);
+}
+.ph-policy .btn {
+  padding-block: 0;
+}
 .project-tabs {
   display: none;
 }

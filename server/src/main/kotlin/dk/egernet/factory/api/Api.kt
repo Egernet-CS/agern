@@ -10,6 +10,7 @@ import dk.egernet.factory.FeedFrame
 import dk.egernet.factory.LoginStepDto
 import dk.egernet.factory.PIPELINE_ROLES
 import dk.egernet.factory.ProjectIcons
+import dk.egernet.factory.ProjectSettingsReq
 import dk.egernet.factory.RunStatus
 import dk.egernet.factory.Services
 import dk.egernet.factory.SettingsDto
@@ -620,6 +621,13 @@ private fun Route.projectRoutes(s: Services) {
         val req = call.receive<IconFromRepositoryReq>()
         call.respond(s.factory.setProjectIconFromRepository(u, repo, req.path))
     }
+    // Project settings (docs/ARCHITECTURE.md §6 "Merge policy"): admins set them, everyone who sees the repo sees them.
+    put("/projects/{repo}/settings") {
+        val u = call.requireAdmin(s)
+        val repo = repoParam()
+        val req = call.receive<ProjectSettingsReq>()
+        call.respond(s.factory.setProjectSettings(u, repo, req))
+    }
     delete("/projects/{repo}/icon") {
         val u = call.requireAdmin(s)
         call.respond(s.factory.deleteProjectIcon(u, repoParam()))
@@ -699,7 +707,11 @@ private fun Route.runRoutes(s: Services) {
  * repository [u] cannot read are left out.
  */
 private suspend fun Services.releaseDto(u: dk.egernet.factory.db.UserRecord, r: dk.egernet.factory.db.ReleaseRecord): dk.egernet.factory.ReleaseDto =
-    r.toDto().let { d -> if (d.repositories.isEmpty()) d else withContext(Dispatchers.IO) { d.forViewer { access.canSee(u, it) } } }
+    withPolicy(r.toDto()).let { d -> if (d.repositories.isEmpty()) d else withContext(Dispatchers.IO) { d.forViewer { access.canSee(u, it) } } }
+
+/** [d] with its project's current merge policy (docs/ARCHITECTURE.md §6 "Merge policy"). */
+private suspend fun Services.withPolicy(d: dk.egernet.factory.ReleaseDto): dk.egernet.factory.ReleaseDto =
+    d.copy(mergePolicy = withContext(Dispatchers.IO) { projectSettings.get(d.repo).mergePolicy })
 
 private fun Route.releaseRoutes(s: Services) {
     get("/projects/{repo}/releases") {
@@ -1150,8 +1162,9 @@ private fun Route.wsRoutes(s: Services) {
                     // Per subscriber: a member repository they cannot read keeps its pull request details to itself.
                     is FeedItem.Release -> FeedFrame(
                         type = "release", repo = item.repo,
-                        release = if (item.release.repositories.isEmpty()) item.release
-                            else withContext(Dispatchers.IO) { item.release.forViewer { s.access.canSee(u, it) } },
+                        release = s.withPolicy(item.release).let { d ->
+                            if (d.repositories.isEmpty()) d else withContext(Dispatchers.IO) { d.forViewer { s.access.canSee(u, it) } }
+                        },
                     )
                     is FeedItem.ReleaseDeleted -> FeedFrame(type = "release_deleted", repo = item.repo, releaseId = item.releaseId)
                     is FeedItem.SandboxApproval -> FeedFrame(type = "sandbox_approval", repo = item.repo, approval = item.approval)
