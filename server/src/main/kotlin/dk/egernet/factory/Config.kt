@@ -164,6 +164,10 @@ data class Config(
                     userFilter = get("FACTORY_LDAP_USER_FILTER") ?: "(uid={0})",
                     bindDn = get("FACTORY_LDAP_BIND_DN"),
                     bindPassword = get("FACTORY_LDAP_BIND_PASSWORD"),
+                    // DNs contain commas, so several groups are separated by ';'.
+                    requiredGroups = (get("FACTORY_LDAP_REQUIRED_GROUP") ?: "").split(';').map { it.trim() }.filter { it.isNotEmpty() },
+                    groupMemberAttribute = get("FACTORY_LDAP_GROUP_MEMBER_ATTRIBUTE") ?: "member",
+                    groupMemberValue = (get("FACTORY_LDAP_GROUP_MEMBER_VALUE") ?: "dn").lowercase(),
                 ),
                 devUsers = devUsers,
                 dataDir = Paths.get(get("FACTORY_DATA_DIR") ?: "./data").toAbsolutePath().normalize(),
@@ -287,8 +291,15 @@ data class LdapConfig(
     val userFilter: String = "(uid={0})",
     val bindDn: String? = null,
     val bindPassword: String? = null,
+    /** Group DNs, any one of which must list the user (FACTORY_LDAP_REQUIRED_GROUP); empty = no group check. */
+    val requiredGroups: List<String> = emptyList(),
+    /** Attribute of the group entry that lists members (FACTORY_LDAP_GROUP_MEMBER_ATTRIBUTE). */
+    val groupMemberAttribute: String = "member",
+    /** `dn` (the member attribute holds user DNs) or `uid` (it holds login names) (FACTORY_LDAP_GROUP_MEMBER_VALUE). */
+    val groupMemberValue: String = "dn",
 ) {
-    override fun toString() = "LdapConfig(url=$url, userDnTemplate=$userDnTemplate, baseDn=$baseDn, bindDn=$bindDn)"
+    override fun toString() = "LdapConfig(url=$url, userDnTemplate=$userDnTemplate, baseDn=$baseDn, bindDn=$bindDn, " +
+        "requiredGroups=$requiredGroups, groupMemberAttribute=$groupMemberAttribute, groupMemberValue=$groupMemberValue)"
 }
 
 /** Sandbox settings (docs/ARCHITECTURE.md §3, §5 "Sandboxes"). */

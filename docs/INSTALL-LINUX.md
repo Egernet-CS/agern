@@ -126,6 +126,30 @@ password hashes on the machine. Your choices:
   `sudo usermod -aG shadow agern && sudo agern restart`. Give those accounts passwords that are
   used nowhere else.
 
+**Restricting LDAP logins to a group.** With `FACTORY_AUTH=ldap` alone, everyone with an account
+in the directory can log in. Whenever the directory is wider than the team (e.g. a whole
+organisation), set a required group. Agern checks it after the user's own bind, as that user, so
+no service account (and no password for one on this host) is needed; it works with the DN template
+as well as with search-then-bind.
+
+```sh
+# groupOfNames (member holds user DNs) — the defaults
+FACTORY_LDAP_REQUIRED_GROUP=cn=agern,ou=groups,dc=example,dc=com
+
+# posixGroup (memberUid holds login names)
+FACTORY_LDAP_REQUIRED_GROUP=cn=agern,ou=groups,dc=example,dc=com
+FACTORY_LDAP_GROUP_MEMBER_ATTRIBUTE=memberUid
+FACTORY_LDAP_GROUP_MEMBER_VALUE=uid
+```
+
+Use `uniqueMember` for `groupOfUniqueNames`. Several groups are separated by `;` (membership of any
+one is enough). The directory must let authenticated users compare or read the member attribute of
+these group entries; otherwise every login is refused. A refused user sees "Wrong username or
+password"; the reason is in the log (`journalctl -u agern | grep 'ldap:'`), e.g.
+`ldap: bob is not in cn=agern,ou=groups,dc=example,dc=com`. Membership is checked at every login,
+so removing someone from the group takes effect at their next login (sessions last up to 14 days).
+`FACTORY_ADMINS` still decides who is an admin, and admins must be in the group too.
+
 ## 5. Claude CLI and gh for the agern user
 
 Agents are `claude` processes; they use `git` (installed with the package) and `gh`. Install them
