@@ -230,7 +230,7 @@ export function DeployPage() {
           </p>
           {err && <p className="form-error" role="alert">{err}</p>}
           <div className="dialog-actions">
-            <button type="button" className="btn btn--ghost" onClick={() => setDialog(null)} disabled={busy} autoFocus>
+            <button type="button" className="btn btn--ghost" onClick={() => setDialog(null)} disabled={busy} data-autofocus>
               Cancel
             </button>
             <button type="button" className="btn btn--approve" onClick={() => void mutate('approve')} disabled={busy}>
@@ -245,7 +245,7 @@ export function DeployPage() {
           <p>Chat agents of {repo} then cannot use any target until an admin approves a version again. Commands already running are not stopped.</p>
           {err && <p className="form-error" role="alert">{err}</p>}
           <div className="dialog-actions">
-            <button type="button" className="btn btn--ghost" onClick={() => setDialog(null)} disabled={busy} autoFocus>
+            <button type="button" className="btn btn--ghost" onClick={() => setDialog(null)} disabled={busy} data-autofocus>
               Cancel
             </button>
             <button type="button" className="btn btn--danger" onClick={() => void mutate('revoke')} disabled={busy}>
@@ -260,7 +260,7 @@ export function DeployPage() {
           <p>A new key pair is generated and the old one is deleted at once. Deployments fail until the new public key is in authorized_keys on every target.</p>
           {err && <p className="form-error" role="alert">{err}</p>}
           <div className="dialog-actions">
-            <button type="button" className="btn btn--ghost" onClick={() => setDialog(null)} disabled={busy} autoFocus>
+            <button type="button" className="btn btn--ghost" onClick={() => setDialog(null)} disabled={busy} data-autofocus>
               Cancel
             </button>
             <button type="button" className="btn btn--danger" onClick={() => void mutate('rotate')} disabled={busy}>

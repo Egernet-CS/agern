@@ -1047,7 +1047,7 @@ function DeploySection({ repo }: { repo: string }) {
       {q.data && s && (
         <ul className="run-list">
           <li>
-            <Link to={`/p/${repo}/deploy`} className={`run-row sbx-row dpl-row sbx-row--${s.tone}`}>
+            <Link to={`/p/${repo}/deploy`} className={`run-row dpl-row sbx-row--${s.tone}`}>
               <div className="rr-top">
                 <span className="rr-title mono">{q.data.path}</span>
               </div>
