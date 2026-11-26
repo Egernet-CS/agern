@@ -429,7 +429,13 @@ class NetworkWaitTest {
         assertEquals(403, a.post("/api/runs/${run.id}/network/retry").status.value, "CSRF header required")
         val retried = a.act(run.id, "retry")
         assertEquals(200, retried.status.value, retried.bodyAsText())
-        assertTrue(AppJson.parseToJsonElement(retried.bodyAsText()).jsonObject["waiting"].let { it == null || it.toString() == "null" })
+        // No longer waiting on attempt 1. The scripted builder fails again at once, so the answer may already show attempt 2.
+        val waitingAfterRetry = AppJson.parseToJsonElement(retried.bodyAsText()).jsonObject["waiting"]
+        assertTrue(
+            waitingAfterRetry == null || waitingAfterRetry is kotlinx.serialization.json.JsonNull ||
+                waitingAfterRetry.jsonObject["attempt"]?.jsonPrimitive?.content != "1",
+            "still waiting on attempt 1 after retry: $waitingAfterRetry",
+        )
         // Fails again: an admin may give up.
         w.awaitWaiting(run.id, attempt = 2)
         val gaveUp = root.act(run.id, "give-up")
