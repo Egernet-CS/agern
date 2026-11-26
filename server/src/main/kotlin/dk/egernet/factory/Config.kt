@@ -57,10 +57,16 @@ data class Config(
     /** FACTORY_SANDBOX*: per-run build/test sandboxes (docs/ARCHITECTURE.md §5 "Sandboxes"). */
     val sandbox: SandboxConfig = SandboxConfig(),
     /**
-     * FACTORY_RELEASE_CHECKS_SETTLE_SECONDS: how long a release pull request's head commit must have had no checks at
-     * all before "no checks" counts as green for an automatic release (CI registers its checks some seconds after a push).
+     * FACTORY_RELEASE_CHECKS_SETTLE_SECONDS: how long a pull request's head commit must have had no checks at all before
+     * "no checks" counts as green, for an automatic release and before a run is merged (CI registers its checks some
+     * seconds after a push).
      */
     val releaseChecksSettleSeconds: Long = 120,
+    /**
+     * FACTORY_RUN_CHECKS_WAIT_MINUTES: how long an approved run waits in `waiting_for_checks` for the checks on its pull
+     * request's head commit before it goes to needs_human (docs/ARCHITECTURE.md §6 "Checks before a merge").
+     */
+    val runChecksWaitMinutes: Long = 60,
     /** How long `POST /mcp` waits for a call before it answers as an event stream (not configurable; tests shorten it). */
     val mcpStreamAfterMs: Long = 5_000,
     /** How often a streamed MCP answer sends a progress notification or keep-alive while the call runs. */
@@ -201,6 +207,10 @@ data class Config(
                     (v.toLongOrNull() ?: throw IllegalArgumentException("FACTORY_RELEASE_CHECKS_SETTLE_SECONDS must be a whole number of seconds"))
                         .also { require(it in 0..3600) { "FACTORY_RELEASE_CHECKS_SETTLE_SECONDS must be between 0 and 3600" } }
                 } ?: 120,
+                runChecksWaitMinutes = get("FACTORY_RUN_CHECKS_WAIT_MINUTES")?.let { v ->
+                    (v.toLongOrNull() ?: throw IllegalArgumentException("FACTORY_RUN_CHECKS_WAIT_MINUTES must be a whole number of minutes"))
+                        .also { require(it in 1..1440) { "FACTORY_RUN_CHECKS_WAIT_MINUTES must be between 1 and 1440" } }
+                } ?: 60,
             ).also {
                 require(it.attachmentMaxMessageBytes >= it.attachmentMaxBytes) {
                     "FACTORY_ATTACHMENT_MAX_MESSAGE_MB must be at least FACTORY_ATTACHMENT_MAX_MB"

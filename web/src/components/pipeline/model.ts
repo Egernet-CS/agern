@@ -134,6 +134,14 @@ export function buildNodes(run: Run, sessions: Map<string, AgentSession>): Recor
   };
 
   nodes.merge = { ...base('merge'), title: run.targetRepo && run.baseBranch ? `merge to ${run.baseBranch}` : run.baseBranch ? 'merge to release' : ROLE_TITLE.merge, state: run.status === 'merged' ? 'done' : TERMINAL_FAIL.includes(run.status) ? 'skipped' : 'pending', sub: run.prNumber ? `PR #${run.prNumber}` : null, tone: run.status === 'merged' ? 'pass' : null, verdict: run.status === 'merged' ? 'MERGED' : null, endedAt: run.status === 'merged' ? run.endedAt : null };
+  // Checks before the merge (docs/ARCHITECTURE.md §6 "Checks before a merge").
+  if (run.status === 'waiting_for_checks') {
+    nodes.merge = { ...nodes.merge, state: 'running', sub: 'waiting for checks' };
+  } else if (run.status === 'needs_human' && run.failureKind === 'checks') {
+    nodes.merge = { ...nodes.merge, state: 'failed', tone: 'fail', sub: 'checks not passed' };
+  } else if (run.status === 'merged' && run.checks?.overriddenBy) {
+    nodes.merge = { ...nodes.merge, note: 'despite checks' };
+  }
   const approver = latestStage(run, 'approver');
   const review = run.conversation.review;
   const waitingSub = review === 'running' ? 'reviewing changes' : review === 'required' ? 'changes not reviewed' : 'waiting for owner';

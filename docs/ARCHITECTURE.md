@@ -67,7 +67,8 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_CHAT_IDLE_MINUTES` | `30` | Idle chat processes are stopped and resumed on next input |
 | `FACTORY_STAGE_TIMEOUT_MINUTES` | `60` | Wall-clock limit for one pipeline stage agent (1–1440). A spec-writer or builder is warned at 80 % of it; on timeout the agent is stopped, the stage is `failed` and the run `failed` with an error that says so (§6 "Time limit") |
 | `FACTORY_NETWORK_RETRY_HOURS` | `24` | How long a run or a release start waits for the network (GitHub, the Claude API) before it fails or holds the issue (0–168, whole hours; `0` switches waiting off, §6 "Transient failures"). Anything else is a startup error |
-| `FACTORY_RELEASE_CHECKS_SETTLE_SECONDS` | `120` | How long the head commit of a release pull request must have had no checks at all before "no checks" counts as green for an automatic release (0–3600; §6 "Checks"). Measured from when Agern first saw that head commit, persisted across restarts |
+| `FACTORY_RELEASE_CHECKS_SETTLE_SECONDS` | `120` | How long the head commit of a pull request must have had no checks at all before "no checks" counts as green, for an automatic release (§6 "Checks") and before a run is merged (§6 "Checks before a merge") (0–3600). Measured from when Agern first saw that head commit (for a run: when Agern pushed it, else its first evaluation), persisted across restarts |
+| `FACTORY_RUN_CHECKS_WAIT_MINUTES` | `60` | How long an approved run waits in `waiting_for_checks` for the checks on its pull request's head commit before it goes to `needs_human` (1–1440; §6 "Checks before a merge") |
 | `FACTORY_AGENT_PATH` | the server's `PATH` | `PATH` value handed to agent and git processes (the only value taken from the server environment) |
 | `FACTORY_GITHUB_API_URL` | `https://api.github.com` | GitHub REST base URL (GitHub Enterprise: `https://host/api/v3`) |
 | `FACTORY_ATTACHMENT_MAX_MB` | `20` | Largest single chat attachment (1–512) |
@@ -742,7 +743,7 @@ issue → spec-writer (opus) → builder (opus) ─┬→ security  (opus)   ┐
                               │              └→ code      (sonnet) ┘
                               └── any CHANGES: resume builder (max 2 rounds)
                                              all PASS → approver (opus)
-                                                          ├ APPROVE  → merge to main
+                                                          ├ APPROVE  → checks → merge to main
                                                           └ ESCALATE → needs-human ← /factory approve
 ```
 
@@ -783,9 +784,10 @@ reaches the default branch only through the owner's approval of the release (§6
     limit that is too short for a large issue; a per-project override (e.g. in `.agern/`) can be added later if a real
     project needs one, and is a configuration change only (`AgentManager.runStageAgent` takes the limit from `Config`).
 - **approver** answers `{ "verdict": "APPROVE" | "ESCALATE", "summary": string }`. `APPROVE`
-  squash-merges the PR and closes the issue, unless its database migrations collide with the target's (§6 "Database
-  migrations"): then the run goes to `needs_human` instead. `ESCALATE` labels the issue `needs-human`, comments,
-  and waits for the owner's `/factory approve`.
+  squash-merges the PR and closes the issue once the checks on the pull request's head commit allow it (§6 "Checks
+  before a merge"), unless its database migrations collide with the target's (§6 "Database migrations"): then the run
+  goes to `needs_human` instead. `ESCALATE` labels the issue `needs-human`, comments, and waits for the owner's
+  `/factory approve`.
 - **Whose models.** Every agent runs on its owner's Claude account, so model choices are personal. The
   global settings (`chatModel`, `pipelineModels`, `maxFixRounds`) are the admin's *defaults* — the models
   shown above unless an admin changes them. Each user may override any of them for themselves
@@ -832,12 +834,13 @@ reaches the default branch only through the owner's approval of the release (§6
 - Orchestration is a deterministic state machine in the server, not something an LLM decides. On
   server restart, unfinished runs — a run waiting for the network included — are marked `failed` with a clear reason
   (v1; resuming a run in place after a restart is not built); a building release then builds the interrupted issue
-  again (§6 "Releases"). While the server runs, a failure that comes from the environment rather than the work does
-  not fail the run: it waits and retries (§6 "Transient failures").
+  again (§6 "Releases"). `needs_human` runs survive, and so do `waiting_for_checks` runs: their wait is resumed with
+  its original deadline (§6 "Checks before a merge"). While the server runs, a failure that comes from the environment
+  rather than the work does not fail the run: it waits and retries (§6 "Transient failures").
 - **Worktrees and branches.** Rule: **every run has its own branch** (`…-<first 8 hex digits of the run id>`, §5)
   and its own worktree `runs/<runId>`, so no run ever reuses, resets or force-pushes the branch, pull request or
   worktree of an earlier run — a leftover can never collide with a new run. At most one run per issue is active
-  (`queued` … `approving`, `needs_human`); a second start is 409 `active_run_exists`.
+  (`queued` … `approving`, `waiting_for_checks`, `needs_human`); a second start is 409 `active_run_exists`.
   - *When a run ends* its worktree is removed before its final status is shown: `merged` (approver or owner
     approve) also deletes the local branch; `failed` (any stage, the time limit, no commits, set-up errors) and
     `cancelled` (also from `needs_human`, or through a release) delete the local branch unless it holds commits
@@ -861,6 +864,72 @@ reaches the default branch only through the owner's approval of the release (§6
     "Sandbox before worktree"), the same is done for every clone on disk. The worktree of a live run, `needs_human`
     included, is never touched. A run's sandbox, which bind-mounts its worktree, is always removed first.
 
+#### Checks before a merge
+
+Every run merge — the approver's `APPROVE`, the owner's approval (button, `/factory approve`, `factory_approve_run`)
+and the step retry of a failed merge — goes through one gate (issue #100). Single, release and workspace runs behave
+alike. Decided by these rules alone, never by an agent.
+
+1. The database migration and submodule guards run first (§6 "Database migrations", "Submodule pointers").
+2. The pull request is read. Not open on GitHub (merged or closed there) or not found: `needs_human`, `failedStep`
+   `merge`, "Pull request <ref> is no longer open on GitHub (<merged|closed>), so Agern did not merge it."
+3. The checks on its current **head commit** are evaluated with the rules of releases (§6 "Releasing", "Checks"):
+   commit statuses, check runs and GitHub Actions workflow runs; `failed` > `pending` > `passed` > `none`, and "no
+   checks" is `awaiting` until the head commit has been known for `FACTORY_RELEASE_CHECKS_SETTLE_SECONDS`. For a run
+   the head is first seen when Agern pushes it (the pipeline's push and the follow-up review's push record the
+   worktree HEAD and the time), else at the first evaluation that sees it; persisted, so a restart does not restart
+   the period.
+4. By state:
+   - **`passed` or `none`**: squash-merged with the merge API's expected `sha` set to the evaluated commit. GitHub's
+     409 (the head moved meanwhile) evaluates the new head (step 2) instead; a merge never happens for another commit
+     than the one whose checks were evaluated. Other merge failures: `needs_human` with `failedStep` `merge`, as before.
+   - **`pending` or `awaiting`**: the run goes to `waiting_for_checks` (error cleared) and a job (cancelled by "Cancel
+     run") evaluates again from step 1 every 30 s, on the pull request's then-current head: a new head gets a fresh
+     settle period and fresh checks. Nobody approves again; it merges as soon as they pass. The run is published when
+     the checks' state, commit or detail changes.
+   - **`failed`**: no merge; `needs_human` with `failureKind` `checks` and `failedStep` `merge`. The reason names every
+     failed check (a Markdown link when GitHub gave an `https://` URL) and the short SHA; when a conclusion is
+     `startup_failure`, `cancelled`, `timed_out` or `stale` it adds "Some checks did not run to completion (for example
+     a startup failure or a cancellation on GitHub's side). Re-run them on GitHub, then approve again." It goes on the
+     issue (the needs-human comment) and on the pull request ("**Agern: not merged.** …").
+   - **`unknown`**: a read GitHub refused (401/403/404) is `needs_human` at once (`failureKind` `checks`): "Could not
+     read the checks of <ref>: <message>. The run owner's GitHub token needs read access to commit statuses, checks and
+     Actions." Other read errors (5xx, I/O, also of the pull request) are waited through like `pending`.
+5. **Time limit.** After `FACTORY_RUN_CHECKS_WAIT_MINUTES` (default 60) in `waiting_for_checks`, counted from the first
+   transition into it of this merge attempt (a head move does not restart it), the run goes to `needs_human`
+   (`failureKind` `checks`, `failedStep` `merge`): "Checks on `<sha7>` of <ref> did not finish within <n> minutes
+   (<detail>). Approve again to wait again, or merge anyway on the run page."
+6. A later approval or merge retry of a `needs_human` run starts again at step 1 on the then-current head; nothing of
+   an earlier evaluation is reused. A `needs_human` run never starts merging by itself.
+
+*The owner's approval* evaluates once before it answers: merged or `needs_human` as before, or the run is answered in
+`waiting_for_checks` and its job goes on; the advisor ends, and a release run settles, only when that job reaches
+`merged` or `needs_human`. `/factory approve` and `factory_approve_run` then answer "Run <id> is waiting for checks on
+`<sha7>` (<detail>); it merges by itself when they pass." Who approved (the owner, or the approver agent) is stored, so
+the merge comment is right after a wait or a restart.
+
+*Waiting.* `waiting_for_checks` is active (one active run per issue, lists, cancel, the worktree is kept) but a restart
+does not fail it: the server resumes the wait at start with the original deadline, and it does not count as in
+progress for `/api/internal/activity`. The advisor and "Review again" are refused while waiting (409
+`run_not_waiting`). A waiting release run keeps its issue `running`; the release builds nothing else meanwhile.
+
+*Merge anyway.* The run's owner — nobody else, admins included — can merge although the checks have not passed:
+`POST /api/runs/{id}/merge-anyway` with `{ headSha }`, the commit whose checks they saw, from the web UI's confirmation
+dialog that names the checks. There is deliberately no MCP tool, MCP argument or `/factory` command for it, so no agent
+can override the checks. Allowed from `needs_human` or `waiting_for_checks` when the run has a pull request and its
+recorded checks are `failed`, `pending`, `awaiting` or `unknown` (else 409 `run_not_overridable`), and only for
+`headSha` equal to the recorded checks' commit (else 409 `checks_changed`); from `needs_human` the conversation gate of
+an approval applies (409 `review_required` / `review_in_progress` / `agent_busy`). A waiting job is stopped first (a
+run that turned out merged meanwhile is answered as is). The guards still run; the pull request is then squash-merged
+with expected `sha` `headSha`, without evaluating the checks — a head that moved since is not merged (`needs_human`:
+"The pull request's head changed since you confirmed; approve again to evaluate the new commit."). The decision is
+recorded on the run (`checks.overriddenBy`, `checks.overriddenAt`), on the pull request ("**Agern:** @<login> merged
+this pull request although its checks had not passed on `<sha7>` (<detail>).") and on the issue (the merged comment
+ends "(approved by @<login>, despite checks: <detail>)").
+
+*Untrusted.* Check names, details and URLs come from GitHub: they are escaped as Markdown text in comments and
+reasons, a URL is used as a link only when it starts with `https://`, and the UI renders them as text.
+
 #### Retrying a run
 
 A failed run can be retried in three ways (issue #53), depending on where it stopped:
@@ -878,8 +947,9 @@ A failed run can be retried in three ways (issue #53), depending on where it sto
   the approver's decision when the approver had approved, else as the owner's — which is what the owner's approval
   also does. It goes through the same gate as the approval: changes from the conversation must have been reviewed
   (409 `review_required` / `review_in_progress` / `agent_busy`, §6 "Conversation at needs human"), and the merge
-  checks the database migrations first (§6 "Database migrations"). A migration conflict is not a failed step: it
-  clears `failedStep`, so the run offers no step retry until its branch is fixed.
+  checks the database migrations first (§6 "Database migrations") and then the checks on the pull request's head
+  commit (§6 "Checks before a merge"). A migration conflict is not a failed step: it clears `failedStep`, so the run
+  offers no step retry until its branch is fixed.
 - **Continue from the commits** (`continue`): a **new run** whose worktree starts at the tip of the failed run's
   branch (local branch, else the remote one, fetched), on its own new branch (§6 "Worktrees and branches"). It reuses
   the failed run's spec (the spec-writer stage is `skipped` with summary "Spec reused from run <id>"; a failed run
@@ -909,9 +979,10 @@ other failure whose branch has commits. Commits are counted in the owner's clone
 `ECONNREFUSED`, `ENOTFOUND`, `ETIMEDOUT`, `ConnectException`, or is an I/O exception), `restart` (failed by a server
 restart: "Server restarted while the run was in progress; retry it to continue or start over."), `blocked` (no
 commits), `step` (with `failedStep`), `other`; and, on a `needs_human` run whose merge was refused,
-`submodule_commit_missing` (with `failedStep` `merge`, §6 "Submodule pointers"). `FailureKind.INTERRUPTED` holds the
-four kinds of the recommendation rule. A run fails with `api_unreachable` only after it waited for the network and
-gave up, reached the limit, or when waiting is switched off (§6 "Transient failures").
+`submodule_commit_missing` (with `failedStep` `merge`, §6 "Submodule pointers") and `checks` (with `failedStep`
+`merge`: the checks failed, did not finish in time or could not be read, §6 "Checks before a merge").
+`FailureKind.INTERRUPTED` holds the four kinds of the recommendation rule. A run fails with `api_unreachable` only
+after it waited for the network and gave up, reached the limit, or when waiting is switched off (§6 "Transient failures").
 
 *Who.* Options: anyone who can see the run (404 otherwise). Retry: the run's owner only — admins included in the
 refusal (403), as for every action that makes agents run on the owner's credentials (§4) — and the owner needs a
@@ -954,9 +1025,11 @@ a stage time-out, a usage limit, a rejected credential, GitHub 4xx, a refused pu
 
 *What waits.* The run's set-up (repository and issue from GitHub, clone, worktree or workspace checkout — retried as a
 whole after removing what the failed attempt checked out), every stage agent, the "spec ready" comment, the push, the
-pull request (`findOpenPull` / `createPull`) and the pipeline's own merge after the approver approved (before each
-retry the pull request is read: merged meanwhile — e.g. the failed answer was lost — counts as merged). The owner's
-Approve, a step retry's merge, follow-up reviews and advisors do not wait.
+pull request (`findOpenPull` / `createPull`) and the pipeline's own merge after the approver approved: its first
+reading of the pull request and its squash merge (before each retry the pull request is read: merged meanwhile — e.g.
+the failed answer was lost — counts as merged; §6 "Checks before a merge"). A checks read that fails is not a network
+wait: the run waits in `waiting_for_checks` and reads again. The owner's Approve, a step retry's merge, a
+`waiting_for_checks` poll's merge, follow-up reviews and advisors do not wait.
 
 *Waiting.* The run keeps its status, worktree, sandbox, branch and stages (a waiting stage stays `running`); its
 `waiting` is `{reason: 'network', since, nextAttemptAt, attempt, detail}`. One wait per run is shared by everything
@@ -1000,8 +1073,8 @@ wrapper), never `null`: the release re-evaluation and its ticker (a non-transien
 stack trace), the release builder's notes and logs, the run failure log, and the scheduler. A run's error keeps an
 exception's own message and is the class name when it has none.
 
-Run `status`: `queued`, `spec`, `building`, `reviewing`, `approving`, `merged`, `needs_human`,
-`failed`, `cancelled`.
+Run `status`: `queued`, `spec`, `building`, `reviewing`, `approving`, `waiting_for_checks` (approved; merges by itself
+when the checks pass, §6 "Checks before a merge"), `merged`, `needs_human`, `failed`, `cancelled`.
 
 Stage `role`: `spec-writer`, `builder`, `security`, `ux`, `ui-design`, `code`, `approver`.
 Stage `status`: `pending`, `running`, `done`, `failed`, `skipped`.
@@ -1563,7 +1636,9 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   into `<default branch>`." Release runs use the same per-user agent slots as all pipeline agents.
 - **Outcomes.** A run that ends `merged` makes its issue `merged`; `needs_human`, `failed` or `cancelled` (also
   through the run's own cancel) makes it `held` with the run's error as note (or "Run failed"). Then the next issue
-  starts. The orchestrator reports every settled release run (end of its pipeline, approve, cancel — not a
+  starts. A run that waits for its checks (`waiting_for_checks`, §6 "Checks before a merge") keeps its issue `running`,
+  and the release builds nothing else meanwhile; failed checks hold the issue like any other `needs_human`, so a broken
+  issue is caught at its own run rather than at the release pull request. The orchestrator reports every settled release run (end of its pipeline, approve, cancel — not a
   cancelled coroutine) through a callback that the builder dispatches asynchronously; settling is idempotent and
   ignores runs no longer linked to an issue.
 - **Held issues.** The owner can approve the held run (`POST /api/runs/{id}/approve`, `/factory approve`): when it
@@ -1617,7 +1692,8 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   `resumeAt`. (An owner without a GitHub token pauses it the same way, with a note saying so.) If the release is
   already `paused` or `cancelled` when such a failure arrives, only the issue changes.
 - **Restart.** Interrupted runs are failed as before (§6). Then each `running` release issue is settled from its
-  run: `merged` → `merged`, `needs_human` → `held`, anything else → `waiting` ("Interrupted by a server restart; it is
+  run: `merged` → `merged`, `needs_human` → `held`, `waiting_for_checks` → stays `running` (the wait is resumed and the
+  run settles afterwards), anything else → `waiting` ("Interrupted by a server restart; it is
   built again"; continued from the run's commits when it has any); every `building` release continues, paused releases stay paused, and a due `resumeAt` is honoured.
   A run that failed in the instant before a restart, before its outcome was recorded, is rebuilt rather than held.
   A `building` release found with nothing left to build becomes `ready`. Every `ready` release is re-evaluated (its
@@ -1788,11 +1864,16 @@ release mode (#41). Single runs are unaffected and still merge into the default 
     approves it by hand. #24 only has to supply the policy from the project setting.
 - **Checks.** Each re-evaluation that reads an open pull request also reads the checks on its head commit with the
   owner's token: the combined commit status (`GET /repos/{o}/{r}/commits/{sha}/status`, the latest status per
-  context) and the latest check runs (`GET …/commits/{sha}/check-runs?filter=latest`, GitHub Actions and other
-  apps). `checksState`: `failed` if any status is `failure`/`error` or any completed check run did not end
-  `success`, `neutral` or `skipped` (so `failure`, `cancelled`, `timed_out`, `action_required`, `stale` fail);
-  otherwise `pending` if any status is `pending` or any check run is not `completed`; otherwise `passed`, or `none`
-  when there are no statuses and no check runs at all (GitHub reports `state: pending` with `total_count: 0` then —
+  context), the latest check runs (`GET …/commits/{sha}/check-runs?filter=latest`, GitHub Actions and other
+  apps) and the GitHub Actions workflow runs of the head commit (`GET /repos/{o}/{r}/actions/runs?head_sha=…`, the
+  latest run per workflow and event): a workflow run that is queued but never started, or that ended in
+  `startup_failure`, has no check runs at all. `checksState`: `failed` if any status is `failure`/`error`, any
+  completed check run or workflow run did not end `success`, `neutral` or `skipped` (so `failure`, `cancelled`,
+  `timed_out`, `action_required`, `stale`, `startup_failure` fail); otherwise `pending` if any status is `pending` or
+  any check run or workflow run is not `completed`; otherwise `passed` (a passing workflow run is one passed check),
+  or `none` when there are no statuses, check runs or workflow runs at all. A token that may not read Actions: the
+  workflow runs are left out (logged) and the rest decides. These rules are shared with the checks before a run is
+  merged (§6 "Checks before a merge"), one function for both (GitHub reports `state: pending` with `total_count: 0` then —
   that is not pending). **Settle period:** GitHub Actions and other CI register their checks only some seconds after
   the push or pull request event, so a head commit with no checks right after Agern opened the pull request (or the
   branch moved) says nothing yet. "No checks" is therefore `awaiting` ("No checks yet; waiting for them to appear
@@ -2089,7 +2170,10 @@ Tools: `factory_list_issues`, `factory_get_issue`, `factory_create_issue`, `fact
 `factory_list_runs`, `factory_get_run`, `factory_approve_run`, `factory_cancel_run`,
 `factory_send_to_agent`, `factory_request_software`, `factory_list_releases`, `factory_create_release`,
 `factory_assign_issues`, `factory_unassign_issues`, `factory_approve_release`. Personal tokens get these
-(`PERSONAL_TOOLS`, see above). Pipeline-stage agents get only `factory_get_issue`
+(`PERSONAL_TOOLS`, see above). `factory_approve_run` ("Merge a run that waits in needs_human. Only the run's owner may
+do this. The merge waits for the checks on the pull request's head commit: passed checks merge at once, pending ones
+leave the run waiting_for_checks until they pass, failed ones leave it in needs_human.") takes only `runId`: no tool
+and no argument merges despite the checks (§6 "Checks before a merge"). Pipeline-stage agents get only `factory_get_issue`
 and `factory_request_software`; with sandboxes switched on (`FACTORY_SANDBOX` not `off`) the builder also
 gets `factory_sandbox_info`, `factory_sandbox_exec` and `factory_sandbox_wait`; the `ux` and `ui-design` reviewers also get
 `factory_attach_screenshot`. The chat agent, the spec-writer and the builder also get `factory_generate_image`. The advisor (§6 "Conversation at needs human") gets the same two stage tools, bound to its
@@ -2328,7 +2412,7 @@ type Screenshot = { id: string; caption: string;   // caption: one line, untrust
   createdAt: string };
 
 type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; issueKind: IssueKind;
-  status: 'queued' | 'spec' | 'building' | 'reviewing' | 'approving' | 'merged' | 'needs_human' | 'failed' | 'cancelled';
+  status: 'queued' | 'spec' | 'building' | 'reviewing' | 'approving' | 'waiting_for_checks' | 'merged' | 'needs_human' | 'failed' | 'cancelled';
   round: number;             // fix rounds so far (0 = initial build)
   maxRounds: number;         // the starting user's effective maxFixRounds, fixed when the run is created
   branch: string | null; prNumber: number | null; prUrl: string | null;
@@ -2343,10 +2427,17 @@ type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; 
   conversation: RunConversation;  // always present; default { sessionId: null, review: 'none', followUpFrom: null }
   continuesRunId: string | null;   // the failed run this one continues from its commits (§6 "Retrying a run")
   continuedByRunId: string | null; // the newest run that continues this one
-  failureKind: 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | 'submodule_commit_missing' | null;
+  failureKind: 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | 'submodule_commit_missing' | 'checks' | null;
   failedStep: 'push' | 'pull_request' | 'merge' | null;  // the step after the builder that failed
   waiting: RunWait | null;  // while it sleeps before retrying an operation that lost the network; it keeps its status
-  warnings: { round: number; roles: StageRole[]; text: string }[] };  // the stages' warnings per round, oldest first
+  warnings: { round: number; roles: StageRole[]; text: string }[];  // the stages' warnings per round, oldest first
+  checks: RunChecks | null };  // the checks last evaluated before a merge (§6 "Checks before a merge"); null until then
+
+type RunChecks = { state: 'awaiting' | 'pending' | 'passed' | 'failed' | 'none' | 'unknown';
+  sha: string; detail: string;                // the head commit they were read for; e.g. "Failed: build, lint"
+  items: { name: string; state: 'failed' | 'pending'; conclusion: string | null; url: string | null }[];  // not passed; at most 50; url only https://
+  waitingSince: string | null; deadline: string | null;   // set only while waiting_for_checks
+  overriddenBy: string | null; overriddenAt: string | null };  // the owner merged anyway
 
 type RetryOptions = { runId: string;       // '' for a release issue without a run
   recommended: 'step' | 'continue' | 'start_over'; reason: string;   // one line
@@ -2486,7 +2577,7 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | Method & path | Body → Response | Notes |
 |---|---|---|
 | `GET /api/health` | → `{ status: 'ok', version, name: 'agern' }` | no auth; the web UI shows `version` in the user menu |
-| `GET /api/internal/activity` | → `{ idle, activeRuns, busyAgents, version }` | no auth, **host-local only**: answered only when the TCP peer is a loopback address and no proxy header (`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP`) is present; anyone else gets the generic 404. `activeRuns`: runs in `queued`/`spec`/`building`/`reviewing`/`approving` (a restart fails them); `busyAgents`: sessions `starting`/`running` (pipeline agents, chats mid-turn). `needs_human` runs and chats between turns survive a restart and do not count. Used by the upgrade timer (§9) |
+| `GET /api/internal/activity` | → `{ idle, activeRuns, busyAgents, version }` | no auth, **host-local only**: answered only when the TCP peer is a loopback address and no proxy header (`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP`) is present; anyone else gets the generic 404. `activeRuns`: runs in `queued`/`spec`/`building`/`reviewing`/`approving` (a restart fails them; `waiting_for_checks` runs are resumed after a restart and do not count); `busyAgents`: sessions `starting`/`running` (pipeline agents, chats mid-turn). `needs_human` runs and chats between turns survive a restart and do not count. Used by the upgrade timer (§9) |
 | `GET /api/auth/providers` | → `{ providers: string[], org: string, twoFactor: boolean }` | no auth |
 | `POST /api/auth/login` | `{ username, password }` → `LoginStep` | sets cookie (pending until 2FA passes) |
 | `POST /api/auth/totp` | `{ code }` → `LoginStep` | pending session; `code` is a TOTP code or a recovery code; 423 when locked |
@@ -2552,10 +2643,11 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `GET /api/projects/{repo}/runs` | → `Run[]` | newest first |
 | `POST /api/projects/{repo}/workspace/labels` | → `{ created: string[]; missing: string[] }` | creates the missing member labels with the caller's token (§5 "Member labels"); 403 `labels_forbidden`, 409 `not_a_workspace` / `workspace_invalid`, 404 when the caller cannot see the project |
 | `POST /api/projects/{repo}/runs` | `{ issueNumber }` → `Run` | needs Claude credential; 409 if the issue has an active run; a workspace project: 409 `workspace_invalid`, `member_label_missing`, `member_label_ambiguous`, 403 `member_not_accessible` (§6 "Workspace runs") |
-| `GET /api/runs?active=true&status=<s>` | → `Run[]` | across visible repos, newest first (max 200). `active=true`: not finished, i.e. `queued`, `spec`, `building`, `reviewing`, `approving` or `needs_human`. `status`: only these statuses, repeatable and/or comma list (`?status=needs_human`); unknown status → 400. Both given: both apply |
+| `GET /api/runs?active=true&status=<s>` | → `Run[]` | across visible repos, newest first (max 200). `active=true`: not finished, i.e. `queued`, `spec`, `building`, `reviewing`, `approving`, `waiting_for_checks` or `needs_human`. `status`: only these statuses, repeatable and/or comma list (`?status=needs_human`); unknown status → 400. Both given: both apply |
 | `GET /api/runs/{id}` | → `Run` | |
 | `GET /api/runs/{id}/screenshots/{sid}` | → image bytes | anyone who may see the run (404 otherwise, and for a screenshot of another run). Served with the sniffed type, `nosniff`, a sandboxing CSP, `Cross-Origin-Resource-Policy: same-origin`, `Cache-Control: private, max-age=31536000, immutable` and `Content-Disposition: inline` (`screenshot-<role>-<id8>.<ext>`). There is no upload or delete route |
-| `POST /api/runs/{id}/approve` | → `Run` | owner only, only in `needs_human`; 409 `review_in_progress`, `agent_busy`, `review_required` (§6 "Conversation at needs human") |
+| `POST /api/runs/{id}/approve` | → `Run` | owner only, only in `needs_human`; 409 `review_in_progress`, `agent_busy`, `review_required` (§6 "Conversation at needs human"); evaluates the checks on the pull request's head first and answers the run merged, `needs_human` or `waiting_for_checks` (§6 "Checks before a merge") |
+| `POST /api/runs/{id}/merge-anyway` | `{ headSha }` → `Run` | owner only (403); merges although the checks on `headSha` have not passed, bound to that commit; 409 `run_not_overridable` (not `needs_human`/`waiting_for_checks`, no pull request, or checks not blocking), `checks_changed` (`headSha` is not the recorded checks' commit), and from `needs_human` `review_required` / `review_in_progress` / `agent_busy`; web only, no MCP tool or chat command (§6 "Checks before a merge") |
 | `POST /api/runs/{id}/conversation` | `{ text }` → 202 `{ status: 'accepted', sessionId }` | owner only (403 for everyone else, admins too), only in `needs_human` (409 `run_not_waiting`). Talks to the run's advisor; the first message creates its session. 400 blank / too long, 409 `review_in_progress`, 409 `agent_busy`, 422 `claude_credential_required`, 409 `too_many_agents`, 409 `run_worktree_missing` |
 | `POST /api/runs/{id}/review` | → `Run` | "Review again": owner only (403 admins too), only in `needs_human`; starts a follow-up review of changes from the conversation. 409 `review_in_progress`, `agent_busy`, `nothing_to_review` (no conversation, or nothing changed since the last completed review); 422 `claude_credential_required` |
 | `POST /api/runs/{id}/cancel` | → `Run` | owner or admin |
@@ -3247,6 +3339,18 @@ offered as targets in the issues panel's selects or the release page's "Add an o
 rules as for building). The mock seeds `web-shop` with a ready and clean release (`1.2`), a conflicting one
 (`cart-fixes`), an incomplete one (`payments`), a released one (`1.1`) and a cancelled one (`promo`), and implements
 approve and check with the server's rules and error codes.
+
+**Checks before a merge** (§6 "Checks before a merge"). A `waiting_for_checks` run shows a status notice (`role="status"`):
+"Waiting for checks on `<sha7>`. <detail>. The pull request is merged automatically when they pass; Agern stops waiting at
+<local time>.", with the pending checks below it as links (new tab) when GitHub gave an `https://` URL. The owner sees
+"Merge anyway…" and "Cancel run"; others "Waiting for checks; it merges by itself." A `needs_human` run whose checks
+block the merge shows the reason in the error banner and gives the owner "✓ Approve & merge" (evaluates again) and
+"Merge anyway…". That dialog ("Merge without passing checks?", the shared `Dialog`: focus trap, Escape, "Don't merge"
+focused) lists each check that has not passed with "failed (<conclusion>)" or "pending" (else the detail), the
+approver's reason when it escalated, and what merging does; errors (`checks_changed`, `review_required`, …) appear in
+the page's `form-error` alert. After an overridden merge a muted line reads "Merged by <user> despite checks: <detail>".
+The diagram's merge node is `running` "waiting for checks", `failed` "checks not passed", or noted "despite checks";
+outcome nodes add their sub and note to their accessible label. The status pill reads "waiting for checks".
 
 **Retrying a run** (§6 "Retrying a run"). The run page of a `failed` or `cancelled` run shows the owner a "Retry…"
 button; "Retry #n" on the release page opens the same dialog ("Retry run <short id>?" / "Retry #n?"). It loads the

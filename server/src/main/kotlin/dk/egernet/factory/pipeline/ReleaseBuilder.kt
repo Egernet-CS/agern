@@ -543,6 +543,8 @@ class ReleaseBuilder(
             when (run?.status) {
                 RunStatus.MERGED -> store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.MERGED, null, run.id)
                 RunStatus.NEEDS_HUMAN -> store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.HELD, run.error ?: "Run failed", run.id)
+                // Approved and waiting for its checks: the orchestrator resumes the wait, and the run settles afterwards.
+                RunStatus.WAITING_FOR_CHECKS -> Unit
                 else -> store.setIssue(ref.releaseId, ref.number, ReleaseIssueState.WAITING, RESTART_NOTE, ref.runId, autoRetryMode(run))
             }
         }

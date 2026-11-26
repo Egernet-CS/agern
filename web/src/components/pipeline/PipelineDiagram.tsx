@@ -142,7 +142,9 @@ function Node({ n, box, selected, onSelect, selectable, now, compact }: { n: Nod
   const isOutcome = n.id === 'merge' || n.id === 'human';
   const isGate = n.id === 'gate';
   const timeText = n.state === 'running' && n.startedAt ? between(n.startedAt, null, now) : n.endedAt && n.startedAt ? between(n.startedAt, n.endedAt) : null;
-  const label = `${n.title}: ${STATE_TEXT[n.state]}${n.verdict ? `, verdict ${n.verdict}` : ''}${n.model ? `, model ${n.model}` : ''}`;
+  // Outcome nodes also say what they wait for or why (e.g. "waiting for checks", "checks not passed", "despite checks").
+  const outcomeText = isOutcome ? [n.sub, n.note].filter(Boolean).map((t) => `, ${t}`).join('') : '';
+  const label = `${n.title}: ${STATE_TEXT[n.state]}${n.verdict ? `, verdict ${n.verdict}` : ''}${n.model ? `, model ${n.model}` : ''}${outcomeText}`;
   const pad = 14;
   const maxChars = Math.floor((w - pad * 2) / 7.6);
   return (
