@@ -70,6 +70,7 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_RELEASE_CHECKS_SETTLE_SECONDS` | `120` | How long the head commit of a release pull request must have had no checks at all before "no checks" counts as green for an automatic release (0–3600; §6 "Checks"). Measured from when Agern first saw that head commit, persisted across restarts |
 | `FACTORY_AGENT_PATH` | the server's `PATH` | `PATH` value handed to agent and git processes (the only value taken from the server environment) |
 | `FACTORY_GITHUB_API_URL` | `https://api.github.com` | GitHub REST base URL (GitHub Enterprise: `https://host/api/v3`) |
+| `FACTORY_GITHUB_STATUS_URL` | githubstatus.com, or off | GitHub's official status summary shown on the GitHub status page (§6 "GitHub status"). Unset: `https://www.githubstatus.com/api/v2/summary.json` when `FACTORY_GITHUB_API_URL` is `https://api.github.com` and the fake GitHub is off, otherwise off (GitHub Enterprise, development). `off` or empty switches it off; any other value must be an `http://` or `https://` URL, else a startup error |
 | `FACTORY_ATTACHMENT_MAX_MB` | `20` | Largest single chat attachment (1–512) |
 | `FACTORY_ATTACHMENT_MAX_MESSAGE_MB` | `50` | All attachments of one message together (1–512, at least the per-file limit) |
 | `FACTORY_ATTACHMENT_MAX_COUNT` | `10` | Attachments per message (1–20) |
@@ -999,6 +1000,82 @@ transiently stays `scheduled` without a start failure and is started at a later 
 wrapper), never `null`: the release re-evaluation and its ticker (a non-transient failure there is logged with its
 stack trace), the release builder's notes and logs, the run failure log, and the scheduler. A run's error keeps an
 exception's own message and is the class name when it has none.
+
+#### GitHub status
+
+When GitHub has problems, Agern shows it on the GitHub status page (issue #99): GitHub's official status combined with
+what Agern itself sees, and a verdict "working", "degraded" or "down" *for Agern* — GitHub can fail for Agern while
+githubstatus.com says "All Systems Operational".
+
+*Recording* (`github/GitHubHealth.kt`, in memory, lost on restart). `HttpGitHub` sends every request — paged requests
+and `getFileBytes` included — through one function that records one outcome per exchange; `CliGitOps` records every
+`clone`, `fetch` and `push` (the first argument that is no option and not the value of a `-c`) when it is not
+`localOnly`. Not recorded: `submodule update` and the fetch of `remoteHasCommit` (other hosts possible), the fake
+GitHub, calls that agents make themselves, webhooks, and the official status fetch. Classes: `ok` (any answer below
+500 that is none of the following — 404 and 422 included — and git exit 0); `server_error` (HTTP 500–599, git "The
+requested URL returned error: 5xx"); `network` (an `IOException` — timeouts, refused connections, DNS, TLS — or an
+`UnresolvedAddressException`, a git timeout, git output `Transient.isNetworkGitMessage` accepts); `rate_limited`
+(429; 403 with `x-ratelimit-remaining: 0`, a `retry-after` header or a message containing "rate limit"; git `returned
+error: 429`); `auth` (401, any other 403; git "Authentication failed", "could not read Username", `returned error:
+401/403`); `other` (git only: any other non-zero exit, e.g. a refused push — a call, never a failure). Kinds, from
+the path without the API base, query and `/repos/{org}/{repo}` (first match): `graphql` (`/graphql`), `issues`
+(`/issues…`, `/labels…`), `pulls`, `releases`, `actions`, `checks` (`/commits/{sha}/status`, `/commits/{sha}/check-runs`,
+`/check-runs…`, `/check-suites…`, `/statuses…`), `contents`, `git_data` (`/git/…`), `repos` (anything else under
+`/repos/…`, and `/orgs/…`), `other` (`/user`, `/rate_limit`, …), plus `git` for the git CLI. Storage per kind: a ring
+of 1440 one-minute buckets with a counter per class (exact counts for 24 h, bounded memory; a bucket is in a window of
+N minutes when its minute start is later than now − N minutes) and the last error `{at, class, status, requestId,
+message}` (shown for 24 h). Nothing else: no bodies, tokens, URLs, paths or users. Recording is thread-safe and never
+throws into the caller.
+
+*Error texts and scrubbing.* HTTP: `HTTP <status>[: <GitHub's message>]`; exception: `<SimpleClassName>[: <message>]`;
+git: the last `fatal:`/`error:` line, else the last non-empty line, else `git <cmd> timed out`. Every stored or
+returned text passes `GitHubHealth.scrub`: control characters and whitespace runs become one space; credentials
+(`ghp_…`/`gho_…`/…, `github_pat_…`, the value after `Bearer`/`Basic`, a secret-looking value after `token`, an
+`Authorization:` header's value, URL userinfo) become `[redacted]`; URLs keep only scheme and host
+(`https://github.com/…`); `<org>/<name>` becomes `<org>/[repository]`; IPv4 literals, bracketed IPv6 literals,
+`localhost` and host names ending in `.local`, `.internal`, `.lan`, `.corp`, `.home.arpa` or `.localdomain` (with any
+port) become `[address]`; absolute paths under `/home/`, `/var/`, `/tmp/`, `/srv/`, `/opt/`, `/root/`, `/data/`,
+`/mnt/`, `/usr/`, `/etc/` or `/Users/` become `[path]`; at most 200 characters (`…` when cut). The request id
+(`x-github-request-id`) is kept only when it matches `[A-Za-z0-9:._-]{1,100}`.
+
+*Verdict* (every request, all kinds, last 5 minutes; F = `server_error` + `network`, S = `ok`): `down` when F ≥ 3 and
+S = 0; `degraded` when F ≥ 2, or when the official status is `ok` and a relevant component (API Requests, Issues, Pull
+Requests, Actions, Git Operations, Webhooks) is not operational; `working` otherwise (also without calls, and when the
+official status is unreachable or off). Rate-limit, auth and other outcomes never change it. Reasons: "All <F> GitHub
+calls by Agern failed in the last 5 minutes (<n> server errors, <m> timeouts or network errors).", "<F> of <T> GitHub
+calls by Agern failed in the last 5 minutes (…)." (followed by the official sentence when both apply), "GitHub reports
+problems with <names>.", "Agern's calls to GitHub are succeeding." or "Agern has made no GitHub calls in the last 15
+minutes.".
+
+*Official status* (`github/GitHubStatusPage.kt`). The server fetches `FACTORY_GITHUB_STATUS_URL` (`GET`, `Accept:
+application/json`, `User-Agent: agern`, no credentials, 5 s connect and request timeout, at most 1 MiB), caches the
+result — failures too — for 60 s and lets concurrent requests share one fetch; the browser never contacts
+githubstatus.com. Kept: `status.indicator` (`none`/`minor`/`major`/`critical`, else `unknown`) and `description`;
+components that are not `operational` (at most 50, relevant ones first, `relevant` flag); incidents that are not
+`resolved`/`postmortem` (at most 20; `url` only for an `https://` shortlink of at most 500 characters). Strings lose
+control characters and are cut (names 200, description 300). `state`: `ok`, `unreachable` (network error, timeout,
+non-2xx, oversized or unparsable; `error` is a scrubbed text such as `HTTP 503`) or `disabled` (no URL).
+
+*Rate limits and privacy.* From every answer with `x-ratelimit-limit`/`-remaining`/`-reset` the recorder keeps
+`{limit, remaining, resetAt, observedAt}` per token fingerprint (first 16 hex characters of SHA-256 of the token; the
+token is never stored, the fingerprint never leaves the server) and resource (`x-ratelimit-resource`, default
+`core`); at most 200 fingerprints (least recently observed evicted), dropped after 24 h without an observation. The
+caller's own limits come from `GET /rate_limit` with their token (`resources.core` → REST, `resources.graphql`;
+cached 60 s per user; falling back to the header observations of their fingerprint; recorded as kind `other`). Other
+tokens appear only as a count of fingerprints with a current `core` observation and the lowest remaining/limit among
+them — no fingerprint, login or user id.
+
+*Error messages.* A GitHub answer ≥ 500 throws `GitHubException` (with `requestId`) whose message is built in one place
+(`GitHubFailure.serverError`): "GitHub failed: <what> returned HTTP <status>[ (request id <id>)][: <GitHub's message,
+scrubbed>]. This is a problem at GitHub, not with Agern or your token. See the GitHub status page in Agern
+(/github-status)." — so API 502 `github_error` answers, MCP tool errors, run failure reasons, network-wait details and
+release notes all carry it. The fake GitHub's 5xx knobs use the same text with request id `FAKE:0000:0000`. Messages
+below 500 are unchanged. In `FactoryService.gh` and `ReleaseService.gh` an `IOException` (not `FileSystemException` /
+`FileNotFoundException`) or `UnresolvedAddressException` becomes 502 `github_unreachable` "GitHub could not be reached
+(<Class>[: <scrubbed message>]). This is a network or GitHub problem, not a problem with your token. See the GitHub
+status page in Agern (/github-status)." with the exception as its cause (still transient); over MCP a tool error
+instead of JSON-RPC "Internal error". A `GitException` whose output classifies as `server_error` or `network`, and a
+git timeout, end with " GitHub or the network failed; see the GitHub status page in Agern (/github-status).".
 
 Run `status`: `queued`, `spec`, `building`, `reviewing`, `approving`, `merged`, `needs_human`,
 `failed`, `cancelled`.
@@ -2468,6 +2545,23 @@ type ClaudeUsage = { credentialKind: 'oauth_token' | 'api_key' | null;
   windows: UsageWindow[];                         // ordered by type; [] unless credentialKind is 'oauth_token'
   spend: { todayUsd: number; monthUsd: number; day: string; month: string } };   // 'YYYY-MM-DD', 'YYYY-MM'
 
+type GitHubStatus = {                                       // GET /api/github/status (§6 "GitHub status")
+  verdict: { state: 'working' | 'degraded' | 'down'; reason: string };
+  generatedAt: string;
+  official: { state: 'ok' | 'unreachable' | 'disabled';
+    indicator: 'none' | 'minor' | 'major' | 'critical' | 'unknown' | null;   // null unless state = ok
+    description: string | null;
+    components: { name: string; status: string; relevant: boolean }[];       // non-operational only
+    incidents: { title: string; status: string; impact: string | null; updatedAt: string | null; url: string | null }[];
+    fetchedAt: string | null; error: string | null };                         // error only for unreachable
+  kinds: { kind: string; label: string; last15m: GitHubCallCounts; last24h: GitHubCallCounts;
+    lastError: { at: string; class: 'server_error' | 'network' | 'rate_limited' | 'auth';
+      status: number | null; requestId: string | null; message: string } | null }[];   // [] with brief
+  rateLimits: { own: { rest: GitHubRateLimit | null; graphql: GitHubRateLimit | null } | null;  // null: no token
+    otherTokens: number; lowestOther: GitHubRateLimit | null } | null };     // null with brief
+type GitHubCallCounts = { calls: number; serverErrors: number; network: number; rateLimited: number; auth: number };
+type GitHubRateLimit = { limit: number; remaining: number; resetAt: string; observedAt: string };
+
 type SoftwareRequest = { id: string; name: string; reason: string; repo: string;
   requestedBy: string; sessionId: string | null;
   status: 'pending' | 'installed' | 'denied'; note: string | null; createdAt: string; resolvedAt: string | null };
@@ -2487,6 +2581,7 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 |---|---|---|
 | `GET /api/health` | → `{ status: 'ok', version, name: 'agern' }` | no auth; the web UI shows `version` in the user menu |
 | `GET /api/internal/activity` | → `{ idle, activeRuns, busyAgents, version }` | no auth, **host-local only**: answered only when the TCP peer is a loopback address and no proxy header (`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP`) is present; anyone else gets the generic 404. `activeRuns`: runs in `queued`/`spec`/`building`/`reviewing`/`approving` (a restart fails them); `busyAgents`: sessions `starting`/`running` (pipeline agents, chats mid-turn). `needs_human` runs and chats between turns survive a restart and do not count. Used by the upgrade timer (§9) |
+| `GET /api/github/status` | → `GitHubStatus` | any logged-in user (no GitHub token needed; 401 otherwise). The same for every user except `rateLimits.own`. `?brief=1` (or `true`): `kinds` is `[]`, `rateLimits` null and no `/rate_limit` call is made — the shell's banner poll (§6 "GitHub status") |
 | `GET /api/auth/providers` | → `{ providers: string[], org: string, twoFactor: boolean }` | no auth |
 | `POST /api/auth/login` | `{ username, password }` → `LoginStep` | sets cookie (pending until 2FA passes) |
 | `POST /api/auth/totp` | `{ code }` → `LoginStep` | pending session; `code` is a TOTP code or a recovery code; 423 when locked |
@@ -3030,6 +3125,22 @@ Routes: `/login`, `/` (projects), `/p/:repo` (issues · CLI chat · agents), `/p
 role and fix rounds, with presets — *Default* clears every choice, *Economy* picks Sonnet for chat and spec,
 Haiku for the four reviewers and one fix round), `/admin` ("Factory settings": the default models and the
 default and maximum fix rounds; installing software stays admin-only).
+
+**GitHub status.** `/github-status` (every logged-in user; user-menu item "GitHub status" between "Credentials &
+security" and "Sign out", suffixed " — degraded" / " — down" while GitHub is not working) shows, polled every 60 s
+with a Refresh button: the verdict (`data-verdict`, heading, glyph and explanation of what it means for runs, chats and
+releases, the reason and "Updated …"); GitHub's official status (description, non-operational components with the
+relevant ones first, open incidents with "Details on githubstatus.com"; a warning when githubstatus.com could not be
+reached; a muted line when it is off; a note when the verdict is not working while GitHub says all is well); "What
+Agern sees", a table per kind with calls, 5xx, timeouts/network, rate limited and auth for the last 15 minutes and 24
+hours and the last error (message, HTTP status, request id, time), scrolling sideways inside its own container; and
+the rate limits of the caller's token and, anonymously, of the other tokens in use. The shell polls
+`GET /api/github/status?brief=1` on mount and every 60 s (one poll for the menu item and the banner). While the verdict
+is degraded or down, a one-line `role="status"` banner between the top bar and `<main>` (`GitHubBanner`, not on
+`/github-status`) says "GitHub is degraded/down for Agern." with a "See GitHub status" link and a Dismiss button.
+Dismissing stores the verdict in `sessionStorage` (`agern.githubBanner.dismissed`): hidden while the verdict stays the
+same, shown again for the other non-working verdict; the stored value is removed when a poll reports `working`. The
+banner is `flex: none`, so the project page's app shell stays one viewport tall.
 
 **Claude usage.** For users with a Claude credential, the top bar shows a compact indicator before the active-agents
 count on every page (`UsageIndicator`, a link to `/settings#models`, `data-level` `none` | `ok` | `high` | `limit` |
