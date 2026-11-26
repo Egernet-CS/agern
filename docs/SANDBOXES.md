@@ -35,8 +35,13 @@ clean environment, without anyone installing that toolchain on the factory host:
 - **a network boundary.** Outbound network is Podman's default, so package registries work — and so
   does the host's LAN. Nothing is restricted in this release.
 
-Only the builder uses the sandbox. The spec writer, the reviewers and the approver read the code on the
-host as before. Projects without an (approved, valid) file keep working exactly as before, on the host.
+Three stages use the sandbox. The spec writer reads its description (`factory_sandbox_info`) and plans
+its use in the spec's **Verification** section; it cannot run anything. The builder runs commands in it
+with the worktree read-write. The `ux` and `ui-design` reviewers get a separate, read-only **review
+sandbox** in which they start the app and take screenshots (below). The `security` and `code` reviewers
+and the approver read the code on the host as before. Projects without an (approved, valid) file keep
+working exactly as before, on the host. No agent can enable, change or approve a sandbox: that stays an
+admin's decision (next section).
 
 ## Approval
 
@@ -122,6 +127,37 @@ when a call is cut off on the agent's side, or the builder's stage ends without 
 on until it ends, reaches its time limit or the sandbox is removed, and a later wait (also in a fix round
 of the same run) gets its result. When the run's sandbox is removed (the run ended, or an admin stopped
 it), a running command dies with it and its waits end with an error saying so.
+
+## The review sandbox
+
+The `ux` and `ui-design` reviewers of a run with an approved file look at the running app in a review
+sandbox: a container of its own, built from the same approved file, so an app that needs the project's
+toolchain or its database can be started for review. What to know when you write the file:
+
+- **Read-only worktree.** `/workspace` is the run's worktree, mounted read-only: every write below it
+  fails. An app that writes into its own tree at start (build output, `node_modules`, caches next to the
+  code) is copied to `/tmp` inside the container first; the reviewers know this. Point caches and
+  temporary files at a `caches:` path or `/tmp` where you can.
+- **Default image only, own services.** It uses the top-level `image`, `setup`, `env`, `user`,
+  `resources` and the default `caches` (shared with the builder's container, read-write) — no platforms
+  — and starts its own copy of every service, with your readiness checks. It does not share data with the
+  builder's services.
+- **Setup.** The setup script runs again in the review sandbox, as root, with `/workspace` read-only: it
+  must not write into `/workspace` (install into the image's system directories, the user's home or a
+  cache instead). Afterwards only the user's home is handed over to `user:`.
+- **A browser.** To take screenshots inside the container the reviewers need a headless browser there:
+  install one in `setup` (e.g. Chromium, or Playwright's browser into a `caches:` path such as
+  `/home/<user>/.cache/ms-playwright`, so it is downloaded once per project).
+- **Output directory.** The only directory the container can write on the host is `/run/agern-review`
+  (`.agern-run/review` in the agents' working directory, git-ignored); screenshots go there and are
+  attached from the host. It is deleted with the sandbox. Do not use `/run/agern-review` in `caches:`.
+- **Lifetime.** One per review round: created by the first reviewer command, shared by both UI
+  reviewers (the app is started once), removed when the round ends. A fix round gets a fresh one.
+- **Memory and slots.** Its container takes one of the server's `FACTORY_SANDBOX_MAX_CONCURRENT` slots
+  and, with its services, the per-container memory each. When no slot is free the server first removes
+  the run's own idle build containers; otherwise the reviewers review on the host as before, nothing waits.
+- **Verification.** The spec can say how the reviewers start the app there (start command, readiness
+  probe, URL, login or seed data) and which screens to look at. A `.agern/preview.md` recipe works too.
 
 ## Platforms
 
@@ -209,7 +245,8 @@ need their own locking.
 | One command | the server's limit (default 30 minutes) and the stage limit; `timeoutSeconds` can only lower it |
 | One tool call | as long as the command: Agern raises the agent's MCP timeouts to the stage/command limit and streams progress while the call runs; `background: true` + `factory_sandbox_wait` returns at once instead |
 | Handles | the running command and the results of the last 20 finished commands per run, until the sandbox is removed |
-| Containers at once | `FACTORY_SANDBOX_MAX_CONCURRENT` over the whole server (default 2), counting the default and each platform container; a builder over it is told to try again later |
+| Containers at once | `FACTORY_SANDBOX_MAX_CONCURRENT` over the whole server (default 2), counting the default and each platform container and the review sandbox's; a builder over it is told to try again later |
+| Review sandbox | one per run, for one review round, default image only; one slot (after removing the run's idle build containers); without a free slot the UI reviewers review on the host |
 | Platforms | `FACTORY_SANDBOX_MAX_PLATFORMS` (default 4) |
 | Services | 5, each with the same CPU and memory limits as the sandbox |
 
@@ -236,7 +273,16 @@ A command that uses more memory than the limit is killed by the kernel; the sand
 - **`The operation timed out` on a sandbox call:** the agent's MCP client gave up on the call (an older
   Agern, or a client that ignores the timeout settings), but the command still ran. Call
   `factory_sandbox_wait` without a handle to get its result.
-- **"The server's sandboxes are all in use":** other runs hold every slot; the builder retries later.
+- **"The server's sandboxes are all in use":** other runs hold every slot; the builder retries later, a
+  UI reviewer reviews on the host without the review sandbox.
+- **"Read-only file system" in the review sandbox:** the app (or your setup script) writes into
+  `/workspace`. Make it write to `/tmp` or a cache path, or let the reviewers copy the tree to `/tmp`
+  first (see "The review sandbox").
+- **Screenshots from the review sandbox do not show up:** they must be written to `/run/agern-review`
+  inside the container; `factory_sandbox_info` says when the output directory could not be created.
+- **The app stops between reviewer commands:** start it detached with every stream redirected
+  (`nohup <start> > /tmp/app.log 2>&1 < /dev/null &`); a command that hits its time limit restarts the
+  container and kills the app.
 - **Permission denied in a cache:** the cache was filled by an earlier version of the file that ran as
   root; ask an admin to remove the project's cache volumes (`agern sandbox prune --caches` removes the
   unused ones).
