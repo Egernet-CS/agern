@@ -188,6 +188,9 @@ buffer its responses: slow tool calls are answered as an event stream that can r
 streams by default; nginx: `proxy_buffering off;` and a `proxy_read_timeout` of at least `30m` for
 `location /mcp`).
 
+What is exposed on the network (the `Origin` checks, `/mcp`, personal MCP tokens sent as bearer
+headers) is summarised in [README.md, "Security: read this first"](../README.md#security-read-this-first).
+
 ## 8. Upgrades, rollback and automatic upgrades
 
 ```sh
@@ -271,6 +274,11 @@ sudo -u postgres dropdb factory && sudo -u postgres dropuser factory
 
 ## 11. Security boundary
 
+The overview (trust model, GitHub token scopes, what is merged without a human, personal MCP tokens)
+is in [README.md, "Security: read this first"](../README.md#security-read-this-first); this section
+covers the machine. Agents can read `/etc/agern/agern.env` and other users' workspaces, so the users
+of one instance must trust each other.
+
 Agents run as the unprivileged `agern` user with Claude Code's permission prompts bypassed: treat
 everything the `agern` user can do as something an agent can do. The design keeps root out of
 reach:
@@ -346,7 +354,8 @@ user, with its permissions bypassed. It can reach everything that user can — i
 the other runs' worktrees. A sandbox is a toolchain, sidecar and resource boundary, **not** a
 security boundary against the agent; containing the agent is a later release. What does hold: the
 containers are rootless (they belong to `agern`, never to root), never privileged, and Agern — not
-the project — decides their mounts, network, capabilities and limits.
+the project — decides their mounts, network, capabilities and limits. See also
+[README.md, "Security: read this first"](../README.md#security-read-this-first).
 
 **How it runs.** Podman runs as the `agern` user in a unit of its own,
 `agern-sandbox.service`, started through `agern-sandbox.socket` (`/run/agern-podman/podman.sock`,

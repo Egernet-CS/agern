@@ -109,12 +109,15 @@ cancel agents, never drive them. Everybody who can read a repository can watch i
 \end{enumerate}
 
 \begin{warning}[Security boundary: use a dedicated machine]
-All agents run as one operating-system user, \texttt{agern}, with Claude Code's permission checks
-bypassed. Agents of different people can therefore read each other's work and anything else
-that user can read on the machine. Run Agern on a dedicated machine or virtual machine that holds
+All agents run on the server as one operating-system user, \texttt{agern}, with Claude Code's
+permission checks bypassed. Agents of different people can therefore read each other's work and
+anything else that user can read on the machine. Sandboxes (chapter~\ref{ch:sandboxes}) do not
+change this: only builds and tests run in them, not the agents. Agents act on GitHub with their
+owner's token and can do whatever it allows; a run the approver approves is merged into the
+default branch without a human. Run Agern on a dedicated machine or virtual machine that holds
 nothing else of value, keep it on a trusted network, and never add the \texttt{agern} user to
-\texttt{sudo} or \texttt{docker}. Details:
-\repodoc{INSTALL-LINUX.md\#11-security-boundary}{\texttt{INSTALL-LINUX.md}, section~11}.
+\texttt{sudo} or \texttt{docker}. Details: \securitydoc{the README's section ``Security: read this
+first''} and \repodoc{INSTALL-LINUX.md\#11-security-boundary}{\texttt{INSTALL-LINUX.md}, section~11}.
 \end{warning}
 
 \whatyouhave
