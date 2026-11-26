@@ -37,7 +37,12 @@ and sandbox limits in \repodoc{INSTALL-LINUX.md\#limits-and-settings}{\texttt{IN
   \envvar{FACTORY_DEPLOY} & \texttt{ssh} & \texttt{off} to take the deploy tools away from chats
   (\repodoc{DEPLOY.md}{\texttt{DEPLOY.md}}).\\
   \envvar{FACTORY_DEPLOY_EXEC_TIMEOUT_MINUTES} & \texttt{30} & The longest one deploy command or copy may take.\\
-  \envvar{FACTORY_DEPLOY_MAX_COPY_MB} & \texttt{512} & The largest file a chat agent may copy to a target.\\
+  \envvar{FACTORY_DEPLOY_MAX_COPY_MB} & \texttt{512} & The largest file a chat agent may copy to a target,
+  and the largest archive a sandbox VM deploy uploads.\\
+  \envvar{FACTORY_SANDBOX_VM} & \texttt{ssh} & \texttt{off} to take the sandbox VM tools away from builders and
+  switch off previews (\repodoc{SANDBOX-VMS.md}{\texttt{SANDBOX-VMS.md}}).\\
+  \envvar{FACTORY_SANDBOX_VM_EXEC_TIMEOUT_MINUTES} & \texttt{30} & The longest one sandbox VM command or deploy may take.\\
+  \envvar{FACTORY_SANDBOX_VM_PREVIEW_MINUTES} & \texttt{120} & How long a human preview holds the sandbox VM.\\
   \texttt{AGERN\_UPGRADE\_CHANNEL} & \texttt{stable} & Set by \cmd{agern auto-upgrade on --channel main} (chapter~\ref{ch:upgrade}).\\
   \bottomrule
 \end{longtable}
