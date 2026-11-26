@@ -182,6 +182,8 @@ data class StageAgentResult(
     val credentialRejected: Boolean = false,
     /** The stage was stopped at the stage time limit. */
     val timedOut: Boolean = false,
+    /** The process started its conversation (emitted `init`); false when, e.g., a `--resume` failed at once. */
+    val started: Boolean = false,
 ) {
     val resultText: String? get() = result?.get("result")?.jsonPrimitive?.contentOrNull
     val structuredOutput: JsonElement? get() = result?.get("structured_output")?.takeIf { it !is kotlinx.serialization.json.JsonNull }
@@ -1157,7 +1159,10 @@ class AgentManager(
         val status = if (l?.stopReason == "stopped") SessionStatus.STOPPED else if (error == null) SessionStatus.DONE else SessionStatus.FAILED
         endStage(s.id, status)
         val rec = sessions.get(s.id)!!
-        return StageAgentResult(rec, l?.claudeSessionId ?: rec.claudeSessionId, l?.lastResult, error == null, error, usageLimit, credentialRejected, timedOut)
+        return StageAgentResult(
+            rec, l?.claudeSessionId ?: rec.claudeSessionId, l?.lastResult, error == null, error, usageLimit, credentialRejected, timedOut,
+            started = l?.sawInit == true,
+        )
     }
 
     /**

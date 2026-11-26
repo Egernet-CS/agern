@@ -140,10 +140,24 @@ data class ReleaseIssueDto(
     val retryMode: String? = null,
     /** The member repository and directory its linked run targets; null without a run or for the project repository. */
     val targetRepo: String? = null, val targetDir: String? = null,
+    /** The linked run's network wait while the issue is `running` and its run waits for the network. */
+    val waiting: RunWaitDto? = null,
 )
 
-/** Why a release is paused; [resumeAt] is set only for an automatic resume after a usage limit. */
-@Serializable data class ReleasePauseDto(val reason: String, val note: String?, val resumeAt: String?)
+/**
+ * Why a release is paused; [resumeAt] is set for an automatic resume (after a usage limit, or the next try for reason
+ * `network`). [since] and [attempt]: the start of the current network streak and its failed starts (reason `network`).
+ */
+@Serializable data class ReleasePauseDto(
+    val reason: String, val note: String?, val resumeAt: String?, val since: String? = null, val attempt: Int? = null,
+)
+
+/**
+ * A run that lost the network and waits before trying again (docs/ARCHITECTURE.md §6 "Transient failures"); ISO instants.
+ * [attempt]: failed attempts of the current streak so far (≥ 1); [detail]: what failed.
+ */
+@Serializable
+data class RunWaitDto(val reason: String, val since: String, val nextAttemptAt: String, val attempt: Int, val detail: String)
 
 @Serializable
 data class ReleaseDto(
@@ -310,6 +324,8 @@ data class RunDto(
     /** A workspace run: the member repository and directory it changes; null otherwise. */
     val targetRepo: String? = null,
     val targetDirectory: String? = null,
+    /** Set while the run sleeps before retrying an operation that failed for lack of network; null otherwise. */
+    val waiting: RunWaitDto? = null,
 )
 
 /** Ways to retry a failed run (docs/ARCHITECTURE.md §6 "Retrying a run"). */
@@ -339,7 +355,8 @@ object FailureKind {
 
     /**
      * Failures that come from the environment rather than the work. Continuing is recommended for them when the branch
-     * has commits; issue #57 (pause and retry transient failures automatically) can build on this set.
+     * has commits. A run only fails with [API_UNREACHABLE] after it waited for the network and gave up (or waiting is
+     * off); see [dk.egernet.factory.pipeline.Transient] and docs/ARCHITECTURE.md §6 "Transient failures".
      */
     val INTERRUPTED = setOf(TIME_LIMIT, USAGE_LIMIT, RESTART, API_UNREACHABLE)
 
@@ -732,6 +749,8 @@ object ReleaseIssueState {
 /** Why a release is paused. */
 object PauseReason {
     const val MANUAL = "manual"; const val USAGE_LIMIT = "usage_limit"; const val CREDENTIALS = "credentials"
+    /** The next issue could not start because GitHub or the Claude API could not be reached; it resumes by itself. */
+    const val NETWORK = "network"
 }
 
 object SessionStatus {

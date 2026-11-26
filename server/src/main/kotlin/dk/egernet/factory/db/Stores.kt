@@ -398,7 +398,25 @@ data class RunRecord(
     val targetDir: String? = null,
     /** Member repositories checked out for this run (docs/ARCHITECTURE.md §4 "Visibility"). */
     val contextRepos: List<String> = emptyList(),
+    /** Set while the run sleeps before retrying an operation that failed for lack of network. */
+    val wait: RunWait? = null,
 )
+
+/** A run's network wait (docs/ARCHITECTURE.md §6 "Transient failures"): see [dk.egernet.factory.RunWaitDto]. */
+data class RunWait(val reason: String, val since: Instant, val nextAt: Instant, val attempts: Int, val detail: String)
+
+/** The wait columns of `runs` (aliased with [prefix]) as a [RunWait], or null when there is none. */
+internal fun ResultSet.runWait(prefix: String = ""): RunWait? {
+    val reason = getString("${prefix}wait_reason") ?: return null
+    val since = instantOrNull("${prefix}wait_since") ?: return null
+    val next = instantOrNull("${prefix}wait_next_at") ?: return null
+    return RunWait(reason, since, next, getInt("${prefix}wait_attempts"), getString("${prefix}wait_detail") ?: "")
+}
+
+/** Statuses in which a run can be waiting for the network. */
+internal val WAITABLE_STATUSES = setOf(RunStatus.QUEUED, RunStatus.SPEC, RunStatus.BUILDING, RunStatus.REVIEWING, RunStatus.APPROVING)
+
+internal fun RunWait.toDto() = dk.egernet.factory.RunWaitDto(reason, since.iso(), nextAt.iso(), attempts, detail.ifBlank { "The network could not be reached" })
 
 class RunStore(private val db: Db) {
     private val screenshots = ScreenshotStore(db)
@@ -417,6 +435,7 @@ class RunStore(private val db: Db) {
         rs.uuidOrNull("continues_run_id"), rs.getString("spec"), rs.getString("builder_summary"),
         rs.getString("failure_kind"), rs.getString("failed_step"),
         rs.getString("target_repo"), rs.getString("target_dir"), splitRepos(rs.getString("context_repos")),
+        rs.runWait(),
     )
 
     private fun mapStage(rs: ResultSet) = StageRecord(
@@ -545,10 +564,27 @@ class RunStore(private val db: Db) {
     fun countInProgress(): Int =
         db.queryOne("SELECT count(*) AS n FROM runs WHERE status IN ('queued','spec','building','reviewing','approving')") { it.getInt("n") } ?: 0
 
-    fun setStatus(id: UUID, status: String, error: String? = null, clearError: Boolean = false) = db.update(
-        """UPDATE runs SET status = ?, error = CASE WHEN ? THEN NULL ELSE COALESCE(?, error) END, updated_at = now(),
-           ended_at = CASE WHEN ? THEN now() ELSE ended_at END WHERE id = ?""",
-        status, clearError, error, status in RunStatus.TERMINAL, id,
+    /** A terminal or `needs_human` status also ends a network wait. */
+    fun setStatus(id: UUID, status: String, error: String? = null, clearError: Boolean = false): Int {
+        val n = db.update(
+            """UPDATE runs SET status = ?, error = CASE WHEN ? THEN NULL ELSE COALESCE(?, error) END, updated_at = now(),
+               ended_at = CASE WHEN ? THEN now() ELSE ended_at END WHERE id = ?""",
+            status, clearError, error, status in RunStatus.TERMINAL, id,
+        )
+        if (status !in WAITABLE_STATUSES) clearWait(id)
+        return n
+    }
+
+    /** The run sleeps for the network until [nextAt]; [attempts] failed since [since] (docs/ARCHITECTURE.md §6 "Transient failures"). */
+    fun setWait(id: UUID, since: Instant, nextAt: Instant, attempts: Int, detail: String) = db.update(
+        """UPDATE runs SET wait_reason = 'network', wait_since = ?, wait_next_at = ?, wait_attempts = ?, wait_detail = ?, updated_at = now()
+           WHERE id = ?""",
+        since, nextAt, attempts, detail.take(500), id,
+    )
+
+    fun clearWait(id: UUID) = db.update(
+        """UPDATE runs SET wait_reason = NULL, wait_since = NULL, wait_next_at = NULL, wait_attempts = 0, wait_detail = NULL
+           WHERE id = ? AND wait_reason IS NOT NULL""", id,
     )
 
     fun setStageRound(runId: UUID, role: String, round: Int) = db.update(
@@ -653,6 +689,7 @@ class RunStore(private val db: Db) {
             continuesRunId = r.continuesRunId?.toString(), continuedByRunId = continuedBy(r.id)?.toString(),
             failureKind = r.failureKind, failedStep = r.failedStep,
             targetRepo = r.targetRepo, targetDirectory = r.targetDir,
+            waiting = r.wait?.takeIf { r.status in WAITABLE_STATUSES }?.toDto(),
             warnings = stageRows.filter { it.warning != null }.groupBy { it.round }.toSortedMap()
                 .map { (round, list) -> dk.egernet.factory.RunWarningDto(round, list.map { it.role }, list.first().warning!!) },
         )
@@ -662,6 +699,7 @@ class RunStore(private val db: Db) {
     fun failUnfinishedAfterRestart(): List<UUID> {
         val ids = db.query("SELECT id FROM runs WHERE status IN ('queued','spec','building','reviewing','approving')") { it.uuid("id") }
         for (id in ids) {
+            // setStatus ends a network wait too: a waiting run is interrupted by a restart like any other.
             setStatus(id, RunStatus.FAILED, "Server restarted while the run was in progress; retry it to continue or start over.")
             setFailure(id, dk.egernet.factory.FailureKind.RESTART, null)
             closeOpenStages(id)

@@ -31,6 +31,13 @@ data class Config(
     val chatIdleMinutes: Long = 30,
     /** FACTORY_STAGE_TIMEOUT_MINUTES: wall-clock limit for one pipeline stage agent. */
     val stageTimeoutMs: Long = 60 * 60_000L,
+    /**
+     * FACTORY_NETWORK_RETRY_HOURS: how long a run or a release start waits for the network (GitHub, the Claude API)
+     * before it fails or holds (docs/ARCHITECTURE.md §6 "Transient failures"); 0 switches waiting off.
+     */
+    val networkRetryMaxMs: Long = 24 * 3_600_000L,
+    /** Delays before the 2nd, 3rd, … attempt after a transient failure; the last repeats (not configurable; tests shorten it). */
+    val networkRetryDelaysMs: List<Long> = listOf(1L, 2L, 5L, 10L, 15L).map { it * 60_000L },
     val githubApiUrl: String = "https://api.github.com",
     val fakeGithub: Boolean = false,
     val pamService: String? = null,
@@ -97,7 +104,7 @@ data class Config(
     override fun toString(): String =
         "Config(host=$host, port=$port, dbUrl=$dbUrl, dbUser=$dbUser, githubOrg=$githubOrg, auth=$authProviders, " +
             "admins=$admins, dataDir=$dataDir, webDir=$webDir, claudeBin=$claudeBin, codexBin=$codexBin, publicUrl=$publicUrl, " +
-            "maxAgentsPerUser=$maxAgentsPerUser, chatIdleMinutes=$chatIdleMinutes, stageTimeoutMs=$stageTimeoutMs, fakeGithub=$fakeGithub, " +
+            "maxAgentsPerUser=$maxAgentsPerUser, chatIdleMinutes=$chatIdleMinutes, stageTimeoutMs=$stageTimeoutMs, networkRetryMaxMs=$networkRetryMaxMs, fakeGithub=$fakeGithub, " +
             "attachments=${attachmentMaxCount}x${attachmentMaxBytes shr 20}MB/${attachmentMaxMessageBytes shr 20}MB, " +
             "screenshots=${screenshotMaxCount}x${screenshotMaxBytes shr 20}MB, images=$imageLimits, sandbox=$sandbox)"
 
@@ -166,6 +173,10 @@ data class Config(
                     ?.also { require(it in 1..24 * 60) { "FACTORY_STAGE_TIMEOUT_MINUTES must be between 1 and 1440" } }
                     ?: (get("FACTORY_STAGE_TIMEOUT_MINUTES")?.let { throw IllegalArgumentException("FACTORY_STAGE_TIMEOUT_MINUTES must be a whole number of minutes") })
                     ?: 60) * 60_000L,
+                networkRetryMaxMs = (get("FACTORY_NETWORK_RETRY_HOURS")?.toLongOrNull()
+                    ?.also { require(it in 0..168) { "FACTORY_NETWORK_RETRY_HOURS must be between 0 and 168" } }
+                    ?: (get("FACTORY_NETWORK_RETRY_HOURS")?.let { throw IllegalArgumentException("FACTORY_NETWORK_RETRY_HOURS must be a whole number of hours") })
+                    ?: 24) * 3_600_000L,
                 githubApiUrl = get("FACTORY_GITHUB_API_URL") ?: "https://api.github.com",
                 fakeGithub = fakeGithub,
                 pamService = get("FACTORY_PAM_SERVICE"),

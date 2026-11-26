@@ -111,6 +111,27 @@ class ReleaseScheduledStartTest {
     }
 
     @Test
+    fun `a start that fails for lack of network stays scheduled and starts at a later tick`() {
+        val n = issue("Flaky network")
+        val r = release("1.6", listOf(n))
+        schedule(r)
+        clock.advance(Duration.ofHours(2))
+        world.github.createBranchFailure = 503
+        tick()
+        val still = get(r)
+        assertEquals(ReleaseStatus.SCHEDULED, still.status)
+        assertNull(still.startFailedReason)
+        assertNotNull(still.scheduledAt)
+        tick()
+        assertEquals(ReleaseStatus.SCHEDULED, get(r).status)
+        world.github.createBranchFailure = null
+        tick()
+        assertEquals(ReleaseStatus.BUILDING, get(r).status)
+        assertNull(get(r).startFailedReason)
+        awaitIssue(r, n, ReleaseIssueState.RUNNING)
+    }
+
+    @Test
     fun `refusals of the real start become start failures`() {
         val empty = release("empty", emptyList())
         schedule(empty)
