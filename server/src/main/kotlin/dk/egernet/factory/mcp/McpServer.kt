@@ -132,10 +132,12 @@ class McpServer(
             schema(Triple("release", "string", "Release name or id"), required = listOf("release"))),
         Tool("factory_sandbox_info", "Whether this run has a sandbox (a container with the project's toolchain and services, " +
             "defined in .agern/sandbox.yml and approved by an admin) and, if not, why. When it has one: image, platforms (other " +
-            "images to test on), the user commands run as, services with their host names, ports and readiness, caches and limits.",
+            "images to test on), the user commands run as, services with their host names, ports and readiness, caches and limits. " +
+            "For a reviewer it describes the run's read-only review sandbox; for the spec-writer it is for planning only.",
             schema()),
         Tool("factory_sandbox_exec", "Run a shell command in this run's sandbox, e.g. a build or the tests. It runs as `sh -lc <command>` " +
-            "in /workspace, which is your working directory (the same files, so edits on the host are visible at once). The " +
+            "in /workspace, which is your working directory (the same files, so edits on the host are visible at once; in a " +
+            "reviewer's review sandbox /workspace is read-only and files for the host go to the output directory in factory_sandbox_info). The " +
             "sandbox is created on first use (this can take a few minutes). Returns { handle, exitCode, output (the tail), truncated, " +
             "durationMs, timedOut }. Use git on the host, not here. The call takes as long as the command, up to the time limit in " +
             "factory_sandbox_info; that is fine for builds and test suites. To keep working meanwhile, pass `background: true`: the " +
@@ -377,10 +379,11 @@ class McpServer(
                 }
                 "factory_sandbox_info" -> {
                     val runId = grant.runId ?: return toolError("Sandboxes belong to pipeline runs; chats have none")
-                    sandboxes.info(runId).let { if (it.isError) return toolError(it.text) else it.text }
+                    sandboxes.info(runId, grant.sandboxScope).let { if (it.isError) return toolError(it.text) else it.text }
                 }
                 "factory_sandbox_exec" -> {
                     val runId = grant.runId ?: return toolError("Sandboxes belong to pipeline runs; chats have none")
+                    if (grant.sandboxScope == SandboxScope.PLAN) return toolError(dk.egernet.factory.sandbox.SandboxManager.PLAN_ONLY)
                     val timeout = args["timeoutSeconds"]?.let { el ->
                         (el as? JsonPrimitive)?.let { p -> p.contentOrNull?.toLongOrNull() } ?: return toolError("timeoutSeconds must be a whole number")
                     }
@@ -389,17 +392,18 @@ class McpServer(
                         (el as? JsonPrimitive)?.takeIf { !it.isString }?.booleanOrNull ?: return toolError("background must be true or false")
                     } ?: false
                     val sessionId = grant.sessionId ?: return toolError("Sandboxes belong to pipeline runs; chats have none")
-                    sandboxes.exec(runId, sessionId, str("command") ?: return toolError("command is required"), timeout, platform, background)
+                    sandboxes.exec(runId, sessionId, str("command") ?: return toolError("command is required"), timeout, platform, background, grant.sandboxScope)
                         .let { if (it.isError) return toolError(it.text) else it.text }
                 }
                 "factory_sandbox_wait" -> {
                     val runId = grant.runId ?: return toolError("Sandboxes belong to pipeline runs; chats have none")
+                    if (grant.sandboxScope == SandboxScope.PLAN) return toolError(dk.egernet.factory.sandbox.SandboxManager.PLAN_ONLY)
                     val handle = args["handle"]?.let { el -> (el as? JsonPrimitive)?.takeIf { it.isString }?.content ?: return toolError("handle must be a string") }
                     val waitSeconds = args["waitSeconds"]?.let { el ->
                         (el as? JsonPrimitive)?.contentOrNull?.toLongOrNull()?.takeIf { it >= 0 }
                             ?: return toolError("waitSeconds must be a whole number of seconds, 0 or more")
                     }
-                    sandboxes.wait(runId, handle, waitSeconds).let { if (it.isError) return toolError(it.text) else it.text }
+                    sandboxes.wait(runId, handle, waitSeconds, grant.sandboxScope).let { if (it.isError) return toolError(it.text) else it.text }
                 }
                 "factory_attach_screenshot" ->
                     screenshots.attach(grant.sessionId ?: return toolError("Only reviewers of a run can attach screenshots"), grant.runId, repo, owner, str("path"), str("caption"))

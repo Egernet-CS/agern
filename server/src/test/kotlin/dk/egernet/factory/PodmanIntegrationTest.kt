@@ -61,6 +61,7 @@ class PodmanIntegrationTest {
     private val runA = UUID.randomUUID()
     private val runB = UUID.randomUUID()
     private val runC = UUID.randomUUID()
+    private val runD = UUID.randomUUID()
     private lateinit var base: Path
 
     private val memory = 128L shl 20
@@ -83,9 +84,11 @@ class PodmanIntegrationTest {
     fun tearDown() {
         if (!enabled) return
         val names = listOf(runA, runB, runC).flatMap { listOf(SandboxManager.containerName(it), SandboxManager.serviceContainerName(it, "web")) } +
-            "agern-it-anon-$runA" + SandboxManager.platformContainerName(runC, "alt")
+            "agern-it-anon-$runA" + SandboxManager.platformContainerName(runC, "alt") +
+            listOf(runD).flatMap { listOf(SandboxManager.reviewContainerName(it), SandboxManager.reviewServiceContainerName(it, "web")) }
         runCatching { rt.removeContainers(names) }
         for (r in listOf(runA, runB, runC)) runCatching { rt.removeNetwork(SandboxManager.networkName(r)) }
+        runCatching { rt.removeNetwork(SandboxManager.reviewNetworkName(runD)) }
         for (v in listOf(SandboxManager.cacheVolumeName(repo, "/cache"), SandboxManager.cacheVolumeName(repo, "/cache", "alt"))) {
             runCatching { podman("volume", "rm", "--force", v) }
         }
@@ -325,5 +328,51 @@ class PodmanIntegrationTest {
         rt.removeNetwork(SandboxManager.networkName(runC))
         assertTrue(rt.listContainers().none { it.runId == runC.toString() }, "containers of run C left")
         assertEquals("by-user\n", Files.readString(byUser), "the worktree survives")
+    }
+
+    @Test
+    fun `the review sandbox mounts the worktree read-only, its output directory writable, and keeps a detached app`() {
+        val worktree = Files.createDirectories(base.resolve("review-worktree"))
+        Files.writeString(worktree.resolve("README"), "hello\n")
+        val out = Files.createDirectories(base.resolve("review-out"))
+        val hostUid = Files.getAttribute(worktree, "unix:uid")
+        for ((label, d) in listOf("root" to def, "user" to def.copy(user = SandboxUser("builder", 1000)))) {
+            val name = SandboxManager.reviewContainerName(runD)
+            rt.createNetwork(SandboxManager.reviewNetworkName(runD), SandboxManager.labels(runD, repo, "review-network"))
+            for (c in d.caches) rt.ensureVolume(SandboxManager.cacheVolumeName(repo, c), linkedMapOf("agern.repo" to repo, "agern.cache" to c))
+            rt.startContainer(SandboxManager.reviewSpec(runD, repo, worktree, d, out))
+            val user = if (d.user != null) {
+                val prep = rt.exec(name, listOf("sh", "-c", SandboxManager.PREPARE_USER_SCRIPT, "agern-user", "1000", "builder") + d.caches,
+                    SandboxManager.WORKDIR, 60_000)
+                assertEquals(0, prep.exitCode, "prepare-user ($label): ${prep.output}")
+                ExecUser(1000, 1000, "builder", "/home/builder")
+            } else null
+            fun run(cmd: String) = rt.exec(name, SandboxManager.shellCommand(cmd), SandboxManager.WORKDIR, 60_000, user)
+
+            // Reading works, every write below /workspace fails.
+            assertEquals("hello", run("cat README").output.trim(), label)
+            val write = run("touch /workspace/pwned")
+            assertTrue(write.exitCode != 0, "writing to /workspace must fail ($label): ${write.output}")
+            assertFalse(Files.exists(worktree.resolve("pwned")), label)
+            assertTrue(run("mkdir /workspace/dir").exitCode != 0, label)
+
+            // The output directory is writable and appears on the host, owned by the service user.
+            assertEquals(0, run("echo shot-$label > ${SandboxManager.REVIEW_OUTPUT}/shot-$label.txt").exitCode, label)
+            val shot = out.resolve("shot-$label.txt")
+            assertEquals("shot-$label\n", Files.readString(shot), label)
+            assertEquals(hostUid, Files.getAttribute(shot, "unix:uid"), "owner of the output file ($label)")
+
+            // A process started detached (all streams redirected) in one exec is still alive in the next.
+            val started = System.nanoTime()
+            val bg = run("nohup sh -c 'while :; do sleep 1; done' > /tmp/app.log 2>&1 < /dev/null & echo started")
+            assertEquals(0, bg.exitCode, bg.output)
+            assertTrue((System.nanoTime() - started) / 1_000_000 < 30_000, "exec returned while the detached child runs ($label)")
+            assertTrue(run("ps 2>/dev/null | grep -v grep | grep -q 'sleep 1' || pgrep -f 'sleep 1'").exitCode == 0, "the detached app survives ($label)")
+
+            assertEquals("review", podman("inspect", "--format", "{{index .Config.Labels \"agern.role\"}}", name).output.trim())
+            rt.removeContainers(listOf(name))
+            rt.removeNetwork(SandboxManager.reviewNetworkName(runD))
+        }
+        assertTrue(rt.listContainers().none { it.runId == runD.toString() })
     }
 }

@@ -76,6 +76,9 @@ Behaviour
         directory, attach it through the MCP tool factory_attach_screenshot with the caption
         "Fake <role> screenshot (<build | fix round N>)", delete the file and append "Attached 1 screenshot." (or the
         tool's error text) to their summary; other roles ignore it
+    - "fake:review-sandbox" makes the ux and ui-design reviewers, before answering, call factory_sandbox_info and
+        factory_sandbox_exec (command "echo reviewed in the sandbox && ls") in the run's read-only review sandbox and
+        append "Review sandbox exec: <answer>" (or the tool's error text) to their summary; other roles ignore it
     - "fake:ui-change" makes the builder also write and commit web/src/FakeBanner.tsx, so the run's diff touches a UI
         file (without "fake:screenshots" Agern then warns "UI change reviewed without screenshots")
     - "fake:image" (optionally "fake:image=<n>") in a chat message calls the MCP tool factory_generate_image with the
@@ -333,6 +336,17 @@ def attach_fake_screenshot(prompt):
         except OSError:
             pass
     return text if is_error else "Attached 1 screenshot."
+
+
+def review_sandbox_exec():
+    """fake:review-sandbox: info and one command in the review sandbox; returns the line for the summary."""
+    try:
+        mcp_call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake-claude", "version": "0"}}, 1)
+        mcp_tool_roundtrip("factory_sandbox_info", {}, 10)
+        text, _ = mcp_tool_roundtrip("factory_sandbox_exec", {"command": "echo reviewed in the sandbox && ls"}, 11)
+    except Exception as e:  # noqa
+        text = "Review sandbox MCP calls failed: %s" % e
+    return "Review sandbox exec: " + text
 
 
 def mcp_init():
@@ -666,6 +680,8 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
         shot = ""
         if "fake:screenshots" in prompt and role in ("ux", "ui-design") and mcp_config:
             shot = " " + attach_fake_screenshot(prompt)
+        if "fake:review-sandbox" in prompt and role in ("ux", "ui-design") and mcp_config:
+            shot += " " + review_sandbox_exec()
         changes = "fake:always-changes" in prompt or ("fake:changes" in prompt and "after fix round" not in prompt)
         if changes:
             detail = "Fake finding from %s." % role

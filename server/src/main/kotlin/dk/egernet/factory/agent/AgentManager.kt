@@ -156,8 +156,10 @@ data class StageAgentRequest(
     val disallowedTools: List<String> = emptyList(),
     val resumeClaudeSessionId: String? = null,
     val title: String? = null,
-    /** MCP tools on top of [McpRegistry.STAGE_TOOLS] (the builder's sandbox tools). */
+    /** MCP tools on top of [McpRegistry.STAGE_TOOLS] (e.g. the sandbox tools). */
     val extraTools: Set<String> = emptySet(),
+    /** Which sandbox the sandbox tools in [extraTools] address. */
+    val sandboxScope: dk.egernet.factory.mcp.SandboxScope = dk.egernet.factory.mcp.SandboxScope.BUILD,
     /** `system` events (level, text) put at the top of the stage's transcript, e.g. whether the run has a sandbox. */
     val notes: List<Pair<String, String>> = emptyList(),
     /** The member repositories of a workspace run, recorded on the session (docs/ARCHITECTURE.md §4 "Visibility"). */
@@ -1042,7 +1044,7 @@ class AgentManager(
                 ?: return finishStage(s, null, "Run owner has no Claude credential", credentialRejected = true)
             val mayInstall = settings.get().agentsMayInstallSoftware
             val tools = (if (mayInstall) McpRegistry.STAGE_TOOLS - "factory_request_software" else McpRegistry.STAGE_TOOLS) + req.extraTools
-            token = mcp.issue(McpGrant(s.id, req.owner.id, req.repo, req.runId, tools))
+            token = mcp.issue(McpGrant(s.id, req.owner.id, req.repo, req.runId, tools, sandboxScope = req.sandboxScope))
             val identity = AgentIdentity(req.owner.username, req.owner.displayName, req.owner.githubLogin, access.githubToken(req.owner), cred)
             val steerable = req.role in STEERABLE_ROLES
             val spec = LaunchSpec(

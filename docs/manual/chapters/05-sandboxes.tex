@@ -105,6 +105,13 @@ chapter~\ref{ch:run}). Without an approved definition the line says why, for exa
 sandbox definition is not approved and the run builds and tests on the host. The builder's
 transcript shows each command it runs in the sandbox, with its output.
 
+The spec writer plans the sandbox's use in a \ui{Verification} section of the spec. The ux and
+ui-design reviewers start the app in a separate \term{review sandbox}: a container from the same
+definition, with its own services and the working copy mounted read-only, shared by both reviewers
+and removed when their review round ends. When they used it, the \ui{SANDBOX} line says
+\ui{review sandbox \checkmark}, and their transcripts show each command marked \ui{review}. When all
+sandbox slots of the server are in use, the reviewers simply review on the server as before.
+
 \whatyouhave
 Sandboxes are on, your project describes its container, and an admin has approved it: the next
 run builds and tests in its own container. Next, take a tour of a project in

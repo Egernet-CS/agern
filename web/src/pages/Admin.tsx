@@ -256,7 +256,7 @@ function SandboxesCard() {
             </div>
           </dl>
           <p className="muted small sbx-slots-note">
-            Every container that runs commands takes one slot: a run’s default image and each platform it tests on. Services do not take a slot, but use memory.
+            Every container that runs commands takes one slot: a run’s default image, each platform it tests on, and its review sandbox. Services do not take a slot, but use memory.
           </p>
           <h3 className="sd-h">
             Running <span className="muted">{o.sandboxes.length}</span>
@@ -289,15 +289,15 @@ function SandboxesCard() {
                   </div>
                   <ul className="sbx-run-containers" aria-label="Containers">
                     {s.containers.map((c) => (
-                      <li key={c.platform}>
-                        <span className="sbx-plat">{c.platform}</span> <code title={c.image}>{shortImage(c.image)}</code>
+                      <li key={`${c.kind}-${c.platform}`}>
+                        <span className="sbx-plat">{c.kind === 'review' ? 'review' : c.platform}</span> <code title={c.image}>{shortImage(c.image)}</code>
                       </li>
                     ))}
                     {s.containers.length === 0 && <li className="muted small">no command container right now</li>}
                   </ul>
                   <div className="sbx-run-spec">
                     {s.services.length > 0 && <span className="muted small">services {s.services.join(', ')}</span>}
-                    {s.platforms.length > s.containers.filter((c) => c.platform !== 'default').length && (
+                    {s.platforms.length > s.containers.filter((c) => c.kind !== 'review' && c.platform !== 'default').length && (
                       <span className="muted small">
                         platforms not started: {s.platforms.filter((p) => !s.containers.some((c) => c.platform === p)).join(', ')}
                       </span>
@@ -344,8 +344,8 @@ function SandboxesCard() {
       <Dialog open={!!target} onClose={() => setTarget(null)} title={`Stop the sandbox of run ${target ? runRef(target) : ''}?`}>
         <div className="form">
           <p>
-            Its containers and network are removed now (cache volumes are kept), and a command running in it is killed. The run itself continues: the builder’s next sandbox command
-            creates a fresh sandbox and runs the setup script again.
+            Its containers and network are removed now, and so is the run’s review sandbox if it has one (cache volumes are kept); a command running in either is killed. The run
+            itself continues: the next sandbox command of the builder or a UI reviewer creates a fresh sandbox and runs the setup script again.
           </p>
           {target && (
             <p className="muted small">

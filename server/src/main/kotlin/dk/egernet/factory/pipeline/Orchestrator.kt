@@ -32,6 +32,7 @@ import dk.egernet.factory.agent.StageAgentRequest
 import dk.egernet.factory.agent.StageAgentResult
 import dk.egernet.factory.agent.UsageLimit
 import dk.egernet.factory.agent.Workspaces
+import dk.egernet.factory.mcp.SandboxScope
 import dk.egernet.factory.conflict
 import dk.egernet.factory.db.RunRecord
 import dk.egernet.factory.db.RunStore
@@ -1321,7 +1322,7 @@ class Orchestrator(
             run.targetRepo != null || run.baseBranch == null || target == repoInfo.defaultBranch -> baseRef
             else -> baseRef.removeSuffix(target) + repoInfo.defaultBranch
         }
-        val sandbox = sandboxes.prepare(run.id, run.repo, worktree, definitionRef, home, definitionRepo = prRepo(run))
+        val sandbox = sandboxes.prepare(run.id, run.repo, worktree, definitionRef, home, definitionRepo = prRepo(run), runDir = root)
         // Images selected for the issue in a chat go into the agents' working directory (docs/ARCHITECTURE.md §6 "Generated images").
         val prepared = withContext(Dispatchers.IO) { images.handOver(runs.get(run.id)!!, root) }
         publish(run.id)
@@ -1365,8 +1366,12 @@ class Orchestrator(
         } else {
             if (resuming) throw StageFailed("The run has no spec to retry with")
             setStatus(run.id, RunStatus.SPEC)
+            // The spec-writer plans the sandbox's use (the Verification section) but cannot run anything in it.
             val specRes = stage(run.id, "spec-writer", 0, owner, ctx, specPrompt(ctx),
-                disallowed = READ_ONLY_TOOLS, extraTools = dk.egernet.factory.images.ImageService.TOOLS, notes = imageNotes)
+                disallowed = READ_ONLY_TOOLS,
+                extraTools = dk.egernet.factory.images.ImageService.TOOLS + (if (sandboxes.enabled) setOf("factory_sandbox_info") else emptySet()),
+                sandboxScope = SandboxScope.PLAN,
+                notes = sandboxNotes(ctx) + imageNotes)
             spec = specRes.resultText?.trim().takeUnless { it.isNullOrEmpty() } ?: throw StageFailed("spec-writer produced no spec")
             runs.setSpec(run.id, spec)
             finishStage(run.id, "spec-writer", 0, null, firstParagraph(spec), emptyList())
@@ -1414,8 +1419,7 @@ class Orchestrator(
                     resume = builderClaudeSession, parent = builderSessionId,
                     extraTools = (if (sandboxes.enabled) dk.egernet.factory.sandbox.SandboxManager.TOOLS else emptySet()) +
                         dk.egernet.factory.images.ImageService.TOOLS,
-                    notes = (ctx.sandbox?.takeIf { sandboxes.enabled }?.let { listOf((if (it.state == "approved") "info" else "warn") to "Sandbox: ${it.reason}") }
-                        ?: emptyList()) + (if (round == 0) imageNotes else emptyList()) +
+                    notes = sandboxNotes(ctx) + (if (round == 0) imageNotes else emptyList()) +
                         (if (round == 0 && previous != null) listOf("info" to "Continues run ${previous.id} from branch ${previous.branch} ($inherited commit(s))") else emptyList()))
                 builderClaudeSession = b.claudeSessionId ?: builderClaudeSession
                 builderSessionId = b.session.id
@@ -1480,24 +1484,34 @@ class Orchestrator(
             }
             publish(run.id)
 
-            // Reviews in parallel
+            // Reviews in parallel. The ux and ui-design reviewers of an approved run share a read-only review sandbox, removed
+            // when the round ends however it ends (docs/ARCHITECTURE.md §5 "Review sandbox").
             setStatus(run.id, RunStatus.REVIEWING)
-            lastReviews = coroutineScope {
-                REVIEWER_ROLES.map { role ->
-                    async {
-                        val r = stage(run.id, role, round, owner, ctx, reviewPrompt(ctx, role, round, spec, builderSummary), schema = Schemas.REVIEW,
-                            disallowed = READ_ONLY_TOOLS, extraTools = if (role in SCREENSHOT_ROLES) Screenshots.TOOLS else emptySet())
-                        val v = parseVerdict(r, setOf("PASS", "CHANGES"))
-                        if (v == null) {
-                            finishStage(run.id, role, round, null, "No valid verdict in the agent's output", emptyList(), failed = true)
-                            null
-                        } else {
-                            finishStage(run.id, role, round, v.verdict, v.summary, v.findings)
-                            role to v
+            val reviewSandbox = reviewSandboxOn(ctx)
+            lastReviews = (try {
+                coroutineScope {
+                    REVIEWER_ROLES.map { role ->
+                        async {
+                            val ui = role in SCREENSHOT_ROLES
+                            val r = stage(run.id, role, round, owner, ctx, reviewPrompt(ctx, role, round, spec, builderSummary, reviewSandbox = ui && reviewSandbox),
+                                schema = Schemas.REVIEW, disallowed = READ_ONLY_TOOLS,
+                                extraTools = if (!ui) emptySet()
+                                    else Screenshots.TOOLS + (if (reviewSandbox) dk.egernet.factory.sandbox.SandboxManager.TOOLS else emptySet()),
+                                sandboxScope = SandboxScope.REVIEW)
+                            val v = parseVerdict(r, setOf("PASS", "CHANGES"))
+                            if (v == null) {
+                                finishStage(run.id, role, round, null, "No valid verdict in the agent's output", emptyList(), failed = true)
+                                null
+                            } else {
+                                finishStage(run.id, role, round, v.verdict, v.summary, v.findings)
+                                role to v
+                            }
                         }
-                    }
-                }.awaitAll()
-            }.let { list ->
+                    }.awaitAll()
+                }
+            } finally {
+                withContext(NonCancellable) { sandboxes.releaseReview(run.id) }
+            }).let { list ->
                 if (list.any { it == null }) throw StageFailed("A reviewer did not return a valid verdict")
                 list.filterNotNull().toMap()
             }
@@ -1518,7 +1532,7 @@ class Orchestrator(
             round++
         }
 
-        // Only the builder uses the sandbox: it is removed as soon as no fix round can follow.
+        // The build sandbox is removed as soon as no fix round can follow (the review sandbox went with the round).
         sandboxes.release(run.id)
 
         // 3. Approval
@@ -2043,6 +2057,7 @@ class Orchestrator(
         schema: String? = null, disallowed: List<String> = emptyList(),
         resume: String? = null, parent: UUID? = null,
         extraTools: Set<String> = emptySet(), notes: List<Pair<String, String>> = emptyList(),
+        sandboxScope: SandboxScope = SandboxScope.BUILD,
     ): StageAgentResult {
         val st = stageRecord(runId, role, round)
         var attemptPrompt = prompt
@@ -2062,7 +2077,7 @@ class Orchestrator(
                     prompt = attemptPrompt, contextRepos = ctx.contextRepos,
                     jsonSchema = schema, disallowedTools = disallowed, resumeClaudeSessionId = attemptResume,
                     title = "$role · ${ctx.tag}" + if (round > 0) " · round $round" else "",
-                    extraTools = extraTools, notes = notes,
+                    extraTools = extraTools, notes = notes, sandboxScope = sandboxScope,
                 ),
             ) { session ->
                 runs.startStage(st.id, session.id, session.model)
@@ -2881,7 +2896,7 @@ class Orchestrator(
         |
         |${c.workspaceBlock}${c.issueText}${c.imagesBlock}
         |${if (c.memberDir == null) "Your working directory is a checkout of the repository at `${c.baseRef}`." else "The target member `${c.memberDir}` is checked out at `${c.baseRef}`."} Explore it (read-only) before writing.
-        |Your final message must be the spec in Markdown and nothing else: it is posted verbatim as a comment on the issue
+        |${specSandboxLine(c)}Your final message must be the spec in Markdown and nothing else: it is posted verbatim as a comment on the issue
         |and handed to the builder.
     """.trimMargin()
 
@@ -2960,12 +2975,37 @@ class Orchestrator(
         append('\n')
     }
 
+    /** The `Sandbox: <reason>` note at the top of the spec-writer's and builder's transcripts (none when sandboxes are off). */
+    private fun sandboxNotes(c: RunContext): List<Pair<String, String>> =
+        c.sandbox?.takeIf { sandboxes.enabled }?.let { listOf((if (it.state == "approved") "info" else "warn") to "Sandbox: ${it.reason}") } ?: emptyList()
+
+    /** Whether this run's ux and ui-design reviewers get the review sandbox: sandboxes on and the run's definition approved. */
+    private fun reviewSandboxOn(c: RunContext) = sandboxes.enabled && c.sandbox?.state == "approved"
+
+    /**
+     * One paragraph for the spec-writer about the run's sandbox, ending in a line break; empty (not even a line break)
+     * when sandboxes are off, so that prompt is exactly as without sandboxes.
+     */
+    private fun specSandboxLine(c: RunContext): String {
+        val sb = c.sandbox?.takeIf { sandboxes.enabled } ?: return ""
+        return if (sb.state == "approved") {
+            "Sandbox: this run has one (image ${sb.image}" + (if (sb.platforms.isEmpty()) "" else "; platforms ${sb.platforms.joinToString(", ")}") +
+                "). You cannot run commands in it; call factory_sandbox_info for its services, platforms and limits and plan its use in " +
+                "the spec's Verification section.\n"
+        } else {
+            "Sandbox: none for this run (${sb.reason}). Do not ask for one and write no Verification section that needs one; the builder " +
+                "and the reviewers work on the host.\n"
+        }
+    }
+
     /** One paragraph for the builder about the run's sandbox (empty line when sandboxes are off). */
     private fun sandboxLine(c: RunContext): String {
         val sb = c.sandbox?.takeIf { sandboxes.enabled } ?: return ""
         return if (sb.state == "approved") {
             "\nSandbox: this run has one (image `${sb.image}`). Build and test inside it with `factory_sandbox_exec` instead of on the host " +
-                "(long commands: `background: true`, then `factory_sandbox_wait`); `factory_sandbox_info` lists its services and limits.\n" +
+                "(long commands: `background: true`, then `factory_sandbox_wait`); `factory_sandbox_info` lists its services and limits. " +
+                "When the spec has a Verification section, run its commands in the sandbox on the platforms it names and report each " +
+                "result in your summary.\n" +
                 (if (sb.platforms.isEmpty()) "" else "Platforms: ${sb.platforms.joinToString(", ") { "`$it`" }} (other images; " +
                     "`factory_sandbox_exec` with `platform`). Run the test suite in the default image and on every platform before you finish, " +
                     "and report the result per platform in your summary.\n")
@@ -3036,7 +3076,10 @@ class Orchestrator(
     }
 
     /** [followUp]: the follow-up round number when this reviews changes from the conversation ([builderSummary] is then the advisor's). */
-    private fun reviewPrompt(c: RunContext, role: String, round: Int, spec: String, builderSummary: String, followUp: Int? = null): String {
+    /** [reviewSandbox]: the reviewer has the run's read-only review sandbox (ux and ui-design of a pipeline round, approved run). */
+    private fun reviewPrompt(
+        c: RunContext, role: String, round: Int, spec: String, builderSummary: String, followUp: Int? = null, reviewSandbox: Boolean = false,
+    ): String {
         val after = when {
             followUp != null -> " (after follow-up round $followUp: changes the run owner requested in a conversation)"
             round > 0 -> " (after fix round $round)"
@@ -3049,7 +3092,7 @@ class Orchestrator(
         |
         |${c.workspaceBlock}Inspect the change with `${c.git} diff ${c.baseRef}...HEAD`, `${c.git} log ${c.baseRef}..HEAD` and by reading the code; run tests or
         |the app where that helps your review.
-        |${if (role in SCREENSHOT_ROLES) uiReviewNote(c) else ""}
+        |${if (role in SCREENSHOT_ROLES) uiReviewNote(c) + (if (reviewSandbox) reviewSandboxLine(c) else "") else ""}
         |${c.releaseNote}${c.issueText}
         |<spec>
         |$spec
@@ -3070,6 +3113,13 @@ class Orchestrator(
             "`${c.memberDir?.let { "$it/" }.orEmpty()}.agern/preview.md` " +
             "first if the repository has one). Agern itself listens on port ${cfg.port} on this host: never start anything on " +
             "that port, never stop or call that server, and never use a production service.\n"
+
+    /** For the ux and ui-design reviewers of a run with a review sandbox (docs/ARCHITECTURE.md §5 "Review sandbox"). */
+    private fun reviewSandboxLine(c: RunContext) =
+        "Review sandbox: this run has a read-only review sandbox (image `${c.sandbox?.image}`), shared with the other UI reviewer of " +
+            "this round. Start the app there with `factory_sandbox_exec` instead of on the host (see \"Review sandbox\" in your role " +
+            "instructions and `factory_sandbox_info`); follow the spec's Verification section if it has one. If the sandbox is busy or " +
+            "cannot be created, review on the host as usual.\n"
 
     private fun approvalPrompt(
         c: RunContext, spec: String, reviews: Map<String, Verdict>, round: Int, maxRounds: Int, prUrl: String?, policy: String,

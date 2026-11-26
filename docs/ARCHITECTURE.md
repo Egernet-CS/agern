@@ -498,7 +498,9 @@ A project can describe a container in which its builds and tests run: its own to
 services such as a database, resource limits and a clean environment, without an admin installing
 anything on the host, and test on more than one image (*platforms*). This is issue #25's "model (a)":
 **the agent process keeps running on the host as before** and gets MCP tools that run commands inside
-its run's sandbox. Project authors: [SANDBOXES.md](SANDBOXES.md).
+its run's sandbox. The spec-writer plans the sandbox's use (a *Verification* section in the spec), the
+builder runs commands in it, and the `ux` and `ui-design` reviewers get a separate, read-only *review
+sandbox* in which they start the app (below). Project authors: [SANDBOXES.md](SANDBOXES.md).
 
 **What a sandbox is not (yet).** It is *not* a security boundary against the agent. The agent runs
 with permissions bypassed as the same OS user that owns the rootless containers, so it can reach
@@ -570,18 +572,29 @@ the default branch's file (the sandbox page and the approval endpoint read it th
 the release could never be approved and would silently cost the rest of the release its sandbox. Nothing merged into a
 release branch can therefore change the sandbox of the release's later runs; a release that needs another toolchain gets
 it through a change to the default branch and a new approval. With no file, an invalid one or an unapproved one the run proceeds
-**without** a sandbox, exactly as before; it does not fail. The builder's transcript starts with a
-`system` event saying why (`warn`), or which image it has (`info`), and its task prompt says the same in
-one paragraph.
+**without** a sandbox, exactly as before; it does not fail. The spec-writer's and the builder's transcripts start with a
+`system` event saying why (`warn`), or which image it has (`info`), and their task prompts say the same in
+one paragraph (the spec-writer's: plan the sandbox's use in the spec's Verification section, or — without one — do not
+ask for a sandbox and write no Verification section that needs one). Whether a project has a sandbox stays an admin's
+decision: no tool of any agent can create, change, approve or revoke a definition or an approval.
 
-**Who gets the tools.** Only the builder (initial build and fix rounds), and only when
-`FACTORY_SANDBOX` is not `off`: it gets `factory_sandbox_info`, `factory_sandbox_exec` and `factory_sandbox_wait` (§7) on top of
-the stage tools. The spec-writer, the four reviewers (the `code` reviewer included) and the approver get
-neither: they are read-only, and a shared sandbox with the worktree mounted read-write would let them
-change it, so in this step they review as before, on the host. (A read-only or overlay-mounted sandbox
-for the `code` reviewer is possible later.) Chats have no sandbox. A tool call acts on the sandbox of the
-run its bearer token belongs to, so an agent can never reach another run's sandbox through the tools
-(command handles included: they are looked up only in that run).
+**Who gets the tools.** Only when `FACTORY_SANDBOX` is not `off`; with it off no stage gets a sandbox tool,
+note or prompt paragraph.
+
+| Stage | Tools (§7) | When |
+|---|---|---|
+| spec-writer | `factory_sandbox_info` only (`access: "plan"`) | always (also for a run without an approved definition: it then says why there is none) |
+| builder (build and fix rounds) | info, exec, wait on the **build sandbox** | always; without an approved definition they answer that there is none |
+| `ux`, `ui-design` in pipeline review rounds | info, exec, wait on the **review sandbox** only | the run's decision is `approved` |
+| `security`, `code`, approver, advisor, chats, follow-up reviewers at `needs_human`, personal tokens | none | — |
+
+The server fixes a token's *sandbox scope* (`plan`, `build`, `review`; `McpGrant.sandboxScope`) when it issues the
+grant; tool arguments never choose it. A build-scoped call can only address the build sandbox of the token's run, a
+review-scoped call only its review sandbox, and a plan-scoped `exec` or `wait` is refused. Command handles are looked
+up only in the sandbox of the token's scope and run, so a reviewer can never wait for (or reach) a builder's command,
+nor an agent another run's. This is what the tools guarantee: no reviewer *tool call* reaches the builder's
+read-write container. It is not a boundary against an agent process on the host (see above). A sandbox for the `code`
+reviewer, the approver or follow-up reviews is possible later.
 
 **Lifecycle.** One sandbox per run, created lazily by the builder's first `factory_sandbox_exec` and
 shared by all builder rounds of the run. Creation, in order: a private network `agern-run-<runId>`; one
@@ -596,8 +609,8 @@ containers also `agern.platform=<name>`). The sandbox is
 removed (all containers and network, never the cache volumes) as soon as no builder round can follow: before
 the approver starts, before the run goes to `needs_human`, and before it is marked `failed` (stage error,
 stage time limit) or `cancelled`. A `needs_human` run keeps its worktree (§6 "Worktrees and branches") but has no
-sandbox, and nothing creates one again: only a builder can, and none follows. Names and labels use the run id,
-never the run's branch name.
+sandbox, and nothing creates one again: only a builder or a pipeline review round can, and none follows. Names and
+labels use the run id, never the run's branch name.
 
 *Sandbox before worktree.* The sandbox bind-mounts the run's worktree, so its containers are always removed
 before the worktree is deleted: the worktree clean-up of every ended run (merged, failed, time limit, cancelled,
@@ -620,6 +633,39 @@ Caches are **per platform**: the same paths, in volumes `agern-cache-<repo>-<fir
 SHA-256(<platform> NUL <path>)>`, because another image's tools (another JDK, another libc, other native
 npm modules) cannot be assumed to share a cache safely. `platform` omitted or `default` is the top-level
 image. Commands stay one at a time per run, whichever container they run in.
+
+**Review sandbox.** The `ux` and `ui-design` reviewers of an approved run start the app in a container of their own,
+so an app that needs the project's toolchain or its database can be looked at and screenshotted (§6 "Screenshots"):
+
+- *Shape.* One per run at a time, built from the run's approved definition: the default image only (no platforms), its
+  own network `agern-review-<runId>`, its own service containers `agern-review-<runId>-<service>` (service name as
+  network alias, readiness checks as above) and the command container `agern-review-<runId>`, with the same
+  environment, `user`, limits, security options and default cache volumes as the build sandbox's default container.
+  Labels: `agern.run`, `agern.repo` and `agern.role=review|review-service|review-network`.
+- *Mounts.* The run's worktree is bind-mounted **read-only** at `/workspace` (still the working directory): every write
+  below it fails. The only writable host directory is `<run directory>/.agern-run/review/` (the agents' working
+  directory, i.e. the workspace root of a workspace run), mounted at `/run/agern-review` — `/run` cannot hold a cache
+  path, so it never collides with one. The server creates it git-ignored and never through a symlink
+  (`ImageService.ensureRunDir`, `SafeFiles`); when it cannot, the sandbox is made without it and
+  `factory_sandbox_info` says so.
+- *Creation and sharing.* Lazily, by the first review-scoped `factory_sandbox_exec` of a round, in the same order as
+  the build sandbox (network, services, cache volumes, container, readiness checks, `prepare-user.sh`, setup as root).
+  After setup only the user's home is handed over (`/workspace` is read-only). Both UI reviewers of the round use the
+  same container — two first calls create it once — and commands stay one at a time: foreground calls queue, a
+  background command refuses the others. Reviewers start a long-running app detached inside a foreground command with
+  all streams redirected (`nohup … > /tmp/app.log 2>&1 < /dev/null &`), which `podman exec` returns from. A failed
+  creation, readiness check or setup removes what was created and frees the slot; a later call tries again.
+- *Logs.* Lifecycle messages and every command's full log go to the transcript of the reviewer that made the call
+  (`payload.sandbox.review: true`, text starting `Review sandbox`); the setup log to the one that triggered creation.
+  The first successful creation sets `Run.sandbox.reviewUsed`.
+- *Removal.* When every reviewer of the round has ended — also when one failed, timed out or the run was cancelled —
+  and so before the next builder round, the approver or `needs_human`; and by every path that removes the build
+  sandbox (`release`, worktree clean-up, reapers, shutdown, an admin's stop). Containers and network go, never cache
+  volumes, and `.agern-run/review/` is deleted. A running command dies with it; its waits end with an error. Each
+  round creates a fresh one, so a fix round never looks at a stale app. Once the run's sandbox was released, no review
+  sandbox can be created for it (a creation racing the release ends with everything removed and its slot freed). At
+  server start the reaper removes every `agern-review-*` container and network it finds: a review round never
+  survives a restart.
 
 **Readiness of services.** A service may name a `ready.command`; after starting the services the server
 runs it with `sh -c` inside the service's container (`exec --workdir /`, each attempt at most 10 s) once
@@ -652,7 +698,8 @@ mapping can take longer to start: rootless storage may copy the image's layers o
 services and their readiness commands, cache paths, setup, the user and limits within the caps. Never
 `--privileged`, never host network/pid/ipc/userns, no added capabilities (Podman's default rootless set), no devices,
 `no-new-privileges`, a PID limit of 4096, `--memory-swap` equal to `--memory`. The run's worktree is
-bind-mounted read-write at `/workspace` (the working directory); nothing else from the host is mounted.
+bind-mounted read-write at `/workspace` (the working directory); nothing else from the host is mounted (the review
+sandbox: the worktree read-only, plus its output directory, above).
 Inside the rootless user namespace the container's root is the service user — with `user`, the user's uid
 is — so files the build writes in `/workspace` belong to that user on the host. Limits apply per container
 (sidecars and platform containers get the same limits as the sandbox). The exact command lines (`podman` or
@@ -674,6 +721,14 @@ run --detach --name agern-run-<id> --label agern.run=<id> --label agern.repo=<re
 run … --name agern-run-<id>--<platform> … --label agern.role=platform --label agern.platform=<platform>
     …(as the sandbox container, with the platform's cache volumes)… <platform image> -c "<keep-alive>"   # platform, on first use
     # with `user: <n>`, both kinds also get, after --network:  --userns keep-id:uid=<n>,gid=<n> --user 0:0
+network create --label agern.run=<id> --label agern.repo=<repo> --label agern.role=review-network agern-review-<id>
+run … --name agern-review-<id>-<svc> … --label agern.role=review-service --label agern.service=<svc>
+    --network agern-review-<id> --network-alias <svc> …(as a service)… <service image>        # review sandbox services
+run --detach --name agern-review-<id> --label agern.run=<id> --label agern.repo=<repo> --label agern.role=review
+    --network agern-review-<id> …(limits, user mapping as the sandbox container)… --workdir /workspace --entrypoint sh [--env K=V …]
+    --mount type=bind,source=<worktree>,target=/workspace,readonly=true
+    [--mount type=bind,source=<run dir>/.agern-run/review,target=/run/agern-review]
+    [--mount type=volume,source=<volume>,target=<path> …] <image> -c "<keep-alive>"      # review sandbox
 exec --workdir / agern-run-<id>-<svc> sh -c <ready.command>                                      # readiness check, until exit 0
 logs --tail 30 agern-run-<id>-<svc>                                                              # when it never passes
 exec --workdir /workspace <container> sh -c <prepare-user.sh> agern-user <n> <name or ''> [<cache path> …]   # with `user`, as root
@@ -685,6 +740,7 @@ restart --time 0 <container>                                       # after a com
 rm --force --ignore --volumes agern-run-<id> [agern-run-<id>--<platform> …] [agern-run-<id>-<svc> …]   # anonymous volumes (an image's VOLUME) too
 rm --force --ignore --volumes agern-run-<id>--<platform>           # a run's idle container, to free its slot (below)
 network rm --force agern-run-<id>
+rm --force --ignore --volumes agern-review-<id> [agern-review-<id>-<svc> …]  ;  network rm --force agern-review-<id>   # end of a review round
 ps --all --filter label=agern.run --format '{{.Names}}	{{index .Labels "agern.run"}}'          # reaper
 network ls --filter label=agern.run --format json                                               # reaper (name, labels)
 image inspect --format '{{json .Config.ExposedPorts}}' <service image>                          # ports for factory_sandbox_info
@@ -725,24 +781,31 @@ started it, when it ends; when the builder's stage ends without waiting, the com
 its limit or the sandbox is released, and a fix round of the same run can still wait for it. A release or an admin
 stop ends a running command's waits at once with the same errors a foreground call gets.
 
-**Stopped by an admin.** An admin can remove a run's sandbox while the run is active (`DELETE
-/api/admin/sandboxes/{runId}`, the admin page's "Stop"): its containers — platform containers and services
-included — and network are removed at once (cache volumes are kept) and its slots are freed. The run itself is not touched: a command running at that moment ends with
-a tool error saying the sandbox was stopped, a `system` warn event in the builder's transcript says who stopped it,
-and the builder's next `factory_sandbox_exec` creates a fresh sandbox (setup runs again) like the first one did.
+**Stopped by an admin.** An admin can remove a run's sandboxes while the run is active (`DELETE
+/api/admin/sandboxes/{runId}`, the admin page's "Stop"): the build sandbox's containers — platform containers and
+services included — and network, and the review sandbox if it exists, are removed at once (cache volumes are kept)
+and their slots are freed; 404 only when the run has neither. The run itself is not touched: a command running at that moment ends with
+a tool error saying the sandbox was stopped, a `system` warn event in the transcript of each sandbox's last user (the
+builder, a reviewer) says who stopped it, and the next `factory_sandbox_exec` creates a fresh sandbox (setup runs
+again) like the first one did.
 
 **Concurrency and memory.** `FACTORY_SANDBOX_MAX_CONCURRENT` counts *containers that run commands*, over all
 runs: a run's sandbox container takes a slot when created and each platform container one more; sidecars
 take none (they belong to the run's network, whatever container uses them). A slot is freed when its
-container is removed. This keeps the cap truthful about load — a run that tests on three images really
+container is removed. A review sandbox's container takes one slot too (its services none). This keeps the cap truthful about load — a run that tests on three images really
 runs three containers, each with the full per-container memory limit — without starving single-image runs.
 When a run needs a slot and none is free, it first removes its *own* other command containers, least
 recently used first (they are idle: one command at a time per run; files in `/workspace` stay, the setup
 runs again when that container is used next); a run that holds none is not queued: the tool answers at once
 that the sandboxes are busy and nothing ran; the agent may try again later (its prompt tells it not to fall
 back to installing a toolchain on the host). So even with a cap of 1 a run can test on every platform, one
-container at a time. The memory one run may use is the per-container limit × (its command containers +
-its services); the admin overview shows that sum per run (`memoryTotal`) and `inUse` counts slots.
+container at a time. A review sandbox that finds no free slot first removes the same run's idle build command
+containers, least recently used first — only while no build command runs or is being started (the build sandbox's
+lock is free) — with the same info event; if there is still none, the reviewer is told at once to review on the host
+without a sandbox (`The server's sandboxes are all in use (<n> of <n> containers). No review sandbox was created …`),
+and the review stage goes on: nothing queues or blocks. The memory one run may use is the per-container limit × (its
+command containers + its services, of both sandboxes); the admin overview shows that sum per run (`memoryTotal`) and
+`inUse` counts slots.
 
 **Network and credentials.** Each run's containers share a private network; sidecars are reachable by
 service name only from that run's containers (and not published on the host). Outbound network access is
@@ -771,11 +834,15 @@ issue → spec-writer (opus) → builder (opus) ─┬→ security  (opus)   ┐
 "Releases"): the run's worktree starts from that branch and its pull request merges into it. A release branch
 reaches the default branch only through the owner's approval of the release (§6 "Releasing").
 
-- **spec-writer** reads the issue and the repo and writes a spec; it is posted as an issue comment.
+- **spec-writer** reads the issue and the repo and writes a spec; it is posted as an issue comment. When the run
+  has an approved sandbox it may plan its use in an optional `## Verification` section (between `## Tests` and
+  `## Out of scope`): the commands the builder runs in the sandbox and on which platforms, and for UI changes how the
+  UI reviewers start the app in the review sandbox and what they look at. It reads the sandbox with
+  `factory_sandbox_info` but cannot run anything in it, and never asks for a sandbox to be enabled or approved.
 - **builder** implements the spec on the run branch and commits. The orchestrator pushes the branch
   and opens a pull request after the first build. When the run has an approved sandbox (§5 "Sandboxes"),
-  the builder builds and tests in it through `factory_sandbox_exec`; the sandbox is removed when the
-  build/review loop ends, before the approver runs. Its task and fix prompts name the branch the pull request merges
+  the builder builds and tests in it through `factory_sandbox_exec` (running the spec's Verification commands there,
+  when it has some); the sandbox is removed when the build/review loop ends, before the approver runs. Its task and fix prompts name the branch the pull request merges
   into and the rule for migration versions (§6 "Database migrations").
 - **reviewers** run in parallel, cannot edit files (`--disallowedTools Edit,Write,NotebookEdit`),
   and answer through `--json-schema` with
@@ -1577,6 +1644,14 @@ other roles do not get the tool.
   everything it started. The summary always says how many it attached, that the change has no UI, or — only after a
   real attempt — the command it ran and the error it got. Missing screenshots are never a reason for `CHANGES` and
   never fail the stage.
+- **Review sandbox:** in a run with an approved sandbox the reviewers start the app in the round's read-only review
+  sandbox (§5 "Sandboxes") instead of on the host, following the spec's Verification section if there is one: started
+  detached with all streams redirected (never `background: true`), checked first whether the other UI reviewer
+  already started it, the tree copied to `/tmp` inside the container when the app must write into it. They capture to
+  `/run/agern-review/<file>` inside the container, read `.agern-run/review/<file>` on the host and attach it with
+  `factory_attach_screenshot { path: ".agern-run/review/<file>" }` — the flow and checks below are unchanged — and
+  need not stop the app: the sandbox is removed when the round ends. When it is busy or cannot be created they review
+  on the host as before.
 - **Preview recipe:** a project can describe how to start its UI for review in `.agern/preview.md` (free text:
   command, port, how to log in, useful pages). Agern's own is in the repository: the web frontend's mock mode
   (`cd web && npm ci && npm run dev:mock -- --host 127.0.0.1 --port <free port> --strictPort`) runs against simulated
@@ -2439,8 +2514,9 @@ and no argument merges despite the checks (§6 "Checks before a merge"). `factor
 `factory_approve_release` are both refused (tool error with the `merge_on_github` message) for a project that merges
 on GitHub (§6 "Merge policy"). Pipeline-stage agents get only `factory_get_issue`
 and `factory_request_software`; with sandboxes switched on (`FACTORY_SANDBOX` not `off`) the builder also
-gets `factory_sandbox_info`, `factory_sandbox_exec` and `factory_sandbox_wait`; the `ux` and `ui-design` reviewers also get
-`factory_attach_screenshot`. The chat agent, the spec-writer and the builder also get `factory_generate_image`. The advisor (§6 "Conversation at needs human") gets the same two stage tools, bound to its
+gets `factory_sandbox_info`, `factory_sandbox_exec` and `factory_sandbox_wait`, the spec-writer `factory_sandbox_info`
+only, and the `ux` and `ui-design` reviewers of pipeline review rounds of an approved run the three sandbox tools for
+the review sandbox; the `ux` and `ui-design` reviewers also get `factory_attach_screenshot`. The chat agent, the spec-writer and the builder also get `factory_generate_image`. The advisor (§6 "Conversation at needs human") gets the same two stage tools, bound to its
 run, and nothing else: no approve, cancel, start, release, sandbox, screenshot or image tool.
 
 Image tool (§6 "Generated images"), chat, spec-writer and builder only:
@@ -2464,8 +2540,10 @@ Screenshot tool (§6 "Screenshots"), `ux` and `ui-design` reviewers only:
   `The file is empty`, `Only PNG, JPEG, GIF or WebP images are accepted`, `This stage already has <n> screenshots
   (the maximum)`.
 
-Sandbox tools (§5 "Sandboxes"), builder only; they act on the sandbox of the token's run, and a token
-without a run (a chat) is refused:
+Sandbox tools (§5 "Sandboxes", "Who gets the tools"); they act on the sandbox of the token's run and scope — the
+build sandbox for the builder, the review sandbox for the `ux` and `ui-design` reviewers, nothing to run for the
+spec-writer (`exec` and `wait` with a plan scope are refused: `The spec-writer cannot run commands in the sandbox; …`)
+— and a token without a run (a chat) is refused:
 - `factory_sandbox_info {}` → JSON `{ available, state, reason }` and, when the run has a sandbox,
   `image`, `created` (the default container exists), `workdir: "/workspace"`, `user: { name, uid, note }`
   (only with `user`), `platforms: [{ name, image, setup, created }]` and, when there are any,
@@ -2474,11 +2552,20 @@ without a run (a chat) is refused:
   no check, `servicesNote` (it may still be starting); `caches`, `env` (names only), `setup` (boolean),
   `limits: { cpus, memory, execTimeoutSeconds, outputTailChars, toolCallTimeoutSeconds }`,
   `capacity: { inUse, max, heldByThisRun }` and, while a command runs, `command: { handle, running: true, elapsedMs }`.
+  For the spec-writer it adds `access: "plan"` and a `note` (it cannot run commands; the builder does; the UI reviewers
+  get a separate read-only review sandbox) and never creates anything. For a reviewer it describes the review
+  sandbox: no `platforms`/`platformNote`, plus `access: "review"`, `readOnly: true`, `outputDir: { container:
+  "/run/agern-review", host: ".agern-run/review" }` (or `null` with an `outputNote`) and a `note` on the read-only
+  `/workspace`, the output directory, starting an app detached and the other UI reviewer; `created`, `command` and
+  `capacity` refer to the review sandbox.
 - `factory_sandbox_exec { command, timeoutSeconds?, platform?, background? }` → JSON `{ handle, exitCode, output,
   truncated, durationMs, timedOut }` plus `platform` when the definition has platforms (`exitCode` −1 when timed out;
   `output` is the tail). `platform` omitted or `default`: the top-level image. With `background: true` (after the
   same validation and, if needed, creation) → `{ handle, running: true, timeoutSeconds, note }` plus `platform` at
-  once. No sandbox for the run, an unknown platform, busy, a failed creation, readiness check or setup, an empty
+  once. In the review sandbox `platform` other than `default` is refused (`The review sandbox has only the default
+  image; leave platform out.`), and without a free slot the answer is `The server's sandboxes are all in use (<n> of
+  <n> containers). No review sandbox was created and nothing was run. Review without it, on the host, as your role
+  instructions describe; do not wait for a slot.` No sandbox for the run, an unknown platform, busy, a failed creation, readiness check or setup, an empty
   command, a non-positive timeout, `background` that is not a boolean (`background must be true or false`) and a
   command while a background one runs (`A command is still running in this run's sandbox (handle cmd-…, started
   <n> s ago). Wait for it with factory_sandbox_wait before starting another.`) come back as tool errors.
@@ -2748,8 +2835,9 @@ type RunSandbox = { state: 'disabled' | 'none' | 'invalid' | 'unapproved' | 'app
   sha256: string | null;     // of the definition on the base commit, when there is one
   image: string | null;
   platforms: string[];       // the definition's platforms ('approved' only; [] for older runs)
-  platformsUsed: string[] }; // where the builder ran commands, 'default' and platform names in first-use order
+  platformsUsed: string[];   // where the builder ran commands, 'default' and platform names in first-use order
                              // (filled only when there are platforms)
+  reviewUsed: boolean };     // a review sandbox of the run was created (the ux and ui-design reviewers used it)
 
 type SandboxDefinition = { image: string; setup: string | null; env: Record<string, string>;
   services: { name: string; image: string; env: Record<string, string>;
@@ -2778,10 +2866,11 @@ type RunningSandbox = { runId: string; repo: string;
   owner: { username: string; displayName: string };
   image: string; services: string[]; sha256: string;      // the approved definition's hash
   createdAt: string; cpus: number; memory: string;         // per-container limits it runs with
-  containers: { platform: string; image: string; createdAt: string }[];  // command containers now: 'default' and/or platforms
+  containers: { platform: string; image: string; createdAt: string;      // command containers now: 'default' and/or
+    kind: 'build' | 'review' }[];                                        // platforms (build), the review sandbox's (review, 'default')
   platforms: string[];       // the definition's platforms, existing or not
   slots: number;             // slots of FACTORY_SANDBOX_MAX_CONCURRENT held: one per container
-  memoryTotal: string };     // memory × (containers + services): what the run may use together
+  memoryTotal: string };     // memory × (containers + services of both sandboxes): what the run may use together
 type SandboxOverview = { enabled: boolean; runtime: 'off' | 'podman' | 'fake';
   inUse: number;             // slots in use: command containers over all runs
   limits: { maxCpus: number; maxMemory: string; maxConcurrent: number; execTimeoutMinutes: number; registries: string[];
@@ -2821,7 +2910,8 @@ type Event = { seq: number; sessionId: string; ts: string;
 //              updatedFrom: string | null }    // the previous HEAD, only for 'updated'
 //          sandbox: the full log of a sandbox setup script or command (§5 "Sandboxes"):
 //            { kind: 'setup' | 'exec', command, exitCode, timedOut, durationMs, output, outputTruncated,
-//              platform: string | null }   // null when the definition has no platforms, else 'default' or the platform
+//              platform: string | null,    // null when the definition has no platforms, else 'default' or the platform
+//              review?: true }             // ran in the read-only review sandbox (ux and ui-design reviewers)
 
 type AgentMessage = { status: 'queued';          // always: picked up at the agent's next step (§6)
   messageId: string; sessionId: string; runId: string | null;
@@ -3804,10 +3894,11 @@ confirmation names every image with its role (default, platform, service) and sh
 and says plainly that they will run on the factory host for
 every run of the project — and "Revoke…" (confirmation); others see who can approve. The page and the row follow
 `sandbox_approval` frames. The run page shows one line under the run's facts: "sandbox" with the image and the approved
-definition's hash prefix and, when the definition has platforms, each platform (marked ✓ once commands ran in it), or
+definition's hash prefix and, when the definition has platforms, each platform (marked ✓ once commands ran in it),
+then "review sandbox ✓" when the UI reviewers ran the app in a review sandbox (`reviewUsed`), or
 "none — <why>" (switched off, no definition, not approved, invalid), and a link to the
-sandbox page. In a builder's transcript every `system` event with `payload.sandbox` is a collapsible command block
-(the platform as a chip when `platform` is set, `$ command` or "setup script", exit code or "timed out", duration,
+sandbox page. In a builder's or UI reviewer's transcript every `system` event with `payload.sandbox` is a collapsible command block
+(a `review` chip when `review` is set — screen readers hear "Review sandbox command:" —, the platform as a chip when `platform` is set, `$ command` or "setup script", exit code or "timed out", duration,
 "truncated"; failures in red): opened, it shows the
 last 200 lines of the output in the terminal style with "Show all N lines", the full script or multi-line command, and
 nothing of the output is rendered while closed. The `factory_sandbox_exec` and `factory_sandbox_wait` tool calls
@@ -3816,9 +3907,9 @@ themselves are summarised as "Exit N in X s · full log below" (or "Timed out �
 arguments show the handle or "latest command". The admin page has a "Sandboxes" card: runtime, containers in use of the maximum (with a note that
 every container that runs commands takes a slot and services take none), the per-container caps, the platform cap, the
 command time limit and the registries; the running sandboxes (run, project, owner, run status, age, each existing
-container as platform chip + image, services, platforms not created yet, slots held, per-container limits and the memory
-the run may use in all, definition hash) with "Stop" (confirmation: the containers go, the run continues and its next sandbox
-command creates a new one); and the projects waiting for an approval, linking to their sandbox pages. The card reloads
+container as platform chip + image — the review sandbox's as a `review` chip —, services, platforms not created yet,
+slots held, per-container limits and the memory the run may use in all, definition hash) with "Stop" (confirmation:
+the containers go, the review sandbox's too, the run continues and its next sandbox command creates a new one); and the projects waiting for an approval, linking to their sandbox pages. The card reloads
 (debounced) on every `sandboxes` frame and otherwise every 60 s. The software
 requests card notes that build and test tools can go in the project's `.agern/sandbox.yml` instead of on the host.
 

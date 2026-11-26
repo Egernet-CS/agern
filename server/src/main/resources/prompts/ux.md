@@ -81,6 +81,33 @@ touches one, you must run the app and look at it.
   without screenshots". Do not install system software to take them: the software installation
   policy applies, and you may ask for a tool with `factory_request_software` (e.g. `chromium`).
 
+### Review sandbox (when your task prompt says this run has one)
+
+The ux and ui-design reviewers of an approved run share a read-only review sandbox: a container from
+the project's approved `.agern/sandbox.yml` (default image, its own services), created by the first
+`factory_sandbox_exec` of either of you. Start the app there instead of on the host; follow the spec's
+Verification section if it has one. `factory_sandbox_info` shows its services, limits and output directory.
+
+- **Read-only worktree:** `/workspace` is the run's worktree, mounted read-only; every write there
+  fails. If the app must write into its tree (build output, `node_modules`, caches), copy it first:
+  `cp -a /workspace /tmp/app && cd /tmp/app && …`.
+- **Already running?** The other UI reviewer may have started the app already. Probe it first (e.g.
+  `curl -fsS http://127.0.0.1:<port>/ >/dev/null && echo up`) and only start it when it is not up.
+- **Start it detached** inside a normal (foreground) `factory_sandbox_exec`, with every stream
+  redirected, then wait for it to answer:
+  `nohup <start command> > /tmp/app.log 2>&1 < /dev/null & for i in $(seq 60); do curl -fsS http://127.0.0.1:<port>/ >/dev/null && break; sleep 1; done; tail -20 /tmp/app.log`.
+  Never start the app server with `background: true`: that command would never end and would block
+  every other command of the shared sandbox. A command that hits its time limit restarts the
+  container, which kills the app.
+- **Screenshots:** capture inside the container (a browser from the image or a cache) to the output
+  directory `/run/agern-review/<file>`, which is `.agern-run/review/<file>` in your working directory
+  on the host. Read that file to look at it, attach it with
+  `factory_attach_screenshot { path: ".agern-run/review/<file>" }`, then delete it on the host.
+- **No need to stop** the app or the container: the review sandbox is removed when the review round
+  ends.
+- **Fallback:** if the tool says the sandboxes are all in use, or the review sandbox cannot be
+  created or set up, do not wait: review on the host as described above.
+
 
 Verdict: `CHANGES` if any `blocker` or `major` finding exists (users cannot complete the task, data
 loss, misleading behaviour, a clear accessibility barrier, a requirement of the spec missing from the

@@ -66,6 +66,37 @@ class PodmanRuntimeTest {
     }
 
     @Test
+    fun `the review sandbox container`() {
+        val worktree = Paths.get("/var/lib/agern/workspaces/alice/demo-app/runs/$runId")
+        val spec = manager.reviewSpec(runId, "demo-app", worktree, def, worktree.resolve(".agern-run/review"))
+        val cacheVolume = manager.cacheVolumeName("demo-app", "/root/.gradle")
+        val args = PodmanRuntime.runArgs(cfg, spec)
+        assertEquals(
+            listOf(
+                "podman", "run", "--detach", "--name", "agern-review-$runId",
+                "--label", "agern.run=$runId", "--label", "agern.repo=demo-app", "--label", "agern.role=review",
+                "--network", "agern-review-$runId",
+                "--security-opt", "no-new-privileges", "--pids-limit", "4096", "--cpus", "1.5", "--memory", "2g", "--memory-swap", "2g",
+                "--stop-timeout", "5", "--pull=missing",
+                "--workdir", "/workspace", "--entrypoint", "sh",
+                "--env", "CI=true",
+                "--mount", "type=bind,source=/var/lib/agern/workspaces/alice/demo-app/runs/$runId,target=/workspace,readonly=true",
+                "--mount", "type=bind,source=/var/lib/agern/workspaces/alice/demo-app/runs/$runId/.agern-run/review,target=/run/agern-review",
+                "--mount", "type=volume,source=$cacheVolume,target=/root/.gradle",
+                "docker.io/library/eclipse-temurin:21-jdk",
+                "-c", "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait \$!; done",
+            ),
+            args,
+        )
+        assertFalse(args.contains("--privileged"))
+        // Without an output directory there is no second bind mount.
+        val bare = PodmanRuntime.runArgs(cfg, manager.reviewSpec(runId, "demo-app", worktree, def, null))
+        assertEquals(1, bare.count { it.startsWith("type=bind,") })
+        val svc = PodmanRuntime.runArgs(cfg, manager.reviewServiceSpec(runId, "demo-app", def.services[0], def))
+        assertTrue(svc.containsAll(listOf("agern-review-$runId-postgres", "agern.role=review-service", "agern-review-$runId", "postgres")), svc.toString())
+    }
+
+    @Test
     fun `a sidecar service`() {
         val spec = manager.serviceSpec(runId, "demo-app", def.services[0], def)
         assertEquals(

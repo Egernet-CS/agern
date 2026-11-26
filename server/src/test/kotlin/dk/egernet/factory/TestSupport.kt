@@ -501,6 +501,8 @@ class FakeSandboxRuntime : dk.egernet.factory.sandbox.SandboxRuntime {
         { _, cmd, _ -> dk.egernet.factory.sandbox.ExecResult(0, "ran: $cmd\n", false, false, 5) }
     /** startContainer fails for names containing this. */
     @Volatile var failStart: String? = null
+    /** Called after a container was started (e.g. to race a release against a creation). */
+    @Volatile var onStart: (dk.egernet.factory.sandbox.ContainerSpec) -> Unit = {}
 
     override fun createNetwork(name: String, labels: Map<String, String>) {
         calls += "network create $name"
@@ -515,6 +517,7 @@ class FakeSandboxRuntime : dk.egernet.factory.sandbox.SandboxRuntime {
         failStart?.let { if (spec.name.contains(it)) throw dk.egernet.factory.sandbox.SandboxRuntimeException("image pull failed (fake)") }
         started += spec
         containers[spec.name] = spec.labels.getValue("agern.run")
+        onStart(spec)
     }
     override fun exec(
         container: String, command: List<String>, workdir: String, timeoutMs: Long, user: dk.egernet.factory.sandbox.ExecUser?,

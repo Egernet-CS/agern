@@ -38,7 +38,7 @@ import type {
   Verdict,
   Workspace,
 } from '../api/types';
-import { approverScript, builderScript, chatReplies, reviewerScript, sandboxBuilderScript, seededChat, specScript, type Step } from './scripts';
+import { approverScript, builderScript, chatReplies, reviewSandboxSteps, reviewerScript, sandboxBuilderScript, seededChat, specScript, type Step } from './scripts';
 
 export const ORG = 'Egernet-CS';
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -154,7 +154,7 @@ export const db = {
   /** FACTORY_SANDBOX is not off (scenario `nosandbox`: switched off). */
   sandboxEnabled: scenario !== 'nosandbox',
   /** Sandboxes that exist right now, by run id (created when an approved run's builder starts, removed after review). */
-  runningSandboxes: new Map<string, { createdAt: string; builderSessionId: string; containers: { platform: string; image: string; createdAt: string }[] }>(),
+  runningSandboxes: new Map<string, { createdAt: string; builderSessionId: string; containers: { platform: string; image: string; createdAt: string; kind: 'build' | 'review' }[] }>(),
   players: new Map<string, Player>(),
   settings: {
     agentsMayInstallSoftware: false,
@@ -788,7 +788,7 @@ function runStage(r: Run, role: StageRole, round: number, plan: Plan, startMs: n
     if (def && !db.runningSandboxes.has(r.id)) {
       const at = iso(Math.min(Date.now(), p.endMs + 4000));
       // Like the backend: one container per image used — the default one, then each platform the builder tests on.
-      const containers = [{ platform: 'default', image: def.image, createdAt: at }, ...def.platforms.map((x) => ({ platform: x.name, image: x.image, createdAt: at }))];
+      const containers = [{ platform: 'default', image: def.image, createdAt: at, kind: 'build' as const }, ...def.platforms.map((x) => ({ platform: x.name, image: x.image, createdAt: at, kind: 'build' as const }))];
       db.runningSandboxes.set(r.id, { createdAt: at, builderSessionId: s.id, containers });
       if (sb && def.platforms.length) sb.platformsUsed = ['default', ...def.platforms.map((x) => x.name)];
       feed({ type: 'sandboxes', runId: r.id, change: 'created' });
@@ -810,6 +810,12 @@ function runStage(r: Run, role: StageRole, round: number, plan: Plan, startMs: n
         ? [{ severity: 'info', file: null, detail: 'Consider a toast when carts are merged on login.' }]
         : [];
     steps = reviewerScript(role, verdict, summary);
+    // Like the backend: an approved run's ux reviewer starts the app in the read-only review sandbox.
+    const reviewDef = r.sandbox?.state === 'approved' ? db.sandboxFiles.get(r.repo)?.definition : null;
+    if (role === 'ux' && reviewDef && r.sandbox) {
+      steps = [...reviewSandboxSteps(reviewDef.image, reviewDef.setup), ...steps];
+      r.sandbox.reviewUsed = true;
+    }
     if (live) steps = [{ kind: 'pause', ms: reviewerMs[role] * 1500 }, ...steps];
     const captions = plan.noScreenshots ? [] : screenshotCaptions[role]?.(round) ?? [];
     if (plan.noScreenshots && (role === 'ux' || role === 'ui-design'))
