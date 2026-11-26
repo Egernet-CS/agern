@@ -190,6 +190,11 @@ function run(id: string): Run {
   if (!r) throw new MockError(404, 'not_found', 'Run not found');
   return r;
 }
+/** "Retry now" / "Give up" of a network wait: the mock never waits, so after the server's checks it answers 409. */
+function notWaitingForNetwork(r: Run): never {
+  if (r.owner.username !== me().username && !me().isAdmin) throw new MockError(403, 'forbidden', 'Only the owner or an admin can do this for this run');
+  throw new MockError(409, 'run_not_waiting_for_network', 'The run is not waiting for the network');
+}
 // ---------------------------------------------------------------- attachments (same rules as the backend)
 
 const LIMITS: ClientConfig['attachments'] = { maxFileBytes: 20 << 20, maxMessageBytes: 50 << 20, maxCount: 10, imageTypes: ['image/png', 'image/jpeg', 'image/gif', 'image/webp'] };
@@ -479,6 +484,16 @@ export const mockApi: Api = {
   startRelease: (id) => ok(() => withRelease(id, (r) => startRelease(r, me()))),
   pauseRelease: (id) => ok(() => withRelease(id, (r) => pauseRelease(r, me()))),
   resumeRelease: (id) => ok(() => withRelease(id, (r) => resumeRelease(r, me()))),
+  // The mock never waits for the network: the checks of the server, then 409.
+  giveUpReleaseNetwork: (id) =>
+    ok(() => {
+      const r = getRelease(id);
+      project(r.repo);
+      if (r.owner && r.owner.username !== me().username && !me().isAdmin) {
+        throw new MockError(403, 'forbidden', `Only ${r.owner.username}, who started this release, or an admin can do this`);
+      }
+      throw new MockError(409, 'release_not_waiting_for_network', 'The release is not waiting for the network');
+    }),
   cancelRelease: (id) => ok(() => withRelease(id, (r) => cancelRelease(r, me()))),
   retryReleaseIssue: (id, n, mode) => ok(() => withRelease(id, (r) => retryReleaseIssue(r, n, me(), mode))),
   releaseIssueRetryOptions: (id, n) =>
@@ -530,6 +545,9 @@ export const mockApi: Api = {
       cancelRun(r);
       return r;
     }),
+
+  retryRunNow: (id) => ok(() => notWaitingForNetwork(run(id))),
+  giveUpRun: (id) => ok(() => notWaitingForNetwork(run(id))),
 
   talkToRun: (id, text) => ok(() => (needGithub(), talkToRun(run(id), text, me()))),
   reviewRun: (id) =>

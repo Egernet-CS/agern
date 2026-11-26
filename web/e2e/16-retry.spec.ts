@@ -3,7 +3,9 @@ import { BASE, login, mutate } from './support';
 
 // Retrying a failed run (docs/ARCHITECTURE.md §6 "Retrying a run"): the dialog preselects the recommendation, a continued
 // run links to the one it continues, and a held release issue is retried the same way. The fake builder with
-// "fake:stop-builder" commits and then stops with "Can't reach the API server", except when it is told to continue.
+// "fake:stop-builder" commits and then stops with "Can't reach the API server", except when it is told to continue (or
+// resumed after the connection came back). A run that loses the API first waits for the network (§6 "Transient
+// failures"): these tests give up waiting, or retry at once.
 test.describe.configure({ mode: 'serial' });
 
 const tag = Date.now().toString(36);
@@ -25,8 +27,26 @@ test('a run that stopped after committing is continued from its commits', async 
   const failedId = (await r.json()).id as string;
 
   await page.goto(`${BASE()}/p/demo-app/runs/${failedId}`);
+  // It waits for the network first; giving up fails it as it would have failed without waiting.
+  const banner = page.getByRole('status').filter({ hasText: 'Waiting for the network' });
+  await expect(banner).toBeVisible(BUILD);
+  await expect(banner).toContainText("Can't reach the API server");
+  await expect(banner).toContainText('Next try at');
+  await expect(banner).toContainText('(attempt 2)');
+  await expect(page.locator('.rh-title')).toContainText('waiting for network');
+  await expect(pill(page)).toHaveText('building');
+  await expect(banner.getByRole('button', { name: 'Retry now' })).toBeEnabled();
+  await banner.getByRole('button', { name: 'Give up…' }).click();
+  const giveUp = page.getByRole('dialog', { name: 'Give up waiting?' });
+  await expect(giveUp).toContainText('The run fails now, as it would have without waiting.');
+  await expect(giveUp.getByRole('button', { name: 'Keep waiting' })).toBeFocused();
+  await giveUp.getByRole('button', { name: 'Give up', exact: true }).click();
+  await expect(giveUp).toBeHidden();
+
   await expect(pill(page)).toHaveText('failed', BUILD);
+  await expect(banner).toBeHidden();
   await expect(page.locator('.run-error')).toContainText("Can't reach the API server");
+  await expect(page.locator('.run-error')).toContainText('Gave up waiting for the network (by @alice, after 1 attempt).');
 
   await page.getByRole('button', { name: 'Retry…' }).click();
   const dialog = page.getByRole('dialog', { name: `Retry run ${failedId.slice(0, 8)}?` });
@@ -49,6 +69,21 @@ test('a run that stopped after committing is continued from its commits', async 
   await expect(page.getByRole('button', { name: 'Retry…' })).toBeVisible();
 });
 
+test('a run waiting for the network is retried at once and resumes its builder', async ({ page }) => {
+  await login(page, 'alice');
+  const n = await newIssue(page, `Retry now ${tag}`, 'The builder loses the network. fake:stop-builder');
+  const r = await page.request.post(`${BASE()}/api/projects/demo-app/runs`, { headers: mutate, data: { issueNumber: n } });
+  expect(r.status(), await r.text()).toBe(201);
+  const id = (await r.json()).id as string;
+
+  await page.goto(`${BASE()}/p/demo-app/runs/${id}`);
+  const banner = page.getByRole('status').filter({ hasText: 'Waiting for the network' });
+  await expect(banner).toBeVisible(BUILD);
+  await banner.getByRole('button', { name: 'Retry now' }).click();
+  await expect(banner).toBeHidden(BUILD);
+  await expect(pill(page)).toHaveText('merged', BUILD);
+});
+
 test('a held release issue is retried from its commits in its turn', async ({ page }) => {
   await login(page, 'alice');
   const name = `retry-${tag}`;
@@ -63,6 +98,13 @@ test('a held release issue is retried from its commits in its turn', async ({ pa
 
   await page.goto(`${BASE()}/p/demo-app/releases/${id}`);
   const row = page.locator('.release-order li', { hasText: title });
+  // Its run waits for the network: the release stays building; giving up holds the issue.
+  await expect(page.locator('.release-status')).toContainText(`#${n} ${title} is waiting for the network since`, BUILD);
+  await expect(row).toContainText('Waiting for the network since');
+  await expect(row.locator('.issue-state')).toHaveText('running');
+  await page.locator('.rh-actions').getByRole('button', { name: 'Give up…' }).click();
+  const giveUp = page.getByRole('dialog', { name: 'Give up waiting?' });
+  await giveUp.getByRole('button', { name: 'Give up', exact: true }).click();
   await expect(row.locator('.issue-state')).toHaveText('held', BUILD);
 
   await page.getByRole('button', { name: `Retry #${n}` }).click();

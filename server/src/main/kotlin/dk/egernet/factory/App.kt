@@ -177,6 +177,7 @@ class Services(
         agents.advisorLaunch = { session, owner -> orchestrator.advisorLaunch(session, owner) }
         agents.afterAdvisorTurn = { session -> session.runId?.let { orchestrator.reconcile(it) } }
         orchestrator.onReleaseRunSettled = releaseBuilder::onRunSettled
+        orchestrator.onReleaseRunWaitChanged = { id -> scope.launch { releaseBuilder.publish(id) } }
         images.publishRun = { orchestrator.publish(it) }
         agents.onChatInput = { sessionId -> images.newTurn(sessionId) }
         agents.onChatClosed = { sessionId -> images.removeSession(sessionId) }

@@ -269,6 +269,20 @@ class ReleaseService(
         return io { store.get(id) } ?: throw notFound("Release not found")
     }
 
+    /**
+     * "Give up" on a release waiting for the network (docs/ARCHITECTURE.md §6 "Transient failures"): the issue that could
+     * not start is held and the release goes on. Owner or admin, as [pause]; 409 `release_not_waiting_for_network`.
+     */
+    suspend fun giveUpNetwork(user: UserRecord, id: UUID): ReleaseRecord {
+        val r = visible(user, id)
+        if (r.started) requireOwnerOrAdmin(user, r)
+        if (r.status != ReleaseStatus.PAUSED || r.pauseReason != dk.egernet.factory.PauseReason.NETWORK) {
+            throw conflict("The release is not waiting for the network", "release_not_waiting_for_network")
+        }
+        builder.giveUpNetwork(user, id)
+        return io { store.get(id) } ?: throw notFound("Release not found")
+    }
+
     suspend fun cancel(user: UserRecord, id: UUID): ReleaseRecord {
         val r = visible(user, id)
         if (r.started) requireOwnerOrAdmin(user, r)
