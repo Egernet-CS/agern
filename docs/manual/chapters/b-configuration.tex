@@ -28,6 +28,7 @@ and sandbox limits in \repodoc{INSTALL-LINUX.md\#limits-and-settings}{\texttt{IN
   \envvar{FACTORY_LDAP_URL} and the other \texttt{FACTORY\_LDAP\_\ldots} & --- & Your directory, with \texttt{FACTORY\_AUTH=ldap}.\\
   \envvar{FACTORY_MAX_AGENTS_PER_USER} & \texttt{8} & Agents one person may run at once.\\
   \envvar{FACTORY_STAGE_TIMEOUT_MINUTES} & \texttt{60} & The longest one pipeline stage may take.\\
+  \envvar{FACTORY_MAX_UPDATE_ROUNDS} & \texttt{2} & \ui{Update and merge} rounds per run (0 to 10; 0 switches it off).\\
   \envvar{FACTORY_CHAT_IDLE_MINUTES} & \texttt{30} & When an idle chat's process is stopped.\\
   \envvar{FACTORY_SANDBOX} & \texttt{off} & Set by \cmd{agern sandbox enable} (chapter~\ref{ch:sandboxes}).\\
   \envvar{FACTORY_SANDBOX_MAX_MEMORY}, \envvar{FACTORY_SANDBOX_MAX_CPUS} & \texttt{4g}, \texttt{2} & Per sandbox container.\\

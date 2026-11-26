@@ -66,6 +66,7 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_MAX_AGENTS_PER_USER` | `8` | Concurrent agent processes per user |
 | `FACTORY_CHAT_IDLE_MINUTES` | `30` | Idle chat processes are stopped and resumed on next input |
 | `FACTORY_STAGE_TIMEOUT_MINUTES` | `60` | Wall-clock limit for one pipeline stage agent (1–1440). A spec-writer or builder is warned at 80 % of it; on timeout the agent is stopped, the stage is `failed` and the run `failed` with an error that says so (§6 "Time limit") |
+| `FACTORY_MAX_UPDATE_ROUNDS` | `2` | Update rounds ("Update and merge", §6 "Retrying a run") a run may use after its approved merge was refused because its target moved (0–10, whole number; `0` switches the feature off and keeps the old refusal texts). Copied to the run when it is created. Anything else is a startup error |
 | `FACTORY_NETWORK_RETRY_HOURS` | `24` | How long a run or a release start waits for the network (GitHub, the Claude API) before it fails or holds the issue (0–168, whole hours; `0` switches waiting off, §6 "Transient failures"). Anything else is a startup error |
 | `FACTORY_RELEASE_CHECKS_SETTLE_SECONDS` | `120` | How long the head commit of a release pull request must have had no checks at all before "no checks" counts as green for an automatic release (0–3600; §6 "Checks"). Measured from when Agern first saw that head commit, persisted across restarts |
 | `FACTORY_AGENT_PATH` | the server's `PATH` | `PATH` value handed to agent and git processes (the only value taken from the server environment) |
@@ -766,7 +767,9 @@ reaches the default branch only through the owner's approval of the release (§6
   the approver is `skipped` and the run goes to `needs_human`.
 - **Rounds** are numbered by fix rounds: `Run.round` and `Stage.round` are `0` for the initial
   build/review, `1..maxRounds` for fix rounds. The UI shows "build" for round 0 and "fix round N of
-  max" after.
+  max" after. Later rounds are follow-up reviews of conversation changes ("follow-up N", §6 "Conversation at needs
+  human") and update rounds ("update N", §6 "Retrying a run"); a round that a `run_updates` row names is an update
+  round, and follow-up numbers skip the update rounds in between.
 - **Time limit.** Every stage agent is stopped after `FACTORY_STAGE_TIMEOUT_MINUTES` (default 60) of
   wall-clock time (waiting for a free agent slot does not count). The stage becomes `failed` with
   summary "Timed out: …", and the run `failed` with error "<role> failed: Timed out: …" (failure kind
@@ -784,7 +787,9 @@ reaches the default branch only through the owner's approval of the release (§6
     project needs one, and is a configuration change only (`AgentManager.runStageAgent` takes the limit from `Config`).
 - **approver** answers `{ "verdict": "APPROVE" | "ESCALATE", "summary": string }`. `APPROVE`
   squash-merges the PR and closes the issue, unless its database migrations collide with the target's (§6 "Database
-  migrations"): then the run goes to `needs_human` instead. `ESCALATE` labels the issue `needs-human`, comments,
+  migrations") or GitHub refuses the merge because the branch conflicts with its target or is behind it: then the run
+  goes to `needs_human` instead, and "Update and merge" (§6 "Retrying a run") can bring the branch up to date with the
+  target on the same run. `ESCALATE` labels the issue `needs-human`, comments,
   and waits for the owner's `/factory approve`.
 - **Whose models.** Every agent runs on its owner's Claude account, so model choices are personal. The
   global settings (`chatModel`, `pipelineModels`, `maxFixRounds`) are the admin's *defaults* — the models
@@ -863,7 +868,11 @@ reaches the default branch only through the owner's approval of the release (§6
 
 #### Retrying a run
 
-A failed run can be retried in three ways (issue #53), depending on where it stopped:
+A run can be retried in four ways (issues #53 and #120), depending on where it stopped:
+
+- **Update and merge** (`update`): the work is finished (spec, build, reviews, approver `APPROVE`) and only the merge
+  was refused because the target moved on (see the paragraph "Update and merge" below). The same run gets an update
+  round; no new spec and no fresh build.
 
 - **Retry the failed step** (`step`): the builder finished, and a mechanical step after it failed — the push, the
   pull request creation, or the merge (also the merge into a release branch). Only that step is retried, **on the same
@@ -879,7 +888,9 @@ A failed run can be retried in three ways (issue #53), depending on where it sto
   also does. It goes through the same gate as the approval: changes from the conversation must have been reviewed
   (409 `review_required` / `review_in_progress` / `agent_busy`, §6 "Conversation at needs human"), and the merge
   checks the database migrations first (§6 "Database migrations"). A migration conflict is not a failed step: it
-  clears `failedStep`, so the run offers no step retry until its branch is fixed.
+  sets `failureKind` `migration_conflict` and clears `failedStep`, so the run offers no step retry, but `update`
+  while update rounds are left; a merge refused for a conflict with the target (`merge_conflict`) keeps `failedStep`
+  `merge`, so both the step retry and `update` are offered.
 - **Continue from the commits** (`continue`): a **new run** whose worktree starts at the tip of the failed run's
   branch (local branch, else the remote one, fetched), on its own new branch (§6 "Worktrees and branches"). It reuses
   the failed run's spec (the spec-writer stage is `skipped` with summary "Spec reused from run <id>"; a failed run
@@ -895,8 +906,66 @@ A failed run can be retried in three ways (issue #53), depending on where it sto
 - **Start over** (`start_over`): a new run from scratch, as before this feature; the old branch, pull request and
   local branch are left as they are (§6 "Worktrees and branches").
 
+*Update and merge* (issue #120, the merge-time part of #35). *Available* (`RunRecord.updateAvailable`, also
+`updateAvailable` on `Run` and on a release issue) when the run is `needs_human`, its `failureKind` is
+`migration_conflict` or `merge_conflict`, it has a branch and a pull request, and `updateRounds < maxUpdateRounds`.
+`merge_conflict` is recorded when a squash merge fails with GitHub 405 or 409 and the pull request then reads as open
+with `mergeable` false or `mergeable_state` `dirty` or `behind` (while `mergeable` is null it is read up to 4 more
+times, `mergeablePollMillis` apart; an error while reading means no conflict, and the failure stays a plain failed
+merge step). `FACTORY_MAX_UPDATE_ROUNDS` (default 2) is copied to `runs.max_update_rounds` when the run is created;
+`runs.update_rounds` counts the rounds started. Update rounds do not use fix rounds (`maxRounds`). *Start*
+(`Orchestrator.update`, under the run's talk lock): 409 `retry_mode_unavailable` when the run is not updatable,
+`review_in_progress` while a follow-up review runs, `agent_busy` while the advisor answers, `run_worktree_missing`
+when the worktree is gone (unreviewed conversation changes do not block it: the round reviews the whole branch). The
+transition `needs_human` → `building` with `update_rounds + 1` is one conditional SQL update, so of two concurrent
+starts one gets 409 `retry_mode_unavailable`; the advisor process is stopped as before a follow-up review. *The round*
+runs as the run's job (Cancel works) with the owner's identity, in round = highest stage round + 1, and records a
+`run_updates` row (`running`):
+1. the `needs-human` label goes, the issue gets "**Agern:** updating run `<id>` with `<target>` and merging again
+   (update round n of max[, automatic in release `<name>`]). Reason: <first line of the refusal>";
+2. the migration problems and a renumbering plan (`MigrationCheck.plan`) are computed as the merge gate sees them;
+3. Agern merges the target into the branch in the run's worktree under the clone lock (`GitOps.mergeBase`): fetch,
+   then a real `git merge --no-edit` with the owner's git identity — never a rebase, a reset of pushed commits or a
+   force push, so the later push is a fast-forward. `up_to_date`, `merged` (clean, committed) or `conflict` (left
+   mid-merge with the conflicted files); a worktree with uncommitted changes to tracked files fails the round. The row
+   records the target and its commit, the head before, the incoming first-parent subjects (at most 50), the conflicts
+   and the migration problems;
+4. the sandbox decision is made again exactly as at the run's start and released when the builder ends;
+5. new stages for the round — builder, the four reviewers and a new approver — and the builder resumes the latest
+   builder conversation (`--resume`, fresh with issue and spec when there is no Claude session) with the update
+   prompt (§6 "Database migrations");
+6. the worktree is checked: a merge still in progress or unmerged paths ("the builder left the merge unfinished"),
+   uncommitted tracked changes, the target commit not in `HEAD`, or no new commit although something conflicted, fail
+   the round. Else the row gets the head after and the builder's commits (at most 20);
+7. push (with the network wait), then the migration check again on the pushed branch: remaining problems fail the
+   round (kind `migration_conflict`); else the row is `resolved`;
+8. the four reviewers ("after update round n: `<target>` was merged into the branch and the builder resolved the
+   conflicts; review the whole change, with attention to what the update changed"); any `CHANGES` → `needs_human`
+   "Reviewers request changes after update round n: <roles>." with the approver `skipped` and no fix round;
+9. the approver (its prompt adds "Update rounds used: n of max; the last one merged `<target>` into the branch.");
+   `APPROVE` merges through every gate (migrations, submodule pointers, squash merge, network wait), `ESCALATE` →
+   `needs_human`. A merge refused again records the conflict kind again, so `update` is offered while rounds remain.
+
+*Failure* of the round (a stage failure, the time limit, the usage limit, git, the checks of steps 3, 6 and 7, a push
+that gave up) does not fail the run: open stages close, the sandbox goes, and when nothing was pushed the worktree is
+restored to the head before the round (`merge --abort`, `reset --hard` to that commit, which is the pushed head), with
+the failure kind and step restored. After the push the kind is `migration_conflict` for remaining migration problems,
+else cleared; a run with an advisor whose reviewed commit is not `HEAD` needs its review again. The row becomes
+`failed`, and the run `needs_human` with "Update round n of max with `<target>` did not finish: <why>." plus "
+Conflicting files: …" (at most 10) and " Migrations: …" when there were any, " Pull request #p was not merged.", and
+either ' "Update and merge" can try again (k round(s) left), or resolve it on the pull request's branch and approve
+again.' or " The limit of max update round(s) is reached: …, or build the issue again from the current `<target>`
+(in a release: Retry)." A cancel ends the row `cancelled`; a restart fails the run (`restart`) and its `running` row
+("Interrupted by a server restart"); the existing `continue` retry then applies. *Shown*: `Run.updates` (number, round,
+limit, trigger `owner`/`release`, target, reason, status, merge status, target commit, incoming subjects, conflicts,
+migration problems, the builder's commits, error, times, and a server-composed `summary` line), the run page's
+"Updates" section and "update N" rounds, and the release issue's `updateSummary`. Texts from the repository are data:
+delimited in the prompt, sanitised and capped in comments, plain text in the web UI.
+
 *Recommendation.* The options endpoint answers each mode with `available` and a one-line `detail`, plus the
-`recommended` mode and a one-line `reason`. Rules, in order: `step` when a step retry is possible; `start_over` when
+`recommended` mode and a one-line `reason`. Options are listed in the order `update`, `step`, `continue`,
+`start_over`. Rules, in order: `update` when it is available ("The work is finished; only the merge into `<target>`
+was refused: <error>"); `step` when a step retry is possible; `start_over` when
 `continue` is not possible (the branch has no commits of its own, or it is found neither locally nor on the remote);
 `start_over` for a cancelled run (continuing stays available); `start_over` when the builder made no commits
 (`blocked`, it reported why); `continue` for the interruptions `time_limit`, `usage_limit`, `restart` and
@@ -909,14 +978,18 @@ other failure whose branch has commits. Commits are counted in the owner's clone
 `ECONNREFUSED`, `ENOTFOUND`, `ETIMEDOUT`, `ConnectException`, or is an I/O exception), `restart` (failed by a server
 restart: "Server restarted while the run was in progress; retry it to continue or start over."), `blocked` (no
 commits), `step` (with `failedStep`), `other`; and, on a `needs_human` run whose merge was refused,
-`submodule_commit_missing` (with `failedStep` `merge`, §6 "Submodule pointers"). `FailureKind.INTERRUPTED` holds the
+`submodule_commit_missing` (with `failedStep` `merge`, §6 "Submodule pointers"), `migration_conflict` (no
+`failedStep`) and `merge_conflict` (with `failedStep` `merge`), the two that make "Update and merge" available
+(`FailureKind.UPDATABLE`). `FailureKind.INTERRUPTED` holds the
 four kinds of the recommendation rule. A run fails with `api_unreachable` only after it waited for the network and
 gave up, reached the limit, or when waiting is switched off (§6 "Transient failures").
 
 *Who.* Options: anyone who can see the run (404 otherwise). Retry: the run's owner only — admins included in the
 refusal (403), as for every action that makes agents run on the owner's credentials (§4) — and the owner needs a
 Claude credential (422 `claude_credential_required`). A single run must be `failed` or `cancelled` (409
-`run_not_retryable`); a release run is retried through its release (409 `release_run`). A mode that is not available
+`run_not_retryable`), except that a `needs_human` run accepts `update` (or `recommended` when that is `update`) and
+nothing else; a release run is retried through its release (409 `release_run`). The automatic update of a release
+runs as the release's owner, who owns its runs. A mode that is not available
 is 409 `retry_mode_unavailable`; an unknown one is 400.
 
 *Default.* A request without a mode (no body, `{}`, or `mode` null) means `start_over`: the release issue retry
@@ -928,8 +1001,10 @@ agree. `recommended` asks for the server's recommendation explicitly; the web UI
 `waiting` at its position with its old run still linked and `retryMode` set (note "Retry: continues from the commits of
 run <id>" / "Retry: the failed step of run <id>"), and the build reaches it in its turn; `advance` then starts a
 continuing run (`continue`) or resumes the old run's failed step (`step`, the issue is `running` with the **same** run)
-instead of a fresh run. For `continue` an old run that is still active (`needs_human`) is cancelled first. If the old
-run was approved and merged by its owner while the issue waited, a `step` issue becomes `merged`. If the retry cannot
+instead of a fresh run. `update` does the same with note "Retry: updates run <id> with `<target>` and merges it":
+`advance` starts the update round on the same run (the issue is `running` with it), and the old run is never
+cancelled. For `continue` an old run that is still active (`needs_human`) is cancelled first. If the old
+run was approved and merged by its owner while the issue waited, a `step` or `update` issue becomes `merged`. If the retry cannot
 start, the issue is `held` with "Could not start a run: …" and keeps the old run linked, so it can be retried again.
 When a release builds an issue again by itself after an interruption — the usage limit, a rejected credential, a
 restart — it continues from the interrupted run's commits when `continue` is recommended for that run, else it starts
@@ -1180,12 +1255,27 @@ branch is never changed, renamed or removed (Flyway checks applied migrations by
   clone, a branch missing, git failing) is logged and blocks nothing: CI is the strict gate.
   - *A run's pull request*, before every squash merge (the approver's `APPROVE`, the owner's approval of a
     `needs_human` run and the step retry of a failed merge, single and release runs alike), compares the run's branch with its target. On a problem
-    nothing is merged and the run goes to `needs_human` through the usual path (label, comment, error), with the
-    reason "Database migration conflict with `<target>`: <problems>. Pull request #<n> was not merged. Migrations
-    already on `<target>` must stay unchanged, and a new migration needs a version above all of them. Fix the
-    migration on the pull request's branch and approve again, or build the issue again from the current `<target>`
-    (in a release: Retry)." In a release, the issue thereby becomes `held` with that note (§6 "Releases",
-    "Outcomes"); approving the run again checks again.
+    nothing is merged and the run goes to `needs_human` through the usual path (label, comment, error) with
+    `failureKind` `migration_conflict`, and the reason "Database migration conflict with `<target>`: <problems>.
+    Pull request #<n> was not merged. Migrations already on `<target>` must stay unchanged, and a new migration needs
+    a version above all of them. " followed by the way forward (`MigrationCheck.runReason`): while update rounds are
+    left 'Use "Update and merge" to have Agern merge `<target>` into the branch and let the builder renumber the
+    migration (update round k of max), or fix the migration on the pull request's branch and approve again.'; at the
+    limit "The limit of max update round(s) is reached: fix the migration on the pull request's branch and approve
+    again, or build the issue again from the current `<target>` (in a release: Retry)."; with
+    `FACTORY_MAX_UPDATE_ROUNDS=0` "Fix the migration on the pull request's branch and approve again, or build the
+    issue again from the current `<target>` (in a release: Retry)." A merge refused by GitHub for a conflict reads
+    "Merging pull request #<n> failed: <why>. The branch conflicts with `<target>` or is behind it. " with the same
+    three endings about resolving the conflicts. In a release, the issue thereby becomes `held` with that note (after
+    the automatic update round, §6 "Releases", "Outcomes"); approving the run again checks again. Runs held for a
+    migration conflict before V26 get the kind from the migration, so they are offered the update too.
+  - *The update round* (§6 "Retrying a run", "Update and merge") computes a renumbering plan (`MigrationCheck.plan`,
+    pure): per migration root, every added migration that the problems flag is renumbered in order of (version,
+    path), counting up from the highest of the target's versions and of the run's added ones that keep theirs; the
+    next version increments the last digit group and keeps zero padding and separators (`25`→`26`, `009`→`010`,
+    `1_9`→`1_10`, `1.2`→`1.3`). Each entry names the file, its new version and name, and the target's file that keeps
+    its version (the one with the same version, else the target's highest); the plan also has the first free version
+    per root and the target migrations the run changed or removed.
   - *A ready release* compares `release/<name>` with the default branch at every re-evaluation once its pull request
     is open (it becomes ready, "Check again", the periodic re-evaluation, before an approval). Its issues are already
     merged into the release branch, so none can be held: the release stays `ready` with the notice "Database migration
@@ -1198,7 +1288,18 @@ branch is never changed, renamed or removed (Flyway checks applied migrations by
   version from the branch its pull request merges into (named in the prompt, fetched first), above every migration
   there, never to change one that exists there, and to check again before finishing, in every fix round and after
   any rebase or merge of that branch. A release run is told that its version must also be above every migration on
-  the default branch, which the release is merged into later.
+  the default branch, which the release is merged into later. The prompt of an update round says that the work was
+  approved but pull request #p could not be merged into `<target>` because it moved on, that this is update round n
+  of at most max and not a fix round, what Agern merged (commit, number of commits) and either the conflicted files
+  (at most 30; resolve, `git add`, `git commit`; do not abort, rebase or reset), "The merge was clean and is
+  committed." or that nothing was merged; the incoming commit subjects in a `<merged_commits>` block labelled as data;
+  for migrations the problems, "Migrations that are on `<target>` keep their version and content: never rename, edit
+  or delete them. Renumber your own migration instead (`git mv`):", one line per plan entry ("`<old>` → version v
+  (`<new name>`); `<kept>` on `<target>` keeps version w."), "The next free version on `<target>` is v.", and a
+  `git checkout <baseRef> -- <path>` line for every target migration to restore; the usual migration and sandbox
+  lines; to build, test and commit without pushing, rebasing, amending or forcing; the refusal (at most 1500
+  characters); the issue and spec only when the conversation is not resumed; and how to end. `builder.md` has a
+  paragraph on update rounds.
 
 ### Submodule pointers
 
@@ -1412,9 +1513,13 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   `automatic`, checked), `released_automatically`, `checks_state`, `checks_sha`, `checks_detail`, `checks_failure_sha`,
   `auto_merge_failed_sha`, `checks_head_seen_at`) and `release_issues` (`release_id`, `repo`, `issue_number`, `position`, `issue_title`, `issue_kind`,
   `added_by`, `added_at`, `state`, `run_id` = the issue's latest release run, `note`, and since V16 `retry_mode`
-  (`continue` | `step` | null, checked; §6 "Retrying a run")). `runs` carry `release_id`
+  (`continue` | `step` | `update` (V26) | null, checked; §6 "Retrying a run")). `runs` carry `release_id`
   (`ON DELETE SET NULL`) and `base_branch` (null = the default branch); for retries (V16) `continues_run_id` (→
-  `runs`, `ON DELETE SET NULL`), `spec`, `builder_summary`, `failure_kind` and `failed_step`. Several releases may exist per project.
+  `runs`, `ON DELETE SET NULL`), `spec`, `builder_summary`, `failure_kind` and `failed_step`; for update rounds (V26)
+  `update_rounds` and `max_update_rounds`, with one `run_updates` row per round (`run_id` → `runs` `ON DELETE
+  CASCADE`, `number` unique per run, `round`, `max_rounds`, `trigger` `owner` | `release`, `target`, `reason`,
+  `status` `running` | `resolved` | `failed` | `cancelled`, `merge_status`, `target_sha`, `head_before`, `head_after`,
+  `incoming_count`, JSON lists `incoming`, `conflicts`, `migrations`, `commits`, `error`, `started_at`, `ended_at`). Several releases may exist per project.
   Creating one creates no branch, no run and makes no GitHub write.
 - **States.** Release `status`: `planning` (shown as "in preparation"), `scheduled`, `building`, `paused`, `ready`
   (shown as "ready to release"), `released`, `cancelled`. *Planned* means `planning` or `scheduled` (a scheduled
@@ -1563,19 +1668,27 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   into `<default branch>`." Release runs use the same per-user agent slots as all pipeline agents.
 - **Outcomes.** A run that ends `merged` makes its issue `merged`; `needs_human`, `failed` or `cancelled` (also
   through the run's own cancel) makes it `held` with the run's error as note (or "Run failed"). Then the next issue
-  starts. The orchestrator reports every settled release run (end of its pipeline, approve, cancel — not a
+  starts. One exception: in a `building` release, a run that ends `needs_human` only because its merge was refused for
+  a conflict with `release/<name>` (it is updatable and has used no update round) is updated automatically, once,
+  before the release stops on it: the update round starts at once (trigger `release`) and the issue stays `running`
+  with the same run and note "Updating with `<target>` (automatic)". When that round ends `needs_human`, the issue is
+  `held` with the run's error; no second automatic round starts. If the update cannot start, the issue is `held` with
+  "<run error> Automatic update could not start: <message>". Paused, cancelled and ready releases and single runs are
+  never updated automatically. The orchestrator reports every settled release run (end of its pipeline, approve, cancel — not a
   cancelled coroutine) through a callback that the builder dispatches asynchronously; settling is idempotent and
   ignores runs no longer linked to an issue.
 - **Held issues.** The owner can approve the held run (`POST /api/runs/{id}/approve`, `/factory approve`): when it
   merges the issue becomes `merged`, if the merge fails it stays `held` with the new reason (a branch that is behind
   is merged by GitHub's squash merge; a conflict fails; database migrations that collide with the release branch's
-  are refused before the merge, §6 "Database migrations"). The owner can retry it, or anyone allowed can take it out.
+  are refused before the merge, §6 "Database migrations"). The owner can retry it — with "Update and merge" as the
+  recommended way when its run is updatable (button next to Retry and Remove) — or anyone allowed can take it out.
 - **Retry** (`POST /api/releases/{id}/issues/{number}/retry`, owner only): the release must be `building`,
   `paused` or `ready` (409 `release_not_building`; a `ready` one becomes `building` again, 409
   `release_already_building` while another release of the project builds), the issue `held` or `skipped` (409 `release_issue_not_held`). It becomes
   `waiting` at its position with note and run link cleared; a linked run that is still active (`needs_human`) is
-  cancelled; the build continues. That is the default (`start_over`); with `{ "mode": "continue" | "step" }` the issue
-  is continued from its run's commits or its run's failed step is retried, in its turn (§6 "Retrying a run").
+  cancelled; the build continues. That is the default (`start_over`); with `{ "mode": "continue" | "step" | "update" }`
+  the issue is continued from its run's commits, its run's failed step is retried, or its run is updated and merged,
+  in its turn (§6 "Retrying a run").
 - **Pause** (owner or admin): `building` → `paused`, reason `manual`, note "Paused by <username>" (else 409
   `release_not_building`). The running run is not stopped: it finishes, its outcome is recorded, and no further
   issue starts. **Resume** (owner only, needs a Claude credential): `paused` → `building` (else 409
@@ -2088,7 +2201,10 @@ streams, no sessions, no resumption).
 Tools: `factory_list_issues`, `factory_get_issue`, `factory_create_issue`, `factory_start_run`,
 `factory_list_runs`, `factory_get_run`, `factory_approve_run`, `factory_cancel_run`,
 `factory_send_to_agent`, `factory_request_software`, `factory_list_releases`, `factory_create_release`,
-`factory_assign_issues`, `factory_unassign_issues`, `factory_approve_release`. Personal tokens get these
+`factory_assign_issues`, `factory_unassign_issues`, `factory_approve_release`. `factory_approve_run` takes an
+optional boolean `update`: `true` starts "Update and merge" exactly as `/factory approve <runId> update` (§6 "Retrying
+a run"); without it the run is merged as it is, and the answer ends with "Update and merge is available: /factory
+approve <id> update" when the run can be updated. Personal tokens get these
 (`PERSONAL_TOOLS`, see above). Pipeline-stage agents get only `factory_get_issue`
 and `factory_request_software`; with sandboxes switched on (`FACTORY_SANDBOX` not `off`) the builder also
 gets `factory_sandbox_info`, `factory_sandbox_exec` and `factory_sandbox_wait`; the `ux` and `ui-design` reviewers also get
@@ -2167,9 +2283,12 @@ message is queued for the agent's next step, never that it was already applied.
 
 Chat input starting with `/factory` is handled by the server and not sent to Claude (with attachments it
 is rejected with 422 `attachments_not_allowed`; they stay unsent so the owner can send them in a normal message):
-`/factory run <issue>`, `/factory status`, `/factory approve [runId]`, `/factory cancel <runId>`,
-`/factory retry <runId> [step|continue|over|recommended]` (owner only; without a mode it lists the options, the
-recommendation and its reason; a release run is retried through its release),
+`/factory run <issue>`, `/factory status`, `/factory approve [runId] [update]` (a plain approval merges as it is and,
+when the run can be updated, ends with the line "Update and merge is available: /factory approve <id> update"; with
+`update` it does what `/factory retry <runId> update` does), `/factory cancel <runId>`,
+`/factory retry <runId> [update|step|continue|over|recommended]` (owner only; without a mode it lists the options, the
+recommendation and its reason; a release run is retried through its release: "Release "<name>": #n is waiting to be
+updated and merged."; a single run answers "Run <id>: updating with <target> and merging (update round k of max)."),
 `/factory releases`, `/factory release create <name> [description…]`, `/factory release add <name> <issue>…`,
 `/factory release remove <issue>…`, `/factory release approve <name>`, `/factory release mode <name>
 manual|automatic`, `/factory help`. The reply is appended to the transcript as a `system` event.
@@ -2543,7 +2662,7 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `PUT /api/releases/{id}/mode` | `{ mode: 'manual' \| 'automatic' }` → `Release` | §6 "Release mode": `planning` anyone; `scheduled`/started: automatic owner only, manual owner or admin (403); 400 missing or unknown mode; 409 `release_not_editable` (released), `release_closed` (cancelled), `release_mode_not_allowed`. A `ready` release is re-evaluated in the background (switched to automatic and green, it is merged) |
 | `POST /api/releases/{id}/check` | → `Release` | owner only; `ready` only (409 `release_not_ready`): re-reads the pull request (opens it when the release is complete and has none, replaces one closed without merging, finishes the release when it was merged on GitHub) and its mergeability |
 | `GET /api/releases/{id}/issues/{number}/retry` | → `RetryOptions` | anyone who can see the release; the issue must be `held`/`skipped` (409 `release_issue_not_held`); the options of its linked run, or only `start_over` when it has none |
-| `POST /api/releases/{id}/issues/{number}/retry` | `{ mode?: … }` (body optional) → `Release` | no body or no mode = `start_over`, as before; `continue`/`step`/`recommended` as in §6 "Retrying a run" (409 `retry_mode_unavailable`); owner only; release `building`/`paused`/`ready` (else 409 `release_not_building`; released: 409 `release_not_editable`), issue `held`/`skipped` (else 409 `release_issue_not_held`); it is built again (a `ready` release builds again: 409 `release_already_building` while another release of the project builds); a partly released release: 409 `release_partially_merged` |
+| `POST /api/releases/{id}/issues/{number}/retry` | `{ mode?: … }` (body optional) → `Release` | no body or no mode = `start_over`, as before; `continue`/`step`/`update`/`recommended` as in §6 "Retrying a run" (409 `retry_mode_unavailable`); owner only; release `building`/`paused`/`ready` (else 409 `release_not_building`; released: 409 `release_not_editable`), issue `held`/`skipped` (else 409 `release_issue_not_held`); it is built again (a `ready` release builds again: 409 `release_already_building` while another release of the project builds); a partly released release: 409 `release_partially_merged` |
 | `POST /api/projects/{repo}/releases/assign` | `{ issueNumbers: number[], releaseId: string \| null }` → `Release[]` | assigns or moves the issues to that release of `{repo}` (404 otherwise), or takes them out with `releaseId: null` (numbers in no release are ignored, no GitHub calls). 1–100 positive numbers, duplicates collapsed (400 otherwise; an invalid `releaseId` is 400). Every issue is fetched with the caller's token: unknown → 404 "Issue #n not found", closed → 409 `issue_closed`; in a workspace project routed as a run (409 `workspace_invalid`, `member_label_missing`, `member_label_ambiguous`, 403 `member_not_accessible`); all-or-nothing; a partly released target: 409 `release_partially_merged`. Target `building`/`paused`/`ready`: owner only, appended as `waiting` (a `ready` target builds again: 409 `release_already_building` while another release of the project builds); target `cancelled`: 409 `release_closed`; target `released`: 409 `release_not_editable`. An issue leaving a `building`/`paused`/`ready` release: owner or admin, and only `waiting`, `held` or `skipped` (else 409 `release_issue_started`); leaving a `cancelled` one: owner or admin; leaving a `released` one: 409 `release_not_editable`. A still active run of an issue that leaves is cancelled. Answers all releases of the project after the change |
 | `PUT /api/releases/{id}/issues/order` | `{ issueNumbers: number[] }` → `Release` | the new complete order; anything but exactly the current issues → 409 `release_issues_changed`, nothing changes. `building`/`paused`/`ready`: owner only, and every issue that is not `waiting` keeps its index (409 `release_issue_started`); `cancelled`: 409 `release_closed`; `released`: 409 `release_not_editable` |
 | `GET /api/projects/{repo}/sandbox` | → `SandboxStatus` | anyone who can see the project; the file is read with the caller's token from the default branch |
@@ -2562,7 +2681,7 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `POST /api/runs/{id}/network/retry` | → `Run` | owner or admin; a run waiting for the network tries again now (§6 "Transient failures"); 409 `run_not_waiting_for_network` |
 | `POST /api/runs/{id}/network/give-up` | → `Run` | owner or admin; the waiting run fails now and is returned once failed; 409 `run_not_waiting_for_network` |
 | `GET /api/runs/{id}/retry` | → `RetryOptions` | anyone who can see the run; how it can be retried and what is recommended (§6 "Retrying a run") |
-| `POST /api/runs/{id}/retry` | `{ mode?: 'step' \| 'continue' \| 'start_over' \| 'recommended' }` (body optional) → `Run` | owner only (admins included: 403), single runs that are `failed` or `cancelled` (409 `run_not_retryable`; a release run: 409 `release_run`); no mode = `start_over`; 409 `retry_mode_unavailable`, `active_run_exists`; 400 unknown mode; 422 `claude_credential_required`. Answers the run now at work: the same run for `step`, a new one otherwise |
+| `POST /api/runs/{id}/retry` | `{ mode?: 'update' \| 'step' \| 'continue' \| 'start_over' \| 'recommended' }` (body optional) → `Run` | owner only (admins included: 403), single runs that are `failed` or `cancelled` (409 `run_not_retryable`), or `needs_human` with `update` (the same run, now `building`; 409 `run_not_retryable` for another mode; a release run: 409 `release_run`); no mode = `start_over`; 409 `retry_mode_unavailable`, `active_run_exists`; 400 unknown mode; 422 `claude_credential_required`. Answers the run now at work: the same run for `step`, a new one otherwise |
 | `GET /api/projects/{repo}/sessions?kind=chat` | → `AgentSession[]` | |
 | `POST /api/projects/{repo}/sessions` | `{ model? }` → `AgentSession` | new chat; needs Claude credential; without `model` the owner's effective `chatModel` |
 | `GET /api/agents?active=true` | → `AgentSession[]` | all kinds, across visible repos. `active=true`: `live` (a process exists, e.g. a chat idling between turns) or `starting`/`running` |
