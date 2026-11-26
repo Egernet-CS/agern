@@ -543,6 +543,33 @@ class ReleaseApprovalTest {
         assertEquals("release_not_ready", code { check(r.id) })
     }
 
+    @Test
+    fun `the project's merge policy decides automatic releases and Agern's approval`() {
+        val root = world.user("root", admin = true)
+        s.projectSettings.put("demo-app", ProjectSettingsDto(MergePolicy.OWNER_APPROVES), root.id)
+        assertEquals("release_mode_not_allowed", code { runBlocking { s.releases.create(alice, "demo-app", "auto", "", ReleaseMode.AUTOMATIC) } })
+
+        s.projectSettings.put("demo-app", ProjectSettingsDto(MergePolicy.GITHUB), root.id)
+        val r = readyRelease("gh-policy", "Policy")
+        // The release's own issue runs still merge into the release branch, as automatic runs.
+        val issueRun = s.runs.get(r.issues.single().runId!!)!!
+        assertEquals(RunStatus.MERGED, issueRun.status)
+        assertEquals(MergePolicy.AUTOMATIC, issueRun.mergePolicy)
+        assertEquals("release_mode_not_allowed", code { runBlocking { s.releases.setMode(alice, r.id, ReleaseMode.AUTOMATIC) } })
+        assertEquals("merge_on_github", code { approve(r.id) })
+        val chat = s.sessions.create("demo-app", "chat", "opus", "idle", alice.id, null)
+        val reply = try { runBlocking { s.factory.handleCommand(chat, alice, "/factory release approve gh-policy") } } catch (e: ApiException) { e.message }
+        assertTrue(reply!!.startsWith("This project merges on GitHub"), reply)
+        assertTrue(gh.actions.any { it.startsWith("comment demo-app#${r.prNumber} **Agern: release `gh-policy` is ready to release.**") })
+        eventually("ready announcement") {
+            comments(r.prNumber!!).any { it.endsWith("This project merges on GitHub: review and merge this pull request there; Agern follows it.") }
+        }
+        assertTrue(gh.actions.none { it.startsWith("merge-") })
+
+        gh.mergeOnGitHub(r.prNumber!!)
+        assertEquals(ReleaseStatus.RELEASED, check(r.id).status)
+    }
+
     // ------------------------------------------------------------ editing rules, cancel, names
 
     @Test

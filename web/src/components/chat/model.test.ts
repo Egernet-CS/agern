@@ -2,11 +2,18 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { FactoryEvent } from '../../api/types';
-import { buildTranscript, deployLogOf, fitWidth, toolArgs, toolSummary } from './model.ts';
+import { buildTranscript, deployLogOf, fitWidth, sandboxLogOf, toolArgs, toolSummary } from './model.ts';
 
 const exec = 'mcp__factory__factory_sandbox_exec';
 const wait = 'mcp__factory__factory_sandbox_wait';
 const result = (v: unknown) => ({ text: JSON.stringify(v), isError: false, images: 0 });
+
+test('a sandbox log keeps the review mark of the review sandbox, and only a true one', () => {
+  const base = { kind: 'exec', command: 'echo hi', exitCode: 0, timedOut: false, durationMs: 5, output: 'hi\n', outputTruncated: false, platform: null };
+  assert.equal(sandboxLogOf({ ...base, review: true })?.review, true);
+  assert.equal(sandboxLogOf(base)?.review, undefined);
+  assert.equal(sandboxLogOf({ ...base, review: 'yes' })?.review, undefined);
+});
 
 test('factory_sandbox_wait arguments show the handle, or the latest command', () => {
   assert.equal(toolArgs(wait, { handle: 'cmd-1a2b3c4d', waitSeconds: 60 }), 'cmd-1a2b3c4d');

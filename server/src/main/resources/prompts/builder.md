@@ -38,6 +38,8 @@ Sandbox (when your task prompt says this run has one):
   `factory_sandbox_wait` without a handle to get its result.
 - If the tool says the sandboxes are busy, try again a bit later; do not install the toolchain on the
   host instead. If the sandbox cannot be created or its setup fails, say so in your summary.
+- When the spec has a Verification section, run its commands in the sandbox on the platforms it names
+  and report each result in your summary.
 - When the run has no sandbox, or the tools are not available to you, build and test on the host as
   described above.
 

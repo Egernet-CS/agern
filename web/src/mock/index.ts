@@ -1,8 +1,11 @@
 // Mock implementation of the Api interface. Enabled with VITE_MOCK=1 (npm run dev:mock).
 // Scenarios via ?mock=default|fresh|noclaude|observer|loggedout|nosandbox|usage-none|usage-high|usage-limit (remembered per tab;
 // nosandbox: FACTORY_SANDBOX=off; usage-*: alice's Claude usage without data, at 86 % or at a reached limit).
+// GitHub status: ?mock=github-degraded (several 5xx on issues and releases while GitHub's own page says all is well) and
+// ?mock=github-down (only network errors, githubstatus.com unreachable); any other scenario: GitHub is working.
 import { ApiError, type Api, type Channel } from '../api/api';
 import * as deploy from './deploy';
+import { githubStatus } from './githubStatus';
 import * as images from './images';
 
 /**
@@ -47,14 +50,17 @@ import {
   retryRun,
   approveRelease,
   checkRelease,
+  syncRelease,
   setReleaseMode,
   approveRun,
+  mergeAnywayRun,
   approveSandbox,
   cancelRun,
   reviewRun,
   talkToRun,
   revokeSandboxApproval,
   setProjectIcon,
+  setProjectSettings,
   setProjectIconFromRepository,
   deleteProjectIcon,
   pendingSandboxes,
@@ -243,6 +249,7 @@ const byNewest = <T extends { createdAt: string }>(a: T, b: T) => b.createdAt.lo
 
 export const mockApi: Api = {
   health: () => ok(() => ({ status: 'ok' as const, version: '0.1.0-mock', name: 'agern' })),
+  githubStatus: (opts) => ok(() => githubStatus(me(), !!opts?.brief)),
   providers: () => ok(() => ({ providers: ['os', 'ldap', 'dev'], org: ORG, twoFactor: true })),
   login: (username, password) =>
     ok((): LoginStep => {
@@ -402,6 +409,13 @@ export const mockApi: Api = {
       setProjectIconFromRepository(repo, path);
       return project(repo);
     }),
+  setProjectSettings: (repo, settings) =>
+    ok(() => {
+      needAdmin();
+      project(repo);
+      setProjectSettings(repo, settings);
+      return project(repo);
+    }),
   deleteProjectIcon: (repo) =>
     ok(() => {
       needAdmin();
@@ -512,6 +526,7 @@ export const mockApi: Api = {
     }),
   approveRelease: (id) => ok(() => withRelease(id, (r) => approveRelease(r, me()))),
   checkRelease: (id) => ok(() => withRelease(id, (r) => checkRelease(r, me()))),
+  syncRelease: (id) => ok(() => withRelease(id, (r) => syncRelease(r, me()))),
   setReleaseMode: (id, mode) => ok(() => withRelease(id, (r) => setReleaseMode(r, mode, me()))),
 
   projectRuns: (repo) => ok(() => (project(repo), [...db.runs.values()].filter((r) => r.repo === repo).sort(byNewest))),
@@ -537,6 +552,12 @@ export const mockApi: Api = {
     ok(() => {
       const r = run(id);
       approveRun(r, me());
+      return r;
+    }),
+  mergeAnywayRun: (id, headSha) =>
+    ok(() => {
+      const r = run(id);
+      mergeAnywayRun(r, me(), headSha);
       return r;
     }),
   runRetryOptions: (id) => ok(() => retryOptionsFor(run(id))),

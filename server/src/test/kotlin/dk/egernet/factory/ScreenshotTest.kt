@@ -170,6 +170,24 @@ class ScreenshotTest {
     }
 
     @Test
+    fun `a screenshot from the review sandbox's output directory can be attached`() {
+        val w = world()
+        val answer = ConcurrentHashMap<String, Answer>()
+        script(w, reviewer = { role, _, p ->
+            if (role == "ux") {
+                // The review sandbox writes to /run/agern-review, which is .agern-run/review in the working directory.
+                val dir = dk.egernet.factory.images.ImageService.ensureRunDir(p.spec.workDir).resolve("review")
+                Files.createDirectories(dir)
+                Files.write(dir.resolve("shot.png"), png(16, 9))
+                answer[role] = attach(w, token(p), "${dk.egernet.factory.sandbox.SandboxManager.REVIEW_OUTPUT_HOST}/shot.png", "From the review sandbox")
+            }
+        })
+        val run = runToEnd(w)
+        assertFalse(answer.getValue("ux").isError, answer.getValue("ux").text)
+        assertEquals("From the review sandbox", run.stage("ux").screenshots.single().caption)
+    }
+
+    @Test
     fun `other roles, chats and hand-built grants cannot attach`() {
         val w = world()
         val answers = ConcurrentHashMap<String, Answer>()

@@ -479,6 +479,8 @@ class ReleaseBuildTest {
         behaviour["Interrupted"] = "ok"
         val s2 = Services(world.cfg, s.db, world.github, world.git, world.launcher)
         extraServices += s2
+        // As TestWorld does: the fake GitHub has no checks, so no settle period before the runs merge.
+        s2.orchestrator.checksSettleSeconds = 0
         s2.start()
         assertEquals(RunStatus.FAILED, s2.runs.get(firstRun)!!.status)
         val done = awaitStates(r.id, stuck to "merged", next to "merged", services = s2)

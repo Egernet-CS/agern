@@ -15,7 +15,18 @@ data class McpGrant(
     val runId: UUID?,
     val tools: Set<String>,
     val personal: PersonalTokenRef? = null,
+    /**
+     * Which of the run's sandboxes the `factory_sandbox_*` tools of this token address (docs/ARCHITECTURE.md §5 "Who gets
+     * the tools"). Fixed by the server when the grant is issued, never taken from a tool's arguments.
+     */
+    val sandboxScope: SandboxScope = SandboxScope.BUILD,
 )
+
+/**
+ * [PLAN]: the spec-writer, `factory_sandbox_info` only; [BUILD]: the builder's read-write sandbox; [REVIEW]: the read-only
+ * review sandbox of the ux and ui-design reviewers.
+ */
+enum class SandboxScope { PLAN, BUILD, REVIEW }
 
 /** The personal token a grant comes from: for attribution only (never the token or its hash). */
 data class PersonalTokenRef(val id: UUID, val name: String)

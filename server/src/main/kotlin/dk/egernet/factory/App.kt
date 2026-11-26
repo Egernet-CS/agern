@@ -76,12 +76,17 @@ class Services(
     val clock: java.time.Clock = java.time.Clock.systemUTC(),
     /** What a scheduled start calls; null = the real start ([ReleaseService.startScheduled]). Tests may replace it. */
     releaseStarter: ReleaseStarter? = null,
-    /** Whether a project allows automatic releases: the seam for #24 (every project does until it exists). */
-    val releaseModePolicy: dk.egernet.factory.pipeline.ReleaseModePolicy = dk.egernet.factory.pipeline.ReleaseModePolicy.ALLOW_ALL,
+    /**
+     * Whether a project allows automatic releases; null = from the project's merge policy (only `automatic` allows them;
+     * docs/ARCHITECTURE.md §6 "Merge policy"). Tests may pass their own.
+     */
+    releaseModePolicy: dk.egernet.factory.pipeline.ReleaseModePolicy? = null,
     /** The image providers offered in Settings; null = OpenAI and Gemini (plus the fake one in fake-GitHub mode). Tests inject fakes. */
     imageProviders: List<dk.egernet.factory.images.ImageProvider>? = null,
     /** Called with every exception that escapes a background coroutine of [scope], after it is logged. Tests record them. */
     onBackgroundFailure: ((Throwable) -> Unit)? = null,
+    /** What Agern sees of GitHub: the same instance [github] and [git] record into (docs/ARCHITECTURE.md §6 "GitHub status"). */
+    val githubHealth: dk.egernet.factory.github.GitHubHealth = dk.egernet.factory.github.GitHubHealth(cfg.githubOrg, clock),
 ) {
     /**
      * Background work of the server. A failure that escapes one of its coroutines is logged (instead of going to the
@@ -102,6 +107,10 @@ class Services(
     val twoFactorStore = TwoFactorStore(db)
     val twoFactor = TwoFactorService(users, twoFactorStore, box)
     val access = Access(cfg, users, box, github)
+    /** `GET /api/github/status`: official status, recorded outcomes, verdict and rate limits. */
+    val githubStatus = dk.egernet.factory.github.GitHubStatusService(
+        githubHealth, dk.egernet.factory.github.OfficialGitHubStatus(cfg.githubStatusUrl, clock), access, clock,
+    )
     val workspaceDefs = dk.egernet.factory.workspace.WorkspaceService(access, gitHost = cfg.gitHost)
     val bus = EventBus()
     val mcpRegistry = McpRegistry()
@@ -150,12 +159,17 @@ class Services(
             dk.egernet.factory.images.CodexLogins(it, images, scope, clock)
         }
     val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
+    /** Per-project settings set by admins: the merge policy and its reviewers (docs/ARCHITECTURE.md §6 "Merge policy"). */
+    val projectSettings = dk.egernet.factory.db.ProjectSettingsStore(db)
+    val modePolicy: dk.egernet.factory.pipeline.ReleaseModePolicy = releaseModePolicy
+        ?: dk.egernet.factory.pipeline.ReleaseModePolicy { repo -> projectSettings.get(repo).mergePolicy == MergePolicy.AUTOMATIC }
     val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes, screenshotStore,
-        sessions, events, images, workspaceDefs, releaseStore)
+        sessions, events, images, workspaceDefs, releaseStore, projectSettings, clock)
     val screenshots = dk.egernet.factory.agent.Screenshots(cfg, screenshotStore, runs, workspaces, publishRun = { orchestrator.publish(it) })
     val releaseLocks = dk.egernet.factory.pipeline.ReleaseLocks()
     val releaseMerger = dk.egernet.factory.pipeline.ReleaseMerger(
-        cfg, releaseStore, users, access, workspaces, bus, releaseLocks, scope, releaseModePolicy, clock,
+        cfg, releaseStore, users, access, workspaces, bus, releaseLocks, scope, modePolicy, clock,
+        mergePolicyOf = { repo -> projectSettings.get(repo).mergePolicy },
     )
     val releaseBuilder = dk.egernet.factory.pipeline.ReleaseBuilder(
         cfg, releaseStore, runs, users, access, orchestrator, bus, scope, releaseLocks, releaseMerger, workspaceDefs,
@@ -166,13 +180,13 @@ class Services(
         releaseStarter ?: ReleaseStarter { release, owner -> releases.startScheduled(owner, release.id) },
     )
     val releases: ReleaseService = ReleaseService(
-        cfg, access, releaseStore, bus, releaseBuilder, releaseScheduler, releaseMerger, releaseModePolicy, workspaceDefs,
+        cfg, access, releaseStore, bus, releaseBuilder, releaseScheduler, releaseMerger, modePolicy, workspaceDefs, projectSettings,
     )
     val projectIcons = dk.egernet.factory.db.ProjectIconStore(db)
     val memberLabels = dk.egernet.factory.workspace.MemberLabels(access)
     val factory = FactoryService(
         cfg, access, runs, orchestrator, agents, softwareRequests, sessions, bus, releases, images.store, projectIcons, workspaceDefs,
-        memberLabels,
+        memberLabels, projectSettings,
     )
     /** Personal MCP tokens (docs/ARCHITECTURE.md §7 "Personal tokens"). */
     val mcpTokens = dk.egernet.factory.db.McpTokenStore(db)
@@ -193,6 +207,7 @@ class Services(
         agents.afterAdvisorTurn = { session -> session.runId?.let { orchestrator.reconcile(it) } }
         orchestrator.onReleaseRunSettled = releaseBuilder::onRunSettled
         orchestrator.onReleaseRunWaitChanged = { id -> scope.launch { releaseBuilder.publish(id) } }
+        orchestrator.onReleaseBranchPushed = { id -> releaseMerger.evaluateLater(id) }
         images.publishRun = { orchestrator.publish(it) }
         agents.onChatInput = { sessionId -> images.newTurn(sessionId) }
         agents.onChatClosed = { sessionId -> images.removeSession(sessionId) }
@@ -205,7 +220,8 @@ class Services(
      */
     fun recoverAfterRestart() {
         val failed = runs.failUnfinishedAfterRestart()
-        // Runs at needs_human survive: an interrupted follow-up review must be started again, and no stage stays open.
+        // Runs at needs_human (and waiting_for_checks) survive: an interrupted follow-up review must be started again, and
+        // no stage stays open.
         runs.recoverConversationsAfterRestart()
         if (failed.isNotEmpty()) LoggerFactory.getLogger("dk.egernet.factory").warn("Marked {} unfinished run(s) as failed after restart", failed.size)
         // Order matters: first the sandboxes of runs that are no longer active (their containers bind-mount the worktrees),
@@ -221,6 +237,8 @@ class Services(
             .getOrDefault(emptyList())
         if (reaped.isNotEmpty()) LoggerFactory.getLogger("dk.egernet.factory").info("Removed {} worktree(s) of ended runs", reaped.size)
         releaseBuilder.recoverAfterRestart()
+        // Runs that were waiting for the checks on their pull request go on waiting, with their original deadline.
+        orchestrator.resumeChecksWaits()
         sessions.recoverAfterRestart()
         webSessions.purgeExpired()
         mcpTokens.purgeRevokedBefore(clock.instant().minus(java.time.Duration.ofDays(30)))
@@ -232,6 +250,7 @@ class Services(
         agents.startIdleReaper()
         releaseBuilder.startTicker()
         releaseMerger.startTicker()
+        orchestrator.startFollower()
         attachments.startReaper(scope)
     }
 
@@ -247,6 +266,7 @@ class Services(
         fun production(cfg: Config): Services {
             val db = Db.connect(cfg.dbUrl, cfg.dbUser, cfg.dbPassword)
             val gitHost = cfg.gitHost
+            val health = dk.egernet.factory.github.GitHubHealth(cfg.githubOrg)
             val github: GitHub = if (cfg.fakeGithub) {
                 LoggerFactory.getLogger("dk.egernet.factory").warn("!!!!!!!! FACTORY_DEV_FAKE_GITHUB: using an in-memory fake GitHub. Tokens 'fake-<login>' are accepted. !!!!!!!!")
                 FakeGitHub.seeded(cfg.githubOrg).apply {
@@ -254,10 +274,10 @@ class Services(
                     checksDir = cfg.dataDir.resolve("fake-github-checks")
                 }
             } else {
-                HttpGitHub(cfg.githubApiUrl, gitHost.trimEnd('/'))
+                HttpGitHub(cfg.githubApiUrl, gitHost.trimEnd('/'), health)
             }
-            val git = CliGitOps(cfg.agentPath, gitHost, localOnly = cfg.fakeGithub)
-            return Services(cfg, db, github, git, LocalProcessLauncher(cfg.claudeBin, cfg.agentPath))
+            val git = CliGitOps(cfg.agentPath, gitHost, localOnly = cfg.fakeGithub, health = health)
+            return Services(cfg, db, github, git, LocalProcessLauncher(cfg.claudeBin, cfg.agentPath), githubHealth = health)
         }
     }
 }

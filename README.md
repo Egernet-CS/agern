@@ -111,15 +111,110 @@ The PDF lands in `build/manual/agern-manual-<version>.pdf`, the screenshots in
 
 ## Security: read this first
 
-**In v1 all agents run as the same OS user — the service user — with Claude's permission checks
-bypassed** (`--permission-mode bypassPermissions`). Agents of different people can therefore read
-each other's workspaces and anything else that user can read on the machine. Run Agern on a
-**dedicated machine or VM** that holds nothing else of value. Per-user OS accounts or containers
-are the planned hardening (`AgentLauncher` is an interface for that reason).
+Agern runs AI agents that execute commands on your machine and act on GitHub with your token.
+Everyone who has an account on an instance, and every agent, must be trusted with everything on that
+instance. Run Agern on a **dedicated machine or VM** that holds nothing else of value, on a trusted
+network.
 
-The installer keeps the code read-only to the service user, never runs Agern as root, and the
-systemd unit adds hardening that still lets agents build software. That does not change the point
-above.
+**Who can do what.**
+
+- *Users* log in with a password and a mandatory second factor (TOTP). They see exactly the
+  repositories their own GitHub token can read, and can chat, create issues and start runs there.
+  Only the owner of a chat, run or release can drive or approve it; others who can see the repository
+  watch read-only.
+- *Admins* (`FACTORY_ADMINS`) can change global settings, reset a user's 2FA, approve sandbox
+  definitions, decide software requests, revoke personal MCP tokens, and stop or cancel other
+  people's agents and runs. They cannot read stored credentials or run agents on someone else's account.
+- *Agents* act with their owner's GitHub token and Claude credential. They can do whatever that token
+  allows, not only what Agern's pipeline does. Issue text, comments and repository content are input
+  to agents, so anyone who can write them can influence an agent.
+- The limit: credentials are stored encrypted (AES-256-GCM under `FACTORY_MASTER_KEY`) and never
+  returned by the API. But all agents run as the same OS user as the server, so an agent can read
+  other users' workspaces and anything the service user can read, including Agern's configuration
+  (on `.deb` installs `/etc/agern/agern.env`). The separation between users is enforced by Agern's
+  server, not by the operating system.
+
+**What runs where.**
+
+- Agent processes (chat, spec-writer, builder, reviewers, approver) run on the host as the
+  unprivileged service user, with Claude Code's permission checks bypassed
+  (`--permission-mode bypassPermissions`).
+- The installer and package never run Agern as root and keep the program files read-only to the
+  service user; the service user has no sudo and the systemd unit adds hardening
+  ([docs/INSTALL-LINUX.md §11](docs/INSTALL-LINUX.md#11-security-boundary)). That does not change the
+  point above. Never add the service user to `sudo` or `docker`.
+- Sandboxes are optional and off by default. With them, the builder's builds and tests run in a
+  per-run rootless Podman container ([docs/SANDBOXES.md](docs/SANDBOXES.md)). They isolate the
+  project's toolchain and sidecar services from the host: only the run's worktree is mounted, no
+  credentials are passed in, CPU and memory are limited, the definition must be approved by an admin,
+  and the containers are never root or privileged.
+- Sandboxes do not isolate the agent itself, which still runs on the host and can reach Podman. The
+  network is not restricted: containers can reach the internet and the host's LAN. The spec-writer,
+  reviewers and approver always run on the host.
+
+**GitHub token.** A classic token needs:
+
+- `repo` (required): clone, push branches, open and merge pull requests, read and write issues,
+  including in private repositories. Agern warns when a classic token lacks it.
+- `workflow`: needed when a run changes files under `.github/workflows/`; GitHub refuses such a push
+  without it, and the run fails at its push step.
+- `read:org` (recommended): the Settings page asks for it because the `gh` CLI that agents use
+  expects it.
+
+A fine-grained token works too: resource owner the organization, limited to the repositories Agern
+should work on, with Contents, Issues and Pull requests read & write and Metadata read; Workflows
+read & write if runs may change workflow files; Commit statuses (and Checks, where GitHub offers it)
+read if releases should be released automatically. The organization may have to approve the token.
+Limiting it to selected repositories is the way to narrow what Agern and its agents can touch.
+
+With the token, Agern clones and pushes run branches; opens, edits and merges pull requests;
+comments; creates and closes issues; sets and creates labels; and creates and deletes run and
+`release/…` branches. Agents can do everything the token permits.
+
+**What Agern does without asking, and how to restrict it.**
+
+- A run that passes all four reviewers and whose approver approves is squash-merged into the default
+  branch and its issue is closed, with no human involved and without waiting for CI. Escalated runs
+  wait for their owner.
+- A release builds its issues on `release/<name>` unattended. It reaches the default branch when its
+  owner approves it (mode *manual*, the default), or by itself if the owner switched that release to
+  *automatic*; an automatic release merges only when it merges cleanly and its checks pass.
+- There is no Agern setting in this version that turns the approver's merge off. To restrict it:
+  - protect the default branch on GitHub (required reviews or status checks, without bypass for the
+    token's user): Agern's merge is then refused and the run waits as "needs human";
+  - put issues in a release and keep releases manual, so only an explicit approval reaches the
+    default branch;
+  - narrow the token (above);
+  - cancel a run: its owner or an admin can do so at any time.
+- The admin setting "agents may install software" is an instruction to agents, not a technical barrier.
+
+**Personal MCP tokens** ([below](#use-agern-from-claude-code-on-your-computer)).
+
+- Created in Settings › Claude on your computer. One token acts as you in one project with the chat
+  agent's factory tools except image generation: creating issues, starting and cancelling runs,
+  approving your own runs and releases, messaging running agents. It can therefore cause merges.
+- It is shown once and stored only as a hash. Expiry is 30 days, 90 days, 1 year or never; prefer an
+  expiring one.
+- Revoke it in Settings (admins can revoke anyone's under Admin); revocation takes effect at once. A
+  token also stops working when you lose access to the repository.
+- Treat it like a password: do not commit it or paste it into chats or issues. It is sent as a bearer
+  header to `<FACTORY_PUBLIC_URL>/mcp`, so use HTTPS wherever the network is not fully trusted.
+
+**Network exposure.**
+
+- Agern is made for a trusted network. Do not expose it to the internet; reach it over a LAN or VPN.
+- `FACTORY_PUBLIC_URL` is the one address people use. Mutating API requests and WebSocket
+  connections from a browser with any other `Origin` are rejected with 403 (`FACTORY_ALLOWED_ORIGINS`
+  adds exceptions), and every mutating request needs a custom header. This stops other web pages
+  from acting as you.
+- The server itself speaks plain HTTP. For HTTPS put a reverse proxy in front, set
+  `FACTORY_HOST=127.0.0.1` and an `https://` public URL; the session cookie is then `Secure`
+  ([docs/INSTALL-LINUX.md §7](docs/INSTALL-LINUX.md#7-network-firewall-and-tls)).
+- `/mcp` is the tool endpoint for agents (over loopback, with per-process tokens) and for personal
+  tokens (through the public URL). It ignores cookies, refuses browser requests (any `Origin` header)
+  and throttles guessed tokens.
+
+To report a vulnerability, see [`SECURITY.md`](SECURITY.md).
 
 ## Development
 
@@ -282,6 +377,7 @@ with the same permission rules as the chat agent (no image generation).
 Revoke a token in Settings when you no longer need it (an admin can revoke anyone's under Admin); it stops
 working at once. The proxy in front of Agern must pass `POST /mcp` unbuffered
 ([docs/INSTALL-LINUX.md](docs/INSTALL-LINUX.md), "TLS").
+What a token can do and how to handle it: see [Security](#security-read-this-first).
 
 **Several servers and projects.** Each token covers one project on one Agern, so register one MCP server per
 project. The suggested names (`agern-<host>-<project>`) differ per instance and project, and each server tells

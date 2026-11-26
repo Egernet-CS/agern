@@ -13,6 +13,9 @@ import dk.egernet.factory.ReleaseMode
 import dk.egernet.factory.ReleasePauseDto
 import dk.egernet.factory.ReleaseStartFailureDto
 import dk.egernet.factory.ReleaseStatus
+import dk.egernet.factory.ReleaseSyncDto
+import dk.egernet.factory.ReleaseSyncState
+import dk.egernet.factory.RunStatus
 import dk.egernet.factory.conflict
 import dk.egernet.factory.forbidden
 import java.sql.Connection
@@ -79,6 +82,12 @@ data class ReleaseRecord(
     val branchDeleted: Boolean = false,
     /** The first failed start of the current network streak (docs/ARCHITECTURE.md §6 "Transient failures"), and how many. */
     val networkSince: Instant? = null, val networkAttempts: Int = 0,
+    /** Commits on the target branch that are not on the release branch, as last compared; null: not known. */
+    val behindBy: Int? = null,
+    /** The last evaluation found database migrations of the release branch that collide with the target's. */
+    val migrationConflict: Boolean = false,
+    /** The latest run that brought the release up to date (docs/ARCHITECTURE.md §6 "Bringing a release up to date"). */
+    val sync: RunRecord? = null,
 ) {
     val automatic: Boolean get() = mode == ReleaseMode.AUTOMATIC
 
@@ -114,6 +123,24 @@ data class ReleaseRecord(
     /** Ready and approvable: something was merged and nothing is held. */
     val complete: Boolean get() = merged.isNotEmpty() && held.isEmpty()
 
+    /**
+     * Whether "Bring up to date" is offered (docs/ARCHITECTURE.md §6 "Bringing a release up to date"): `ready`, a single
+     * repository with a branch, and a conflict, a branch behind its target or a migration conflict.
+     */
+    val syncNeeded: Boolean
+        get() = status == ReleaseStatus.READY && !multiRepo && branch != null &&
+            (mergeState == ReleaseMergeState.CONFLICT || (behindBy ?: 0) > 0 || migrationConflict)
+
+    /** [dk.egernet.factory.ReleaseSyncState] of the latest sync run, or null when there is none. */
+    val syncState: String?
+        get() = sync?.let { s ->
+            when (s.status) {
+                RunStatus.MERGED -> ReleaseSyncState.DONE
+                RunStatus.FAILED, RunStatus.CANCELLED -> if (s.syncPushedSha != null) ReleaseSyncState.UNREVIEWED else ReleaseSyncState.FAILED
+                else -> ReleaseSyncState.RUNNING
+            }
+        }
+
     fun toDto() = ReleaseDto(
         id.toString(), repo, name, description, status, OwnerDto(createdByUsername, createdByDisplayName),
         createdAt.iso(), updatedAt.iso(),
@@ -148,6 +175,13 @@ data class ReleaseRecord(
         mode = mode, releasedAutomatically = releasedAutomatically,
         checks = if (prNumber != null || checksSha != null) ReleaseChecksDto(checksState, checksDetail, checksSha) else null,
         repositories = repositoriesDto(),
+        behindBy = behindBy, migrationConflict = migrationConflict, syncNeeded = syncNeeded,
+        sync = sync?.let { s ->
+            ReleaseSyncDto(
+                s.id.toString(), syncState!!, OwnerDto(s.ownerUsername, s.ownerDisplayName), s.createdAt.iso(), s.endedAt?.iso(),
+                s.syncPushedSha, s.error,
+            )
+        },
     )
 
     /** [dk.egernet.factory.ReleaseDto.repositories]: empty unless multi-repository. */
@@ -245,6 +279,7 @@ class ReleaseStore(private val db: Db) {
         checksFailureSha = rs.getString("checks_failure_sha"), autoMergeFailedSha = rs.getString("auto_merge_failed_sha"),
         prMergedAt = rs.instantOrNull("pr_merged_at"), branchDeleted = rs.getBoolean("branch_deleted"),
         networkSince = rs.instantOrNull("network_since"), networkAttempts = rs.getInt("network_attempts"),
+        behindBy = rs.intOrNull("behind_by"), migrationConflict = rs.getBoolean("migration_conflict"),
     )
 
     private fun mapRepo(rs: ResultSet) = ReleaseRepoRecord(
@@ -285,10 +320,13 @@ class ReleaseStore(private val db: Db) {
             .groupBy({ it.first }, { it.second })
     }
 
+    private val runs = RunStore(db)
+
     private fun withIssues(list: List<ReleaseRecord>): List<ReleaseRecord> {
         val issues = issuesOf(list.map { it.id })
         val repos = reposOf(list.map { it.id })
-        return list.map { it.copy(issues = issues[it.id] ?: emptyList(), repos = repos[it.id] ?: emptyList()) }
+        val syncs = runs.latestSyncs(list.map { it.id })
+        return list.map { it.copy(issues = issues[it.id] ?: emptyList(), repos = repos[it.id] ?: emptyList(), sync = syncs[it.id]) }
     }
 
     /** Runs [block], turning a violation of the unique name index into 409 `release_name_taken`. */
@@ -383,7 +421,7 @@ class ReleaseStore(private val db: Db) {
     /** `building`, `paused` or `ready` → `cancelled`. False otherwise. */
     fun cancel(id: UUID): Boolean = db.update(
         """UPDATE releases SET status = 'cancelled', ended_at = now(), pause_reason = NULL, pause_note = NULL, resume_at = NULL,
-             network_since = NULL, network_attempts = 0
+             network_since = NULL, network_attempts = 0, behind_by = NULL, migration_conflict = false
            WHERE id = ? AND status IN ('building', 'paused', 'ready')""", id,
     ) == 1
 
@@ -401,7 +439,8 @@ class ReleaseStore(private val db: Db) {
 
     /** `building` → `ready` (nothing left to build). The "ready" comment is due again and mergeability unknown. */
     fun markReady(id: UUID): Boolean = db.update(
-        """UPDATE releases SET status = 'ready', ready_at = now(), ready_announced = false, merge_state = 'unknown'
+        """UPDATE releases SET status = 'ready', ready_at = now(), ready_announced = false, merge_state = 'unknown',
+             behind_by = NULL, migration_conflict = false
            WHERE id = ? AND status = 'building'""", id,
     ) == 1
 
@@ -410,7 +449,9 @@ class ReleaseStore(private val db: Db) {
      * `release_already_building` when another release of the project holds it. False when the release is not ready.
      */
     fun reopen(id: UUID): Boolean = try {
-        db.update("UPDATE releases SET status = 'building', ready_at = NULL WHERE id = ? AND status = 'ready'", id) == 1
+        db.update(
+            "UPDATE releases SET status = 'building', ready_at = NULL, behind_by = NULL, migration_conflict = false WHERE id = ? AND status = 'ready'", id,
+        ) == 1
     } catch (e: SQLException) {
         if (e.sqlState == "23505") throw slotTaken()
         throw e
@@ -553,6 +594,16 @@ class ReleaseStore(private val db: Db) {
         "UPDATE releases SET pr_merged_at = now(), merge_sha = ? WHERE id = ? AND pr_merged_at IS NULL", sha, id,
     ) == 1
 
+    /**
+     * How `release/<name>` compares with its target, as last compared: [behindBy] commits behind, [migrationConflict]
+     * whether its migrations collide. Only while `ready`; true when a value changed.
+     */
+    fun setComparison(id: UUID, behindBy: Int?, migrationConflict: Boolean): Boolean = db.update(
+        "UPDATE releases SET behind_by = CAST(? AS int), migration_conflict = ? WHERE id = ? AND status = 'ready' " +
+            "AND (behind_by IS DISTINCT FROM CAST(? AS int) OR migration_conflict <> ?)",
+        behindBy, migrationConflict, id, behindBy, migrationConflict,
+    ) == 1
+
     fun setNotice(id: UUID, notice: String?) = db.update("UPDATE releases SET notice = ? WHERE id = ?", notice, id)
 
     /** Claims the "ready to release" announcement of the current ready period; true for exactly one caller. */
@@ -566,7 +617,8 @@ class ReleaseStore(private val db: Db) {
     fun markReleased(id: UUID, method: String?, sha: String?, by: UUID?, automatic: Boolean = false): Boolean = db.update(
         """UPDATE releases SET status = 'released', released_at = now(), ended_at = now(), released_by = CAST(? AS uuid),
            released_automatically = ?,
-           merge_method = COALESCE(CAST(? AS text), merge_method), merge_sha = ?, merge_state = 'clean', notice = NULL, cleanup_pending = true
+           merge_method = COALESCE(CAST(? AS text), merge_method), merge_sha = ?, merge_state = 'clean', notice = NULL, cleanup_pending = true,
+           behind_by = NULL, migration_conflict = false
            WHERE id = ? AND status = 'ready'""",
         by, automatic, method, sha, id,
     ) == 1
@@ -759,7 +811,10 @@ class ReleaseStore(private val db: Db) {
         // A ready release builds again for its new issues (needs the project's building slot; all or nothing).
         if (added.isNotEmpty() && target.status == ReleaseStatus.READY) {
             try {
-                c.prepare("UPDATE releases SET status = 'building', ready_at = NULL WHERE id = ? AND status = 'ready'", arrayOf<Any?>(releaseId))
+                c.prepare(
+                    "UPDATE releases SET status = 'building', ready_at = NULL, behind_by = NULL, migration_conflict = false WHERE id = ? AND status = 'ready'",
+                    arrayOf<Any?>(releaseId),
+                )
                     .use { it.executeUpdate() }
             } catch (e: SQLException) {
                 if (e.sqlState == "23505") throw slotTaken()

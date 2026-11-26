@@ -302,7 +302,7 @@ class FakeGitOps : GitOps {
     ): dk.egernet.factory.git.BranchComparison? {
         comparisons += "$headBranch -> $baseBranch"
         val c = comparison(baseBranch, headBranch) ?: return null
-        return dk.egernet.factory.git.BranchComparison(c.baseFiles.filter { dirOf(it) != null }, c.changes.filter { dirOf(it.path) != null })
+        return dk.egernet.factory.git.BranchComparison(c.baseFiles.filter { dirOf(it) != null }, c.changes.filter { dirOf(it.path) != null }, c.behind)
     }
     /** What [changedGitlinks] answers for (base branch, head branch); a thrown exception is thrown by it. Default: none. */
     @Volatile var gitlinks: (base: String, head: String) -> List<dk.egernet.factory.git.GitlinkChange>? = { _, _ -> emptyList() }
@@ -314,6 +314,34 @@ class FakeGitOps : GitOps {
     /** What [unpushedSubmodules] answers for every checkout. */
     @Volatile var unpushed: List<dk.egernet.factory.git.UnpushedSubmodule> = emptyList()
     override fun unpushedSubmodules(dir: Path, home: Path) = unpushed
+    /** What [compareWorktree] answers for the base ref (before the [dirOf] filter); default: nothing changed, not behind. */
+    @Volatile var worktreeComparison: (baseRef: String) -> dk.egernet.factory.git.BranchComparison? =
+        { _ -> dk.egernet.factory.git.BranchComparison(emptyList(), emptyList()) }
+    override fun compareWorktree(worktree: Path, baseRef: String, home: Path, dirOf: (String) -> String?): dk.egernet.factory.git.BranchComparison? {
+        val c = worktreeComparison(baseRef) ?: return null
+        return dk.egernet.factory.git.BranchComparison(c.baseFiles.filter { dirOf(it) != null }, c.changes.filter { dirOf(it.path) != null }, c.behind)
+    }
+    /** What [mergeState] answers for (start commit, merged ref); default: [headSha], merged and finished. */
+    @Volatile var merge: (start: String, mergedRef: String) -> dk.egernet.factory.git.MergeCheck =
+        { _, _ -> dk.egernet.factory.git.MergeCheck(headSha, containsStart = true, containsMerged = true, unfinished = false) }
+    /** Every [mergeState], as `"<start> <mergedRef>"`. */
+    val mergeChecks = CopyOnWriteArrayList<String>()
+    override fun mergeState(worktree: Path, startSha: String, mergedRef: String, home: Path): dk.egernet.factory.git.MergeCheck {
+        mergeChecks += "$startSha $mergedRef"
+        return merge(startSha, mergedRef)
+    }
+    /** Every fast-forward push ([pushFastForward]), as `"<branch> <sha>"`; never in [pushes]. */
+    val ffPushes = CopyOnWriteArrayList<String>()
+    /** Runs before every fast-forward push (e.g. to clear a conflict, as GitHub would after the merge). */
+    @Volatile var beforeFastForward: (branch: String) -> Unit = {}
+    /** While set, [pushFastForward] is refused as a non-fast-forward with this output. */
+    @Volatile var rejectFastForward: String? = null
+    override fun pushFastForward(id: AgentIdentity, worktree: Path, branch: String, home: Path) {
+        failPush?.let { throw dk.egernet.factory.git.GitException(it) }
+        rejectFastForward?.let { throw dk.egernet.factory.git.PushRejectedException(it) }
+        beforeFastForward(branch)
+        ffPushes += "$branch $headSha"
+    }
     override fun removeWorktree(mainDir: Path, worktree: Path, home: Path, keepUnpushed: Boolean) {
         if (!deleteWorktrees) return
         worktree.toFile().deleteRecursively()
@@ -379,6 +407,13 @@ class TestWorld(
         onBackgroundFailure = { backgroundFailures += it },
     )
 
+    init {
+        // The fake GitHub has no checks: without this, every run would wait out the settle period before it merges.
+        // Tests of the checks before a merge set their own values; release tests set the release merger's period.
+        services.orchestrator.checksSettleSeconds = 0
+        services.orchestrator.checksPollMillis = 50
+    }
+
     /** Puts `.agern/sandbox.yml` on the default branch (GitHub API and git alike); null removes it. */
     fun sandboxFile(content: String?, repo: String = "demo-app") {
         github.setFile(repo, dk.egernet.factory.sandbox.SANDBOX_FILE, content)
@@ -441,6 +476,11 @@ class FailingPushGit(private val inner: GitOps) : GitOps by inner {
         failPush?.let { throw dk.egernet.factory.git.GitException(it) }
         pushes += branch
         inner.push(id, worktree, branch, home)
+    }
+    override fun pushFastForward(id: AgentIdentity, worktree: Path, branch: String, home: Path) {
+        failPush?.let { throw dk.egernet.factory.git.GitException(it) }
+        inner.pushFastForward(id, worktree, branch, home)
+        pushes += "ff $branch"
     }
 }
 
@@ -505,6 +545,8 @@ class FakeSandboxRuntime : dk.egernet.factory.sandbox.SandboxRuntime {
         { _, cmd, _ -> dk.egernet.factory.sandbox.ExecResult(0, "ran: $cmd\n", false, false, 5) }
     /** startContainer fails for names containing this. */
     @Volatile var failStart: String? = null
+    /** Called after a container was started (e.g. to race a release against a creation). */
+    @Volatile var onStart: (dk.egernet.factory.sandbox.ContainerSpec) -> Unit = {}
 
     override fun createNetwork(name: String, labels: Map<String, String>) {
         calls += "network create $name"
@@ -519,6 +561,7 @@ class FakeSandboxRuntime : dk.egernet.factory.sandbox.SandboxRuntime {
         failStart?.let { if (spec.name.contains(it)) throw dk.egernet.factory.sandbox.SandboxRuntimeException("image pull failed (fake)") }
         started += spec
         containers[spec.name] = spec.labels.getValue("agern.run")
+        onStart(spec)
     }
     override fun exec(
         container: String, command: List<String>, workdir: String, timeoutMs: Long, user: dk.egernet.factory.sandbox.ExecUser?,

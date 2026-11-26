@@ -126,6 +126,30 @@ password hashes on the machine. Your choices:
   `sudo usermod -aG shadow agern && sudo agern restart`. Give those accounts passwords that are
   used nowhere else.
 
+**Restricting LDAP logins to a group.** With `FACTORY_AUTH=ldap` alone, everyone with an account
+in the directory can log in. Whenever the directory is wider than the team (e.g. a whole
+organisation), set a required group. Agern checks it after the user's own bind, as that user, so
+no service account (and no password for one on this host) is needed; it works with the DN template
+as well as with search-then-bind.
+
+```sh
+# groupOfNames (member holds user DNs) — the defaults
+FACTORY_LDAP_REQUIRED_GROUP=cn=agern,ou=groups,dc=example,dc=com
+
+# posixGroup (memberUid holds login names)
+FACTORY_LDAP_REQUIRED_GROUP=cn=agern,ou=groups,dc=example,dc=com
+FACTORY_LDAP_GROUP_MEMBER_ATTRIBUTE=memberUid
+FACTORY_LDAP_GROUP_MEMBER_VALUE=uid
+```
+
+Use `uniqueMember` for `groupOfUniqueNames`. Several groups are separated by `;` (membership of any
+one is enough). The directory must let authenticated users compare or read the member attribute of
+these group entries; otherwise every login is refused. A refused user sees "Wrong username or
+password"; the reason is in the log (`journalctl -u agern | grep 'ldap:'`), e.g.
+`ldap: bob is not in cn=agern,ou=groups,dc=example,dc=com`. Membership is checked at every login,
+so removing someone from the group takes effect at their next login (sessions last up to 14 days).
+`FACTORY_ADMINS` still decides who is an admin, and admins must be in the group too.
+
 ## 5. Claude CLI and gh for the agern user
 
 Agents are `claude` processes; they use `git` (installed with the package) and `gh`. Install them
@@ -187,6 +211,9 @@ Agern's factory tools through `FACTORY_PUBLIC_URL`, docs/ARCHITECTURE.md §7 "Pe
 buffer its responses: slow tool calls are answered as an event stream that can run for minutes (Caddy
 streams by default; nginx: `proxy_buffering off;` and a `proxy_read_timeout` of at least `30m` for
 `location /mcp`).
+
+What is exposed on the network (the `Origin` checks, `/mcp`, personal MCP tokens sent as bearer
+headers) is summarised in [README.md, "Security: read this first"](../README.md#security-read-this-first).
 
 ## 8. Upgrades, rollback and automatic upgrades
 
@@ -271,6 +298,11 @@ sudo -u postgres dropdb factory && sudo -u postgres dropuser factory
 
 ## 11. Security boundary
 
+The overview (trust model, GitHub token scopes, what is merged without a human, personal MCP tokens)
+is in [README.md, "Security: read this first"](../README.md#security-read-this-first); this section
+covers the machine. Agents can read `/etc/agern/agern.env` and other users' workspaces, so the users
+of one instance must trust each other.
+
 Agents run as the unprivileged `agern` user with Claude Code's permission prompts bypassed: treat
 everything the `agern` user can do as something an agent can do. The design keeps root out of
 reach:
@@ -346,7 +378,8 @@ user, with its permissions bypassed. It can reach everything that user can — i
 the other runs' worktrees. A sandbox is a toolchain, sidecar and resource boundary, **not** a
 security boundary against the agent; containing the agent is a later release. What does hold: the
 containers are rootless (they belong to `agern`, never to root), never privileged, and Agern — not
-the project — decides their mounts, network, capabilities and limits.
+the project — decides their mounts, network, capabilities and limits. See also
+[README.md, "Security: read this first"](../README.md#security-read-this-first).
 
 **How it runs.** Podman runs as the `agern` user in a unit of its own,
 `agern-sandbox.service`, started through `agern-sandbox.socket` (`/run/agern-podman/podman.sock`,

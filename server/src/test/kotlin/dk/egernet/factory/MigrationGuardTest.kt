@@ -207,9 +207,12 @@ class MigrationGuardTest {
         val r = awaitRelease(r0.id, "ready with a notice") { it.status == ReleaseStatus.READY && it.notice != null }
         val pr = r.prNumber!!
         val notice = "Database migration conflict with `main`: `$dir/V16__mine.sql` has the same version (16) as " +
-            "`$dir/V16__other.sql`. The release is not merged. Fix the migrations on `release/s` (merge `main` into it; a new " +
-            "migration needs a version above every migration on `main`, and existing ones must stay unchanged), then use \"Check again\"."
+            "`$dir/V16__other.sql`. The release is not merged. A new migration needs a version above every migration on `main`, " +
+            "and existing ones must stay unchanged. Use \"Bring up to date\" on the release page (or `/factory release sync s`), or " +
+            "fix the migrations on `release/s` and use \"Check again\"."
         assertEquals(notice, r.notice)
+        // The comparison is stored for "Bring up to date".
+        assertTrue(r.migrationConflict && r.syncNeeded, r.toString())
         assertTrue("release/s -> main" in world.git.comparisons, world.git.comparisons.toString())
         // Automatic and green, yet not merged, and not announced as ready.
         runBlocking { s.releaseMerger.tick() }

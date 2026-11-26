@@ -29,6 +29,9 @@ import dk.egernet.factory.forbidden
 import dk.egernet.factory.git.GitOps
 import dk.egernet.factory.github.Access
 import dk.egernet.factory.github.GitHubException
+import dk.egernet.factory.images.ImageService
+import dk.egernet.factory.images.SafeFiles
+import dk.egernet.factory.mcp.SandboxScope
 import dk.egernet.factory.notFound
 import dk.egernet.factory.unprocessable
 import kotlinx.coroutines.CompletableDeferred
@@ -67,6 +70,10 @@ data class SandboxAnswer(val isError: Boolean, val text: String)
  *
  * A run's sandbox is a private network with the services, plus one container per image that runs commands: the default
  * image and, on first use, each platform. Every such container takes one slot of FACTORY_SANDBOX_MAX_CONCURRENT.
+ *
+ * Besides this build sandbox a run can have a review sandbox for one review round at a time: the same approved definition
+ * (default image only) on its own network with its own services, the worktree mounted read-only, created on the first
+ * command of the ux or ui-design reviewer and shared by both, removed when the round ends ([releaseReview]).
  *
  * The sandbox gives the project its toolchain, sidecar services, resource limits and a clean environment. It is NOT a
  * security boundary against the agent: the agent runs on the host as the same OS user that owns the rootless containers.
@@ -107,6 +114,8 @@ class SandboxManager(
 
     private val slots = Semaphore(sc.maxConcurrent)
     private val sandboxes = ConcurrentHashMap<UUID, RunSandbox>()
+    /** Review sandboxes, by run: at most one per run, for one review round. */
+    private val reviews = ConcurrentHashMap<UUID, RunSandbox>()
 
     private sealed interface Plan {
         data class Available(val definition: SandboxDefinition, val sha256: String) : Plan
@@ -139,7 +148,14 @@ class SandboxManager(
         val elapsedMs: Long get() = System.currentTimeMillis() - startedAt
     }
 
-    private class RunSandbox(val runId: UUID, val repo: String, val worktree: Path, val plan: Plan, @Volatile var info: RunSandboxDto) {
+    /**
+     * A run's build sandbox, or ([review] true) its review sandbox, whose [parent] is the build sandbox entry it was made
+     * from. [runDir]: the agents' working directory (where the review sandbox's output directory lives).
+     */
+    private class RunSandbox(
+        val runId: UUID, val repo: String, val worktree: Path, val plan: Plan, @Volatile var info: RunSandboxDto,
+        val runDir: Path? = null, val review: Boolean = false, val parent: RunSandbox? = null,
+    ) {
         /**
          * Serialises creation and commands: one command at a time per run. Taken by the tool call (waiting for a
          * foreground command, `tryLock` for a background one) and released by the command's job when it ends. Release,
@@ -163,10 +179,15 @@ class SandboxManager(
         /** Services whose readiness check passed since the services were (re)created. */
         val ready: MutableSet<String> = ConcurrentHashMap.newKeySet()
         @Volatile var released = false
-        /** The builder session that used the sandbox last (where an admin's stop is reported). */
+        /** The session that used the sandbox last (where an admin's stop is reported). */
         @Volatile var sessionId: UUID? = null
         /** Bumped by every admin stop, so a creation or command in flight notices its containers are gone. */
         val generation = AtomicInteger()
+
+        /** Review sandbox: the host directory mounted at [REVIEW_OUTPUT] (null: none, see [outputNote]). */
+        @Volatile var outputDir: Path? = null
+        /** Review sandbox: why it has no output directory. */
+        @Volatile var outputNote: String? = null
 
         val created: Boolean get() = infra || boxes.isNotEmpty()
         val definition: SandboxDefinition? get() = (plan as? Plan.Available)?.definition
@@ -174,12 +195,22 @@ class SandboxManager(
 
     /** Every container a run can have, existing or not (removal ignores missing ones). */
     private fun names(rs: RunSandbox): List<String> {
+        if (rs.review) return listOf(reviewContainerName(rs.runId)) + rs.definition?.services.orEmpty().map { reviewServiceContainerName(rs.runId, it.name) }
         val def = rs.definition ?: return listOf(containerName(rs.runId))
         return listOf(containerName(rs.runId)) + def.platforms.map { platformContainerName(rs.runId, it.name) } +
             def.services.map { serviceContainerName(rs.runId, it.name) }
     }
 
-    private fun boxName(runId: UUID, key: String) = if (key == DEFAULT) containerName(runId) else platformContainerName(runId, key)
+    private fun boxName(rs: RunSandbox, key: String) = when {
+        rs.review -> reviewContainerName(rs.runId)
+        key == DEFAULT -> containerName(rs.runId)
+        else -> platformContainerName(rs.runId, key)
+    }
+
+    private fun netName(rs: RunSandbox) = if (rs.review) reviewNetworkName(rs.runId) else networkName(rs.runId)
+
+    private fun svcName(rs: RunSandbox, service: String) =
+        if (rs.review) reviewServiceContainerName(rs.runId, service) else serviceContainerName(rs.runId, service)
 
     private fun announce(rs: RunSandbox, change: String) = emitFeed(FeedItem.Sandboxes(rs.repo, rs.runId.toString(), change))
 
@@ -191,33 +222,35 @@ class SandboxManager(
      * approval. Never throws; the decision is stored on the run and returned. [definitionRepo]: the repository whose
      * approval counts (a workspace run's target member); [repo] stays the run's project.
      */
-    suspend fun prepare(runId: UUID, repo: String, worktree: Path, baseRef: String, home: Path, definitionRepo: String = repo): RunSandboxDto {
+    suspend fun prepare(
+        runId: UUID, repo: String, worktree: Path, baseRef: String, home: Path, definitionRepo: String = repo, runDir: Path = worktree,
+    ): RunSandboxDto {
+        suspend fun record(info: RunSandboxDto, available: Plan.Available?, repo: String, worktree: Path) = recordDecision(runId, info, available, repo, worktree, runDir)
         if (!enabled) {
-            return record(runId, RunSandboxDto("disabled", "Sandboxes are switched off on this server (FACTORY_SANDBOX=off).", null, null), null, repo, worktree)
+            return record(RunSandboxDto("disabled", "Sandboxes are switched off on this server (FACTORY_SANDBOX=off).", null, null), null, repo, worktree)
         }
         val content = try {
             withContext(Dispatchers.IO) {
                 devDefinitionSource?.invoke(definitionRepo) ?: git.readFile(worktree, baseRef, SANDBOX_FILE, home, SandboxDefinitions.MAX_BYTES)
             }
         } catch (e: Exception) {
-            return record(runId, RunSandboxDto("invalid", "Could not read $SANDBOX_FILE from $baseRef: ${e.message}", null, null), null, repo, worktree)
+            return record(RunSandboxDto("invalid", "Could not read $SANDBOX_FILE from $baseRef: ${e.message}", null, null), null, repo, worktree)
         }
         if (content == null) {
-            return record(runId, RunSandboxDto("none", "The repository has no $SANDBOX_FILE on its default branch ($baseRef).", null, null), null, repo, worktree)
+            return record(RunSandboxDto("none", "The repository has no $SANDBOX_FILE on its default branch ($baseRef).", null, null), null, repo, worktree)
         }
         return when (val parsed = SandboxDefinitions.parse(content, sc)) {
             is ParsedDefinition.Invalid -> record(
-                runId, RunSandboxDto("invalid", "$SANDBOX_FILE on $baseRef is invalid: " + parsed.errors.joinToString("; "), parsed.sha256, null),
+                RunSandboxDto("invalid", "$SANDBOX_FILE on $baseRef is invalid: " + parsed.errors.joinToString("; "), parsed.sha256, null),
                 null, repo, worktree,
             )
             is ParsedDefinition.Valid -> {
-                // A workspace run's sandbox is approved per member repository (docs/ARCHITECTURE.md �6 "Workspace runs").
+                // A workspace run's sandbox is approved per member repository (docs/ARCHITECTURE.md §6 "Workspace runs").
                 val approval = withContext(Dispatchers.IO) { approvals.get(definitionRepo) }
                 val def = parsed.definition
                 if (approval != null && approval.sha256 == parsed.sha256) {
                     val platforms = if (def.platforms.isEmpty()) "" else "; platforms ${def.platforms.joinToString(", ") { "${it.name} (${it.image})" }}"
                     record(
-                        runId,
                         RunSandboxDto(
                             "approved",
                             "Sandbox definition ${parsed.sha256.take(12)} approved by ${approval.approvedByUsername}; image ${def.image}$platforms. " +
@@ -230,7 +263,6 @@ class SandboxManager(
                     val why = if (approval == null) "no version of it has been approved by an admin"
                     else "it changed since an admin approved version ${approval.sha256.take(12)}"
                     record(
-                        runId,
                         RunSandboxDto("unapproved", "$SANDBOX_FILE (${parsed.sha256.take(12)}) is not approved: $why. An admin can approve it in the project's sandbox settings.", parsed.sha256, def.image),
                         null, repo, worktree,
                     )
@@ -239,9 +271,11 @@ class SandboxManager(
         }
     }
 
-    private suspend fun record(runId: UUID, info: RunSandboxDto, available: Plan.Available?, repo: String, worktree: Path): RunSandboxDto {
+    private suspend fun recordDecision(
+        runId: UUID, info: RunSandboxDto, available: Plan.Available?, repo: String, worktree: Path, runDir: Path,
+    ): RunSandboxDto {
         withContext(Dispatchers.IO) { runs.setSandbox(runId, info) }
-        if (enabled) sandboxes[runId] = RunSandbox(runId, repo, worktree, available ?: Plan.Unavailable(info.reason), info)
+        if (enabled) sandboxes[runId] = RunSandbox(runId, repo, worktree, available ?: Plan.Unavailable(info.reason), info, runDir)
         return info
     }
 
@@ -249,46 +283,85 @@ class SandboxManager(
 
     private val execCapMs: Long get() = minOf(sc.execTimeoutMs, cfg.stageTimeoutMs)
 
-    /** `factory_sandbox_info` for an agent of run [runId]. */
-    suspend fun info(runId: UUID): SandboxAnswer {
-        val rs = sandboxes[runId]
-        val plan = rs?.plan
+    /**
+     * `factory_sandbox_info` for an agent of run [runId] whose token has [toolScope]: the build sandbox (builder), the review
+     * sandbox (ux and ui-design reviewers; never created here) or the plan (spec-writer, which cannot run anything).
+     */
+    suspend fun info(runId: UUID, toolScope: SandboxScope = SandboxScope.BUILD): SandboxAnswer {
+        val build = sandboxes[runId]
+        val plan = build?.plan
+        val review = toolScope == SandboxScope.REVIEW
+        // What `created`, `command`, readiness and capacity describe: the review sandbox (if it exists now) or the build one.
+        val live: RunSandbox? = if (review) reviews[runId] else build
         // Exposed ports are known once the images are pulled, i.e. after the sandbox was created.
-        val ports: Map<String, List<String>> = if (plan is Plan.Available && rs.infra) withContext(Dispatchers.IO) {
+        val ports: Map<String, List<String>> = if (plan is Plan.Available && (build.infra || live?.infra == true)) withContext(Dispatchers.IO) {
             plan.definition.services.associate { it.name to runtime!!.exposedPorts(it.image) }
         } else emptyMap()
         val obj = buildJsonObject {
-            put("available", plan is Plan.Available && !rs.released)
-            put("state", rs?.info?.state ?: if (enabled) "none" else "disabled")
+            put("available", plan is Plan.Available && !build.released)
+            put("state", build?.info?.state ?: if (enabled) "none" else "disabled")
             put("reason", when {
                 !enabled -> "Sandboxes are switched off on this server. Build and test on the host as usual."
-                rs == null -> "This run has no sandbox."
-                rs.released -> "The run's sandbox has been removed (the build/review part of the run is over)."
-                else -> rs.info.reason
+                build == null -> "This run has no sandbox."
+                build.released -> "The run's sandbox has been removed (the build/review part of the run is over)."
+                else -> build.info.reason
             })
             if (plan is Plan.Available) {
                 val def = plan.definition
+                when (toolScope) {
+                    SandboxScope.PLAN -> {
+                        put("access", "plan")
+                        put("note", "You cannot run commands in this sandbox; this is for planning the spec's Verification section. " +
+                            "The builder runs commands in it (worktree read-write, on the platforms listed here). The ux and ui-design " +
+                            "reviewers get a separate review sandbox from the same definition: default image only, own services, the " +
+                            "worktree mounted read-only, shared by both for one review round.")
+                    }
+                    SandboxScope.REVIEW -> {
+                        put("access", "review")
+                        put("readOnly", true)
+                        val out = live?.outputDir
+                        val noteOut = live?.outputNote
+                        if (live == null || out != null) {
+                            putJsonObject("outputDir") { put("container", REVIEW_OUTPUT); put("host", REVIEW_OUTPUT_HOST) }
+                        } else {
+                            put("outputDir", kotlinx.serialization.json.JsonNull)
+                            put("outputNote", noteOut ?: "This review sandbox has no output directory; screenshots cannot be taken inside it.")
+                        }
+                        put("note", "This is the run's review sandbox, shared with the other UI reviewer (ux, ui-design) of this round " +
+                            "and removed when the round ends. $WORKDIR is the run's worktree, read-only: writes there fail (copy the tree " +
+                            "to /tmp inside the container if the app must write into it). Files for the host, such as screenshots, go to " +
+                            "$REVIEW_OUTPUT, which is $REVIEW_OUTPUT_HOST in your working directory. Start a long-running app detached " +
+                            "inside a foreground command with every stream redirected, e.g. `nohup <start> > /tmp/app.log 2>&1 < /dev/null &` " +
+                            "followed by a readiness probe; never with `background: true`, which blocks every other command of this " +
+                            "sandbox. The other UI reviewer may already have started the app: check (e.g. probe its URL) before you start it.")
+                    }
+                    SandboxScope.BUILD -> {}
+                }
                 put("image", def.image)
-                put("created", rs.boxes.containsKey(DEFAULT))
+                put("created", live?.boxes?.containsKey(DEFAULT) == true)
                 put("workdir", WORKDIR)
-                put("shell", "Commands run as `sh -lc <command>` in $WORKDIR, which is your working directory (the same files).")
+                put("shell", "Commands run as `sh -lc <command>` in $WORKDIR, which is your working directory (the same files" +
+                    (if (review) ", read-only here" else "") + ").")
                 if (def.user != null) {
                     putJsonObject("user") {
-                        put("name", rs.boxes.values.firstNotNullOfOrNull { it.user?.name } ?: def.user.name)
+                        put("name", live?.boxes?.values?.firstNotNullOfOrNull { it.user?.name } ?: def.user.name)
                         put("uid", def.user.uid)
-                        put("note", "Commands run as this user, not root; the setup script ran as root. Files you create in $WORKDIR belong to you on the host.")
+                        put("note", if (review) "Commands run as this user, not root; the setup script ran as root. $WORKDIR is read-only."
+                            else "Commands run as this user, not root; the setup script ran as root. Files you create in $WORKDIR belong to you on the host.")
                     }
                 }
-                putJsonArray("platforms") {
-                    for (p in def.platforms) addJsonObject {
-                        put("name", p.name); put("image", p.image); put("setup", p.setup != null)
-                        put("created", rs.boxes.containsKey(p.name))
+                if (!review) {
+                    putJsonArray("platforms") {
+                        for (p in def.platforms) addJsonObject {
+                            put("name", p.name); put("image", p.image); put("setup", p.setup != null)
+                            put("created", build.boxes.containsKey(p.name))
+                        }
                     }
-                }
-                if (def.platforms.isNotEmpty()) {
-                    put("platformNote", "Pass `platform` to factory_sandbox_exec to run a command in a platform's image (its own container, " +
-                        "created on first use, same files, services and limits; caches are per platform). Without `platform` commands run in the " +
-                        "default image. Run the test suite on every platform before you finish and report the result per platform.")
+                    if (def.platforms.isNotEmpty()) {
+                        put("platformNote", "Pass `platform` to factory_sandbox_exec to run a command in a platform's image (its own container, " +
+                            "created on first use, same files, services and limits; caches are per platform). Without `platform` commands run in the " +
+                            "default image. Run the test suite on every platform before you finish and report the result per platform.")
+                    }
                 }
                 putJsonArray("services") {
                     for (s in def.services) addJsonObject {
@@ -296,7 +369,7 @@ class SandboxManager(
                         putJsonArray("ports") { ports[s.name].orEmpty().forEach { add(it) } }
                         put("readiness", when {
                             s.ready == null -> "unchecked"
-                            s.name in rs.ready -> "ready"
+                            live != null && s.name in live.ready -> "ready"
                             else -> "checked on creation"
                         })
                     }
@@ -313,30 +386,53 @@ class SandboxManager(
                     put("execTimeoutSeconds", execCapMs / 1000); put("outputTailChars", OUTPUT_TAIL_CHARS)
                     put("toolCallTimeoutSeconds", cfg.mcpToolTimeoutMs / 1000)
                 }
-                rs.current?.takeIf { it.running }?.let { c ->
+                live?.current?.takeIf { it.running }?.let { c ->
                     putJsonObject("command") { put("handle", c.handle); put("running", true); put("elapsedMs", c.elapsedMs) }
                 }
-                putJsonObject("capacity") { put("inUse", inUse()); put("max", sc.maxConcurrent); put("heldByThisRun", rs.slotsHeld.get()) }
+                putJsonObject("capacity") { put("inUse", inUse()); put("max", sc.maxConcurrent); put("heldByThisRun", live?.slotsHeld?.get() ?: 0) }
             }
         }
         return SandboxAnswer(false, obj.toString())
     }
 
     /**
+     * The review sandbox entry of run [build]'s run, made on first use from the build entry's plan. Null when the run's
+     * sandbox has been released, also when that happens while the entry is made: [releaseNow] marks the build entry
+     * released before it takes the review entry out, and this checks the mark after putting the entry in, so either the
+     * release removes the new entry or this does.
+     */
+    private fun reviewSandbox(build: RunSandbox, plan: Plan.Available): RunSandbox? {
+        if (build.released) return null
+        val rs = reviews.computeIfAbsent(build.runId) {
+            RunSandbox(build.runId, build.repo, build.worktree, plan, build.info, build.runDir, review = true, parent = build)
+        }
+        if (build.released || rs.parent !== build) {
+            if (reviews.remove(build.runId, rs)) dropReview(rs)
+            return null
+        }
+        return rs
+    }
+
+    /**
      * `factory_sandbox_exec`: runs [command] with `sh -lc` in the run's sandbox — in [platform]'s container when given —
-     * creating it first if needed. The full output (up to [ExecLimits.LOG_CHARS]) goes into [sessionId]'s transcript as a
+     * creating it first if needed. With [toolScope] REVIEW that is the run's review sandbox (never the build sandbox), with
+     * PLAN nothing runs. The full output (up to [ExecLimits.LOG_CHARS]) goes into [sessionId]'s transcript as a
      * `system` event; the agent gets the tail. The command runs in a job on the manager's scope under a handle: in the
      * foreground the call waits for it, with [background] it returns the handle at once ([wait] gets the result).
      */
     suspend fun exec(
         runId: UUID, sessionId: UUID, command: String, timeoutSeconds: Long?, platform: String? = null, background: Boolean = false,
+        toolScope: SandboxScope = SandboxScope.BUILD,
     ): SandboxAnswer {
         if (!enabled) return SandboxAnswer(true, "Sandboxes are switched off on this server. Build and test on the host as usual.")
-        val rs = sandboxes[runId] ?: return SandboxAnswer(true, "This run has no sandbox. Build and test on the host as usual.")
-        val plan = rs.plan
-        if (plan !is Plan.Available) return SandboxAnswer(true, "No sandbox for this run: ${rs.info.reason} Build and test on the host as usual.")
+        if (toolScope == SandboxScope.PLAN) return SandboxAnswer(true, PLAN_ONLY)
+        val build = sandboxes[runId] ?: return SandboxAnswer(true, "This run has no sandbox. Build and test on the host as usual.")
+        val plan = build.plan
+        if (plan !is Plan.Available) return SandboxAnswer(true, "No sandbox for this run: ${build.info.reason} Build and test on the host as usual.")
         val def = plan.definition
+        val review = toolScope == SandboxScope.REVIEW
         val key = platform?.trim()?.takeIf { it.isNotEmpty() } ?: DEFAULT
+        if (review && key != DEFAULT) return SandboxAnswer(true, "The review sandbox has only the default image; leave platform out.")
         if (key != DEFAULT && def.platforms.none { it.name == key }) {
             return SandboxAnswer(true, "Unknown platform '$key'. " + if (def.platforms.isEmpty()) "This sandbox has no platforms; leave `platform` out."
                 else "This sandbox has: $DEFAULT (${def.image}), " + def.platforms.joinToString(", ") { "${it.name} (${it.image})" } + ".")
@@ -346,6 +442,7 @@ class SandboxManager(
         val cap = execCapMs
         if (timeoutSeconds != null && timeoutSeconds <= 0) return SandboxAnswer(true, "timeoutSeconds must be positive")
         val timeoutMs = minOf(timeoutSeconds?.let { it * 1000 } ?: cap, cap)
+        val rs = if (review) reviewSandbox(build, plan) ?: return SandboxAnswer(true, "The run's sandbox has been removed.") else build
         // One command at a time: a background command refuses everything else; a foreground one queues foreground calls.
         rs.current?.takeIf { it.running && (background || it.background) }?.let { return busy(it) }
         if (background) {
@@ -356,7 +453,7 @@ class SandboxManager(
         }
         var handedOver = false
         try {
-            if (rs.released) return SandboxAnswer(true, "The run's sandbox has been removed.")
+            if (rs.released) return SandboxAnswer(true, if (review) "The review sandbox has been removed (the review round is over)." else "The run's sandbox has been removed.")
             rs.sessionId = sessionId
             if (!rs.boxes.containsKey(key)) create(rs, plan, key, sessionId)?.let { return SandboxAnswer(true, it) }
             val box = rs.boxes[key] ?: return SandboxAnswer(true, STOPPED_WHILE_RUNNING)
@@ -389,7 +486,7 @@ class SandboxManager(
                 put("handle", cmd.handle)
                 put("running", true)
                 put("timeoutSeconds", timeoutMs / 1000)
-                if (def.platforms.isNotEmpty()) put("platform", key)
+                if (platformLabel(rs, def, key) != null) put("platform", key)
                 put("note", "Started in the background. Call factory_sandbox_wait to get the exit code and output; do not poll with sleep.")
             }.toString())
         } finally {
@@ -400,7 +497,7 @@ class SandboxManager(
     /** The part of a command after the container exists: runs it, handles a timeout, logs it and builds the answer. */
     private suspend fun runCommand(rs: RunSandbox, def: SandboxDefinition, box: Box, cmd: Command, generation: Int): SandboxAnswer {
         val key = cmd.key
-        val name = boxName(rs.runId, key)
+        val name = boxName(rs, key)
         val r = try {
             withContext(Dispatchers.IO) { runtime!!.exec(name, shellCommand(cmd.command), WORKDIR, cmd.timeoutMs, box.user) }
         } catch (e: Exception) {
@@ -408,14 +505,14 @@ class SandboxManager(
             return SandboxAnswer(true, "The sandbox command could not be run: ${e.message}")
         }
         box.lastUsed = System.nanoTime()
-        if (rs.released) return SandboxAnswer(true, REMOVED_WHILE_RUNNING)
+        if (rs.released) return SandboxAnswer(true, removedWhileRunning(rs))
         if (rs.generation.get() != generation) return SandboxAnswer(true, STOPPED_WHILE_RUNNING)
         if (r.timedOut) {
             // Kill whatever the command left running; files (and what setup installed) are kept.
             runCatching { withContext(Dispatchers.IO) { runtime!!.restartContainer(name) } }
                 .onFailure { log.warn("Restarting sandbox {} of run {} after a timeout failed: {}", key, rs.runId, it.message) }
         }
-        logEvent(cmd.sessionId, "exec", cmd.command, r, cmd.timeoutMs, platformLabel(def, key))
+        logEvent(cmd.sessionId, "exec", cmd.command, r, cmd.timeoutMs, platformLabel(rs, def, key), rs.review)
         val tail = r.output.takeLast(OUTPUT_TAIL_CHARS)
         return SandboxAnswer(false, buildJsonObject {
             put("handle", cmd.handle)
@@ -424,7 +521,7 @@ class SandboxManager(
             put("truncated", r.outputTruncated || tail.length < r.output.length)
             put("durationMs", r.durationMs)
             put("timedOut", r.timedOut)
-            if (def.platforms.isNotEmpty()) put("platform", key)
+            if (platformLabel(rs, def, key) != null) put("platform", key)
             if (r.timedOut) put("note", "Stopped after ${cmd.timeoutMs / 1000} s; every process in the container was killed (files are kept).")
         }.toString())
     }
@@ -451,14 +548,20 @@ class SandboxManager(
     /**
      * `factory_sandbox_wait`: waits up to [waitSeconds] (null: until it ends; capped at the command limit) for the command
      * [handle] of run [runId] — blank: the most recently started one — and returns its result, or that it still runs.
-     * Never takes the run's command lock, so any number of waits can run at once.
+     * Handles are looked up only in the sandbox of [toolScope] (build or review), so a reviewer never reaches a builder's
+     * command nor the reverse. Never takes the sandbox's command lock, so any number of waits can run at once.
      */
-    suspend fun wait(runId: UUID, handle: String?, waitSeconds: Long?): SandboxAnswer {
+    suspend fun wait(runId: UUID, handle: String?, waitSeconds: Long?, toolScope: SandboxScope = SandboxScope.BUILD): SandboxAnswer {
         if (!enabled) return SandboxAnswer(true, "Sandboxes are switched off on this server. Build and test on the host as usual.")
-        val rs = sandboxes[runId] ?: return SandboxAnswer(true, "This run has no sandbox. Build and test on the host as usual.")
-        val plan = rs.plan
-        if (plan !is Plan.Available) return SandboxAnswer(true, "No sandbox for this run: ${rs.info.reason} Build and test on the host as usual.")
+        if (toolScope == SandboxScope.PLAN) return SandboxAnswer(true, PLAN_ONLY)
+        val build = sandboxes[runId] ?: return SandboxAnswer(true, "This run has no sandbox. Build and test on the host as usual.")
+        val plan = build.plan
+        if (plan !is Plan.Available) return SandboxAnswer(true, "No sandbox for this run: ${build.info.reason} Build and test on the host as usual.")
         if (waitSeconds != null && waitSeconds < 0) return SandboxAnswer(true, "waitSeconds must be a whole number of seconds, 0 or more")
+        val rs = if (toolScope == SandboxScope.REVIEW) {
+            reviews[runId] ?: return SandboxAnswer(true, if (handle.isNullOrBlank()) "No command has been started in this round's review sandbox yet."
+                else "Unknown handle '${handle.trim().take(64)}'. Handles come from factory_sandbox_exec in this round's review sandbox.")
+        } else build
         val wanted = handle?.trim()?.takeIf { it.isNotEmpty() }
         val cmd = if (wanted == null) rs.latest ?: return SandboxAnswer(true, "No sandbox command has been started in this run yet.")
         else synchronized(rs.commands) { rs.commands[wanted] } ?: return SandboxAnswer(true, "Unknown handle '${wanted.take(64)}'. Handles " +
@@ -482,11 +585,12 @@ class SandboxManager(
         }.toString())
     }
 
-    /** What the transcript calls the container a command ran in: null when the definition has no platforms. */
-    private fun platformLabel(def: SandboxDefinition, key: String): String? = if (def.platforms.isEmpty()) null else key
+    /** What the transcript calls the container a command ran in: null when the definition has no platforms (or in review). */
+    private fun platformLabel(rs: RunSandbox, def: SandboxDefinition, key: String): String? = if (rs.review || def.platforms.isEmpty()) null else key
 
     /** Records on the run where the builder ran commands (only when there are platforms), so the run page can say. */
     private suspend fun noteUsed(rs: RunSandbox, key: String) {
+        if (rs.review) return
         val def = rs.definition ?: return
         if (def.platforms.isEmpty() || key in rs.info.platformsUsed) return
         rs.info = rs.info.copy(platformsUsed = rs.info.platformsUsed + key)
@@ -495,11 +599,44 @@ class SandboxManager(
         emitRun(rs.runId)
     }
 
+    /** Records on the run (once) that its UI reviewers had a review sandbox, so the run page can say. */
+    private suspend fun noteReviewUsed(build: RunSandbox) {
+        if (build.info.reviewUsed) return
+        build.info = build.info.copy(reviewUsed = true)
+        runCatching { withContext(Dispatchers.IO) { runs.setSandbox(build.runId, build.info) } }
+            .onFailure { log.warn("Recording the review sandbox of run {} failed: {}", build.runId, it.message) }
+        emitRun(build.runId)
+    }
+
+    /**
+     * Creates the review sandbox's output directory `<run dir>/.agern-run/review/` (git-ignored, never through a symlink).
+     * When that is not possible the sandbox is made without it and [RunSandbox.outputNote] says why. Blocking.
+     */
+    private fun prepareOutputDir(rs: RunSandbox) {
+        val root = rs.runDir
+        if (root == null) {
+            rs.outputDir = null
+            rs.outputNote = "This review sandbox has no output directory (the run's working directory is unknown); screenshots cannot leave it."
+            return
+        }
+        try {
+            ImageService.ensureRunDir(root)
+            rs.outputDir = SafeFiles.plainDirectories(root, ImageService.RUN_DIR, REVIEW_OUTPUT_DIR)
+            rs.outputNote = null
+        } catch (e: Exception) {
+            log.warn("Creating the review output directory of run {} failed: {}", rs.runId, e.message)
+            rs.outputDir = null
+            rs.outputNote = "This review sandbox has no output directory: $REVIEW_OUTPUT_HOST could not be created safely in your working " +
+                "directory (${e.message}). Screenshots cannot leave the sandbox; take them on the host instead."
+        }
+    }
+
     /**
      * Takes a slot of the concurrency cap for a new command container of [rs]. When none is free, the run's own other
      * command containers (idle: one command at a time per run) are removed, least recently used first, until one is.
      */
     private fun acquireSlot(rs: RunSandbox, key: String, sessionId: UUID): Boolean {
+        if (rs.review) return acquireReviewSlot(rs, sessionId)
         while (true) {
             if (slots.tryAcquire()) {
                 rs.slotsHeld.incrementAndGet()
@@ -512,10 +649,35 @@ class SandboxManager(
         }
     }
 
+    /**
+     * Takes a slot for the review sandbox [rs]. When none is free, the same run's idle build command containers are
+     * removed, least recently used first — only while no build command runs or is being started (the build sandbox's lock
+     * is free). Never waits.
+     */
+    private fun acquireReviewSlot(rs: RunSandbox, sessionId: UUID): Boolean {
+        while (true) {
+            if (slots.tryAcquire()) {
+                rs.slotsHeld.incrementAndGet()
+                return true
+            }
+            val build = rs.parent ?: return false
+            if (!build.lock.tryLock()) return false
+            try {
+                val victim = build.boxes.values.minByOrNull { it.lastUsed } ?: return false
+                removeBox(build, victim)
+                publishSystem(sessionId, systemPayload("info", "Removed this run's idle `${victim.key}` container to make room for the " +
+                    "review sandbox (the server's sandbox slots are all in use; FACTORY_SANDBOX_MAX_CONCURRENT=${sc.maxConcurrent}). " +
+                    "It is created again when used."))
+            } finally {
+                build.lock.unlock()
+            }
+        }
+    }
+
     /** Removes one command container and frees its slot; the network and services stay. */
     private fun removeBox(rs: RunSandbox, box: Box) {
         if (rs.boxes.remove(box.key, box)) {
-            runCatching { runtime!!.removeContainers(listOf(boxName(rs.runId, box.key))) }
+            runCatching { runtime!!.removeContainers(listOf(boxName(rs, box.key))) }
                 .onFailure { log.warn("Removing sandbox container {} of run {} failed: {}", box.key, rs.runId, it.message) }
             releaseSlot(rs)
             announce(rs, "removed")
@@ -529,7 +691,7 @@ class SandboxManager(
     /**
      * Creates the command container [key] (`default` or a platform) — and first, when the run has none yet, its network,
      * services (waiting for their readiness checks) — prepares `user:`, runs the setup script. Returns an error message,
-     * or null.
+     * or null. For a review sandbox the same steps make its own network, services and the read-only command container.
      */
     private suspend fun create(rs: RunSandbox, plan: Plan.Available, key: String, sessionId: UUID): String? {
         val rt = runtime!!
@@ -538,12 +700,20 @@ class SandboxManager(
         val image = platform?.image ?: def.image
         val setup = if (platform != null) platform.setup else def.setup
         if (!withContext(Dispatchers.IO) { acquireSlot(rs, key, sessionId) }) {
+            if (rs.review) {
+                return "The server's sandboxes are all in use (${sc.maxConcurrent} of ${sc.maxConcurrent} containers). No review sandbox " +
+                    "was created and nothing was run. Review without it, on the host, as your role instructions describe; do not wait for a slot."
+            }
             return "The server's sandboxes are all in use (${sc.maxConcurrent} of ${sc.maxConcurrent} containers, by other runs). " +
                 "Nothing was run. Try again in a few minutes; meanwhile continue with work that needs no build."
         }
         val generation = rs.generation.get()
         val started = System.currentTimeMillis()
-        val what = if (key == DEFAULT) "the sandbox" else "platform `$key`"
+        val what = when {
+            rs.review -> "the review sandbox"
+            key == DEFAULT -> "the sandbox"
+            else -> "platform `$key`"
+        }
         publishSystem(sessionId, systemPayload("info", "Creating $what: image $image" +
             (if (!rs.infra && def.services.isNotEmpty()) ", services ${def.services.joinToString(", ") { it.name }}" else "") + " …"))
         var box: Box? = null
@@ -559,28 +729,36 @@ class SandboxManager(
         try {
             withContext(Dispatchers.IO) {
                 if (!rs.infra) {
-                    rt.createNetwork(networkName(rs.runId), labels(rs.runId, rs.repo, "network"))
+                    rt.createNetwork(netName(rs), labels(rs.runId, rs.repo, if (rs.review) "review-network" else "network"))
                     rs.infra = true
                     rs.createdAt = Instant.now()
                     rs.ready.clear()
-                    for (s in def.services) rt.startContainer(serviceSpec(rs.runId, rs.repo, s, def))
+                    for (s in def.services) {
+                        rt.startContainer(if (rs.review) reviewServiceSpec(rs.runId, rs.repo, s, def) else serviceSpec(rs.runId, rs.repo, s, def))
+                    }
                 }
                 for (c in def.caches) {
                     val labels = linkedMapOf(LABEL_REPO to rs.repo, "agern.cache" to c)
                     if (platform != null) labels["agern.platform"] = platform.name
                     rt.ensureVolume(cacheVolumeName(rs.repo, c, platform?.name), labels)
                 }
-                rt.startContainer(commandSpec(rs.runId, rs.repo, rs.worktree, def, platform))
+                if (rs.review) {
+                    prepareOutputDir(rs)
+                    rt.startContainer(reviewSpec(rs.runId, rs.repo, rs.worktree, def, rs.outputDir))
+                } else {
+                    rt.startContainer(commandSpec(rs.runId, rs.repo, rs.worktree, def, platform))
+                }
                 box = Box(key, image).also { rs.boxes[key] = it }
             }
             announce(rs, "created")
             if (rs.released) {
                 teardown(rs)
-                return "The run ended while its sandbox was being created."
+                return if (rs.review) "The review round ended while its review sandbox was being created." else "The run ended while its sandbox was being created."
             }
             if (rs.generation.get() != generation) {
                 teardown(rs)
-                return "An admin stopped this run's sandbox while it was being created. Nothing was run; the next command creates it again."
+                return "An admin stopped this run's ${if (rs.review) "review " else ""}sandbox while it was being created. Nothing was run; " +
+                    "the next command creates it again."
             }
             // Services: wait for the ones with a readiness check (once per network; a platform reuses them).
             for (s in def.services) {
@@ -594,7 +772,7 @@ class SandboxManager(
                         "`ready.timeoutSeconds` in $SANDBOX_FILE (needs an admin's approval); otherwise report the problem in your summary."
                 }
             }
-            val name = boxName(rs.runId, key)
+            val name = boxName(rs, key)
             val u = def.user
             if (u != null) {
                 val r = withContext(Dispatchers.IO) {
@@ -611,25 +789,30 @@ class SandboxManager(
             }
             if (setup != null) {
                 val r = withContext(Dispatchers.IO) { rt.exec(name, shellCommand(setup), WORKDIR, execCapMs) }
-                logEvent(sessionId, "setup", setup, r, execCapMs, platformLabel(def, key))
+                logEvent(sessionId, "setup", setup, r, execCapMs, platformLabel(rs, def, key), rs.review)
                 if (r.timedOut || r.exitCode != 0) {
                     undo()
-                    return "The ${if (key == DEFAULT) "sandbox's" else "platform `$key`'s"} setup script failed (" +
+                    return "The ${if (rs.review) "review sandbox's" else if (key == DEFAULT) "sandbox's" else "platform `$key`'s"} setup script failed (" +
                         (if (r.timedOut) "timed out" else "exit ${r.exitCode}") +
                         "), so the container was removed. Output (tail):\n" + r.output.takeLast(4000) +
                         "\nThe definition comes from the default branch and needs an admin's approval to change; report the problem in your summary."
                 }
                 // Setup runs as root: hand what it left in the user's home and the worktree to the user (not into cache volumes).
+                // The review sandbox's worktree is read-only: only the home.
                 box!!.user?.let { eu ->
+                    val paths = if (rs.review) listOf(eu.home) else listOf(eu.home, WORKDIR)
                     withContext(Dispatchers.IO) {
-                        runCatching { rt.exec(name, listOf("sh", "-c", HAND_OVER_SCRIPT, "agern-hand-over", eu.uid.toString(), eu.home, WORKDIR), WORKDIR, 600_000) }
+                        runCatching { rt.exec(name, listOf("sh", "-c", HAND_OVER_SCRIPT, "agern-hand-over", eu.uid.toString()) + paths, WORKDIR, 600_000) }
                     }
                 }
             }
             val who = box!!.user?.let { ", commands as ${it.name} (uid ${it.uid})" } ?: ""
-            publishSystem(sessionId, systemPayload("info", "${if (key == DEFAULT) "Sandbox" else "Platform `$key`"} ready in " +
+            val label = if (rs.review) "Review sandbox" else if (key == DEFAULT) "Sandbox" else "Platform `$key`"
+            val readOnly = if (rs.review) ", $WORKDIR read-only" + (if (rs.outputDir != null) ", output in $REVIEW_OUTPUT_HOST" else ", no output directory") else ""
+            publishSystem(sessionId, systemPayload("info", "$label ready in " +
                 "${(System.currentTimeMillis() - started) / 1000.0} s: $image, ${PodmanRuntime.formatCpus(def.cpus)} CPUs, " +
-                "${SandboxConfig.formatMemory(def.memoryBytes)} memory$who."))
+                "${SandboxConfig.formatMemory(def.memoryBytes)} memory$who$readOnly."))
+            if (rs.review) rs.parent?.let { noteReviewUsed(it) }
             return null
         } catch (e: Exception) {
             log.warn("Creating sandbox container {} of run {} failed: {}", key, rs.runId, e.message)
@@ -642,7 +825,7 @@ class SandboxManager(
     /** Runs a service's readiness check until it passes; an error message (with the service's last log lines) or null. */
     private fun waitReady(rs: RunSandbox, s: SandboxService, ready: SandboxReady, generation: Int): String? {
         val rt = runtime!!
-        val name = serviceContainerName(rs.runId, s.name)
+        val name = svcName(rs, s.name)
         val deadline = System.nanoTime() + ready.timeoutSeconds * 1_000_000_000L
         var last = ""
         while (true) {
@@ -669,36 +852,41 @@ class SandboxManager(
     private fun systemPayload(level: String, text: String) = buildJsonObject { put("level", level); put("text", text) }
 
     /** The full log of a setup script or command, kept in the agent's transcript for the run page. */
-    private fun logEvent(sessionId: UUID, kind: String, command: String, r: ExecResult, timeoutMs: Long, platform: String?) {
+    private fun logEvent(sessionId: UUID, kind: String, command: String, r: ExecResult, timeoutMs: Long, platform: String?, review: Boolean = false) {
         val what = if (kind == "setup") "setup script" else "`" + command.lineSequence().first().take(200) + "`"
         val where = platform?.let { " [$it]" } ?: ""
         val outcome = if (r.timedOut) "timed out after ${timeoutMs / 1000} s" else "exit ${r.exitCode}"
         publishSystem(sessionId, buildJsonObject {
             put("level", if (r.timedOut || r.exitCode != 0) "warn" else "info")
-            put("text", "Sandbox$where $what: $outcome in ${r.durationMs / 1000.0} s")
+            put("text", "${if (review) "Review sandbox" else "Sandbox"}$where $what: $outcome in ${r.durationMs / 1000.0} s")
             putJsonObject("sandbox") {
                 put("kind", kind); put("command", command); put("exitCode", r.exitCode); put("timedOut", r.timedOut)
                 put("durationMs", r.durationMs); put("output", r.output); put("outputTruncated", r.outputTruncated)
                 put("platform", platform)
+                if (review) put("review", true)
             }
         })
     }
 
     // ------------------------------------------------------------------ cleanup
 
-    /** Removes the run's sandbox (containers, network) and frees its slots. Idempotent; never throws. */
+    /** Removes the run's sandboxes (build and review: containers, networks) and frees their slots. Idempotent; never throws. */
     suspend fun release(runId: UUID) {
-        if (!sandboxes.containsKey(runId)) return
+        if (!sandboxes.containsKey(runId) && !reviews.containsKey(runId)) return
         withContext(NonCancellable + Dispatchers.IO) { releaseNow(runId) }
     }
 
     /**
      * [release], blocking: what the worktree cleanup calls first, so a run's containers are always gone before its
-     * worktree — which they bind-mount — is deleted (docs/ARCHITECTURE.md §5 "Lifecycle").
+     * worktree — which they bind-mount — is deleted (docs/ARCHITECTURE.md §5 "Lifecycle"). Afterwards no review sandbox
+     * can be created for the run ([reviewSandbox]).
      */
     fun releaseNow(runId: UUID) {
-        val rs = sandboxes.remove(runId) ?: return
-        rs.released = true
+        val rs = sandboxes.remove(runId)
+        // Marked before the review entry is taken out: a review sandbox being made right now sees the mark and goes.
+        rs?.released = true
+        reviews.remove(runId)?.let { dropReview(it) }
+        if (rs == null) return
         // The command dies with its container; waits on it learn so now, not when the runtime's exec returns.
         rs.current?.result?.complete(SandboxAnswer(true, REMOVED_WHILE_RUNNING))
         val had = rs.created
@@ -706,11 +894,36 @@ class SandboxManager(
         if (had) announce(rs, "removed")
     }
 
+    /**
+     * Removes run [runId]'s review sandbox, if any (containers, network; never cache volumes), and its output directory.
+     * Called when the review round ends, however it ends. The next review round creates a fresh one. Never throws.
+     */
+    suspend fun releaseReview(runId: UUID) {
+        val rs = reviews.remove(runId) ?: return
+        withContext(NonCancellable + Dispatchers.IO) { dropReview(rs) }
+    }
+
+    /** Tears down a review sandbox that is no longer in [reviews]. Blocking. */
+    private fun dropReview(rs: RunSandbox) {
+        rs.released = true
+        rs.current?.result?.complete(SandboxAnswer(true, removedWhileRunning(rs)))
+        val had = rs.created
+        teardown(rs)
+        if (had) announce(rs, "removed")
+        val out = rs.outputDir ?: return
+        rs.outputDir = null
+        // Only the directory this sandbox created, and only while `.agern-run` is still a real directory (no symlink).
+        runCatching {
+            val runDir = out.parent
+            if (java.nio.file.Files.isDirectory(runDir, java.nio.file.LinkOption.NOFOLLOW_LINKS)) SafeFiles.deleteTree(out)
+        }.onFailure { log.warn("Deleting the review output directory of run {} failed: {}", rs.runId, it.message) }
+    }
+
     private fun teardown(rs: RunSandbox) {
         val rt = runtime ?: return
         if (rs.created || rs.slotsHeld.get() > 0) {
             runCatching { rt.removeContainers(names(rs)) }.onFailure { log.warn("Removing the sandbox of run {} failed: {}", rs.runId, it.message) }
-            runCatching { rt.removeNetwork(networkName(rs.runId)) }.onFailure { log.warn("Removing the network of run {} failed: {}", rs.runId, it.message) }
+            runCatching { rt.removeNetwork(netName(rs)) }.onFailure { log.warn("Removing the network of run {} failed: {}", rs.runId, it.message) }
         }
         rs.boxes.clear()
         rs.infra = false
@@ -720,45 +933,63 @@ class SandboxManager(
         if (held > 0) slots.release(held)
     }
 
+    private fun removedWhileRunning(rs: RunSandbox) = if (rs.review) REVIEW_REMOVED_WHILE_RUNNING else REMOVED_WHILE_RUNNING
+
     // ------------------------------------------------------------------ admin (docs/ARCHITECTURE.md §8)
 
     /**
-     * Admin: removes run [runId]'s sandbox now (all its containers and network; cache volumes stay) and frees its slots.
-     * The run itself continues: the builder's next `factory_sandbox_exec` creates a fresh sandbox (setup runs again), a
-     * command running at that moment ends with an error saying so. 404 when the run has no sandbox right now.
+     * Admin: removes run [runId]'s sandboxes now — the build sandbox and the review sandbox, whichever exist (all their
+     * containers and networks; cache volumes stay) — and frees their slots. The run itself continues: the next
+     * `factory_sandbox_exec` of the builder or a reviewer creates a fresh one (setup runs again), a command running at
+     * that moment ends with an error saying so. 404 when the run has neither right now.
      */
     suspend fun stop(admin: UserRecord, runId: UUID) {
         if (!admin.isAdmin) throw forbidden("Only an admin can stop a sandbox")
-        val rs = sandboxes[runId]?.takeIf { !it.released && (it.created || it.slotsHeld.get() > 0) }
-            ?: throw notFound("Run $runId has no sandbox right now")
-        rs.generation.incrementAndGet()
-        withContext(NonCancellable + Dispatchers.IO) { teardown(rs) }
-        rs.current?.result?.complete(SandboxAnswer(true, STOPPED_WHILE_RUNNING))
-        log.info("Sandbox of run {} stopped by {}", runId, admin.username)
-        announce(rs, "stopped")
-        rs.sessionId?.let {
-            publishSystem(it, systemPayload("warn", "An admin (${admin.username}) stopped this run's sandbox: its containers and network were removed " +
-                "(cache volumes are kept). The run continues; the next sandbox command creates a new sandbox and runs the setup script again."))
+        fun live(rs: RunSandbox?) = rs?.takeIf { !it.released && (it.created || it.slotsHeld.get() > 0) }
+        val targets = listOfNotNull(live(sandboxes[runId]), live(reviews[runId]))
+        if (targets.isEmpty()) throw notFound("Run $runId has no sandbox right now")
+        for (rs in targets) {
+            rs.generation.incrementAndGet()
+            withContext(NonCancellable + Dispatchers.IO) { teardown(rs) }
+            rs.current?.result?.complete(SandboxAnswer(true, STOPPED_WHILE_RUNNING))
+            log.info("{} of run {} stopped by {}", if (rs.review) "Review sandbox" else "Sandbox", runId, admin.username)
+            announce(rs, "stopped")
+            rs.sessionId?.let {
+                publishSystem(it, systemPayload("warn", if (rs.review) {
+                    "An admin (${admin.username}) stopped this run's review sandbox: its containers and network were removed (cache " +
+                        "volumes are kept). The review continues; the next review sandbox command creates it again and runs the setup script again."
+                } else {
+                    "An admin (${admin.username}) stopped this run's sandbox: its containers and network were removed " +
+                        "(cache volumes are kept). The run continues; the next sandbox command creates a new sandbox and runs the setup script again."
+                }))
+            }
         }
     }
 
-    /** Admin: the runtime, its limits and the sandboxes that exist right now (oldest first). */
+    /** Admin: the runtime, its limits and the sandboxes that exist right now (oldest first), build and review together per run. */
     suspend fun overview(admin: UserRecord): SandboxOverviewDto = withContext(Dispatchers.IO) {
-        val list = sandboxes.values.filter { it.created && !it.released }.mapNotNull { rs ->
-            val def = (rs.plan as? Plan.Available) ?: return@mapNotNull null
-            val run = runs.get(rs.runId) ?: return@mapNotNull null
-            val at = rs.createdAt ?: rs.boxes.values.minOfOrNull { it.createdAt } ?: return@mapNotNull null
+        val list = (sandboxes.keys + reviews.keys).distinct().mapNotNull { runId ->
+            val b = sandboxes[runId]?.takeIf { it.created && !it.released }
+            val r = reviews[runId]?.takeIf { it.created && !it.released }
+            val any = b ?: r ?: return@mapNotNull null
+            val def = (any.plan as? Plan.Available) ?: return@mapNotNull null
+            val run = runs.get(runId) ?: return@mapNotNull null
+            val at = listOfNotNull(b, r).flatMap { rs -> listOfNotNull(rs.createdAt) + rs.boxes.values.map { it.createdAt } }.minOrNull()
+                ?: return@mapNotNull null
             val visible = access.canSee(admin, run.repo, run.contextRepos)
             val d = def.definition
-            val containers = rs.boxes.values.sortedBy { it.createdAt }.map { SandboxContainerDto(it.key, it.image, it.createdAt.iso()) }
+            val containers = b?.boxes?.values.orEmpty().sortedBy { it.createdAt }.map { SandboxContainerDto(it.key, it.image, it.createdAt.iso()) } +
+                r?.boxes?.values.orEmpty().map { SandboxContainerDto(it.key, it.image, it.createdAt.iso(), kind = "review") }
+            val services = listOfNotNull(b, r).count { it.infra } * d.services.size
             RunningSandboxDto(
-                runId = rs.runId.toString(), repo = rs.repo, visible = visible, issueNumber = run.issueNumber,
+                runId = runId.toString(), repo = any.repo, visible = visible, issueNumber = run.issueNumber,
                 issueTitle = if (visible) run.issueTitle else null, runStatus = run.status,
                 owner = OwnerDto(run.ownerUsername, run.ownerDisplayName), image = d.image,
                 services = d.services.map { it.name }, sha256 = def.sha256, createdAt = at.iso(),
                 cpus = d.cpus, memory = SandboxConfig.formatMemory(d.memoryBytes),
-                containers = containers, platforms = d.platforms.map { it.name }, slots = rs.slotsHeld.get(),
-                memoryTotal = SandboxConfig.formatMemory(d.memoryBytes * (containers.size + (if (rs.infra) d.services.size else 0)).coerceAtLeast(1)),
+                containers = containers, platforms = d.platforms.map { it.name },
+                slots = (b?.slotsHeld?.get() ?: 0) + (r?.slotsHeld?.get() ?: 0),
+                memoryTotal = SandboxConfig.formatMemory(d.memoryBytes * (containers.size + services).coerceAtLeast(1)),
             )
         }.sortedBy { it.createdAt }
         SandboxOverviewDto(
@@ -792,7 +1023,8 @@ class SandboxManager(
     /**
      * Removes containers and networks labelled `agern.run` whose run is not active (server start: whatever a crash or
      * restart left behind) — sandboxes, platform containers and services alike. Sandboxes of runs this server still
-     * tracks, or that are still active, are kept.
+     * tracks, or that are still active, are kept; a review sandbox only while this server tracks it (a review round never
+     * survives a restart).
      */
     suspend fun reapOrphans(): List<String> {
         val rt = runtime ?: return emptyList()
@@ -804,8 +1036,11 @@ class SandboxManager(
                 val uuid = runCatching { UUID.fromString(id) }.getOrNull() ?: return@filter false
                 sandboxes.containsKey(uuid) || runs.get(uuid)?.status in RunStatus.ACTIVE
             }.toSet()
-            val goneContainers = containers.filter { it.runId !in keep }.map { it.name }
-            val goneNetworks = networks.filter { it.runId !in keep }.map { it.name }.distinct()
+            fun gone(r: LabelledResource): Boolean = if (r.name.startsWith(REVIEW_PREFIX)) {
+                runCatching { UUID.fromString(r.runId) }.getOrNull()?.let { reviews.containsKey(it) } != true
+            } else r.runId !in keep
+            val goneContainers = containers.filter(::gone).map { it.name }
+            val goneNetworks = networks.filter(::gone).map { it.name }.distinct()
             if (goneContainers.isNotEmpty()) runCatching { rt.removeContainers(goneContainers) }.onFailure { log.warn("Removing leftover sandboxes failed: {}", it.message) }
             for (n in goneNetworks) runCatching { rt.removeNetwork(n) }.onFailure { log.warn("Removing leftover network {} failed: {}", n, it.message) }
             if (goneContainers.isNotEmpty() || goneNetworks.isNotEmpty()) {
@@ -817,7 +1052,7 @@ class SandboxManager(
 
     /** Server shutdown: best-effort removal of every sandbox this server created. */
     suspend fun shutdown() {
-        for (id in sandboxes.keys.toList()) release(id)
+        for (id in (sandboxes.keys + reviews.keys).distinct()) release(id)
     }
 
     /** Slots in use right now: command containers that exist (or are being created), over all runs. */
@@ -896,6 +1131,10 @@ class SandboxManager(
         fun serviceContainerName(runId: UUID, service: String) = "agern-run-$runId-$service"
         /** `--` cannot clash with a service's container: service names start with a letter. */
         fun platformContainerName(runId: UUID, platform: String) = "agern-run-$runId--$platform"
+        /** The review sandbox (docs/ARCHITECTURE.md §5 "Review sandbox"): its own command container, network and services. */
+        fun reviewContainerName(runId: UUID) = "$REVIEW_PREFIX$runId"
+        fun reviewNetworkName(runId: UUID) = "$REVIEW_PREFIX$runId"
+        fun reviewServiceContainerName(runId: UUID, service: String) = "$REVIEW_PREFIX$runId-$service"
         /** Per project and, for a platform, per platform (another image's tools may not share a cache safely). */
         fun cacheVolumeName(repo: String, path: String, platform: String? = null) =
             "agern-cache-$repo-" + SandboxDefinitions.sha256(if (platform == null) path else "$platform $path").take(12)
@@ -924,6 +1163,30 @@ class SandboxManager(
             keepIdUid = def.user?.uid, user = if (def.user != null) "0:0" else null,
         )
 
+        /**
+         * The review sandbox's command container: the default image with the env, `user:`, limits and default cache volumes
+         * of [commandSpec], on the review network, the worktree bind-mounted **read-only** at [WORKDIR] and [outputDir]
+         * (when there is one) read-write at [REVIEW_OUTPUT], the only host directory it can write to.
+         */
+        fun reviewSpec(runId: UUID, repo: String, worktree: Path, def: SandboxDefinition, outputDir: Path?) = ContainerSpec(
+            name = reviewContainerName(runId),
+            image = def.image,
+            labels = labels(runId, repo, "review"),
+            network = reviewNetworkName(runId),
+            env = def.env,
+            mounts = listOf(SandboxMount(worktree.toAbsolutePath().normalize().toString(), WORKDIR, volume = false, readOnly = true)) +
+                listOfNotNull(outputDir?.let { SandboxMount(it.toAbsolutePath().normalize().toString(), REVIEW_OUTPUT, volume = false) }) +
+                def.caches.map { SandboxMount(cacheVolumeName(repo, it), it, volume = true) },
+            workdir = WORKDIR, cpus = def.cpus, memoryBytes = def.memoryBytes, entrypoint = "sh", command = keepAlive,
+            keepIdUid = def.user?.uid, user = if (def.user != null) "0:0" else null,
+        )
+
+        fun reviewServiceSpec(runId: UUID, repo: String, svc: SandboxService, def: SandboxDefinition) = ContainerSpec(
+            name = reviewServiceContainerName(runId, svc.name), image = svc.image,
+            labels = labels(runId, repo, "review-service").also { it["agern.service"] = svc.name },
+            network = reviewNetworkName(runId), networkAlias = svc.name, env = svc.env, cpus = def.cpus, memoryBytes = def.memoryBytes,
+        )
+
         fun serviceSpec(runId: UUID, repo: String, svc: SandboxService, def: SandboxDefinition) = ContainerSpec(
             name = serviceContainerName(runId, svc.name), image = svc.image,
             labels = labels(runId, repo, "service").also { it["agern.service"] = svc.name },
@@ -940,6 +1203,17 @@ class SandboxManager(
             listOf("sh", "-c", "{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; exec sh -lc \"\$1\"", "sh", command)
 
         const val WORKDIR = "/workspace"
+        /** Name prefix of every review sandbox container and network. */
+        const val REVIEW_PREFIX = "agern-review-"
+        /** Where the review sandbox's output directory is mounted inside it (`/run` cannot hold a cache path). */
+        const val REVIEW_OUTPUT = "/run/agern-review"
+        /** The output directory's name below `.agern-run/` in the run directory. */
+        const val REVIEW_OUTPUT_DIR = "review"
+        /** The output directory relative to the agents' working directory, as reviewers pass it to factory_attach_screenshot. */
+        const val REVIEW_OUTPUT_HOST = ".agern-run/review"
+        /** What a spec-writer (plan scope) is told when it tries to run something. */
+        const val PLAN_ONLY = "The spec-writer cannot run commands in the sandbox; factory_sandbox_info is for planning the " +
+            "spec's Verification section. The builder runs the commands."
         /** The key of the top-level image among a run's command containers. */
         const val DEFAULT = SandboxDefinitions.DEFAULT_PLATFORM
 
@@ -950,6 +1224,7 @@ class SandboxManager(
         const val HAND_OVER_SCRIPT = "uid=\$1; shift; find \"\$@\" -xdev ! -user \"\$uid\" -exec chown -h \"\$uid:\$uid\" {} + 2>/dev/null || true"
 
         private const val REMOVED_WHILE_RUNNING = "The run's sandbox was removed while the command ran (the run ended)."
+        private const val REVIEW_REMOVED_WHILE_RUNNING = "The review sandbox was removed while the command ran (the review round or the run ended)."
         /** Finished commands whose results a run keeps for `factory_sandbox_wait`. */
         const val KEPT_RESULTS = 20
         private const val STOPPED_WHILE_RUNNING = "An admin stopped this run's sandbox while the command ran, so it was killed. " +

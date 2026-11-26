@@ -1,13 +1,16 @@
 import { useEffect, useState } from 'react';
 import { BrowserRouter, Navigate, NavLink, Outlet, Route, Routes, useLocation } from 'react-router-dom';
 import { api, isMock, isSessionActive } from './api';
+import { GitHubBanner } from './components/ui/GitHubBanner';
 import { UsageIndicator } from './components/ui/UsageIndicator';
 import { Logo, Wordmark } from './components/ui/ui';
 import { useAsync } from './lib/async';
 import { AuthProvider, useAuth } from './lib/auth';
+import { menuLabel } from './lib/githubStatus';
 import { FeedProvider, useFeed, useLiveSessions } from './lib/realtime';
 import { AdminPage } from './pages/Admin';
 import { AgentsPage } from './pages/Agents';
+import { GitHubStatusPage } from './pages/GitHubStatus';
 import { LoginPage } from './pages/Login';
 import { ProjectPage } from './pages/Project';
 import { ProjectsPage } from './pages/Projects';
@@ -34,6 +37,7 @@ export function App() {
               <Route path="/agents" element={<AgentsPage />} />
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="/admin" element={<AdminPage />} />
+              <Route path="/github-status" element={<GitHubStatusPage />} />
               <Route path="*" element={<NotFound />} />
             </Route>
           </Route>
@@ -126,6 +130,9 @@ function Shell() {
   useAppShell(appShell);
   const health = useAsync(() => api.health(), []);
   const version = typeof health.data?.version === 'string' ? health.data.version.trim() : '';
+  // One brief poll feeds the user menu and the banner; a failed load keeps the previous answer.
+  const github = useAsync(() => api.githubStatus({ brief: true }), [], { pollMs: 60_000 });
+  const githubState = github.data?.verdict.state;
   if (!me) return null;
   return (
     <div className={`shell ${appShell ? 'shell--app' : ''}`}>
@@ -154,6 +161,7 @@ function Shell() {
                   <span className="muted">{me.githubLogin ? `@${me.githubLogin}` : 'no GitHub token'}</span>
                 </div>
                 <NavLink role="menuitem" to="/settings">Credentials & security</NavLink>
+                <NavLink role="menuitem" to="/github-status">{menuLabel(githubState)}</NavLink>
                 <button role="menuitem" type="button" onClick={() => void logout()}>Sign out</button>
                 {version && (
                   <div className="usermenu-version">
@@ -165,6 +173,7 @@ function Shell() {
           </div>
         </div>
       </header>
+      <GitHubBanner state={githubState} pathname={loc.pathname} />
       <main id="main" className="main">
         <Outlet />
       </main>
