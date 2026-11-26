@@ -40,6 +40,16 @@ object DeployKeys {
 
     fun fingerprint(kp: KeyPair): String = KeyUtils.getFingerPrint(BuiltinDigests.sha256, kp.public)
 
+    /** The SecretBox associated data of [repo]'s stored private key (`deploy-key:<repo>`). */
+    fun aad(repo: String) = "deploy-key:$repo"
+
+    /**
+     * [repo]'s decrypted key, in memory for one operation (deploy targets and sandbox VMs share it); null when the
+     * project has none. Blocking (reads the database).
+     */
+    fun identity(keys: dk.egernet.factory.db.DeployKeyStore, box: dk.egernet.factory.security.SecretBox, repo: String): DeployIdentity? =
+        keys.get(repo)?.let { DeployIdentity(box.decrypt(it.privateKeyEnc, aad(repo)), it.fingerprint) }
+
     /** Parses a private key written by [generate] (OpenSSH format, unencrypted). */
     fun load(openSsh: String): KeyPair =
         SecurityUtils.loadKeyPairIdentities(null, NamedResource.ofName("deploy-key"), ByteArrayInputStream(openSsh.toByteArray(Charsets.US_ASCII)), null)

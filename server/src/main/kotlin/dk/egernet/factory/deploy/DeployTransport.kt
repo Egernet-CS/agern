@@ -60,10 +60,43 @@ interface DeployTransport : AutoCloseable {
     fun exec(endpoint: DeployEndpoint, identity: DeployIdentity, command: String, timeoutMs: Long): DeployExecResult
     /** Uploads one file to [dest] with SCP; returns the bytes sent. Throws [DeployTimeout] after [timeoutMs]. */
     fun copy(endpoint: DeployEndpoint, identity: DeployIdentity, upload: DeployUpload, dest: String, timeoutMs: Long): Long
+
+    /** [check] that [cancel] can abort (the connection is closed; the call then fails or returns early). */
+    fun check(endpoint: DeployEndpoint, identity: DeployIdentity, cancel: DeployCancel) = check(endpoint, identity)
+    /** [exec] that [cancel] can abort: the connection is closed and the call returns early. */
+    fun exec(endpoint: DeployEndpoint, identity: DeployIdentity, command: String, timeoutMs: Long, cancel: DeployCancel): DeployExecResult =
+        exec(endpoint, identity, command, timeoutMs)
+    /** [copy] that [cancel] can abort: the connection is closed and the call fails. */
+    fun copy(endpoint: DeployEndpoint, identity: DeployIdentity, upload: DeployUpload, dest: String, timeoutMs: Long, cancel: DeployCancel): Long =
+        copy(endpoint, identity, upload, dest, timeoutMs)
 }
 
 /** A copy did not finish within its time limit; the connection was closed. */
 class DeployTimeout(message: String) : Exception(message)
+
+/**
+ * Aborts operations in flight from another thread (a sandbox VM lease that ends while a command runs): [cancel] runs
+ * every registered hook once; a hook registered after [cancel] runs at once. A thread interrupt does not end MINA's
+ * waits, so the transport closes its connection instead.
+ */
+class DeployCancel {
+    private val hooks = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+    @Volatile var cancelled = false
+        private set
+
+    /** Registers [hook]; the returned handle unregisters it. */
+    fun onCancel(hook: () -> Unit): AutoCloseable {
+        hooks += hook
+        if (cancelled) runCatching { hook() }
+        return AutoCloseable { hooks -= hook }
+    }
+
+    fun cancel() {
+        if (cancelled) return
+        cancelled = true
+        for (h in hooks) runCatching { h() }
+    }
+}
 
 /**
  * The real transport: Apache MINA SSHD in this process, so the private key never reaches a file, a process argument or
@@ -79,12 +112,22 @@ class MinaDeployTransport(
     @Volatile private var closed = false
 
     override fun check(endpoint: DeployEndpoint, identity: DeployIdentity) {
-        session(endpoint, identity) { }
+        session(endpoint, identity, null) { }
     }
 
-    override fun exec(endpoint: DeployEndpoint, identity: DeployIdentity, command: String, timeoutMs: Long): DeployExecResult {
+    override fun check(endpoint: DeployEndpoint, identity: DeployIdentity, cancel: DeployCancel) {
+        session(endpoint, identity, cancel) { }
+    }
+
+    override fun exec(endpoint: DeployEndpoint, identity: DeployIdentity, command: String, timeoutMs: Long): DeployExecResult =
+        execCancellable(endpoint, identity, command, timeoutMs, null)
+
+    override fun exec(endpoint: DeployEndpoint, identity: DeployIdentity, command: String, timeoutMs: Long, cancel: DeployCancel): DeployExecResult =
+        execCancellable(endpoint, identity, command, timeoutMs, cancel)
+
+    private fun execCancellable(endpoint: DeployEndpoint, identity: DeployIdentity, command: String, timeoutMs: Long, cancel: DeployCancel?): DeployExecResult {
         val started = System.nanoTime()
-        return session(endpoint, identity) { s ->
+        return session(endpoint, identity, cancel) { s ->
             val out = TailOutput(ExecLimits.LOG_CHARS * 4L)
             val ch: ChannelExec = s.createExecChannel(command)
             ch.isUsePty = false
@@ -106,7 +149,13 @@ class MinaDeployTransport(
     }
 
     override fun copy(endpoint: DeployEndpoint, identity: DeployIdentity, upload: DeployUpload, dest: String, timeoutMs: Long): Long =
-        session(endpoint, identity) { s ->
+        copyCancellable(endpoint, identity, upload, dest, timeoutMs, null)
+
+    override fun copy(endpoint: DeployEndpoint, identity: DeployIdentity, upload: DeployUpload, dest: String, timeoutMs: Long, cancel: DeployCancel): Long =
+        copyCancellable(endpoint, identity, upload, dest, timeoutMs, cancel)
+
+    private fun copyCancellable(endpoint: DeployEndpoint, identity: DeployIdentity, upload: DeployUpload, dest: String, timeoutMs: Long, cancel: DeployCancel?): Long =
+        session(endpoint, identity, cancel) { s ->
             // A minimal SCP source (the protocol `scp -t` speaks): the content comes from an open stream, so what is sent
             // is exactly the file that was checked, and the remote side keeps the file's name when [dest] is a directory.
             // [dest] matched a pattern without spaces or shell metacharacters: the remote shell sees it unchanged.
@@ -164,9 +213,13 @@ class MinaDeployTransport(
         }
     }
 
-    /** Opens a session to [endpoint], verified and authenticated, runs [block] and closes everything. */
-    private fun <T> session(endpoint: DeployEndpoint, identity: DeployIdentity, block: (ClientSession) -> T): T {
+    /**
+     * Opens a session to [endpoint], verified and authenticated, runs [block] and closes everything. [cancel] stops the
+     * client, which closes the connection and ends every wait of [block].
+     */
+    private fun <T> session(endpoint: DeployEndpoint, identity: DeployIdentity, cancel: DeployCancel?, block: (ClientSession) -> T): T {
         if (closed) throw DeployException("connect", "The server is shutting down")
+        if (cancel?.cancelled == true) throw DeployException("connect", "The operation was cancelled")
         val pinned = endpoint.hostKey
         val presented = java.util.concurrent.atomic.AtomicReference<String?>()
         val verified = java.util.concurrent.atomic.AtomicBoolean()
@@ -183,6 +236,7 @@ class MinaDeployTransport(
         client.agentFactory = null
         client.forwardingFilter = RejectAllForwardingFilter.INSTANCE
         open += client
+        val hook = cancel?.onCancel { runCatching { client.stop() } }
         try {
             client.start()
             val s = try {
@@ -210,6 +264,7 @@ class MinaDeployTransport(
                 return block(s)
             }
         } finally {
+            hook?.close()
             open -= client
             runCatching { client.stop() }
         }
@@ -292,7 +347,9 @@ class DevFakeDeployTransport : DeployTransport {
         val started = System.currentTimeMillis()
         val out = StringBuilder()
         var exit = 0
-        for (part in command.split(Regex("&&|;|\\n")).map { it.trim() }.filter { it.isNotEmpty() }) {
+        // A sandbox VM command starts with its `export AGERN_SHA=… AGERN_RUN_ID=… AGERN_ARCHIVE=…` line: nothing to run.
+        val body = if (command.startsWith("export AGERN_")) command.substringAfter('\n', "") else command
+        for (part in body.split(Regex("&&|;|\\n")).map { it.trim() }.filter { it.isNotEmpty() }) {
             val words = part.split(Regex("\\s+"))
             when (words[0]) {
                 "echo" -> out.append(words.drop(1).joinToString(" ") { it.trim('"', '\'') }).append('\n')

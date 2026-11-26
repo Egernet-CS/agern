@@ -230,4 +230,28 @@ class MinaDeployTransportTest {
         assertEquals("host_key", e.stage, e.message)
         assertEquals(before, authAttempts.get(), "no authentication attempted")
     }
+
+    @Test
+    fun `cancelling an exec in flight returns promptly, a thread interrupt alone does not`() {
+        val port = server(ed25519Host)
+        // A cancel token closes the connection: the call returns long before the command would end.
+        val cancel = dk.egernet.factory.deploy.DeployCancel()
+        val started = System.nanoTime()
+        Thread { Thread.sleep(500); cancel.cancel() }.start()
+        val r = transport.exec(endpoint(port, ed25519Host), identity, "out started; sleep 20000", 60_000, cancel)
+        val ms = (System.nanoTime() - started) / 1_000_000
+        assertTrue(ms < 10_000, "returned after $ms ms")
+        assertNull(r.exitCode)
+        // Cancelled before it starts: refused at once.
+        assertFailsWith<DeployException> { transport.exec(endpoint(port, ed25519Host), identity, "out x", 60_000, cancel) }
+
+        // An interrupt does not end MINA's wait (why the transport has the cancel hook): the call runs on to its time limit.
+        val caller = Thread.currentThread()
+        val t0 = System.nanoTime()
+        Thread { Thread.sleep(300); caller.interrupt() }.start()
+        val r2 = runCatching { transport.exec(endpoint(port, ed25519Host), identity, "sleep 2500; exit 0", 10_000) }
+        Thread.interrupted()
+        val ms2 = (System.nanoTime() - t0) / 1_000_000
+        assertTrue(r2.isFailure || ms2 >= 2_000, "an interrupt ended the wait after $ms2 ms: ${r2.getOrNull()}")
+    }
 }

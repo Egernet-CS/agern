@@ -626,6 +626,18 @@ private fun Route.projectRoutes(s: Services) {
         val name = call.parameters["name"].orEmpty()
         call.respond(s.deploys.check(u, repo, name))
     }
+    // The sandbox VM, its approval, check and lease (docs/SANDBOX-VMS.md, docs/ARCHITECTURE.md §8).
+    get("/projects/{repo}/sandbox-vm") { call.respond(s.sandboxVms.status(call.requireUser(s), repoParam())) }
+    post("/projects/{repo}/sandbox-vm/approval") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        val req = call.receive<ApproveSandboxReq>()
+        if (!Regex("^[0-9a-fA-F]{64}$").matches(req.sha256.trim())) throw badRequest("sha256 must be 64 hex digits")
+        call.respond(s.sandboxVms.approve(u, repo, req.sha256))
+    }
+    delete("/projects/{repo}/sandbox-vm/approval") { call.respond(s.sandboxVms.revoke(call.requireUser(s), repoParam())) }
+    post("/projects/{repo}/sandbox-vm/check") { call.respond(s.sandboxVms.check(call.requireUser(s), repoParam())) }
+    delete("/projects/{repo}/sandbox-vm/lease") { call.respond(s.sandboxVms.forceRelease(call.requireUser(s), repoParam())) }
     // Project icons (docs/ARCHITECTURE.md §8 "Project icons"): admins set them, everyone who sees the repo sees them.
     put("/projects/{repo}/icon") {
         val u = call.requireAdmin(s)
@@ -698,6 +710,9 @@ private fun Route.runRoutes(s: Services) {
         call.respondStoredFile(bytes, m.mediaType, "inline", name)
     }
     post("/runs/{id}/approve") { call.respond(s.factory.approveRun(call.requireUser(s), uuidParam("id"))) }
+    // "Try it on the sandbox VM" (docs/SANDBOX-VMS.md "Preview"): the run's owner or an admin.
+    post("/runs/{id}/sandbox-vm/preview") { call.respond(s.runs.toDto(s.sandboxVms.startPreview(call.requireUser(s), uuidParam("id")))) }
+    delete("/runs/{id}/sandbox-vm/preview") { call.respond(s.runs.toDto(s.sandboxVms.releasePreview(call.requireUser(s), uuidParam("id")))) }
     // "Merge anyway" despite checks that have not passed (docs/ARCHITECTURE.md §6 "Checks before a merge"): owner only.
     post("/runs/{id}/merge-anyway") {
         val u = call.requireUser(s)
