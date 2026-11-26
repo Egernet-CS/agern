@@ -282,6 +282,30 @@ export type Release = {
    * followed by the project repository (`directory` null). The fields above describe the project repository's PR.
    */
   repositories: ReleaseRepo[];
+  /** Commits on `targetBranch` that are not on the release branch, as last compared; null = not known. */
+  behindBy?: number | null;
+  /** The last evaluation found migrations of the release branch that collide with `targetBranch`'s. */
+  migrationConflict?: boolean;
+  /** "Bring up to date" is offered: ready, one repository, and a conflict, a branch behind or a migration conflict. */
+  syncNeeded?: boolean;
+  /** The release's latest run that brought it up to date, or null. */
+  sync?: ReleaseSync | null;
+};
+
+/**
+ * `running` (queued, building, reviewing), `done` (merged), `failed` (failed or cancelled, nothing pushed) or
+ * `unreviewed` (failed or cancelled after its merge was pushed).
+ */
+export type ReleaseSyncState = 'running' | 'done' | 'failed' | 'unreviewed';
+
+export type ReleaseSync = {
+  runId: string;
+  state: ReleaseSyncState;
+  by: Owner;
+  startedAt: string;
+  endedAt?: string | null;
+  pushedSha?: string | null;
+  error?: string | null;
 };
 
 /** Building or paused: at most one per project. */
@@ -531,7 +555,19 @@ export type Run = {
   checks?: RunChecks | null;
   /** Set while the run waits for the network before trying again; it keeps its status meanwhile. */
   waiting?: RunWait | null;
+  /** `issue`, or `sync` for a run that brings a release up to date (it belongs to no issue: `issueNumber` is 0). */
+  kind?: RunKind;
+  /** A sync run: the commit it last pushed to its release branch. */
+  syncPushedSha?: string | null;
 };
+
+export type RunKind = 'issue' | 'sync';
+
+/** A run that brings a release up to date (docs/ARCHITECTURE.md §6 "Bringing a release up to date"). */
+export const isSyncRun = (r: Pick<Run, 'kind'>) => r.kind === 'sync';
+
+/** How lists name a run: `#<issue>`, or `sync` for a run that belongs to no issue (never `#0`). */
+export const runRef = (r: { kind?: RunKind; issueNumber: number }) => (r.kind === 'sync' || r.issueNumber === 0 ? 'sync' : `#${r.issueNumber}`);
 
 /** One check that has not passed. Name and URL come from GitHub (untrusted); `url` is only ever an `https://` URL. */
 export type RunCheckItem = { name: string; state: 'failed' | 'pending'; conclusion: string | null; url: string | null };

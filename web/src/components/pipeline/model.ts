@@ -85,7 +85,11 @@ export function buildNodes(run: Run, sessions: Map<string, AgentSession>): Recor
   const nodes = {} as Record<NodeId, NodeView>;
   const base = (id: NodeId): NodeView => ({ id, title: ROLE_TITLE[id], sub: null, model: null, state: 'pending', verdict: null, tone: null, stage: null, startedAt: null, endedAt: null, note: null, round: null });
 
-  nodes.issue = { ...base('issue'), title: `#${run.issueNumber}`, sub: run.issueTitle, state: 'done', note: run.issueKind, startedAt: run.createdAt };
+  const sync = run.kind === 'sync';
+  // A sync run belongs to no issue: its first node is the release branch it brings up to date.
+  nodes.issue = sync
+    ? { ...base('issue'), title: 'sync', sub: run.issueTitle, state: 'done', note: run.baseBranch, startedAt: run.createdAt }
+    : { ...base('issue'), title: `#${run.issueNumber}`, sub: run.issueTitle, state: 'done', note: run.issueKind, startedAt: run.createdAt };
 
   // Run.round counts fix rounds: 0 is the initial build, 1..maxRounds are fix rounds.
   const currentRound = Math.max(run.round, latestStage(run, 'builder')?.round ?? 0);
@@ -158,12 +162,23 @@ export function buildNodes(run: Run, sessions: Map<string, AgentSession>): Recor
   const review = run.conversation.review;
   const waitingSub = review === 'running' ? 'reviewing changes' : review === 'required' ? 'changes not reviewed' : 'waiting for owner';
   // Under `owner_approves` every merge is the owner's, also after an approver APPROVE; a merge on GitHub is nobody's in Agern.
+  // A sync run has no approver and nothing for a human to approve: it never merges into the default branch.
   const approvedByHuman =
-    run.status === 'merged' && !mergedOnGitHub && (run.mergePolicy === 'owner_approves' || approver?.verdict === 'ESCALATE' || approver?.status === 'skipped');
+    !sync && run.status === 'merged' && !mergedOnGitHub && (run.mergePolicy === 'owner_approves' || approver?.verdict === 'ESCALATE' || approver?.status === 'skipped');
+  if (sync) {
+    const pushed = !!run.syncPushedSha;
+    nodes.merge = {
+      ...nodes.merge,
+      title: `push ${run.baseBranch ?? 'release branch'}`,
+      sub: run.status === 'merged' ? (pushed ? 'up to date' : 'already up to date') : pushed ? `pushed ${run.syncPushedSha!.slice(0, 7)}` : null,
+      verdict: run.status === 'merged' ? 'UP TO DATE' : null,
+      note: null,
+    };
+  }
   nodes.human = {
     ...base('human'),
-    state: run.status === 'needs_human' ? 'running' : approvedByHuman ? 'done' : TERMINAL_FAIL.includes(run.status) || run.status === 'merged' || run.status === 'ready' ? 'skipped' : 'pending',
-    sub: run.status === 'needs_human' ? waitingSub : approvedByHuman ? 'approved by owner' : run.status === 'merged' || run.status === 'ready' ? 'not needed' : onGitHub ? 'review on GitHub' : '/factory approve',
+    state: run.status === 'needs_human' ? 'running' : approvedByHuman ? 'done' : sync || TERMINAL_FAIL.includes(run.status) || run.status === 'merged' || run.status === 'ready' ? 'skipped' : 'pending',
+    sub: run.status === 'needs_human' ? waitingSub : approvedByHuman ? 'approved by owner' : sync || run.status === 'merged' || run.status === 'ready' ? 'not needed' : onGitHub ? 'review on GitHub' : '/factory approve',
     tone: run.status === 'needs_human' ? 'escalate' : approvedByHuman ? 'pass' : null,
     verdict: run.status === 'needs_human' ? 'WAITING' : approvedByHuman ? 'APPROVED' : null,
   };

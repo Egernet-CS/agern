@@ -157,6 +157,7 @@ export const httpApi: Api = {
   releaseIssueRetryOptions: (id, issueNumber) => get(`/api/releases/${enc(id)}/issues/${issueNumber}/retry`),
   approveRelease: (id) => post(`/api/releases/${enc(id)}/approve`),
   checkRelease: (id) => post(`/api/releases/${enc(id)}/check`),
+  syncRelease: (id) => post(`/api/releases/${enc(id)}/sync`),
   setReleaseMode: (id, mode) => put(`/api/releases/${enc(id)}/mode`, { mode }),
   scheduleRelease: (id, startAt) => put(`/api/releases/${enc(id)}/schedule`, { startAt }),
   cancelReleaseSchedule: (id) => del(`/api/releases/${enc(id)}/schedule`),

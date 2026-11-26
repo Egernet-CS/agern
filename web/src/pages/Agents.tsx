@@ -54,8 +54,8 @@ export function AgentsPage() {
           {runs.map((r) => (
             <Link key={r.id} to={`/p/${r.repo}/runs/${r.id}`} className={`band-run band-run--${r.status}`}>
               <div className="br-top">
-                <span className="mono br-repo">{r.repo}#{r.issueNumber}</span>
-                <RunStatusPill status={r.status} />
+                <span className="mono br-repo">{r.repo}{r.kind === 'sync' ? ' · sync' : `#${r.issueNumber}`}</span>
+                <RunStatusPill status={r.status} kind={r.kind} />
               </div>
               <div className="br-title">{r.issueTitle}</div>
               <div className="br-line">

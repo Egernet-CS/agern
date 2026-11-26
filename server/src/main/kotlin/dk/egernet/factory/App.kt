@@ -192,6 +192,7 @@ class Services(
         agents.afterAdvisorTurn = { session -> session.runId?.let { orchestrator.reconcile(it) } }
         orchestrator.onReleaseRunSettled = releaseBuilder::onRunSettled
         orchestrator.onReleaseRunWaitChanged = { id -> scope.launch { releaseBuilder.publish(id) } }
+        orchestrator.onReleaseBranchPushed = { id -> releaseMerger.evaluateLater(id) }
         images.publishRun = { orchestrator.publish(it) }
         agents.onChatInput = { sessionId -> images.newTurn(sessionId) }
         agents.onChatClosed = { sessionId -> images.removeSession(sessionId) }

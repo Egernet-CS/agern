@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, ApiError, isReleaseFinished, isReleaseOpen, isRunWorking, isSessionActive, type AgentSession, type CheckoutInfo, type Issue, type IssueKind, type MergePolicy, type Release, type ReleaseMode, type Run, type Workspace } from '../api';
+import { api, ApiError, isReleaseFinished, isReleaseOpen, isRunWorking, isSessionActive, runRef, type AgentSession, type CheckoutInfo, type Issue, type IssueKind, type MergePolicy, type Release, type ReleaseMode, type Run, type Workspace } from '../api';
 import { ChatView } from '../components/chat/ChatView';
 import { IssueImagesDialog } from '../components/images/IssueImagesDialog';
 import { REVIEWERS, roundName } from '../components/pipeline/model';
@@ -1181,11 +1181,11 @@ function ActivityPanel({
           <li key={r.id}>
             <Link to={`/p/${repo}/runs/${r.id}`} className={`run-row run-row--${r.status}`}>
               <div className="rr-top">
-                <span className="mono">#{r.issueNumber}</span>
+                <span className="mono">{runRef(r)}</span>
                 <span className="rr-title">{r.issueTitle}</span>
               </div>
               <div className="rr-bot">
-                <RunStatusPill status={r.status} />
+                <RunStatusPill status={r.status} kind={r.kind} />
                 <span className="rr-line">{runStageLine(r)}</span>
               </div>
               <div className="rr-meta">{r.owner.username} · {timeAgo(r.updatedAt)}</div>

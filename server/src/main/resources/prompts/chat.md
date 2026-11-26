@@ -61,7 +61,7 @@ Rules:
 - Never print, log or commit credentials or tokens, and never read files outside the project and your
   home directory looking for them.
 - The person can also type `/factory run <issue>`, `/factory status`, `/factory approve [runId]`,
-  `/factory cancel <runId>`, `/factory releases`, `/factory release create|add|remove|approve …` and
+  `/factory cancel <runId>`, `/factory releases`, `/factory release create|add|remove|approve|sync …` and
   `/factory help`; those are handled by the factory, not by you. Mention
   them when useful.
 - A `<checkout_status>` block at the start of a message comes from Agern, not from the person: it

@@ -416,7 +416,7 @@ class FactoryService(
             "status" -> {
                 val list = runs.list(repo, activeOnly = false, limit = 10)
                 if (list.isEmpty()) "No runs in $repo yet." else list.joinToString("\n", "Runs in $repo (newest first):\n") {
-                    "• ${it.id}  #${it.issueNumber} ${it.issueTitle} — ${it.status}" +
+                    "• ${it.id}  ${if (it.isSync) "sync" else "#${it.issueNumber}"} ${it.issueTitle} — ${it.status}" +
                         (if (it.round > 0) " (fix round ${it.round}/${it.maxRounds})" else "") +
                         (it.prUrl?.let { u -> " $u" } ?: "") + (it.error?.let { e -> "\n    $e" } ?: "")
                 }
@@ -448,7 +448,7 @@ class FactoryService(
     /** `/factory release create|add|remove …` (docs/ARCHITECTURE.md §7). */
     private suspend fun releaseCommand(owner: UserRecord, repo: String, args: List<String>): String {
         val usage = "Usage: /factory release create <name> [description] | add <name> <issue>… | remove <issue>… | " +
-            "approve <name> | mode <name> manual|automatic"
+            "approve <name> | sync <name> | mode <name> manual|automatic"
         return when (args.firstOrNull()?.lowercase()) {
             "mode" -> {
                 val modeUsage = "Usage: /factory release mode <name> manual|automatic"
@@ -459,6 +459,10 @@ class FactoryService(
             "approve" -> {
                 val name = args.getOrNull(1) ?: return "Usage: /factory release approve <name>"
                 approvedReply(releases.approve(owner, releases.find(owner, repo, name).id))
+            }
+            "sync" -> {
+                val name = args.getOrNull(1)?.takeIf { args.size == 2 } ?: return "Usage: /factory release sync <name>"
+                syncReply(releases.sync(owner, releases.find(owner, repo, name).id))
             }
             "create" -> {
                 val name = args.getOrNull(1) ?: return "Usage: /factory release create <name> [description]"
@@ -491,6 +495,7 @@ class FactoryService(
         val id = args.firstOrNull()?.let { parseUuid(it) } ?: return usage
         val run = visibleRun(owner, id)
         if (run.repo != repo) throw notFound("Run not found in this project")
+        if (run.isSync) throw dk.egernet.factory.pipeline.Orchestrator.syncNotRetried()
         val mode = when (args.getOrNull(1)?.lowercase()) {
             null -> null
             "step" -> RetryMode.STEP
@@ -562,6 +567,13 @@ class FactoryService(
                 issues + (r.notice?.let { " $it" } ?: "")
         }
 
+        /** The reply to `/factory release sync`. */
+        fun syncReply(s: ReleaseService.SyncStarted): String {
+            val branch = s.release.branch ?: "release/${s.release.name}"
+            return "Bringing release \"${s.release.name}\" up to date with ${s.target}: run ${s.run.id} merges ${s.target} into $branch, " +
+                "resolves conflicts and renumbers migrations. Nothing is merged into ${s.target}."
+        }
+
         /** The reply to `/factory release mode`. */
         fun modeReply(r: dk.egernet.factory.db.ReleaseRecord): String =
             if (r.automatic) "Release \"${r.name}\" is released automatically: once it is ready, complete and merges cleanly, and all " +
@@ -619,6 +631,7 @@ class FactoryService(
             |  /factory release add <name> <issue>…            put issues into a release (moves them from another)
             |  /factory release remove <issue>…                take issues out of their release
             |  /factory release approve <name>                 merge a release that is ready to release (owner only)
+            |  /factory release sync <name>                    bring a ready release up to date with the default branch (owner or admin)
             |  /factory release mode <name> manual|automatic   release it on approval (default) or automatically when green
             |  /factory help              this help
             |To steer a running spec-writer or builder, select it on the run page and type below its transcript,

@@ -49,6 +49,7 @@ import {
   retryRun,
   approveRelease,
   checkRelease,
+  syncRelease,
   setReleaseMode,
   approveRun,
   mergeAnywayRun,
@@ -518,6 +519,7 @@ export const mockApi: Api = {
     }),
   approveRelease: (id) => ok(() => withRelease(id, (r) => approveRelease(r, me()))),
   checkRelease: (id) => ok(() => withRelease(id, (r) => checkRelease(r, me()))),
+  syncRelease: (id) => ok(() => withRelease(id, (r) => syncRelease(r, me()))),
   setReleaseMode: (id, mode) => ok(() => withRelease(id, (r) => setReleaseMode(r, mode, me()))),
 
   projectRuns: (repo) => ok(() => (project(repo), [...db.runs.values()].filter((r) => r.repo === repo).sort(byNewest))),

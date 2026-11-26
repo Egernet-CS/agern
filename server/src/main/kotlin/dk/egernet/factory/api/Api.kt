@@ -800,6 +800,10 @@ private fun Route.releaseRoutes(s: Services) {
         val u = call.requireUser(s)
         call.respond(s.releaseDto(u, s.releases.check(u, uuidParam("id"))))
     }
+    post("/releases/{id}/sync") {
+        val u = call.requireUser(s)
+        call.respond(s.releaseDto(u, s.releases.sync(u, uuidParam("id")).release))
+    }
     get("/releases/{id}/issues/{number}/retry") {
         val u = call.requireUser(s)
         val id = uuidParam("id")

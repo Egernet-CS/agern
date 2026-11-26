@@ -1803,6 +1803,7 @@ function evaluateRelease(r: Release) {
     const checks = releaseChecks.get(`${r.repo}:${r.branch}`) ?? { state: 'none', detail: 'No checks' };
     r.checks = { ...checks, sha: `${r.name.length}f3a9c1e7b2d4${r.prNumber}`.slice(0, 40) };
   } else r.mergeState = 'unknown';
+  r.syncNeeded = !r.repositories.length && !!r.branch && (r.mergeState === 'conflict' || (r.behindBy ?? 0) > 0 || !!r.migrationConflict);
   r.notice = null;
   touchRelease(r);
   // Automatic release: the same merge as an approval by the owner, once complete, clean and green; blockers wait.
@@ -1829,6 +1830,39 @@ export function checkRelease(r: Release, by: User) {
   guardRelease(r, by, 'owner');
   if (r.status !== 'ready') throw conflictOf(r);
   evaluateRelease(r);
+  return r;
+}
+
+/**
+ * "Bring up to date" (owner or admin). The mock has no agents for it: it records a finished sync at once and the
+ * release merges cleanly afterwards.
+ */
+export function syncRelease(r: Release, by: User) {
+  if (r.status === 'planning' || r.status === 'scheduled') throw conflictOf(r);
+  guardRelease(r, by, 'ownerOrAdmin');
+  if (r.status !== 'ready') throw conflictOf(r);
+  if (r.repositories.length)
+    throw new MockError(409, 'release_sync_unsupported', `Bringing a release of several repositories up to date is not supported yet; merge the base branch into \`${r.branch}\` in each repository by hand.`);
+  if (r.sync?.state === 'running')
+    throw new MockError(409, 'release_sync_running', `Release "${r.name}" is already being brought up to date (run ${r.sync.runId}).`);
+  if (!r.syncNeeded)
+    throw new MockError(409, 'release_up_to_date', `\`${r.branch}\` is not behind \`main\` and has no conflicts. Use "Check again" if that changed.`);
+  const now = new Date().toISOString();
+  r.sync = {
+    runId: uid(),
+    state: 'done',
+    by: { username: by.username, displayName: by.displayName },
+    startedAt: now,
+    endedAt: now,
+    pushedSha: Array.from({ length: 40 }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join(''),
+    error: null,
+  };
+  conflictingReleases.delete(`${r.repo}:${r.branch}`);
+  r.mergeState = 'clean';
+  r.behindBy = 0;
+  r.migrationConflict = false;
+  r.syncNeeded = false;
+  touchRelease(r);
   return r;
 }
 

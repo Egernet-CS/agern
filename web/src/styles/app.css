@@ -3209,6 +3209,23 @@ html.app-locked #root {
   flex-wrap: wrap;
   gap: 8px;
 }
+.release-sync-actions {
+  display: flex;
+  gap: 8px;
+}
+.release-sync {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.release-sync--running {
+  padding: 8px 12px;
+  border-radius: var(--r);
+  border: 1px solid rgba(255, 177, 74, 0.35);
+  background: var(--amber-wash);
+}
+.release-sync-link {
+  white-space: nowrap;
+}
 .release-notice {
   max-width: 900px;
   margin: 0 0 14px;

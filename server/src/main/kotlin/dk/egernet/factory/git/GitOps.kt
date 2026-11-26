@@ -7,7 +7,20 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.TimeUnit
 
-class GitException(message: String) : RuntimeException(message)
+open class GitException(message: String) : RuntimeException(message)
+
+/**
+ * [GitOps.pushFastForward] was refused because the branch is not an ancestor of what was pushed (it moved meanwhile).
+ * [output] is git's output.
+ */
+class PushRejectedException(val output: String) : GitException("push rejected: $output")
+
+/**
+ * The state of a worktree after a merge ([GitOps.mergeState]): its [head], whether it contains the start commit and the
+ * merged ref, and whether the merge is [unfinished] (a merge in progress, unmerged paths or uncommitted changes to
+ * tracked files).
+ */
+data class MergeCheck(val head: String, val containsStart: Boolean, val containsMerged: Boolean, val unfinished: Boolean)
 
 /** One entry of `git worktree list`: its path as git reports it and its branch (null when detached). */
 data class WorktreeInfo(val path: Path, val branch: String?)
@@ -17,9 +30,10 @@ data class FileChange(val status: Char, val path: String)
 
 /**
  * [GitOps.compareBranches]: the files on the base branch's tip under the directories of interest, and what the head
- * changes (relative to the merge base) in them. Renames are a removal plus an addition.
+ * changes (relative to the merge base) in them. Renames are a removal plus an addition. [behind]: the commits on the
+ * base that are not on the head.
  */
-data class BranchComparison(val baseFiles: List<String>, val changes: List<FileChange>)
+data class BranchComparison(val baseFiles: List<String>, val changes: List<FileChange>, val behind: Int = 0)
 
 /**
  * A submodule pointer (gitlink) a branch adds or moves ([GitOps.changedGitlinks]): the submodule at [path] now points
@@ -126,6 +140,26 @@ interface GitOps {
     fun compareBranches(
         mainDir: Path, baseBranch: String, headBranch: String, home: Path, githubToken: String?, dirOf: (String) -> String?,
     ): BranchComparison? = null
+    /**
+     * As [compareBranches], for the `HEAD` of [worktree] against the local ref [baseRef] (e.g. `origin/main`), without
+     * fetching. Null when a ref is missing; throws [GitException] when git fails.
+     */
+    fun compareWorktree(worktree: Path, baseRef: String, home: Path, dirOf: (String) -> String?): BranchComparison? = null
+    /**
+     * After a merge of [mergedRef] in [worktree] that started at commit [startSha]: see [MergeCheck]. Throws
+     * [GitException] when git fails.
+     */
+    fun mergeState(worktree: Path, startSha: String, mergedRef: String, home: Path): MergeCheck =
+        MergeCheck(head(worktree, home), containsStart = true, containsMerged = true, unfinished = false)
+    /**
+     * Pushes the `HEAD` of [worktree] to [branch] on origin as a fast-forward only: never `--force` or
+     * `--force-with-lease` (a sync run, docs/ARCHITECTURE.md §6 "Bringing a release up to date"). In fake-GitHub mode
+     * the local branch is moved instead, also only as a fast-forward. Throws [PushRejectedException] when the branch is
+     * not an ancestor of `HEAD` (it moved meanwhile), [GitException] for any other failure.
+     */
+    fun pushFastForward(id: AgentIdentity, worktree: Path, branch: String, home: Path) {
+        push(id, worktree, branch, home)
+    }
     /**
      * Brings the main checkout at [mainDir] up to date with `origin/<defaultBranch>` when that is safe: fetches that
      * branch first when [fetch] is set (a failed fetch is ignored), then fast-forwards only when the checkout is on
@@ -481,8 +515,23 @@ class CliGitOps(
         mainDir: Path, baseBranch: String, headBranch: String, home: Path, githubToken: String?, dirOf: (String) -> String?,
     ): BranchComparison? {
         val (base, head) = fetchPair(mainDir, baseBranch, headBranch, home, githubToken) ?: return null
+        return compareRefs(mainDir, base, head, home, dirOf)
+    }
+
+    override fun compareWorktree(worktree: Path, baseRef: String, home: Path, dirOf: (String) -> String?): BranchComparison? {
+        require(baseRef.isNotBlank() && !baseRef.startsWith("-")) { "Invalid ref" }
+        for (ref in listOf(baseRef, "HEAD")) {
+            if (gitStatus(worktree, home, null, "rev-parse", "--verify", "--quiet", "$ref^{commit}", timeoutSec = 60).first != 0) return null
+        }
+        return compareRefs(worktree, baseRef, "HEAD", home, dirOf)
+    }
+
+    /** The comparison of [compareBranches] between two existing refs [base] and [head] of the repository at [dir]. */
+    private fun compareRefs(dir: Path, base: String, head: String, home: Path, dirOf: (String) -> String?): BranchComparison {
+        val behind = git(dir, home, null, "rev-list", "--count", "$head..$base", timeoutSec = 120).trim().toIntOrNull()
+            ?: throw GitException("git rev-list gave no count")
         // NUL-separated: <status> NUL <path> NUL ...
-        val fields = git(mainDir, home, null, "diff", "--name-status", "--no-renames", "-z", "$base...$head", "--").split('\u0000')
+        val fields = git(dir, home, null, "diff", "--name-status", "--no-renames", "-z", "$base...$head", "--").split('\u0000')
         val changes = (0 until fields.size - 1 step 2).mapNotNull { i ->
             val path = fields[i + 1]
             if (dirOf(path) == null) return@mapNotNull null
@@ -490,10 +539,52 @@ class CliGitOps(
             FileChange(status, path)
         }
         val dirs = changes.mapNotNull { dirOf(it.path) }.distinct().sorted()
-        if (dirs.isEmpty()) return BranchComparison(emptyList(), emptyList())
-        val baseFiles = git(mainDir, home, null, "ls-tree", "-r", "-z", "--name-only", base, "--", *dirs.toTypedArray())
+        if (dirs.isEmpty()) return BranchComparison(emptyList(), emptyList(), behind)
+        val baseFiles = git(dir, home, null, "ls-tree", "-r", "-z", "--name-only", base, "--", *dirs.toTypedArray())
             .split('\u0000').filter { it.isNotEmpty() && dirOf(it) != null }
-        return BranchComparison(baseFiles, changes)
+        return BranchComparison(baseFiles, changes, behind)
+    }
+
+    override fun mergeState(worktree: Path, startSha: String, mergedRef: String, home: Path): MergeCheck {
+        require(SHA_RE.matches(startSha)) { "Invalid commit id" }
+        require(mergedRef.isNotBlank() && !mergedRef.startsWith("-")) { "Invalid ref" }
+        val head = git(worktree, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim()
+        fun ancestor(ref: String): Boolean {
+            val (code, out) = gitStatus(worktree, home, null, "merge-base", "--is-ancestor", ref, "HEAD", timeoutSec = 120)
+            return when (code) {
+                0 -> true
+                1 -> false
+                else -> throw GitException("git merge-base failed: ${out.takeLast(500).trim()}")
+            }
+        }
+        val mergeInProgress = gitStatus(worktree, home, null, "rev-parse", "-q", "--verify", "MERGE_HEAD", timeoutSec = 60).first == 0
+        val unmerged = git(worktree, home, null, "ls-files", "-u", timeoutSec = 60).isNotBlank()
+        val dirty = git(worktree, home, null, "status", "--porcelain", "--untracked-files=no", timeoutSec = 120).isNotBlank()
+        return MergeCheck(head, ancestor(startSha), ancestor(mergedRef), mergeInProgress || unmerged || dirty)
+    }
+
+    override fun pushFastForward(id: AgentIdentity, worktree: Path, branch: String, home: Path) {
+        require(branch.isNotBlank() && !branch.startsWith("-")) { "Invalid branch name" }
+        val head = git(worktree, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim()
+        if (localOnly) {
+            // Fake GitHub: the release branch is a local branch of the clone; move it only as a fast-forward.
+            val ref = "refs/heads/$branch"
+            val old = gitStatus(worktree, home, null, "rev-parse", "--verify", "--quiet", "$ref^{commit}", timeoutSec = 60)
+                .let { (code, out) -> if (code == 0) out.trim() else null }
+            if (old != null && gitStatus(worktree, home, null, "merge-base", "--is-ancestor", old, head, timeoutSec = 120).first != 0) {
+                throw PushRejectedException("! [rejected] HEAD -> $branch (non-fast-forward)")
+            }
+            // Compare-and-swap: refused when the branch moved since it was read.
+            val (code, out) = gitStatus(worktree, home, null, "update-ref", ref, head, old ?: "", timeoutSec = 60)
+            if (code != 0) throw PushRejectedException(out.takeLast(1000).trim())
+            return
+        }
+        // Never --force or --force-with-lease: the remote refuses anything that is not a fast-forward.
+        val (code, out) = gitStatus(worktree, home, id, "push", "origin", "HEAD:refs/heads/$branch")
+        if (code == 0) return
+        val text = out.takeLast(1000).trim()
+        if (Regex("(?i)\\[rejected]|non-fast-forward|fetch first|stale info").containsMatchIn(text)) throw PushRejectedException(text)
+        throw GitException("git push failed: $text")
     }
 
     override fun changedGitlinks(mainDir: Path, baseBranch: String, headBranch: String, home: Path, githubToken: String?): List<GitlinkChange>? {

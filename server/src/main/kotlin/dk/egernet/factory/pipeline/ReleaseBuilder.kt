@@ -148,7 +148,7 @@ class ReleaseBuilder(
         }
         publish(id)
         merger.commentCancelled(id, user)
-        for (run in io { runs.activeByRelease(id) }) cancelRun(user, run.id)
+        for (run in io { runs.activeByRelease(id) }) cancelRun(user, run.id, byRelease = true)
     }
 
     /** A held or skipped issue of release [id], or 409 / 404 (the checks of [retry]). */
@@ -227,13 +227,20 @@ class ReleaseBuilder(
     }
 
     /** Cancels runs whose issue left a release (taken out or moved). */
+    /**
+     * Starts a sync run of [r] as [owner] (docs/ARCHITECTURE.md §6 "Bringing a release up to date"); called by
+     * [ReleaseMerger.startSync] under the release's mutex.
+     */
+    suspend fun startSyncRun(owner: UserRecord, r: ReleaseRecord, defaultBranch: String): dk.egernet.factory.db.RunRecord =
+        orchestrator.startSync(owner, r, defaultBranch)
+
     suspend fun cancelRuns(user: UserRecord, runIds: List<UUID>) {
         for (runId in runIds) if (io { runs.get(runId) }?.status in RunStatus.ACTIVE) cancelRun(user, runId)
     }
 
-    private suspend fun cancelRun(user: UserRecord, runId: UUID) {
+    private suspend fun cancelRun(user: UserRecord, runId: UUID, byRelease: Boolean = false) {
         try {
-            orchestrator.cancel(user, runId)
+            orchestrator.cancel(user, runId, byRelease)
         } catch (e: ApiException) {
             log.info("Run {} of a release was not cancelled: {}", runId, e.message)
         }
@@ -473,6 +480,11 @@ class ReleaseBuilder(
      */
     suspend fun settle(outcome: RunOutcome) {
         val releaseId = outcome.run.releaseId ?: return
+        if (outcome.run.isSync) {
+            // A sync run builds no issue: its outcome only changes how the release evaluates (and is published).
+            merger.evaluate(releaseId)
+            return
+        }
         lock(releaseId).withLock {
             val ref = io { store.issueByRun(outcome.run.id) } ?: return
             val run = io { runs.get(outcome.run.id) } ?: return

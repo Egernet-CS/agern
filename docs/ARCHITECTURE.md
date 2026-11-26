@@ -92,7 +92,7 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_SANDBOX_MAX_CONCURRENT` | `2` | Containers that run commands that may exist at the same time, over all runs (1–100): a run's sandbox takes one slot and each platform container it creates one more (sidecars take none). A builder that would exceed it first gives up its run's own idle containers, else gets a "busy" answer |
 | `FACTORY_SANDBOX_MAX_PLATFORMS` | `4` | Platforms a definition may name besides its default image (0–20; `0` forbids them) |
 | `FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES` | `30` | Default and maximum time for one sandbox command (1–1440), also capped by `FACTORY_STAGE_TIMEOUT_MINUTES` |
-| `FACTORY_DEV_FAKE_GITHUB` | `false` | Development only, requires `FACTORY_AUTH=dev`: in-memory fake GitHub (org with `demo-app`, `private-lab` and the workspace `demo-workspace` with its members `demo-ws-app` (base branch `dev`), `demo-ws-tools` and `demo-ws-lab` (only alice can read it); issues #1–#5 of `demo-workspace` carry one, no, several and an inaccessible member's label; the submodule workspace `demo-shop` whose `.gitmodules` declares `services/api` (`demo-shop-api`, SSH URL), `web` (`demo-shop-web`, relative URL, `branch = main`), `tools/cli` (`demo-ws-tools`, whose label no issue of `demo-shop` carries, so it is missing until Agern creates it) and `vendor/icons` (another organization, context only), with issues #1–#2 labelled `demo-shop-api` and `demo-shop-web` and #3 without a member label (a run of `demo-shop` itself); tokens `fake-<login>` = classic with `repo`, `read:org`; `fake-<login>~<scope>,…` = only those scopes), local `git init` instead of clones, pushes skipped |
+| `FACTORY_DEV_FAKE_GITHUB` | `false` | Development only, requires `FACTORY_AUTH=dev`: in-memory fake GitHub (org with `demo-app`, `private-lab` and the workspace `demo-workspace` with its members `demo-ws-app` (base branch `dev`), `demo-ws-tools` and `demo-ws-lab` (only alice can read it); issues #1–#5 of `demo-workspace` carry one, no, several and an inaccessible member's label; the submodule workspace `demo-shop` whose `.gitmodules` declares `services/api` (`demo-shop-api`, SSH URL), `web` (`demo-shop-web`, relative URL, `branch = main`), `tools/cli` (`demo-ws-tools`, whose label no issue of `demo-shop` carries, so it is missing until Agern creates it) and `vendor/icons` (another organization, context only), with issues #1–#2 labelled `demo-shop-api` and `demo-shop-web` and #3 without a member label (a run of `demo-shop` itself); tokens `fake-<login>` = classic with `repo`, `read:org`; `fake-<login>~<scope>,…` = only those scopes), local `git init` instead of clones, pushes skipped (a sync run's fast-forward push moves the local release branch instead); `<dataDir>/fake-github-checks/<repo>/<branch>.json` sets the checks of a branch's head and, with `"conflict": true`, makes its pull requests conflict (§6 "Releasing", "Fake-GitHub mode") |
 
 ## 4. Identity and secrets
 
@@ -1427,9 +1427,11 @@ branch is never changed, renamed or removed (Flyway checks applied migrations by
   - *A ready release* compares `release/<name>` with the default branch at every re-evaluation once its pull request
     is open (it becomes ready, "Check again", the periodic re-evaluation, before an approval). Its issues are already
     merged into the release branch, so none can be held: the release stays `ready` with the notice "Database migration
-    conflict with `<default>`: <problems>. The release is not merged. Fix the migrations on `release/<name>` (merge
-    `<default>` into it; a new migration needs a version above every migration on `<default>`, and existing ones must
-    stay unchanged), then use "Check again".", is not announced as ready to release, is not merged automatically, and
+    conflict with `<default>`: <problems>. The release is not merged. A new migration needs a version above every
+    migration on `<default>`, and existing ones must stay unchanged. Use "Bring up to date" on the release page (or
+    `/factory release sync <name>`), or fix the migrations on `release/<name>` and use "Check again"." (a member
+    repository of a release of several repositories: "… Fix the migrations on `release/<name>` (merge `<default>` into
+    it), then use "Check again"."), is not announced as ready to release, is not merged automatically, and
     approval answers 409 `release_migration_conflict` with the notice and " Nothing was merged." (§6 "Releasing"). The
     next re-evaluation without a problem clears the notice.
 - **The builder's prompt.** `builder.md` and the build, continue (§6 "Retrying a run") and fix prompts tell the builder to take a new migration's
@@ -1921,14 +1923,108 @@ release mode (#41). Single runs are unaffected and still merge into the default 
 - **Conflicts.** If the default branch moved (another release or a single run merged) and the release branch no
   longer merges cleanly, `mergeState` is `conflict`, the release stays `ready`, the release page says so, and the
   pull request gets one comment "**Agern:** `release/<name>` no longer merges cleanly into `<default>`. Agern will not
-  merge it. Resolve the conflicts on the release branch, then use "Check again" on the release page: <URL>". Approval
-  answers 409 `release_conflict` and changes nothing. The owner decides: resolve the conflict on the release branch
-  (e.g. merge the default branch into it and push) and "Check again", or cancel. Agern does not resolve conflicts
-  itself (issue #35); nothing here prevents that from being added as another way forward from this state.
+  merge it. Use "Bring up to date" on the release page (or `/factory release sync <name>`), or resolve the conflicts
+  on the release branch and use "Check again": <URL>" (a release of several repositories keeps "Resolve the conflicts
+  on the release branch, then use "Check again" on the release page: <URL>"). Approval answers 409 `release_conflict`
+  and changes nothing. The owner decides: bring it up to date (below), resolve the conflict on the release branch by
+  hand (e.g. merge the default branch into it and push) and "Check again", or cancel.
 - **Database migrations.** A release branch whose migrations collide with the default branch's (e.g. another release
   merged the same version first) stays `ready` with the notice of §6 "Database migrations", without the ready
-  announcement and without an automatic merge; approval answers 409 `release_migration_conflict`. The owner fixes the
-  release branch (merge the default branch into it, renumber the release's new migration) and uses "Check again".
+  announcement and without an automatic merge; approval answers 409 `release_migration_conflict`. The owner brings
+  it up to date (below), or fixes the release branch by hand (merge the default branch into it, renumber the release's
+  new migration) and uses "Check again".
+- **Bringing a release up to date** (issue #63). A `ready` release of one repository whose branch conflicts with,
+  is behind, or has migrations colliding with the default branch can be brought up to date by an agent run that
+  merges the default branch into `release/<name>`. Nothing is ever merged into the default branch by it, and nothing
+  is force-pushed.
+  - *Model.* Every full evaluation of a `ready` single-repository release (also one without a pull request yet) and
+    the periodic reconcile of a manual one compare `release/<name>` with the target in the owner's clone
+    (`GitOps.compareBranches`, which also counts `behind`: `git rev-list --count <head>..<base>`) and store
+    `releases.behind_by` (commits on the target not on the release branch; `NULL`: not known) and
+    `releases.migration_conflict` (`MigrationCheck` found problems). A comparison that cannot be made is logged and
+    leaves both unchanged; leaving `ready` resets them. `syncNeeded` = `ready`, not several repositories, a branch,
+    and (`mergeState = conflict` or `behindBy > 0` or `migrationConflict`). `Release.sync` describes the release's
+    latest sync run: `running` (queued, building, reviewing), `done` (merged), `failed` (failed or cancelled, nothing
+    pushed) or `unreviewed` (failed or cancelled after it pushed: `runs.sync_pushed_sha` is set). It is derived from
+    the run rather than stored in `releases.notice`, which every evaluation overwrites.
+  - *Starting* (`POST /api/releases/{id}/sync`, `/factory release sync <name>`; no MCP tool), in this order: 404
+    when the release is not visible; 409 `release_not_ready` unless started and `ready`; 403 unless the caller is the
+    release owner or an admin; 409 `release_sync_unsupported` for several repositories ("Bringing a release of several
+    repositories up to date is not supported yet; merge the base branch into `release/<name>` in each repository by
+    hand."); 422 `claude_credential_required`; the caller's GitHub token (as for every GitHub action); 409
+    `release_sync_merge_commits_disallowed` when the repository (read with the caller's token) forbids merge commits
+    ("<repo> does not allow merge commits, and a release branch that contains a merge commit cannot be rebased; allow
+    merge commits in the repository's GitHub settings first." — `methodFor` would otherwise leave no usable method).
+    Then, under the release's mutex (so a start and an approval serialise): still `ready` (409 `release_not_ready`),
+    no sync run in progress (409 `release_sync_running`, "Release "<name>" is already being brought up to date (run
+    <id>)."; also enforced by an advisory lock in `RunStore.createSync`), and `syncNeeded` (409 `release_up_to_date`,
+    "`release/<name>` is not behind `<target>` and has no conflicts. Use "Check again" if that changed."). **The run
+    belongs to the caller** and uses only the caller's Claude credential and GitHub token: an admin who presses the
+    button runs it as the admin, never on the release owner's credentials. `/factory release sync <name>` answers
+    `Bringing release "<name>" up to date with <target>: run <id> merges <target> into release/<name>, resolves
+    conflicts and renumbers migrations. Nothing is merged into <target>.`
+  - *The sync run* is a row of `runs` with `kind = 'sync'` (every other run: `issue`), `issue_number = 0`, title
+    "Bring release/<name> up to date with <target>", `base_branch = release/<name>`, the local working branch
+    `factory/sync-<name>-<run8>` (never pushed under that name), the caller's `maxFixRounds`, no pull request. Its
+    stages: builder and the four reviewers; spec-writer and approver `skipped` ("Not used when bringing a release up to
+    date"). Statuses `queued` → `building` → `reviewing` → `merged` | `failed` | `cancelled` (shown as "up to date"
+    when merged). Sync runs belong to no issue: they are left out of `activeRunFor`/`activeRunsByIssue` and the
+    one-active-run-per-issue check, never block issue runs, but count as active runs of the project. Their agent
+    sessions have no issue number and the titles `<role> · sync <name>`. The pipeline:
+    1. *Set-up* (retried as a whole on transient failures): a worktree on the working branch at the up-to-date tip of
+       `release/<name>`, the default branch fetched, submodules updated, the start commit remembered. The sandbox
+       decision is the default branch's, as for release runs; no image hand-over.
+    2. *Builder* (steerable): merge with `git merge --no-ff <defaultRef>`, never rebase, reset, amend or rewrite and
+       never push; resolve keeping both sides' behaviour and check semantic combinations; renumber every migration the
+       release adds above the default branch's highest (never touching one that is there; `scripts/check-migrations.sh
+       <defaultRef>` must pass where it exists); build and test (the sandbox when there is one); when it cannot be done
+       safely, put the branch back (`git merge --abort` / `git reset --hard <start>`) and say what is left; end with a
+       summary per conflicted file, the renumbered migrations and the checks. The `<release>` block (name, description,
+       merged issues) is data.
+    3. *Verification by the server* before any push (`GitOps.mergeState`, `GitOps.compareWorktree`): the start commit
+       (in a fix round: the commit pushed last) and `<defaultRef>` are ancestors of `HEAD`; no merge in progress, no
+       unmerged paths, no uncommitted changes to tracked files; `MigrationCheck.problems` of `HEAD` against
+       `<defaultRef>` is empty. Otherwise the builder stage and the run fail (`failureKind` `other`): "Could not bring
+       `release/<name>` up to date with `<target>`: <reason>. Nothing was pushed." plus " The agent said: <first
+       paragraph, ≤ 1000 characters>"; reasons in this order: "the branch no longer contains the release branch's
+       commits (history was rewritten)", "`<target>` was not merged into it", "the merge is not finished (unmerged
+       paths, a merge in progress or uncommitted changes)", "database migration conflict: <problems>", and "its
+       database migrations could not be compared with `<target>`" (fails closed). A failing builder stage ends the
+       same way. `HEAD` equal to the start commit: "Already up to date; nothing to push", reviewers skipped, `merged`.
+    4. *Push*: `git push origin HEAD:refs/heads/release/<name>` with neither `--force` nor `--force-with-lease`
+       (`GitOps.pushFastForward`; in fake-GitHub mode the local branch is moved by compare-and-swap, only as a
+       fast-forward). Transient failures wait for the network; a rejection fails the run: "Pushing to
+       `release/<name>` was refused because the branch changed meanwhile: <git output>. Nothing was pushed; use "Bring
+       up to date" again." After a push: `sync_pushed_sha`, the release is re-evaluated in the background
+       (`onReleaseBranchPushed` → `ReleaseMerger.evaluateLater`), and the release pull request gets "**Agern:** merged
+       `<target>` into `release/<name>` (commit `<sha7>`, started by @<login>) to bring the release up to date.
+       Reviewers are looking at the conflict resolution: <run page>".
+    5. *Review*: the four reviewers, read-only, review only the merge (`git show --remerge-diff` and `--cc` of each
+       merge commit in `git rev-list --merges <start>..HEAD`, `git log -p <merge>..HEAD`): both sides kept, semantic
+       combinations, migrations renumbered and none of the default branch's touched. No screenshot note or UI warning.
+    6. *Fix rounds* on `CHANGES` up to `maxRounds`: the builder conversation is resumed ("commit fixes on top; never
+       amend, rebase or reset: the merge is already pushed"), then verification, push and review again. `CHANGES` at
+       the limit fail the run: "Reviewers still request changes on the merge of `<target>` into `release/<name>`
+       after N fix round(s): <roles>. The merge is already on `release/<name>` (commit `<sha7>`); look at the findings
+       before releasing."
+    7. *End*: all `PASS` → worktree and working branch removed, `merged`. Every ending re-evaluates and publishes the
+       release (`ReleaseBuilder.settle`); a run that ends `failed` or `cancelled` after a push comments on the release
+       pull request "**Agern:** the review of the merge of `<target>` into `release/<name>` (commit `<sha7>`) did not
+       pass or did not finish: <first line of the error>. <run page>". Nothing is labelled and nothing is commented on
+       an issue.
+    Cancel: the run's owner or an admin, and cancelling the release cancels it (whoever started it). Retry: 409
+    `sync_run` ("A run that brings a release up to date is not retried; use "Bring up to date" on the release
+    again."), and every retry option is unavailable with that reason. A restart fails it with "Server restarted while
+    the release branch was being brought up to date; use "Bring up to date" again."
+  - *Holds.* While the latest sync run is `running`, approval answers 409 `release_sync_running` ("Release "<name>"
+    is being brought up to date (run <id>); wait for it to finish or cancel it.", checked under the mutex) and an
+    automatic release is not merged (its notice is left alone). While it is `unreviewed`, an automatic release is not
+    merged and gets the notice "The merge of `<target>` into `<branch>` (run <id>) was pushed but its review did not
+    pass or did not finish, so the release is not merged automatically. Look at the run, then approve by hand.";
+    manual approval is allowed. `failed`, `done` or no sync run: as before. After a sync the release branch contains a
+    merge commit, so it is merged with a merge commit instead of by rebasing (`methodFor`). The release is published
+    when a sync run starts, pushes and ends; `/factory releases` adds under a `ready` release "Sync: running (run
+    <id>)", "Sync: failed, nothing pushed: <error>" or "Sync: pushed but not fully reviewed: <error>".
 - **Approval** (`POST /api/releases/{id}/approve`, `/factory release approve <name>`, `factory_approve_release`):
   **only the owner**; everyone else, admins included, gets 403 `forbidden` ("Only <owner>, who started this release,
   can do this"); a caller who cannot see the project gets 404 first. Admins may still cancel (they stop, never
@@ -2180,8 +2276,9 @@ release mode (#41). Single runs are unaffected and still merge into the default 
   merge settings; deleting a branch closes its open pull requests, as on GitHub; commit statuses and check runs per
   head branch (`setStatus`, `setCheckRun`; none: no checks), and a failure to read them. In development
   (`FACTORY_DEV_FAKE_GITHUB`) `<dataDir>/fake-github-checks/<repo>/<branch>.json` (`{"statuses": {"ci": "pending"},
-  "checkRuns": [{"name", "status", "conclusion"}]}`) sets the checks of a branch while the server runs; the e2e suite
-  uses it.
+  "checkRuns": [{"name", "status", "conclusion"}]}`) sets the checks of a branch while the server runs, and
+  `"conflict": true` makes its pull requests conflict (reported and refused on merge like `conflicting`) while the
+  file says so; the e2e suite uses both.
 
 ### Generated images
 
@@ -2423,8 +2520,8 @@ run of merge policy `github`, §6 "Merge policy"), `/factory cancel <runId>`,
 `/factory retry <runId> [step|continue|over|recommended]` (owner only; without a mode it lists the options, the
 recommendation and its reason; a release run is retried through its release),
 `/factory releases`, `/factory release create <name> [description…]`, `/factory release add <name> <issue>…`,
-`/factory release remove <issue>…`, `/factory release approve <name>`, `/factory release mode <name>
-manual|automatic`, `/factory help`. The reply is appended to the transcript as a `system` event.
+`/factory release remove <issue>…`, `/factory release approve <name>`, `/factory release sync <name>`,
+`/factory release mode <name> manual|automatic`, `/factory help`. The reply is appended to the transcript as a `system` event.
 Release commands act in the chat's project as its owner: `releases` lists each release with its status ("in
 preparation" with the issue count, plus " (scheduled start failed: <reason>)" after a failed scheduled start;
 "scheduled for <ISO time, UTC> by <owner>" plus ", waiting for release "<name>"" when due and waiting; for started ones "building", "paused" or "cancelled", "k of n merged", the owner
@@ -2437,7 +2534,13 @@ start), `scheduled for <ISO time, UTC> by <username>` (plus `, waiting for relea
 (`building`, `paused`). Scheduling has no command or tool. Issue tokens accept `5`, `#5` and `#5,`; an unknown release name gets a reply naming the existing
 ones; a missing or invalid argument gets a one-line usage reply. Renaming, deleting and reordering are web-only.
 `release approve <name>` approves a ready release (owner only, §6 "Releasing"; without a name: "Usage: /factory
-release approve <name>") and answers like `factory_approve_release`; refusals are shown as their message. In
+release approve <name>") and answers like `factory_approve_release`; refusals are shown as their message.
+`release sync <name>` brings a ready release up to date (owner or admin, §6 "Releasing", "Bringing a release up to
+date"; without a name: "Usage: /factory release sync <name>") and answers `Bringing release "<name>" up to date with
+<target>: run <id> merges <target> into release/<name>, resolves conflicts and renumbers migrations. Nothing is merged
+into <target>.`; under a `ready` release `releases` adds the line "Sync: …" of its latest sync run (not when done).
+`retry <runId>` of a sync run answers "A run that brings a release up to date is not retried; …"; `status` lists a
+sync run as `sync <title>`. In
 `releases`, ready and released releases show "ready to release" / "released", the pull request URL, and for ready
 ones " — N held" or " — conflicts with <default>" when that applies, plus a notice line when there is one. An
 automatic release that is not finished shows ", releases automatically when ready", a released one ", released
@@ -2548,7 +2651,15 @@ type Release = { id: string; repo: string; name: string; description: string;
   checks: { state: 'unknown' | 'awaiting' | 'none' | 'pending' | 'passed' | 'failed';   // on the pull request's head commit
             detail: string | null; sha: string | null } | null;           // null until there is a pull request
   mergePolicy: MergePolicy;                 // the project's current policy (§6 "Merge policy")
-  repositories: ReleaseRepo[] };            // §6 "Several repositories"; [] unless multi-repository
+  repositories: ReleaseRepo[];              // §6 "Several repositories"; [] unless multi-repository
+  behindBy: number | null;                  // commits on targetBranch not on the release branch, as last compared
+  migrationConflict: boolean;               // its migrations collide with targetBranch's (last evaluation)
+  syncNeeded: boolean;                      // "Bring up to date" is offered (§6 "Bringing a release up to date")
+  sync: ReleaseSync | null };               // its latest sync run
+
+type ReleaseSync = { runId: string; state: 'running' | 'done' | 'failed' | 'unreviewed';
+  by: { username: string; displayName: string }; startedAt: string; endedAt: string | null;
+  pushedSha: string | null; error: string | null };
 
 type StageRole = 'spec-writer' | 'builder' | 'security' | 'ux' | 'ui-design' | 'code' | 'approver';
 type SessionKind = 'chat' | 'advisor' | StageRole;   // advisor: the agent a run's owner talks to at needs_human
@@ -2610,7 +2721,9 @@ type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; 
   mergedBy: string | null;         // the GitHub login that merged it there, when GitHub reports it
   waiting: RunWait | null;  // while it sleeps before retrying an operation that lost the network; it keeps its status
   warnings: { round: number; roles: StageRole[]; text: string }[];  // the stages' warnings per round, oldest first
-  checks: RunChecks | null };  // the checks last evaluated before a merge (§6 "Checks before a merge"); null until then
+  checks: RunChecks | null;  // the checks last evaluated before a merge (§6 "Checks before a merge"); null until then
+  kind: 'issue' | 'sync';         // sync: brings a release up to date; issueNumber 0, no issue (§6 "Releasing")
+  syncPushedSha: string | null };  // a sync run: the commit it last pushed to its release branch
 
 type RunChecks = { state: 'awaiting' | 'pending' | 'passed' | 'failed' | 'none' | 'unknown';
   sha: string; detail: string;                // the head commit they were read for; e.g. "Failed: build, lint"
@@ -2828,8 +2941,9 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `POST /api/releases/{id}/resume` | → `Release` | owner only; `paused` → `building` (else 409 `release_not_paused`); 422 `claude_credential_required`. For reason `network` this is "Retry now" |
 | `POST /api/releases/{id}/network/give-up` | → `Release` | owner or admin; only `paused` with reason `network` (else 409 `release_not_waiting_for_network`): holds the issue that could not start and goes on with the next one (§6 "Transient failures") |
 | `POST /api/releases/{id}/cancel` | → `Release` | owner or admin; `building`/`paused`/`ready` → `cancelled` (else 409 `release_not_building`; released: 409 `release_not_editable`); cancels the release's active runs; a release pull request is left open with a comment |
-| `POST /api/releases/{id}/approve` | → `Release` | owner only (admins included in the refusal: 403); 409 `merge_on_github` when the project merges on GitHub (§6 "Merge policy"); merges the ready release's pull request (rebase, or a merge commit where rebase merging is disabled; never squash), closes its merged issues and deletes `release/<name>` (§6 "Releasing"). 409 `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`, `release_migration_conflict`, `release_submodule_commit_missing`, `release_submodule_check_failed`, `release_merge_method_unavailable`, `release_merge_failed`; nothing changes on GitHub with any of them; a multi-repository release merges its member pull requests first and answers 409 `release_partially_merged` with the per-repository report when it stops after a merge (§6 "Several repositories") |
+| `POST /api/releases/{id}/approve` | → `Release` | owner only (admins included in the refusal: 403); 409 `merge_on_github` when the project merges on GitHub (§6 "Merge policy"); merges the ready release's pull request (rebase, or a merge commit where rebase merging is disabled; never squash), closes its merged issues and deletes `release/<name>` (§6 "Releasing"). 409 `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`, `release_migration_conflict`, `release_submodule_commit_missing`, `release_submodule_check_failed`, `release_merge_method_unavailable`, `release_merge_failed`, `release_sync_running` (while a sync run of it is in progress); nothing changes on GitHub with any of them; a multi-repository release merges its member pull requests first and answers 409 `release_partially_merged` with the per-repository report when it stops after a merge (§6 "Several repositories") |
 | `PUT /api/releases/{id}/mode` | `{ mode: 'manual' \| 'automatic' }` → `Release` | §6 "Release mode": `planning` anyone; `scheduled`/started: automatic owner only, manual owner or admin (403); 400 missing or unknown mode; 409 `release_not_editable` (released), `release_closed` (cancelled), `release_mode_not_allowed`. A `ready` release is re-evaluated in the background (switched to automatic and green, it is merged) |
+| `POST /api/releases/{id}/sync` | → `Release` | "Bring up to date" (§6 "Bringing a release up to date"): owner or admin; 404 not visible, 409 `release_not_ready`, 403, 409 `release_sync_unsupported`, 422 `claude_credential_required`, GitHub token as everywhere, 409 `release_sync_merge_commits_disallowed`, then under the mutex 409 `release_not_ready`, `release_sync_running`, `release_up_to_date`; starts a sync run owned by the caller and answers the release |
 | `POST /api/releases/{id}/check` | → `Release` | owner only; `ready` only (409 `release_not_ready`): re-reads the pull request (opens it when the release is complete and has none, replaces one closed without merging, finishes the release when it was merged on GitHub) and its mergeability |
 | `GET /api/releases/{id}/issues/{number}/retry` | → `RetryOptions` | anyone who can see the release; the issue must be `held`/`skipped` (409 `release_issue_not_held`); the options of its linked run, or only `start_over` when it has none |
 | `POST /api/releases/{id}/issues/{number}/retry` | `{ mode?: … }` (body optional) → `Release` | no body or no mode = `start_over`, as before; `continue`/`step`/`recommended` as in §6 "Retrying a run" (409 `retry_mode_unavailable`); owner only; release `building`/`paused`/`ready` (else 409 `release_not_building`; released: 409 `release_not_editable`), issue `held`/`skipped` (else 409 `release_issue_not_held`); it is built again (a `ready` release builds again: 409 `release_already_building` while another release of the project builds); a partly released release: 409 `release_partially_merged` |
@@ -2851,8 +2965,8 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `POST /api/runs/{id}/cancel` | → `Run` | owner or admin |
 | `POST /api/runs/{id}/network/retry` | → `Run` | owner or admin; a run waiting for the network tries again now (§6 "Transient failures"); 409 `run_not_waiting_for_network` |
 | `POST /api/runs/{id}/network/give-up` | → `Run` | owner or admin; the waiting run fails now and is returned once failed; 409 `run_not_waiting_for_network` |
-| `GET /api/runs/{id}/retry` | → `RetryOptions` | anyone who can see the run; how it can be retried and what is recommended (§6 "Retrying a run") |
-| `POST /api/runs/{id}/retry` | `{ mode?: 'step' \| 'continue' \| 'start_over' \| 'recommended' }` (body optional) → `Run` | owner only (admins included: 403), single runs that are `failed` or `cancelled` (409 `run_not_retryable`; a release run: 409 `release_run`); no mode = `start_over`; 409 `retry_mode_unavailable`, `active_run_exists`; 400 unknown mode; 422 `claude_credential_required`. Answers the run now at work: the same run for `step`, a new one otherwise |
+| `GET /api/runs/{id}/retry` | → `RetryOptions` | anyone who can see the run; how it can be retried and what is recommended (§6 "Retrying a run"); for a sync run every option is unavailable with the reason "A run that brings a release up to date is not retried; …" |
+| `POST /api/runs/{id}/retry` | `{ mode?: 'step' \| 'continue' \| 'start_over' \| 'recommended' }` (body optional) → `Run` | owner only (admins included: 403), single runs that are `failed` or `cancelled` (409 `run_not_retryable`; a release run: 409 `release_run`; a sync run: 409 `sync_run`); no mode = `start_over`; 409 `retry_mode_unavailable`, `active_run_exists`; 400 unknown mode; 422 `claude_credential_required`. Answers the run now at work: the same run for `step`, a new one otherwise |
 | `GET /api/projects/{repo}/sessions?kind=chat` | → `AgentSession[]` | |
 | `POST /api/projects/{repo}/sessions` | `{ model? }` → `AgentSession` | new chat; needs Claude credential; without `model` the owner's effective `chatModel` |
 | `GET /api/agents?active=true` | → `AgentSession[]` | all kinds, across visible repos. `active=true`: `live` (a process exists, e.g. a chat idling between turns) or `starting`/`running` |
@@ -3504,7 +3618,8 @@ Releasing on the release page (§6 "Releasing"). A `ready` release shows the sec
 the link "#<prNumber>" to the pull request (new tab) and `release/<name> → <targetBranch>`, or "No pull request
 yet."; a `role="status"` line — complete and clean "Ready to release. Merges cleanly into <target>."; complete and
 unknown "Ready to release. Mergeability has not been confirmed yet."; conflict "`release/<name>` no longer merges
-cleanly into <target>. Agern will not merge it. Resolve the conflicts on the release branch, then check again.";
+cleanly into <target>. Agern will not merge it. Bring it up to date, or resolve the conflicts on the release branch
+and check again.";
 incomplete "Incomplete: N issue(s) are held (#a, #b). Approve or retry their runs, or move them out, before
 releasing."; empty "Nothing was merged into the release branch, so there is nothing to release."; no usable merge
 method "This repository only allows squash merges. …" — and, when it can be approved, a muted line naming the merge
@@ -3521,6 +3636,32 @@ in `ready` (adding builds again); there is no Pause. Each issue with a run pull 
 "Released <time ago> by <owner> · pull request #n" (or "Merged on GitHub <time ago> · …"), the method in words, the
 default branch's commit (7 characters) and that the issues were closed and the branch deleted. The note "This release
 is a plan…" is shown only while planning.
+
+Bringing a release up to date on the release page (§6 "Releasing", "Bringing a release up to date"), only for a
+single-repository `ready` release (a release of several repositories shows nothing of this): when the branch does not
+conflict but is behind, a muted line "`release/<name>` is N commit(s) behind <target>." below the status line.
+Directly below the status line (the conflict notice's button, not repeated in the actions row) the release owner and
+admins get "Bring up to date" when `syncNeeded` and no sync run is `running`, disabled while any action of the page is
+busy; everyone else then sees "Only <owner> or an admin can bring it up to date.". It opens the dialog "Bring
+release/<name> up to date?": "An agent run merges <target> into release/<name> with a merge commit (no rebase, no
+force-push), resolves the conflicts, renumbers this release's own database migrations above <target>'s, runs the
+project's checks and pushes release/<name>. Reviewers then look at the conflict resolution. Nothing is merged into
+<target>. It runs with your Claude credential and GitHub token." plus, when the release would be rebased, "Afterwards
+the release is merged with a merge commit instead of by rebasing."; "Cancel" (focused) and "Bring up to date"; Escape
+closes; an error closes it and shows in the page's alert line. The latest sync run shows as: `running` — a
+`role="status"` line "Bringing release/<name> up to date with <target> (started by <user>)." with "Open the run", and
+"Approve and release" is disabled ("Check again" stays); `failed` — a `role="alert"` block "Could not bring it up to
+date. <error>" with the link (the button is offered again while `syncNeeded`); `unreviewed` — a `role="alert"` block
+"<target> was merged into release/<name> (commit <sha7>), but the review of the merge did not pass or did not finish.
+<error> Look at the run before releasing." with the link; `done` — a muted "Brought up to date with <target> <time
+ago> by <user>." with the link. It updates live from `release` frames.
+
+A sync run (`Run.kind = 'sync'`) never shows `#0`: lists show `sync` where they show `#<n>` (run header and document
+title, agents band, home page strip, project runs list, admin sandbox rows and dialog) and its title "Bring
+release/<name> up to date with <target>"; its first diagram node is "sync" with the release branch, and its detail
+shows the release (name, `release/<name>` → target, a link to the release page, the pushed commit) instead of reading
+an issue. Its status pill reads "up to date" when merged; the diagram shows spec-writer and approver skipped, the
+outcome node "push release/<name>" and never a human approval. There is no Retry; Cancel as for other runs.
 
 Release mode on the release page (§6 "Release mode"): except when released or cancelled, the header shows the mode —
 for whoever may change it a select labelled "Release mode" ("Manual approval" / "Automatic"; "Automatic" is disabled

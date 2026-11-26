@@ -412,7 +412,13 @@ data class RunRecord(
     val mergeApprovedBy: String? = null,
     /** Set while the run sleeps before retrying an operation that failed for lack of network. */
     val wait: RunWait? = null,
+    /** [dk.egernet.factory.RunKind]: `issue`, or `sync` (brings a release up to date; [issueNumber] is 0). */
+    val kind: String = dk.egernet.factory.RunKind.ISSUE,
+    /** A sync run: the commit it last pushed to its release branch. */
+    val syncPushedSha: String? = null,
 ) {
+    val isSync: Boolean get() = kind == dk.egernet.factory.RunKind.SYNC
+
     /** [checksJson] decoded; null when there is none (or it cannot be read). */
     val checks: dk.egernet.factory.RunChecksDto?
         get() = checksJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunChecksDto.serializer(), it) }.getOrNull() }
@@ -435,6 +441,11 @@ internal val WAITABLE_STATUSES = setOf(RunStatus.QUEUED, RunStatus.SPEC, RunStat
 internal fun RunWait.toDto() = dk.egernet.factory.RunWaitDto(reason, since.iso(), nextAt.iso(), attempts, detail.ifBlank { "The network could not be reached" })
 
 class RunStore(private val db: Db) {
+    companion object {
+        /** The error of a sync run a restart interrupted. */
+        const val SYNC_RESTART_ERROR = "Server restarted while the release branch was being brought up to date; use \"Bring up to date\" again."
+    }
+
     private val screenshots = ScreenshotStore(db)
     private val images = ImageStore(db)
     private val findingsSer = ListSerializer(FindingDto.serializer())
@@ -453,7 +464,7 @@ class RunStore(private val db: Db) {
         rs.getString("target_repo"), rs.getString("target_dir"), splitRepos(rs.getString("context_repos")),
         rs.getString("merge_policy"), rs.getBoolean("merged_on_github"), rs.getString("merged_by"),
         rs.getString("checks"), rs.instantOrNull("checks_waiting_since"), rs.instantOrNull("checks_deadline"),
-        rs.getString("merge_approved_by"), rs.runWait(),
+        rs.getString("merge_approved_by"), rs.runWait(), rs.getString("kind"), rs.getString("sync_pushed_sha"),
     )
 
     private fun mapStage(rs: ResultSet) = StageRecord(
@@ -477,7 +488,7 @@ class RunStore(private val db: Db) {
         val inserted = db.tx { c ->
             c.prepare("SELECT pg_advisory_xact_lock(hashtext(?))", arrayOf<Any?>("$repo#$issueNumber")).use { it.executeQuery().close() }
             val active = c.prepare(
-                "SELECT count(*) FROM runs WHERE repo = ? AND issue_number = ? AND status IN ('queued','spec','building','reviewing','approving','waiting_for_checks','needs_human')",
+                "SELECT count(*) FROM runs WHERE repo = ? AND issue_number = ? AND kind = 'issue' AND status IN ('queued','spec','building','reviewing','approving','waiting_for_checks','needs_human')",
                 arrayOf<Any?>(repo, issueNumber),
             ).use { ps -> ps.executeQuery().use { rs -> rs.next(); rs.getInt(1) } }
             if (active > 0) return@tx false
@@ -495,6 +506,51 @@ class RunStore(private val db: Db) {
         return if (inserted) get(id) else null
     }
 
+    /**
+     * Creates a sync run of release [releaseId] (docs/ARCHITECTURE.md §6 "Bringing a release up to date"): `kind = sync`,
+     * `issue_number = 0`, starting from and pushing to [releaseBranch], working on the local branch [branch]. Null when
+     * the release already has a sync run in progress (checked under a per-release advisory lock).
+     */
+    fun createSync(
+        id: UUID, repo: String, title: String, maxRounds: Int, ownerId: UUID, releaseId: UUID, releaseBranch: String, branch: String,
+    ): RunRecord? {
+        val inserted = db.tx { c ->
+            c.prepare("SELECT pg_advisory_xact_lock(hashtext(?))", arrayOf<Any?>("sync:$releaseId")).use { it.executeQuery().close() }
+            val active = c.prepare(
+                "SELECT count(*) FROM runs WHERE release_id = ? AND kind = 'sync' AND status IN ('queued','building','reviewing')",
+                arrayOf<Any?>(releaseId),
+            ).use { ps -> ps.executeQuery().use { rs -> rs.next(); rs.getInt(1) } }
+            if (active > 0) return@tx false
+            c.prepare(
+                """INSERT INTO runs(id, repo, issue_number, issue_title, issue_kind, status, max_rounds, owner_id, release_id, base_branch,
+                     branch, kind)
+                   VALUES (?, ?, 0, ?, 'task', 'queued', ?, ?, ?, ?, ?, 'sync')""",
+                arrayOf<Any?>(id, repo, title, maxRounds, ownerId, releaseId, releaseBranch, branch),
+            ).use { it.executeUpdate() }
+            true
+        }
+        return if (inserted) get(id) else null
+    }
+
+    /** The latest sync run of release [releaseId], or null. */
+    fun latestSync(releaseId: UUID): RunRecord? =
+        db.queryOne("$select WHERE r.release_id = ? AND r.kind = 'sync' ORDER BY r.created_at DESC LIMIT 1", releaseId, map = ::map)
+
+    /** The latest sync run of each of [releaseIds] (one query). */
+    fun latestSyncs(releaseIds: Collection<UUID>): Map<UUID, RunRecord> {
+        if (releaseIds.isEmpty()) return emptyMap()
+        return db.query(
+            "SELECT DISTINCT ON (r.release_id) r.*, u.username AS owner_username, u.display_name AS owner_display_name " +
+                "FROM runs r JOIN users u ON u.id = r.owner_id WHERE r.kind = 'sync' AND r.release_id IN (" +
+                releaseIds.joinToString(",") { "?" } + ") ORDER BY r.release_id, r.created_at DESC",
+            *releaseIds.toTypedArray(), map = ::map,
+        ).associateBy { it.releaseId!! }
+    }
+
+    /** A sync run pushed [sha] to its release branch. */
+    fun setSyncPushed(id: UUID, sha: String) =
+        db.update("UPDATE runs SET sync_pushed_sha = ?, updated_at = now() WHERE id = ?", sha, id)
+
     fun get(id: UUID) = db.queryOne("$select WHERE r.id = ?", id, map = ::map)
 
     /**
@@ -506,7 +562,7 @@ class RunStore(private val db: Db) {
         val run = get(id) ?: return@tx false
         c.prepare("SELECT pg_advisory_xact_lock(hashtext(?))", arrayOf<Any?>("${run.repo}#${run.issueNumber}")).use { it.executeQuery().close() }
         val active = c.prepare(
-            "SELECT count(*) FROM runs WHERE repo = ? AND issue_number = ? AND id <> ? AND status IN ('queued','spec','building','reviewing','approving','waiting_for_checks','needs_human')",
+            "SELECT count(*) FROM runs WHERE repo = ? AND issue_number = ? AND id <> ? AND kind = 'issue' AND status IN ('queued','spec','building','reviewing','approving','waiting_for_checks','needs_human')",
             arrayOf<Any?>(run.repo, run.issueNumber, id),
         ).use { ps -> ps.executeQuery().use { rs -> rs.next(); rs.getInt(1) } }
         if (active > 0) return@tx false
@@ -550,7 +606,7 @@ class RunStore(private val db: Db) {
     }
 
     fun activeRunFor(repo: String, issueNumber: Int): UUID? = db.queryOne(
-        "SELECT id FROM runs WHERE repo = ? AND issue_number = ? AND status IN ('queued','spec','building','reviewing','approving','waiting_for_checks','needs_human') ORDER BY created_at DESC LIMIT 1",
+        "SELECT id FROM runs WHERE repo = ? AND issue_number = ? AND kind = 'issue' AND status IN ('queued','spec','building','reviewing','approving','waiting_for_checks','needs_human') ORDER BY created_at DESC LIMIT 1",
         repo, issueNumber,
     ) { it.uuid("id") }
 
@@ -571,7 +627,7 @@ class RunStore(private val db: Db) {
     ) { it.getInt("pr_number") }
 
     fun activeRunsByIssue(repo: String): Map<Int, UUID> = db.query(
-        "SELECT issue_number, id FROM runs WHERE repo = ? AND status IN ('queued','spec','building','reviewing','approving','waiting_for_checks','needs_human')",
+        "SELECT issue_number, id FROM runs WHERE repo = ? AND kind = 'issue' AND status IN ('queued','spec','building','reviewing','approving','waiting_for_checks','needs_human')",
         repo,
     ) { it.getInt("issue_number") to it.uuid("id") }.toMap()
 
@@ -790,6 +846,7 @@ class RunStore(private val db: Db) {
             waiting = r.wait?.takeIf { r.status in WAITABLE_STATUSES }?.toDto(),
             warnings = stageRows.filter { it.warning != null }.groupBy { it.round }.toSortedMap()
                 .map { (round, list) -> dk.egernet.factory.RunWarningDto(round, list.map { it.role }, list.first().warning!!) },
+            kind = r.kind, syncPushedSha = r.syncPushedSha,
         )
     }
 
@@ -798,14 +855,20 @@ class RunStore(private val db: Db) {
      * are resumed ([dk.egernet.factory.pipeline.Orchestrator.resumeChecksWaits]).
      */
     fun failUnfinishedAfterRestart(): List<UUID> {
-        val ids = db.query("SELECT id FROM runs WHERE status IN ('queued','spec','building','reviewing','approving')") { it.uuid("id") }
-        for (id in ids) {
+        val ids = db.query("SELECT id, kind FROM runs WHERE status IN ('queued','spec','building','reviewing','approving')") {
+            it.uuid("id") to it.getString("kind")
+        }
+        for ((id, kind) in ids) {
             // setStatus ends a network wait too: a waiting run is interrupted by a restart like any other.
-            setStatus(id, RunStatus.FAILED, "Server restarted while the run was in progress; retry it to continue or start over.")
+            setStatus(
+                id, RunStatus.FAILED,
+                if (kind == dk.egernet.factory.RunKind.SYNC) SYNC_RESTART_ERROR
+                else "Server restarted while the run was in progress; retry it to continue or start over.",
+            )
             setFailure(id, dk.egernet.factory.FailureKind.RESTART, null)
             closeOpenStages(id)
         }
-        return ids
+        return ids.map { it.first }
     }
 
     /**

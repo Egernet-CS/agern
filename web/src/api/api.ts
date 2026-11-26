@@ -150,6 +150,12 @@ export interface Api {
   /** Owner only: "Check again" — re-reads (or opens) the release pull request and its mergeability. 409 `release_not_ready`. */
   checkRelease(id: string): Promise<Release>;
   /**
+   * "Bring up to date" (owner or admin): starts a run that merges the default branch into `release/<name>`. 404 / 403;
+   * 409 `release_not_ready`, `release_sync_unsupported`, `release_sync_merge_commits_disallowed`, `release_sync_running`,
+   * `release_up_to_date`; 422 `claude_credential_required`.
+   */
+  syncRelease(id: string): Promise<Release>;
+  /**
    * Manual or automatic release. Planned: anyone who can see the project; scheduled or started: automatic is the owner's
    * alone, manual also an admin's (403 otherwise). 409 `release_not_editable` (released) / `release_closed` (cancelled).
    */
