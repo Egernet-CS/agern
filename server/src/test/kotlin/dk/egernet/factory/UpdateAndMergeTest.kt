@@ -275,6 +275,26 @@ class UpdateAndMergeTest {
     }
 
     @Test
+    fun `an update round that would push a project file is not pushed and needs a human again`() {
+        conflictOnMerge()
+        val bytes = "licensed sdk".toByteArray()
+        world.uploadProjectFile("demo-app", "vendor/sdk.zip", bytes)
+        val run = await(start().id)
+        assertEquals(RunStatus.NEEDS_HUMAN, run.status, run.error)
+        val pushesBefore = git.pushes.size
+        onUpdateBuilder = {
+            git.headSha = "merged-by-builder-000000000000000000000"
+            git.newBlobsAnswer = listOf(dk.egernet.factory.git.NewBlob(gitBlobId(bytes), bytes.size.toLong(), "libs/sdk.zip"))
+        }
+        update(run.id)
+        val done = awaitUpdated(run.id)
+        assertEquals(RunStatus.NEEDS_HUMAN, done.status)
+        assertEquals(pushesBefore, git.pushes.size)
+        assertTrue(done.error!!.contains("did not finish: Not pushed: the branch contains project file `vendor/sdk.zip`"), done.error)
+        assertEquals(dk.egernet.factory.db.UpdateStatus.FAILED, s.runs.updates(run.id).single().status)
+    }
+
+    @Test
     fun `a merge that fails without a conflict is a step to retry, as before`() {
         gh.failMerge = true
         val run = await(start().id)

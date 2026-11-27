@@ -292,6 +292,17 @@ class ReleaseSyncTest {
     )
 
     @Test
+    fun `a merge that contains a project file is not pushed`() = failsWith(
+        "pf",
+        {
+            val bytes = "licensed sdk".toByteArray()
+            world.uploadProjectFile("demo-app", "vendor/sdk.zip", bytes)
+            git.newBlobsAnswer = listOf(dk.egernet.factory.git.NewBlob(gitBlobId(bytes), bytes.size.toLong(), "vendor/sdk.zip"))
+        },
+        "Could not bring `release/pf` up to date with `main`: Not pushed: the branch contains project file `vendor/sdk.zip`",
+    )
+
+    @Test
     fun `a release branch that moved meanwhile refuses the push`() = failsWith(
         "p", { git.rejectFastForward = "! [rejected] HEAD -> release/p (fetch first)" },
         "Pushing to `release/p` was refused because the branch changed meanwhile: ! [rejected] HEAD -> release/p (fetch first). Nothing was pushed; " +
