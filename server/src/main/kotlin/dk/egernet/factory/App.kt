@@ -132,8 +132,14 @@ class Services(
     val attachments = dk.egernet.factory.agent.Attachments(cfg, dk.egernet.factory.db.AttachmentStore(db))
     val preferences = dk.egernet.factory.db.PreferenceStore(db, settings)
     val usage = dk.egernet.factory.db.ClaudeUsageStore(db, clock)
+    /**
+     * Per-project settings set by admins: the merge policy and its reviewers, and the base branch (docs/ARCHITECTURE.md
+     * §6 "Merge policy", "Base branch").
+     */
+    val projectSettings = dk.egernet.factory.db.ProjectSettingsStore(db)
+    val projectBranches = ProjectBranches(projectSettings)
     val agents = AgentManager(cfg, sessions, events, access, launcher, bus, mcpRegistry, settings, prompts, workspaces, scope, attachments, preferences, usage,
-        workspaceDefs,
+        workspaceDefs, projectBranches,
         // Deploy tools only for chats, and only when switched on (never in McpRegistry.CHAT_TOOLS, so personal tokens cannot inherit them).
         chatExtraTools = if (cfg.deploy.enabled && deployTransport != null) dk.egernet.factory.deploy.DeployManager.TOOLS else emptySet(),
         chatProjectFiles = { repo -> projectFiles.currentDir(repo) })
@@ -189,12 +195,10 @@ class Services(
             dk.egernet.factory.images.CodexLogins(it, images, scope, clock)
         }
     val releaseStore = dk.egernet.factory.db.ReleaseStore(db)
-    /** Per-project settings set by admins: the merge policy and its reviewers (docs/ARCHITECTURE.md §6 "Merge policy"). */
-    val projectSettings = dk.egernet.factory.db.ProjectSettingsStore(db)
     val modePolicy: dk.egernet.factory.pipeline.ReleaseModePolicy = releaseModePolicy
         ?: dk.egernet.factory.pipeline.ReleaseModePolicy { repo -> projectSettings.get(repo).mergePolicy == MergePolicy.AUTOMATIC }
     val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes, screenshotStore,
-        sessions, events, images, workspaceDefs, releaseStore, projectSettings, clock, sandboxVms, projectFiles)
+        sessions, events, images, workspaceDefs, releaseStore, projectSettings, clock, sandboxVms, projectFiles, projectBranches)
     val screenshots = dk.egernet.factory.agent.Screenshots(cfg, screenshotStore, runs, workspaces, publishRun = { orchestrator.publish(it) })
     val releaseLocks = dk.egernet.factory.pipeline.ReleaseLocks()
     val releaseMerger = dk.egernet.factory.pipeline.ReleaseMerger(

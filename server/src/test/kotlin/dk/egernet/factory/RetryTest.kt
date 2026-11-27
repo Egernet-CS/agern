@@ -181,6 +181,29 @@ class RetryTest {
     }
 
     @Test
+    fun `continuing keeps the continued run's base branch, starting over takes the project's current one`() {
+        val root = world.user("root", admin = true)
+        world.github.branches.getOrPut("demo-app") { mutableSetOf() } += "dev"
+        s.projectSettings.put("demo-app", ProjectSettingsDto(baseBranch = "dev"), root.id)
+        val a = await(start(issue("Keep my base", "unreachable")).id)
+        val b = await(start(issue("Take the new base", "unreachable")).id)
+        assertEquals(RunStatus.FAILED, a.status)
+        assertEquals("dev", a.baseBranch)
+        assertEquals("dev", b.baseBranch)
+        s.projectSettings.put("demo-app", ProjectSettingsDto(), root.id)
+
+        val continued = retry(a.id, RetryMode.CONTINUE)
+        assertEquals("dev", continued.baseBranch)
+        val doneA = await(UUID.fromString(continued.id))
+        assertEquals(RunStatus.MERGED, doneA.status, doneA.error)
+        assertEquals("dev", doneA.baseBranch)
+
+        val over = retry(b.id, RetryMode.START_OVER)
+        assertEquals("main", over.baseBranch)
+        assertEquals(RunStatus.MERGED, await(UUID.fromString(over.id)).status)
+    }
+
+    @Test
     fun `starting over runs from scratch on a new branch and leaves the old branch as it was`() {
         val n = issue("Restart me", "unreachable")
         val failed = await(start(n).id)

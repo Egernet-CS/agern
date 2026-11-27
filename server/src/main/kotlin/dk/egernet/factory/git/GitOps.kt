@@ -52,14 +52,16 @@ data class UnpushedSubmodule(val path: String, val head: String, val commits: In
 
 /**
  * The state of a main checkout relative to `origin/<defaultBranch>` after [GitOps.syncCheckout]
- * (docs/ARCHITECTURE.md §5 "Workspaces"). [branch] is null for a detached HEAD; [head] is the full HEAD sha after the
- * sync. [status] is `current`, `updated` (fast-forwarded from [updatedFrom]) or `behind` (not updated because of
- * [reason]: `other_branch`, `local_changes`, `local_commits` or `update_failed`). [newCommits]: how many commits an
- * update brought in (the `behind` before it); 0 otherwise.
+ * (docs/ARCHITECTURE.md §5 "Workspaces"); [defaultBranch] is the branch the checkout follows (a project's base branch).
+ * [branch] is null for a detached HEAD; [head] is the full HEAD sha after the sync. [status] is `current`, `updated`
+ * (fast-forwarded or switched from [updatedFrom]) or `behind` (not updated because of [reason]: `other_branch`,
+ * `local_changes`, `local_commits` or `update_failed`). [newCommits]: how many commits a fast-forward brought in (the
+ * `behind` before it); 0 otherwise. [switchedFrom]: the branch Agern switched the checkout from to [defaultBranch].
  */
 data class CheckoutState(
     val branch: String?, val defaultBranch: String, val head: String, val behind: Int, val ahead: Int,
     val status: String, val reason: String?, val updatedFrom: String?, val newCommits: Int = 0,
+    val switchedFrom: String? = null,
 )
 
 /**
@@ -204,10 +206,15 @@ interface GitOps {
     /**
      * Brings the main checkout at [mainDir] up to date with `origin/<defaultBranch>` when that is safe: fetches that
      * branch first when [fetch] is set (a failed fetch is ignored), then fast-forwards only when the checkout is on
-     * [defaultBranch], clean and without local commits. Never modifies the checkout otherwise. Null when there is no
-     * clone or no `origin/<defaultBranch>`; throws [IllegalArgumentException] for an invalid branch name.
+     * [defaultBranch], clean and without local commits. With [switchFrom] (the repository's default branch), a checkout
+     * that is still on the branch Agern followed last (git config `agern.followed-branch`, else [switchFrom]), clean and
+     * without commits beyond `origin/<that branch>`, is first switched to [defaultBranch] (a project's base branch).
+     * Never modifies the checkout otherwise. Null when there is no clone or no `origin/<defaultBranch>`; throws
+     * [IllegalArgumentException] for an invalid branch name.
      */
-    fun syncCheckout(id: AgentIdentity?, mainDir: Path, defaultBranch: String, home: Path, fetch: Boolean): CheckoutState? = null
+    fun syncCheckout(
+        id: AgentIdentity?, mainDir: Path, defaultBranch: String, home: Path, fetch: Boolean, switchFrom: String? = null,
+    ): CheckoutState? = null
     /**
      * The submodule pointers [headBranch] adds or moves relative to its merge base with [baseBranch], both as they are
      * on GitHub (fetched first with [githubToken], as in [compareBranches]); removed submodules do not count. Null when
@@ -305,6 +312,8 @@ class CliGitOps(
     private val log = LoggerFactory.getLogger(CliGitOps::class.java)
 
     private companion object {
+        /** Git config key in a main clone: the branch Agern made the checkout follow last ([syncCheckout]). */
+        const val FOLLOWED_KEY = "agern.followed-branch"
         /** The mode of a gitlink (a submodule pointer) in a tree. */
         const val GITLINK_MODE = "160000"
         val SHA_RE = Regex("[0-9a-f]{40}|[0-9a-f]{64}")
@@ -922,12 +931,15 @@ class CliGitOps(
         }
     }
 
-    override fun syncCheckout(id: AgentIdentity?, mainDir: Path, defaultBranch: String, home: Path, fetch: Boolean): CheckoutState? {
+    override fun syncCheckout(
+        id: AgentIdentity?, mainDir: Path, defaultBranch: String, home: Path, fetch: Boolean, switchFrom: String?,
+    ): CheckoutState? {
         require(defaultBranch.isNotBlank() && !defaultBranch.startsWith("-")) { "Invalid branch name" }
+        require(switchFrom == null || (switchFrom.isNotBlank() && !switchFrom.startsWith("-"))) { "Invalid branch name" }
         if (!Files.exists(mainDir.resolve(".git"))) return null
-        val branch = gitStatus(mainDir, home, null, "symbolic-ref", "--quiet", "--short", "HEAD", timeoutSec = 60)
+        var branch = gitStatus(mainDir, home, null, "symbolic-ref", "--quiet", "--short", "HEAD", timeoutSec = 60)
             .let { (code, out) -> if (code == 0) out.trim().takeIf { it.isNotEmpty() } else null }
-        val head = git(mainDir, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim()
+        var head = git(mainDir, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim()
         // Fake GitHub: there is no remote to follow.
         if (localOnly) return CheckoutState(branch, defaultBranch, head, 0, 0, "current", null, null)
 
@@ -937,11 +949,67 @@ class CliGitOps(
                 .onFailure { log.warn("git fetch of {} failed in {}: {}", defaultBranch, mainDir, it.message) }
         }
         if (gitStatus(mainDir, home, null, "rev-parse", "--verify", "--quiet", "$remote^{commit}", timeoutSec = 60).first != 0) return null
+        val headBefore = head
+        val switchedFrom = branch?.takeIf { switchFrom != null && it != defaultBranch && switchToFollowed(id, mainDir, it, defaultBranch, switchFrom, home) }
+        if (switchedFrom != null) {
+            branch = defaultBranch
+            head = git(mainDir, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim()
+        } else if (branch == defaultBranch) {
+            rememberFollowed(mainDir, defaultBranch, home)
+        }
         val counts = git(mainDir, home, null, "rev-list", "--left-right", "--count", "HEAD...$remote", timeoutSec = 60)
             .trim().split(Regex("\\s+"))
         val ahead = counts.getOrNull(0)?.toIntOrNull() ?: throw GitException("git rev-list gave no counts")
         val behind = counts.getOrNull(1)?.toIntOrNull() ?: throw GitException("git rev-list gave no counts")
-        if (behind == 0) return CheckoutState(branch, defaultBranch, head, 0, ahead, "current", null, null)
+        if (behind == 0) {
+            // A switch alone changed the files: reported like an update, from the HEAD before the switch.
+            return if (switchedFrom != null) CheckoutState(branch, defaultBranch, head, 0, ahead, "updated", null, headBefore, switchedFrom = switchedFrom)
+            else CheckoutState(branch, defaultBranch, head, 0, ahead, "current", null, null)
+        }
+        return fastForward(id, mainDir, branch, defaultBranch, remote, head, headBefore, behind, ahead, switchedFrom, home)
+    }
+
+    /**
+     * The checkout at [mainDir] is on [cur], not on [base]: switches it to [base] when [cur] is the branch Agern followed
+     * last (git config `agern.followed-branch`, else [defaultBranch]) and nothing of the user's can be lost (a clean tree,
+     * no commits beyond `origin/<cur>`). Hooks are off. True when it switched; a failure is logged and leaves it as it was.
+     */
+    private fun switchToFollowed(id: AgentIdentity?, mainDir: Path, cur: String, base: String, defaultBranch: String, home: Path): Boolean {
+        val followed = gitStatus(mainDir, home, null, "config", "--get", FOLLOWED_KEY, timeoutSec = 60)
+            .let { (code, out) -> if (code == 0) out.trim().takeIf { it.isNotEmpty() } else null } ?: defaultBranch
+        if (cur != followed) return false
+        if (git(mainDir, home, null, "status", "--porcelain", timeoutSec = 60).isNotBlank()) return false
+        val curRemote = "refs/remotes/origin/$cur"
+        if (gitStatus(mainDir, home, null, "rev-parse", "--verify", "--quiet", "$curRemote^{commit}", timeoutSec = 60).first != 0) return false
+        val unpushed = git(mainDir, home, null, "rev-list", "--count", "$curRemote..HEAD", timeoutSec = 60).trim().toIntOrNull() ?: return false
+        if (unpushed > 0) return false
+        val hasLocal = gitStatus(mainDir, home, null, "rev-parse", "--verify", "--quiet", "refs/heads/$base", timeoutSec = 60).first == 0
+        val args = if (hasLocal) listOf("checkout", "--quiet", base) else listOf("checkout", "--quiet", "-b", base, "--track", "origin/$base")
+        val (code, out) = gitStatus(mainDir, home, null, "-c", "core.hooksPath=/dev/null", *args.toTypedArray(), timeoutSec = 60)
+        if (code != 0) {
+            log.warn("Switching {} from {} to {} failed: {}", mainDir, cur, base, out.takeLast(500).trim())
+            return false
+        }
+        log.info("Switched {} from {} to {}, the branch it follows", mainDir, cur, base)
+        updateSubmodules(id, mainDir, home)?.let { log.warn("Submodules of {} could not be updated: {}", mainDir, it) }
+        rememberFollowed(mainDir, base, home)
+        return true
+    }
+
+    /** Records [branch] as the branch the checkout at [mainDir] follows (git config `agern.followed-branch`). Never throws. */
+    private fun rememberFollowed(mainDir: Path, branch: String, home: Path) {
+        val now = gitStatus(mainDir, home, null, "config", "--get", FOLLOWED_KEY, timeoutSec = 60)
+            .let { (code, out) -> if (code == 0) out.trim() else null }
+        if (now == branch) return
+        val (code, out) = gitStatus(mainDir, home, null, "config", FOLLOWED_KEY, branch, timeoutSec = 60)
+        if (code != 0) log.warn("Recording the followed branch of {} failed: {}", mainDir, out.takeLast(300).trim())
+    }
+
+    /** The fast-forward part of [syncCheckout]: [behind] > 0. */
+    private fun fastForward(
+        id: AgentIdentity?, mainDir: Path, branch: String?, defaultBranch: String, remote: String, head: String, headBefore: String,
+        behind: Int, ahead: Int, switchedFrom: String?, home: Path,
+    ): CheckoutState {
 
         val dirty = git(mainDir, home, null, "status", "--porcelain", timeoutSec = 60).isNotBlank()
         val reason = when {
@@ -950,7 +1018,7 @@ class CliGitOps(
             ahead > 0 -> "local_commits"
             else -> null
         }
-        if (reason != null) return CheckoutState(branch, defaultBranch, head, behind, ahead, "behind", reason, null)
+        if (reason != null) return CheckoutState(branch, defaultBranch, head, behind, ahead, "behind", reason, null, switchedFrom = switchedFrom)
 
         // The only command of the sync that changes the working tree, the index or a local ref; hooks are off.
         val (code, out) = gitStatus(
@@ -958,11 +1026,11 @@ class CliGitOps(
         )
         if (code != 0) {
             log.warn("Fast-forwarding {} in {} failed: {}", defaultBranch, mainDir, out.takeLast(500).trim())
-            return CheckoutState(branch, defaultBranch, head, behind, ahead, "behind", "update_failed", null)
+            return CheckoutState(branch, defaultBranch, head, behind, ahead, "behind", "update_failed", null, switchedFrom = switchedFrom)
         }
         val newHead = git(mainDir, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim()
         updateSubmodules(id, mainDir, home)?.let { log.warn("Submodules of {} could not be updated: {}", mainDir, it) }
-        return CheckoutState(branch, defaultBranch, newHead, 0, 0, "updated", null, head, newCommits = behind)
+        return CheckoutState(branch, defaultBranch, newHead, 0, 0, "updated", null, headBefore, newCommits = behind, switchedFrom = switchedFrom)
     }
 
     /** [worktree]'s path from its last `runs/<uuid>` segments on; its last two segments when there are none. */

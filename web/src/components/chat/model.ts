@@ -245,6 +245,7 @@ export function checkoutOf(v: unknown): CheckoutInfo | undefined {
     status,
     reason: CHECKOUT_REASONS.find((r) => r === v.reason) ?? null,
     updatedFrom: str(v.updatedFrom),
+    switchedFrom: str(v.switchedFrom),
   };
 }
 

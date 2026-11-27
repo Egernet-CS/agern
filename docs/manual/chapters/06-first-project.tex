@@ -63,6 +63,16 @@ On a phone the three panes become tabs at the top: \ui{chat}, \ui{issues} and
 
 \phoneshot{12-project-activity-tab-phone}{The agents \& runs tab on a phone.}{project-phone-agents}
 
+Below the project's name, the header shows its merge policy and its \textbf{base branch}: the
+branch new runs start from, open their pull request against and merge into. By default it is the
+repository's default branch (for example \texttt{main}). A team that works on an integration branch
+such as \texttt{dev} can have an admin choose it with \ui{Change} next to \ui{Base branch}; the
+branch must exist on GitHub. Runs started afterwards use it, and each run shows its base branch in
+its header; runs already in progress keep theirs. GitHub closes an issue by itself only when a pull
+request is merged into the default branch, so for a merge into another base branch Agern closes the
+issue. The chat's checkout follows the base branch too. Releases are still created from and merged
+into the default branch.
+
 \section{Project files}\label{sec:project-files}
 
 Some projects need files that must not be committed, such as a vendor SDK, a licensed library or a

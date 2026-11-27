@@ -80,19 +80,25 @@ data class ProjectDto(
 )
 
 /**
- * Per-project settings set by an admin (docs/ARCHITECTURE.md §6 "Merge policy"): the [MergePolicy] and, used only with
- * [MergePolicy.GITHUB], the GitHub logins and team slugs requested as reviewers on a run's pull request.
+ * Per-project settings set by an admin (docs/ARCHITECTURE.md §6 "Merge policy", "Base branch"): the [MergePolicy] and,
+ * used only with [MergePolicy.GITHUB], the GitHub logins and team slugs requested as reviewers on a run's pull request;
+ * and the [baseBranch] new single runs start from and merge into.
  */
 @Serializable
 data class ProjectSettingsDto(
     val mergePolicy: String = MergePolicy.AUTOMATIC,
     val reviewers: List<String> = emptyList(),
     val teamReviewers: List<String> = emptyList(),
+    /** The base branch of new single runs; null = the repository's default branch. */
+    val baseBranch: String? = null,
 )
 
-/** `PUT /api/projects/{repo}/settings`. Omitted lists are empty lists. */
+/** `PUT /api/projects/{repo}/settings`, a full replacement. Omitted lists are empty lists; an omitted [baseBranch] clears it. */
 @Serializable
-data class ProjectSettingsReq(val mergePolicy: String? = null, val reviewers: List<String>? = null, val teamReviewers: List<String>? = null)
+data class ProjectSettingsReq(
+    val mergePolicy: String? = null, val reviewers: List<String>? = null, val teamReviewers: List<String>? = null,
+    val baseBranch: String? = null,
+)
 
 /** How a project's runs reach the default branch (docs/ARCHITECTURE.md §6 "Merge policy"). */
 object MergePolicy {
@@ -377,7 +383,11 @@ data class RunDto(
     val sandboxVm: RunSandboxVmDto? = null,
     /** The release this run builds an issue for; null for a single run (or when the release was deleted). */
     val releaseId: String? = null,
-    /** The branch the run starts from and merges into; null = the repository's default branch. */
+    /**
+     * The branch the run starts from and merges into: the project's base branch (docs/ARCHITECTURE.md §6 "Base branch"),
+     * a release branch or a member's base. Non-null for runs started since base branches exist; null on an older single
+     * run means the repository's default branch.
+     */
     val baseBranch: String? = null,
     /** The conversation with the run's advisor while it needs a human (docs/ARCHITECTURE.md §6 "Conversation at needs human"). */
     val conversation: RunConversationDto = RunConversationDto(),
