@@ -1919,7 +1919,7 @@ and merging it leaves the issue open.
   line `Remaining:`, each at most 300 characters, at most 20. The text is the agent's: capped, shown as plain text.
 - **When it counts.** After the spec is stored — written by the spec-writer (after the `Blocked on:` check) or reused by
   a `continue` run; never on a step retry — a plan with remaining items makes a single or workspace run partial
-  (`runs.partial`, `runs.delivery` JSONB, `partial_set_by` null; V33), with the `info` event "Partial delivery: this
+  (`runs.partial`, `runs.delivery` JSONB, `partial_set_by` null; V34), with the `info` event "Partial delivery: this
   run covers part of #N (k step(s) remain); the issue stays open after the merge." on the spec-writer's session. A plan
   without remaining items is not partial (`warn` "The spec has a Delivery plan without remaining steps; the run is
   treated as a complete delivery."). A release run stores the plan but is never partial (`warn` "The spec plans a
