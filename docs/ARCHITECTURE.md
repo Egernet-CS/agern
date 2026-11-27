@@ -67,7 +67,7 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_MAX_AGENTS_PER_USER` | `8` | Concurrent agent processes per user |
 | `FACTORY_CHAT_IDLE_MINUTES` | `30` | Idle chat processes are stopped and resumed on next input |
 | `FACTORY_STAGE_TIMEOUT_MINUTES` | `60` | Wall-clock limit for one pipeline stage agent (1–1440). A spec-writer or builder is warned at 80 % of it; on timeout the agent is stopped, the stage is `failed` and the run `failed` with an error that says so (§6 "Time limit") |
-| `FACTORY_MAX_UPDATE_ROUNDS` | `2` | Update rounds ("Update and merge", §6 "Retrying a run") a run may use after its approved merge was refused because its target moved (0–10, whole number; `0` switches the feature off and keeps the old refusal texts). Copied to the run when it is created. Anything else is a startup error |
+| `FACTORY_MAX_UPDATE_ROUNDS` | `2` | Update rounds (§6 "Retrying a run", "Update and merge" and "Keeping runs up to date") a run may use: started by Agern when a single run's target moved (before the approver or at the merge gate), by the owner ("Update and merge", "Update from base branch"), or by a building release (0–10, whole number; `0` switches update rounds off entirely, including the automatic ones, and keeps the old refusal texts). Copied to the run when it is created. Anything else is a startup error |
 | `FACTORY_NETWORK_RETRY_HOURS` | `24` | How long a run or a release start waits for the network (GitHub, the Claude API) before it fails or holds the issue (0–168, whole hours; `0` switches waiting off, §6 "Transient failures"). Anything else is a startup error |
 | `FACTORY_RELEASE_CHECKS_SETTLE_SECONDS` | `120` | How long the head commit of a pull request must have had no checks at all before "no checks" counts as green, for an automatic release (§6 "Checks") and before a run is merged (§6 "Checks before a merge") (0–3600). Measured from when Agern first saw that head commit (for a run: when Agern pushed it, else its first evaluation), persisted across restarts |
 | `FACTORY_RUN_CHECKS_WAIT_MINUTES` | `60` | How long an approved run waits in `waiting_for_checks` for the checks on its pull request's head commit before it goes to `needs_human` (1–1440; §6 "Checks before a merge") |
@@ -440,7 +440,9 @@ decides with the caller's token): the same listing and creation, now regardless 
 `{ created, missing }`; 403 `labels_forbidden` "Your GitHub token cannot create labels in <org>/<repo>: <labels> are
 still missing." when GitHub refused and nothing was created; 409 `not_a_workspace` or `workspace_invalid`. The fake
 GitHub lists the labels its issues carry plus those created, and refuses to create labels in a repository while
-`<dataDir>/fake-github/<repo>/.agern-fake/labels-readonly` exists (for the end-to-end test).
+`<dataDir>/fake-github/<repo>/.agern-fake/labels-readonly` exists (for the end-to-end test). Likewise, while
+`<dataDir>/fake-github/<repo>/.agern-fake/land-merges` exists, a run's merged pull request in that repository also lands
+on the owner's local target branch (§6 "Keeping runs up to date", *Fake-GitHub mode*).
 
 Layout under `workspaces/<user>/<workspace repo>/`:
 
@@ -1030,11 +1032,13 @@ issue → spec-writer (opus) → builder (opus) ─┬→ security  (opus)   ┐
                               │              ├→ ui-design (sonnet) │
                               │              └→ code      (sonnet) ┘
                               └── any CHANGES: resume builder (max 2 rounds)
-                                             all PASS → approver (opus)
+                                             all PASS → target moved? → update round (§6 "Keeping runs up to date")
+                                                      → approver (opus)
                                                           ├ APPROVE  → checks → merge to main
                                                           └ ESCALATE → needs-human ← /factory approve
    merge policy owner_approves: APPROVE and ESCALATE → needs-human ← /factory approve
    merge policy github:         APPROVE and ESCALATE → ready (pull request left open; merged or closed on GitHub)
+   spec "Blocked on: #n" (n open) → failed (blocked) before the builder
 ```
 
 "main" is the repository's default branch for a single run, and `release/<name>` for a release run (§6
@@ -1050,6 +1054,30 @@ reaches the default branch only through the owner's approval of the release (§6
   `## Tests` and `## Out of scope`): the commands the builder runs in the sandbox and on which platforms, and for UI
   changes how the UI reviewers start the app in the review sandbox and what they look at. It reads the sandbox with
   `factory_sandbox_info` but cannot run anything in it, and never asks for a sandbox to be enabled or approved.
+- **Blocked on another issue.** When the issue cannot be built before another open issue of the same repository is
+  done, `spec-writer.md` has the spec start with the line `Blocked on: #<n>` (several: `Blocked on: #<n>, #<m>`; bold
+  allowed), then a short paragraph with the reason. After the spec-writer (not for a reused spec) the orchestrator
+  parses the first non-empty line (`BlockedMarker`, `^\**Blocked on:\**\s*#\d+(\s*,\s*#\d+)*\s*$`, case-insensitive)
+  and reads each named issue (not the run's own) with the owner's token from the run's repository. Any still open: the
+  spec is stored and posted as usual, the run ends `failed` with `failureKind` `blocked` and the error "Blocked on #12
+  (open)[, #15 (open)]: <first paragraph after the marker, at most 500 characters>. Start the run again when the
+  blocking issue is merged."; the builder, reviewer and approver stages are `skipped`; the issue gets the usual failure
+  comment and a release holds the issue as for any failed run. Retry recommends `start_over` with that error as
+  reason. All closed, not found or unreadable: a `warn` event on the spec-writer's transcript ("The spec says it is
+  blocked on #12, which is closed; continuing.") and the pipeline goes on. Starting such a run again automatically
+  when the blocking issue merges is not built.
+- **Other active runs** (a warning, never a block). When a single or release run is created, the other active issue
+  runs of the same project (`RunStatus.ACTIVE`, not sync runs; newest first, at most 10) are stored on it as
+  `Run.overlaps` (`runs.other_runs`): run, issue number and title, owner, status at that moment, and `references` —
+  the new issue's title or body names that issue as a whole token (`(?<![\w/])#<n>\b`), or that run's stored spec
+  names the new issue. After the new run's spec is stored (written or reused), the file paths it names are compared
+  with the stored specs of the listed runs that are still active (`Overlaps.paths`: backticked tokens with a `/`, no
+  whitespace, a file extension, not starting with `http`, `-` or `/api/`; a trailing `:<line>` dropped) and each entry's
+  `files` becomes the intersection (sorted, at most 20); the run is published again and, when any are shared, the
+  spec-writer's transcript gets a `warn` event "Other active runs name the same files: run <id8> (#n): `a`, `b`". Any
+  failure here is logged and ignored. `factory_start_run` and `/factory run` append "Other active runs in this project:
+  #12 <title> (run <id>, <status>, @<owner>)[ — referenced by this issue]; … Their changes may conflict with this one;
+  Agern brings the branch up to date before merging."
 - **builder** implements the spec on the run branch and commits; the build stage owns implementation and
   verification. `builder.md` tells it to start from the spec's Findings (reuse its reproduction commands and
   verified fixes before exploring on its own) and to verify the result itself. The orchestrator pushes the branch
@@ -1094,8 +1122,10 @@ reaches the default branch only through the owner's approval of the release (§6
   `automatic` (the default, §6 "Merge policy") `APPROVE` squash-merges the PR and closes the issue once the checks on
   the pull request's head commit allow it (§6 "Checks before a merge"), unless its database migrations collide with
   the target's (§6 "Database migrations") or GitHub refuses the merge because the branch conflicts with its target or
-  is behind it: then the run goes to `needs_human` instead, and "Update and merge" (§6 "Retrying a run") can bring the
-  branch up to date with the target on the same run. `ESCALATE` labels the issue `needs-human`, comments, and waits
+  is behind it. For a single run Agern then brings the branch up to date itself in an update round (§6 "Keeping runs up
+  to date"); a release run goes to `needs_human` instead, and "Update and merge" (§6 "Retrying a run") can bring the
+  branch up to date with the target on the same run. Before the approver runs, a single run whose target moved gets
+  that update round first. `ESCALATE` labels the issue `needs-human`, comments, and waits
   for the owner's `/factory approve`. Under the other policies the verdict is only a recommendation: `owner_approves`
   always waits in `needs_human`, `github` ends the run `ready` and never merges.
 - **Whose models.** Every agent runs on its owner's Claude account, so model choices are personal. The
@@ -1202,7 +1232,16 @@ Every run merge — the approver's `APPROVE`, the owner's approval (button, `/fa
 and the step retry of a failed merge — goes through one gate (issue #100). Single, release and workspace runs behave
 alike. Decided by these rules alone, never by an agent.
 
-1. The database migration and submodule guards run first (§6 "Database migrations", "Submodule pointers").
+1. The database migration and submodule guards run first (§6 "Database migrations", "Submodule pointers"). One
+   comparison of the run's branch with its target (`GitOps.compareBranches`) serves the migration guard and the
+   freshness check; a comparison that cannot be made is logged and counts as "no problems, not behind".
+   *Freshness* (single runs with `maxUpdateRounds > 0`, §6 "Keeping runs up to date"): migration problems, or a branch
+   that is behind its target (`behind > 0`), start an automatic update round instead of `needs_human` or a merge when
+   automatic updating is allowed; behind, at the limit of update rounds and approved by the approver agent:
+   `needs_human` ("Not merged: `<target>` moved on again (<n> new commit(s)) and the limit of <max> update round(s) is
+   reached, so the merged result was not built and reviewed. Approve to merge pull request <ref> as it is, or build the
+   issue again from the current `<target>`.", `merge_conflict`, `merge`); behind and approved by a person: merged as
+   today (their decision). Release and sync runs skip the freshness check.
 2. The pull request is read. Not open on GitHub (merged or closed there) or not found: `needs_human`, `failedStep`
    `merge`, "Pull request <ref> is no longer open on GitHub (<merged|closed>), so Agern did not merge it."
 3. The checks on its current **head commit** are evaluated with the rules of releases (§6 "Releasing", "Checks"):
@@ -1214,7 +1253,9 @@ alike. Decided by these rules alone, never by an agent.
 4. By state:
    - **`passed` or `none`**: squash-merged with the merge API's expected `sha` set to the evaluated commit. GitHub's
      409 (the head moved meanwhile) evaluates the new head (step 2) instead; a merge never happens for another commit
-     than the one whose checks were evaluated. Other merge failures: `needs_human` with `failedStep` `merge`, as before.
+     than the one whose checks were evaluated. Other merge failures: `needs_human` with `failedStep` `merge`, as before —
+     except a refusal for a conflict with the target (`merge_conflict`) of a single run whose automatic updating is
+     allowed, which starts an update round instead.
    - **`pending` or `awaiting`**: the run goes to `waiting_for_checks` (error cleared) and a job (cancelled by "Cancel
      run") evaluates again from step 1 every 30 s, on the pull request's then-current head: a new head gets a fresh
      settle period and fresh checks. Nobody approves again; it merges as soon as they pass. The run is published when
@@ -1303,7 +1344,7 @@ A run can be retried in four ways (issues #53 and #120), depending on where it s
 - **Start over** (`start_over`): a new run from scratch, as before this feature; the old branch, pull request and
   local branch are left as they are (§6 "Worktrees and branches").
 
-*Update and merge* (issue #120, the merge-time part of #35). *Available* (`RunRecord.updateAvailable`, also
+*Update and merge* (issue #120; started automatically for single runs since #35, see "Keeping runs up to date" below). *Available* (`RunRecord.updateAvailable`, also
 `updateAvailable` on `Run` and on a release issue) when the run is `needs_human`, its `failureKind` is
 `migration_conflict` or `merge_conflict`, it has a branch and a pull request, and `updateRounds < maxUpdateRounds`.
 `merge_conflict` is recorded when a squash merge fails with GitHub 405 or 409 and the pull request then reads as open
@@ -1354,10 +1395,75 @@ either ' "Update and merge" can try again (k round(s) left), or resolve it on th
 again.' or " The limit of max update round(s) is reached: …, or build the issue again from the current `<target>`
 (in a release: Retry)." A cancel ends the row `cancelled`; a restart fails the run (`restart`) and its `running` row
 ("Interrupted by a server restart"); the existing `continue` retry then applies. *Shown*: `Run.updates` (number, round,
-limit, trigger `owner`/`release`, target, reason, status, merge status, target commit, incoming subjects, conflicts,
-migration problems, the builder's commits, error, times, and a server-composed `summary` line), the run page's
-"Updates" section and "update N" rounds, and the release issue's `updateSummary`. Texts from the repository are data:
-delimited in the prompt, sanitised and capped in comments, plain text in the web UI.
+limit, trigger `owner`/`release`/`base_moved`, target, reason, status, merge status, target commit, incoming subjects,
+the pull requests merged in, conflicts, migration problems, the builder's commits, error, times, and a server-composed
+`summary` line, "(automatic)" for `release` and `base_moved`), the run page's "Updates" section and "update N" rounds,
+and the release issue's `updateSummary`. Texts from the repository are data: delimited in the prompt, sanitised and
+capped in comments, plain text in the web UI.
+
+*Merged pull requests.* In every update round the pull requests that came in are derived from the incoming
+first-parent subjects (`IncomingPulls`: a trailing `(#<n>)` or `Merge pull request #<n> `; distinct, at most 10), each
+read with the owner's token from the run's pull request repository (title, description, URL; a failed read keeps the
+number with the subject as title). They are stored on the row (`run_updates.pulls`, `RunUpdate.pulls`), named in the
+failure text ("Merged into `<target>` meanwhile: #12 <title>, …", at most 5), and given to the builder after
+`<merged_commits>` in a `<merged_pull_requests>` block with the first 1500 characters of each description, introduced
+as data ("Your change must keep working together with them"). The update prompt also says "Never resolve a conflict by
+dropping the other side's change. If one side really must give way, say so explicitly in your final summary."; the
+builder's summary is the stage summary and `builderSummary`.
+
+#### Keeping runs up to date
+
+Issue #35: a run must not get stuck, or merge an untested result, because its target moved while it worked. Terms:
+*target* = the run's base branch, else the repository's default branch; *single run* = no release, not a sync run;
+*behind* = the branch comparison reports target commits the pushed branch lacks.
+
+*Automatic updating is allowed* for a single run whose merge policy is not `github`, with `maxUpdateRounds > 0` and
+`updateRounds < maxUpdateRounds`, a branch, a pull request, its worktree, and an owner with a Claude credential.
+
+- **Before the approver.** After the review loop ended with every reviewer `PASS`, the pushed branch is compared with
+  the target. Behind and allowed: an update round (trigger `base_moved`, reason "`<target>` moved on (<n> new
+  commit(s)) before the approver ran") starts on the same run instead of the approver; the still-pending approver stage
+  moves to the round, so the round has one approver. Not behind (or not allowed): the approver runs as before.
+- **At the merge gate** (§6 "Checks before a merge", step 1 and the merge refusal): migration problems, a branch that
+  is behind ("… before the merge"), or GitHub's refusal for a conflict start an update round (trigger `base_moved`,
+  reason the first line of the refusal) when allowed. This covers every caller of the gate: the pipeline's merge, the
+  update round's own merge, the owner's Approve (button, `/factory approve`, `factory_approve_run`, then answered in
+  `building`), the step retry of a failed merge and the `waiting_for_checks` poll (also after a restart). "Merge
+  anyway" is unchanged.
+- **The round** is the update round of "Update and merge" above, with these differences: it starts from `reviewing`,
+  `approving` or `waiting_for_checks` (one conditional SQL update that also counts the round); the issue gets
+  "**Agern:** `<target>` moved on; updating run `<id>` with it (update round n of max, automatic). <reason>"; the
+  builder's prompt opens by cause ("… was built and reviewed, but `<target>` moved on meanwhile; bring the change up to
+  date before it is approved and merged." before the approver, today's text at the gate, "The run owner asked to bring
+  the branch up to date with `<target>`." on demand) and names the refusal only when there was one; a clean merge
+  still resumes the builder to build and test the merged result. All four reviewers always run again. Its approver
+  decides by the merge policy (`automatic`: `APPROVE` merges, `owner_approves`: `needs_human` with the recommendation,
+  `github`: `ready`). When its merge gate finds the target moved again, the next round starts while rounds remain; one
+  driver loops over the rounds of a job, so the job's clean-up and a release's callback happen once.
+- **Failure** of an automatic round never fails the run: as above (worktree restored when nothing was pushed, row
+  `failed`, `needs_human`), and with nothing pushed the run gets `merge_conflict` + `merge` (or `migration_conflict`
+  without a step when migration problems were found), so "Update and merge" is offered while rounds remain.
+- **On demand: "Update from base branch"** (`POST /api/runs/{id}/update`, owner only; `Run.updateOnDemand`): a single
+  run at `needs_human` (any merge policy, any failure) or `ready` under policy `github`, with a branch, a pull request
+  and rounds left. A run whose merge was refused for a conflict gets exactly "Update and merge"; otherwise the round has
+  trigger `owner` and the on-demand prompt. 409 `base_not_moved` ("Branch `<branch>` already contains `<target>`;
+  nothing to update.") when the comparison says not behind (no round is used; a comparison that cannot be made goes
+  ahead). A `ready` run is re-activated first (409 `active_run_exists` when the issue has another active run, 409
+  `pull_request_closed` when its pull request is no longer open) and its worktree re-created on its own branch; the
+  round ends by policy (`ready` again under `github`; a failed round leaves it at `needs_human`, which the follower
+  still ends when the pull request is merged or closed on GitHub).
+- **Release and sync runs** keep the behaviour above unchanged (no check before the approver, `needs_human` at the gate,
+  the release's one automatic round with trigger `release`); so does a run with `maxUpdateRounds == 0`. Under policy
+  `github` nothing updates by itself; "Update from base branch" is the only way.
+- **History.** Only merge commits are added to the run's branch (`git merge`, pushed as a fast-forward); no rebase,
+  reset of pushed commits or force push anywhere. The only reset stays the restore of a round that pushed nothing.
+- **Fake-GitHub mode** (development and e2e only). The fake GitHub merges in memory, so local base branches never move.
+  While `<dataDir>/fake-github/<repo>/.agern-fake/land-merges` exists (read only when `FACTORY_DEV_FAKE_GITHUB` is
+  set), a run's merged pull request is also applied to the owner's local target branch as one squash commit titled like
+  the pull request (`GitOps.landSquash`, under the clone lock, before the run's worktree and local branch are removed):
+  a clean checked-out target follows the new commit, a dirty one is not touched; a conflict or git failure is logged and
+  never fails the merge. The `fake-claude` builder, in an update round with a merge in progress, keeps both sides of
+  every conflicted file and concludes the merge; without one it makes no commit.
 
 *Recommendation.* The options endpoint answers each mode with `available` and a one-line `detail`, plus the
 `recommended` mode and a one-line `reason`. Options are listed in the order `update`, `step`, `continue`,
@@ -1712,6 +1818,10 @@ policy is the workspace repository's, never a member's.
 | `owner_approves` | always `needs_human` | only the run owner's approval |
 | `github` | `ready` (terminal) | never Agern: the team, on GitHub |
 
+Keeping the branch up to date (§6 "Keeping runs up to date") follows the policy: under `automatic` and
+`owner_approves` Agern starts update rounds by itself when the target moved; under `github` only on demand ("Update
+from base branch" on the `ready` or `needs_human` run), and an approved round ends `ready` again.
+
 - **Snapshot.** `Orchestrator.create` stores the policy in force on the run (`runs.merge_policy`, `Run.mergePolicy`);
   it never changes afterwards (also not for a step retry). A new run created by a retry takes the project's current
   policy; a release run always stores `automatic` (releases below); runs from before the setting are `automatic`.
@@ -2055,6 +2165,10 @@ A release set to **automatic** is merged the same way without the approval, once
 checks are green ("Release mode" below). Delivered in steps (issue #13): planning (#17), starting and building
 (#19), scheduled starts (#21, "Scheduled start" below), the release pull request, approval and merge (#20), and the
 release mode (#41). Single runs are unaffected and still merge into the default branch.
+
+Release runs keep the update behaviour of #120 unchanged (§6 "Keeping runs up to date"): they merge one at a time into
+their release branch, get no freshness check before the approver or at the gate, and the release starts at most one
+automatic update round per run (trigger `release`).
 
 - **Model.** Tables `releases` (`id`, `repo`, `name`, `description`, `status`, `created_by`, timestamps; once
   started also `owner_id`, `branch`, `started_at`, `ended_at`, and while paused `pause_reason`, `pause_note`,
@@ -2862,9 +2976,14 @@ Tools: `factory_list_issues`, `factory_get_issue`, `factory_create_issue`, `fact
 do this. The merge waits for the checks on the pull request's head commit: passed checks merge at once, pending ones
 leave the run waiting_for_checks until they pass, failed ones leave it in needs_human.") takes `runId` and an
 optional boolean `update`: `true` starts "Update and merge" exactly as `/factory approve <runId> update` (§6 "Retrying
-a run"); without it the run is merged as it is, and the answer ends with "Update and merge is available: /factory
-approve <id> update" when the run can be updated. No tool and no argument merges despite the checks (§6 "Checks
-before a merge"). `factory_approve_run` and `factory_approve_release` are both refused (tool error with the
+a run"); without it the run goes through the merge gate, and the answer ends with "Update and merge is available:
+/factory approve <id> update" when the run can be updated. When the gate starts an update round for a single run whose
+target moved (§6 "Keeping runs up to date") the answer is "Run <id>: `<target>` moved on, so Agern is updating the branch
+first (update round k of max). It merges by itself when the reviewers and the approver pass it." (`owner_approves`:
+"It will wait for your approval again when the update is reviewed."); `/factory approve` answers the same.
+`factory_start_run` (and `/factory run`) appends the sentence about other active runs in the project when there are
+any (§6, "Other active runs"). No tool and no argument merges despite the checks (§6 "Checks before a merge"); "Update
+from base branch" has no tool or chat command (web and HTTP API only). `factory_approve_run` and `factory_approve_release` are both refused (tool error with the
 `merge_on_github` message) for a project that merges on GitHub (§6 "Merge policy"). Pipeline-stage agents get only `factory_get_issue`
 and `factory_request_software`; with sandboxes switched on (`FACTORY_SANDBOX` not `off`) the builder also
 gets `factory_sandbox_info`, `factory_sandbox_exec` and `factory_sandbox_wait`, the spec-writer `factory_sandbox_info`
@@ -3209,7 +3328,27 @@ type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; 
   warnings: { round: number; roles: StageRole[]; text: string }[];  // the stages' warnings per round, oldest first
   checks: RunChecks | null;  // the checks last evaluated before a merge (§6 "Checks before a merge"); null until then
   kind: 'issue' | 'sync';         // sync: brings a release up to date; issueNumber 0, no issue (§6 "Releasing")
-  syncPushedSha: string | null };  // a sync run: the commit it last pushed to its release branch
+  syncPushedSha: string | null;    // a sync run: the commit it last pushed to its release branch
+  updateRounds: number; maxUpdateRounds: number;  // update rounds started, and the run's limit (§6 "Retrying a run")
+  updateAvailable: boolean;        // "Update and merge" can start now
+  updateOnDemand: boolean;         // "Update from base branch" can start now (§6 "Keeping runs up to date")
+  updates: RunUpdate[];            // the run's update rounds, oldest first
+  overlaps: RunOverlap[] };        // other active runs of the project when it started (a warning; §6 "Other active runs")
+
+type RunUpdate = { number: number; round: number; maxRounds: number;
+  trigger: 'owner' | 'release' | 'base_moved';  // release, base_moved: automatic
+  target: string; reason: string | null;
+  status: 'running' | 'resolved' | 'failed' | 'cancelled';
+  mergeStatus: 'up_to_date' | 'merged' | 'conflict' | null; targetSha: string | null;
+  incomingCount: number; incoming: string[];     // first-parent subjects that came in (at most 50)
+  pulls: { number: number; title: string; url: string | null }[];  // pull requests merged in (at most 10); url only https
+  conflicts: string[]; migrations: string[]; commits: string[];  // untrusted repository text
+  error: string | null; startedAt: string; endedAt: string | null; summary: string };
+
+type RunOverlap = { runId: string; issueNumber: number; issueTitle: string; owner: string;
+  status: Run['status'];           // at the moment this run started
+  references: boolean;             // this issue names that issue, or that run's spec names this issue
+  files: string[] };               // paths both specs name (after this run's spec; at most 20)
 
 type RunChecks = { state: 'awaiting' | 'pending' | 'passed' | 'failed' | 'none' | 'unknown';
   sha: string; detail: string;                // the head commit they were read for; e.g. "Failed: build, lint"
@@ -3534,7 +3673,8 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `GET /api/runs?active=true&status=<s>` | → `Run[]` | across visible repos, newest first (max 200). `active=true`: not finished, i.e. `queued`, `spec`, `building`, `reviewing`, `approving`, `waiting_for_checks` or `needs_human`. `status`: only these statuses, repeatable and/or comma list (`?status=needs_human`); unknown status → 400. Both given: both apply |
 | `GET /api/runs/{id}` | → `Run` | |
 | `GET /api/runs/{id}/screenshots/{sid}` | → image bytes | anyone who may see the run (404 otherwise, and for a screenshot of another run). Served with the sniffed type, `nosniff`, a sandboxing CSP, `Cross-Origin-Resource-Policy: same-origin`, `Cache-Control: private, max-age=31536000, immutable` and `Content-Disposition: inline` (`screenshot-<role>-<id8>.<ext>`). There is no upload or delete route |
-| `POST /api/runs/{id}/approve` | → `Run` | owner only, only in `needs_human`; 409 `merge_on_github` for a run of merge policy `github`, whatever its status (after 404 and 403; §6 "Merge policy"); 409 `review_in_progress`, `agent_busy`, `review_required` (§6 "Conversation at needs human"); evaluates the checks on the pull request's head first and answers the run merged, `needs_human` or `waiting_for_checks` (§6 "Checks before a merge") |
+| `POST /api/runs/{id}/approve` | → `Run` | owner only, only in `needs_human`; 409 `merge_on_github` for a run of merge policy `github`, whatever its status (after 404 and 403; §6 "Merge policy"); 409 `review_in_progress`, `agent_busy`, `review_required` (§6 "Conversation at needs human"); evaluates the checks on the pull request's head first and answers the run merged, `needs_human` or `waiting_for_checks` (§6 "Checks before a merge"); a single run whose branch is behind its target, has a migration clash or is refused for a conflict, with update rounds left, is answered `building` with an automatic update round running (§6 "Keeping runs up to date") |
+| `POST /api/runs/{id}/update` | → `Run` | "Update from base branch" (§6 "Keeping runs up to date"): owner only (403 for everyone else, admins included; 404 when not visible); 422 `claude_credential_required`; 409 `update_unavailable` (not `needs_human`, or `ready` under policy `github`; a release or sync run; limit reached; switched off; no pull request), `base_not_moved` (no round used), `review_in_progress`, `agent_busy`, `run_worktree_missing`, `active_run_exists` and `pull_request_closed` (a `ready` run); answers the same run, now `building` |
 | `POST /api/runs/{id}/merge-anyway` | `{ headSha }` → `Run` | owner only (403); 409 `merge_on_github` for a run of merge policy `github`; merges although the checks on `headSha` have not passed, bound to that commit; 409 `run_not_overridable` (not `needs_human`/`waiting_for_checks`, no pull request, or checks not blocking), `checks_changed` (`headSha` is not the recorded checks' commit), and from `needs_human` `review_required` / `review_in_progress` / `agent_busy`; web only, no MCP tool or chat command (§6 "Checks before a merge") |
 | `POST /api/runs/{id}/conversation` | `{ text }` → 202 `{ status: 'accepted', sessionId }` | owner only (403 for everyone else, admins too), only in `needs_human` (409 `run_not_waiting`). Talks to the run's advisor; the first message creates its session. 400 blank / too long, 409 `review_in_progress`, 409 `agent_busy`, 422 `claude_credential_required`, 409 `too_many_agents`, 409 `run_worktree_missing` |
 | `POST /api/runs/{id}/review` | → `Run` | "Review again": owner only (403 admins too), only in `needs_human`; starts a follow-up review of changes from the conversation. 409 `review_in_progress`, `agent_busy`, `nothing_to_review` (no conversation, or nothing changed since the last completed review); 422 `claude_credential_required` |
@@ -4336,6 +4476,22 @@ approver's reason when it escalated, and what merging does; errors (`checks_chan
 the page's `form-error` alert. After an overridden merge a muted line reads "Merged by <user> despite checks: <detail>".
 The diagram's merge node is `running` "waiting for checks", `failed` "checks not passed", or noted "despite checks";
 outcome nodes add their sub and note to their accessible label. The status pill reads "waiting for checks".
+
+**Keeping runs up to date** (§6 "Keeping runs up to date"). For the owner of a single run at `needs_human` (or `ready`
+under policy `github`) with `updateOnDemand` and without `updateAvailable`, the header shows a secondary button
+"Update from base branch" after Approve (in tab order), with the hint "Update from base branch: Agern merges `<target>`
+into the branch, the builder resolves conflicts and re-runs the tests, and the reviewers and the approver run again
+(update round k of max)." plus, by policy, "If they approve, the pull request is merged." / "Then it waits for your
+approval." / "The pull request stays open for GitHub."; it is disabled with the same hints as "Update and merge"
+(`aria-describedby`), says "Updating…" while the request runs, and errors (e.g. `base_not_moved`) appear in the page's
+error line. While the run is active and `overlaps` is not empty, a `notice` (role `note`, label "Other active runs")
+says "Other runs were active in this project when this run started:" with one item per run (`#n title` linking to that
+run, its status at start, owner, "referenced by this issue", "same files: `a`, `b`") and "A warning only — Agern brings
+the branch up to date before merging." The "Updates" section shows per round "Update round n of max · automatic"
+(`release`, `base_moved`), the reason line, "Pull requests merged into `<target>`" (`#n title`, a link only for
+`https://` URLs), and, when files conflicted, "The builder resolved the conflicts in k file(s)." (resolved) or "The
+conflicts were not resolved." (failed). Repository texts are plain text. The mock implements `updateRun`, shows a merged
+run with a resolved `base_moved` round and an active run with `overlaps`.
 
 **Retrying a run** (§6 "Retrying a run"). The run page of a `failed` or `cancelled` run shows the owner a "Retry…"
 button; "Retry #n" on the release page opens the same dialog ("Retry run <short id>?" / "Retry #n?"). It loads the
