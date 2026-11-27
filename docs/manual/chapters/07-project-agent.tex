@@ -57,10 +57,26 @@ run turns it into a full specification (chapter~\ref{ch:run}).
 
 \screenshot[0.85\linewidth]{23-new-issue-desktop}{Creating an issue by hand.}{new-issue}
 
+\section{Context and compaction}\label{sec:compaction}
+
+The agent remembers the conversation in its \emph{context}, which has a limit. The chat's footer
+shows how full it is, for example \ui{context 312k / 1M \textperiodcentered{} 31\%}. From 80\,\% it turns amber and
+reads \ui{nearly full}.
+
+Near the limit the agent compacts the conversation automatically: it replaces the earlier messages
+with a summary and carries on. The chat marks the spot with a divider such as
+\ui{Conversation compacted here (auto) --- 850k $\rightarrow$ 85k tokens}. The messages above it stay readable
+but are dimmed, because the agent no longer sees them word for word.
+
+You can compact earlier yourself, when the agent is not working: choose \ui{Compact} in the footer,
+or type \cmd{/compact} followed by what the summary must keep, for example
+\cmd{/compact keep the deployment decisions}.
+
 \section{Factory commands}\label{sec:factory-commands}
 
-The chat also understands a few commands that act directly, without asking the model. Type
-\cmd{/} at the start of the prompt to see them (figure~\ref{fig:autocomplete}):
+The chat also understands a few commands. The \cmd{/factory} commands act directly, without asking
+the model; \cmd{/compact} is passed to the agent's Claude Code. Type \cmd{/} at the start of the
+prompt to see them (figure~\ref{fig:autocomplete}):
 
 \begin{center}
 \begin{tabular}{@{}ll@{}}
@@ -73,6 +89,7 @@ The chat also understands a few commands that act directly, without asking the m
   \cmd{/factory approve [runId] update} & Update and merge a run whose merge was refused\\
   \cmd{/factory cancel <runId>} & Cancel a run\\
   \cmd{/factory help} & Show factory commands\\
+  \cmd{/compact [what to keep]} & Summarise the conversation to free up context\\
   \bottomrule
 \end{tabular}
 \end{center}
