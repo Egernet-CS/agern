@@ -422,6 +422,8 @@ data class RunRecord(
     /** Update rounds started on the run, and its limit ("Update and merge", docs/ARCHITECTURE.md §6 "Retrying a run"). */
     val updateRounds: Int = 0,
     val maxUpdateRounds: Int = 0,
+    /** JSON list of [dk.egernet.factory.RunOverlapDto]: other active runs of the project when the run started. */
+    val overlapsJson: String? = null,
 ) {
     val isSync: Boolean get() = kind == dk.egernet.factory.RunKind.SYNC
 
@@ -435,7 +437,29 @@ data class RunRecord(
 
     /** Whether the owner can start an update round now ([updatable]). */
     val updateAvailable: Boolean get() = updatable(status, failureKind, branch, prNumber, updateRounds, maxUpdateRounds)
+
+    /** Whether the owner can bring the branch up to date now, "Update from base branch" ([updatableOnDemand]). */
+    val updateOnDemand: Boolean get() =
+        updatableOnDemand(status, releaseId, kind, mergePolicy, branch, prNumber, updateRounds, maxUpdateRounds)
+
+    /** [overlapsJson] decoded; empty when there is none (or it cannot be read). */
+    val overlaps: List<dk.egernet.factory.RunOverlapDto>
+        get() = overlapsJson?.let { runCatching { AppJson.decodeFromString(overlapListSer, it) }.getOrNull() }.orEmpty()
 }
+
+internal val overlapListSer = ListSerializer(dk.egernet.factory.RunOverlapDto.serializer())
+internal val updatePullListSer = ListSerializer(dk.egernet.factory.RunUpdatePullDto.serializer())
+
+/**
+ * The rule for "Update from base branch" (docs/ARCHITECTURE.md §6 "Retrying a run"): a single run (no release, not a
+ * sync run) that needs a human (any merge policy, any failure), or is `ready` under policy `github`; with a branch, a
+ * pull request and update rounds left.
+ */
+fun updatableOnDemand(
+    status: String?, releaseId: UUID?, kind: String, mergePolicy: String, branch: String?, prNumber: Int?, updateRounds: Int, maxUpdateRounds: Int,
+): Boolean = releaseId == null && kind == dk.egernet.factory.RunKind.ISSUE &&
+    (status == RunStatus.NEEDS_HUMAN || (status == RunStatus.READY && mergePolicy == dk.egernet.factory.MergePolicy.GITHUB)) &&
+    branch != null && prNumber != null && updateRounds < maxUpdateRounds
 
 /**
  * The one rule for "Update and merge": a run that needs a human because its merge was refused for a conflict with its
@@ -451,6 +475,7 @@ data class RunUpdateRecord(
     val reason: String?, val status: String, val mergeStatus: String?, val targetSha: String?, val headBefore: String?,
     val headAfter: String?, val incomingCount: Int, val incoming: List<String>, val conflicts: List<String>,
     val migrations: List<String>, val commits: List<String>, val error: String?, val startedAt: Instant, val endedAt: Instant?,
+    val pulls: List<dk.egernet.factory.RunUpdatePullDto> = emptyList(),
 ) {
     /** E.g. "Update round 1 of 2 (automatic): merged `release/1.0` (3 commits); 2 conflicted files; builder added 1 commit — resolved". */
     val summary: String get() {
@@ -463,18 +488,24 @@ data class RunUpdateRecord(
         if (conflicts.isNotEmpty()) parts += n(conflicts.size, "conflicted file")
         if (migrations.isNotEmpty()) parts += n(migrations.size, "migration problem")
         if (commits.isNotEmpty()) parts += "builder added ${n(commits.size, "commit")}"
-        val head = "Update round $number of $maxRounds" + if (trigger == UpdateTrigger.RELEASE) " (automatic)" else ""
+        val head = "Update round $number of $maxRounds" + if (trigger in UpdateTrigger.AUTOMATIC) " (automatic)" else ""
         return head + (if (parts.isEmpty()) "" else ": " + parts.joinToString("; ")) + " — $status"
     }
 
     fun toDto() = dk.egernet.factory.RunUpdateDto(
         number, round, maxRounds, trigger, target, reason, status, mergeStatus, targetSha, incomingCount, incoming, conflicts,
-        migrations, commits, error, startedAt.iso(), endedAt?.iso(), summary,
+        migrations, commits, error, startedAt.iso(), endedAt?.iso(), summary, pulls,
     )
 }
 
 /** [RunUpdateRecord.trigger]. */
-object UpdateTrigger { const val OWNER = "owner"; const val RELEASE = "release" }
+object UpdateTrigger {
+    const val OWNER = "owner"; const val RELEASE = "release"
+    /** Started by Agern because the run's target moved (docs/ARCHITECTURE.md §6 "Retrying a run", "Update and merge"). */
+    const val BASE_MOVED = "base_moved"
+    /** The triggers of rounds no person started. */
+    val AUTOMATIC = setOf(RELEASE, BASE_MOVED)
+}
 
 /** [RunUpdateRecord.mergeStatus]. */
 object UpdateMerge { const val UP_TO_DATE = "up_to_date"; const val MERGED = "merged"; const val CONFLICT = "conflict" }
@@ -498,11 +529,12 @@ internal fun mapRunUpdate(rs: ResultSet) = RunUpdateRecord(
     rs.getString("head_before"), rs.getString("head_after"), rs.getInt("incoming_count"), rs.stringList("incoming_text"),
     rs.stringList("conflicts_text"), rs.stringList("migrations_text"), rs.stringList("commits_text"), rs.getString("error"),
     rs.instant("started_at"), rs.instantOrNull("ended_at"),
+    rs.getString("pulls_text")?.let { runCatching { AppJson.decodeFromString(updatePullListSer, it) }.getOrNull() }.orEmpty(),
 )
 
 /** The columns of `run_updates u` for [mapRunUpdate] (JSON lists as text). */
 internal const val RUN_UPDATE_COLUMNS = "u.*, u.incoming::text AS incoming_text, u.conflicts::text AS conflicts_text, " +
-    "u.migrations::text AS migrations_text, u.commits::text AS commits_text"
+    "u.migrations::text AS migrations_text, u.commits::text AS commits_text, u.pulls::text AS pulls_text"
 
 /** A run's network wait (docs/ARCHITECTURE.md §6 "Transient failures"): see [dk.egernet.factory.RunWaitDto]. */
 data class RunWait(val reason: String, val since: Instant, val nextAt: Instant, val attempts: Int, val detail: String)
@@ -529,7 +561,7 @@ class RunStore(private val db: Db) {
     private val screenshots = ScreenshotStore(db)
     private val images = ImageStore(db)
     private val findingsSer = ListSerializer(FindingDto.serializer())
-    private val select = """SELECT r.*, u.username AS owner_username, u.display_name AS owner_display_name
+    private val select = """SELECT r.*, r.other_runs::text AS other_runs_text, u.username AS owner_username, u.display_name AS owner_display_name
         FROM runs r JOIN users u ON u.id = r.owner_id"""
 
     private fun map(rs: ResultSet) = RunRecord(
@@ -545,7 +577,7 @@ class RunStore(private val db: Db) {
         rs.getString("merge_policy"), rs.getBoolean("merged_on_github"), rs.getString("merged_by"),
         rs.getString("checks"), rs.instantOrNull("checks_waiting_since"), rs.instantOrNull("checks_deadline"),
         rs.getString("merge_approved_by"), rs.runWait(), rs.getString("kind"), rs.getString("sync_pushed_sha"),
-        rs.getString("sandbox_vm"), rs.getInt("update_rounds"), rs.getInt("max_update_rounds"),
+        rs.getString("sandbox_vm"), rs.getInt("update_rounds"), rs.getInt("max_update_rounds"), rs.getString("other_runs_text"),
     )
 
     private fun mapStage(rs: ResultSet) = StageRecord(
@@ -622,7 +654,7 @@ class RunStore(private val db: Db) {
     fun latestSyncs(releaseIds: Collection<UUID>): Map<UUID, RunRecord> {
         if (releaseIds.isEmpty()) return emptyMap()
         return db.query(
-            "SELECT DISTINCT ON (r.release_id) r.*, u.username AS owner_username, u.display_name AS owner_display_name " +
+            "SELECT DISTINCT ON (r.release_id) r.*, r.other_runs::text AS other_runs_text, u.username AS owner_username, u.display_name AS owner_display_name " +
                 "FROM runs r JOIN users u ON u.id = r.owner_id WHERE r.kind = 'sync' AND r.release_id IN (" +
                 releaseIds.joinToString(",") { "?" } + ") ORDER BY r.release_id, r.created_at DESC",
             *releaseIds.toTypedArray(), map = ::map,
@@ -660,13 +692,66 @@ class RunStore(private val db: Db) {
      * `building` in round [round], with one more update round counted and its error and failure cleared. One
      * conditional update, so of two concurrent starts only one wins (false for the other).
      */
-    fun startUpdate(id: UUID, round: Int): Boolean = db.update(
-        """UPDATE runs SET status = 'building', round = ?, update_rounds = update_rounds + 1, error = NULL, failure_kind = NULL,
-             failed_step = NULL, updated_at = now()
-           WHERE id = ? AND status = 'needs_human' AND failure_kind IN ('migration_conflict', 'merge_conflict')
-             AND branch IS NOT NULL AND pr_number IS NOT NULL AND update_rounds < max_update_rounds""",
-        round, id,
-    ) == 1
+    fun startUpdate(
+        id: UUID, round: Int, from: Set<String> = setOf(RunStatus.NEEDS_HUMAN), updatableKindRequired: Boolean = true,
+    ): Boolean {
+        require(from.isNotEmpty())
+        val kind = if (updatableKindRequired) " AND failure_kind IN ('migration_conflict', 'merge_conflict')" else ""
+        return db.update(
+            """UPDATE runs SET status = 'building', round = ?, update_rounds = update_rounds + 1, error = NULL, failure_kind = NULL,
+                 failed_step = NULL, updated_at = now()
+               WHERE id = ? AND status IN (${from.joinToString(",") { "?" }})$kind
+                 AND branch IS NOT NULL AND pr_number IS NOT NULL AND update_rounds < max_update_rounds""",
+            round, id, *from.toTypedArray(),
+        ) == 1
+    }
+
+    /** Why [startReadyUpdate] did not start the round. */
+    enum class ReadyUpdateRefusal { ACTIVE_RUN_EXISTS, NOT_AVAILABLE }
+
+    /**
+     * "Update from base branch" on a `ready` run of policy `github`: the run becomes `building` again in round [round],
+     * with one more update round counted and its end time cleared. Refused when the issue has another active run (checked
+     * under the same lock as [createIfNoActive] and [reactivate]) or the run is not such a run any more. Null when started.
+     */
+    fun startReadyUpdate(id: UUID, round: Int): ReadyUpdateRefusal? = db.tx { c ->
+        val run = get(id) ?: return@tx ReadyUpdateRefusal.NOT_AVAILABLE
+        c.prepare("SELECT pg_advisory_xact_lock(hashtext(?))", arrayOf<Any?>("${run.repo}#${run.issueNumber}")).use { it.executeQuery().close() }
+        val active = c.prepare(
+            "SELECT count(*) FROM runs WHERE repo = ? AND issue_number = ? AND id <> ? AND kind = 'issue' AND status IN ('queued','spec','building','reviewing','approving','waiting_for_checks','needs_human')",
+            arrayOf<Any?>(run.repo, run.issueNumber, id),
+        ).use { ps -> ps.executeQuery().use { rs -> rs.next(); rs.getInt(1) } }
+        if (active > 0) return@tx ReadyUpdateRefusal.ACTIVE_RUN_EXISTS
+        val n = c.prepare(
+            """UPDATE runs SET status = 'building', round = ?, update_rounds = update_rounds + 1, error = NULL, ended_at = NULL,
+                 failure_kind = NULL, failed_step = NULL, updated_at = now()
+               WHERE id = ? AND status = 'ready' AND merge_policy = 'github' AND release_id IS NULL AND kind = 'issue'
+                 AND branch IS NOT NULL AND pr_number IS NOT NULL AND update_rounds < max_update_rounds""",
+            arrayOf<Any?>(round, id),
+        ).use { it.executeUpdate() }
+        if (n == 1) null else ReadyUpdateRefusal.NOT_AVAILABLE
+    }
+
+    /**
+     * The other active issue runs of [repo] (not [exceptId], no sync runs), newest first, at most [limit]: what a run that
+     * starts now is warned about (docs/ARCHITECTURE.md §6 "Other active runs").
+     */
+    fun otherActiveIssueRuns(repo: String, exceptId: UUID, limit: Int = 10): List<RunRecord> = db.query(
+        """$select WHERE r.repo = ? AND r.id <> ? AND r.kind = 'issue'
+           AND r.status IN ('queued','spec','building','reviewing','approving','waiting_for_checks','needs_human')
+           ORDER BY r.created_at DESC LIMIT ?""",
+        repo, exceptId, limit, map = ::map,
+    )
+
+    /** Stores the snapshot of other active runs on the run. */
+    fun setOverlaps(id: UUID, overlaps: List<dk.egernet.factory.RunOverlapDto>) = db.update(
+        "UPDATE runs SET other_runs = ?, updated_at = now() WHERE id = ?", JsonbParam(AppJson.encodeToString(overlapListSer, overlaps)), id,
+    )
+
+    /** The pull requests that came in with an update round's merge. */
+    fun recordUpdatePulls(id: UUID, pulls: List<dk.egernet.factory.RunUpdatePullDto>) = db.update(
+        "UPDATE run_updates SET pulls = ? WHERE id = ?", JsonbParam(AppJson.encodeToString(updatePullListSer, pulls)), id,
+    )
 
     fun createUpdate(runId: UUID, number: Int, round: Int, maxRounds: Int, trigger: String, target: String, reason: String?): UUID {
         val id = UUID.randomUUID()
@@ -986,6 +1071,7 @@ class RunStore(private val db: Db) {
             kind = r.kind, syncPushedSha = r.syncPushedSha,
             updateRounds = r.updateRounds, maxUpdateRounds = r.maxUpdateRounds, updateAvailable = r.updateAvailable,
             updates = updates(r.id).map { it.toDto() },
+            updateOnDemand = r.updateOnDemand, overlaps = r.overlaps,
         )
     }
 

@@ -93,12 +93,15 @@ class MigrationGuardTest {
         assertEquals(RunStatus.NEEDS_HUMAN, s.runs.get(run.id)!!.status)
         s.runs.setReviewState(run.id, ReviewState.NONE)
 
-        // The retried merge goes through the migration check; a conflict is not a step that can be retried.
+        // The retried merge goes through the migration check; a clash starts an automatic update round (whose builder
+        // does not renumber here), and a migration conflict is not a step that can be retried.
         compare({ it == failed.branch }, FileChange('A', "$dir/V16__mine.sql"))
         runBlocking { s.orchestrator.retryStep(alice, s.runs.get(run.id)!!) }
-        eventually { s.runs.get(run.id)!!.error?.startsWith("Database migration conflict") == true }
+        eventually { s.runs.updates(run.id).isNotEmpty() && s.orchestrator.job(run.id) == null }
         val held = await(run.id)
         assertEquals(RunStatus.NEEDS_HUMAN, held.status)
+        assertEquals(FailureKind.MIGRATION_CONFLICT, held.failureKind)
+        assertTrue(held.error!!.contains("Migrations: `$dir/V16__mine.sql` has the same version (16)"), held.error)
         assertNull(held.failedStep)
         assertEquals(emptyList(), merges())
 
@@ -116,30 +119,39 @@ class MigrationGuardTest {
         }
     }
 
+    /** Waits until no job works on [id] any more (its automatic update rounds included), then for it to stop. */
+    private fun settledRun(id: UUID): dk.egernet.factory.db.RunRecord {
+        eventually { s.orchestrator.job(id) == null }
+        return await(id)
+    }
+
     @Test
     fun `a run adding a migration version the target already has is held, and merges once it is renumbered`() {
         compare({ it.startsWith("factory/issue-1-") }, FileChange('A', "$dir/V16__mine.sql"))
         val run = start()
-        val held = await(run.id)
+        eventually { s.runs.updates(run.id).isNotEmpty() }
+        // The clash started an automatic update round; its builder (a stub here) did not renumber, so the run is held.
+        val held = settledRun(run.id)
         assertEquals(RunStatus.NEEDS_HUMAN, held.status)
-        assertEquals(
-            "Database migration conflict with `main`: `$dir/V16__mine.sql` has the same version (16) as `$dir/V16__other.sql`. " +
-                "Pull request #${held.prNumber} was not merged. Migrations already on `main` must stay unchanged, and a new " +
-                "migration needs a version above all of them. Use \"Update and merge\" to have Agern merge `main` into the branch " +
-                "and let the builder renumber the migration (update round 1 of 2), or fix the migration on the pull request's " +
-                "branch and approve again.",
-            held.error,
-        )
+        assertTrue(held.error!!.startsWith("Update round 1 of 2 with `main` did not finish: the builder made no commits."), held.error)
+        assertTrue(held.error!!.contains("Migrations: `$dir/V16__mine.sql` has the same version (16) as `$dir/V16__other.sql`."), held.error)
         assertEquals(FailureKind.MIGRATION_CONFLICT, held.failureKind)
         assertTrue(held.updateAvailable)
         assertEquals(emptyList(), merges(), "nothing was merged")
         assertTrue("${held.branch} -> main" in world.git.comparisons, world.git.comparisons.toString())
         assertTrue(gh.actions.any { it.startsWith("label demo-app#1") && it.contains("needs-human") }, gh.actions.toString())
-        assertTrue(comments(1).any { it.startsWith("**Agern: needs a human.** Database migration conflict with `main`") })
+        assertTrue(comments(1).any { it.startsWith("**Agern: needs a human.** Update round 1 of 2 with `main` did not finish") })
 
-        // Approving without a fix holds it again.
+        // Approving without a fix starts the last round, which is held again; after it the guard's own reason stays.
         runBlocking { s.orchestrator.approve(alice, run.id) }
-        assertEquals(RunStatus.NEEDS_HUMAN, await(run.id).status)
+        assertEquals(2, settledRun(run.id).updateRounds)
+        runBlocking { s.orchestrator.approve(alice, run.id) }
+        val again = settledRun(run.id)
+        assertEquals(RunStatus.NEEDS_HUMAN, again.status)
+        assertTrue(again.error!!.startsWith(
+            "Database migration conflict with `main`: `$dir/V16__mine.sql` has the same version (16) as `$dir/V16__other.sql`. " +
+                "Pull request #${held.prNumber} was not merged.",
+        ), again.error)
         assertEquals(emptyList(), merges())
 
         // Renumbered on the branch: the approval merges.
@@ -152,15 +164,18 @@ class MigrationGuardTest {
     @Test
     fun `a lower version or a changed base migration is held too`() {
         world.git.comparison = { _, _ -> BranchComparison(base, listOf(FileChange('A', "$dir/V14__late.sql"), FileChange('M', "$dir/V15__earlier.sql"))) }
-        val held = await(start().id)
+        val run = start()
+        eventually { s.runs.updates(run.id).isNotEmpty() }
+        val held = settledRun(run.id)
         assertEquals(RunStatus.NEEDS_HUMAN, held.status)
         assertTrue(
-            held.error!!.startsWith(
-                "Database migration conflict with `main`: `$dir/V15__earlier.sql` was changed; `$dir/V14__late.sql` " +
-                    "(version 14) is not higher than `$dir/V16__other.sql` (version 16). Pull request #",
+            held.error!!.contains(
+                "Migrations: `$dir/V15__earlier.sql` was changed; `$dir/V14__late.sql` (version 14) is not higher than " +
+                    "`$dir/V16__other.sql` (version 16).",
             ),
             held.error,
         )
+        assertTrue(s.runs.updates(run.id).single().reason!!.startsWith("Database migration conflict with `main`"))
         assertEquals(emptyList(), merges())
     }
 

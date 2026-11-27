@@ -710,6 +710,8 @@ private fun Route.runRoutes(s: Services) {
         call.respondStoredFile(bytes, m.mediaType, "inline", name)
     }
     post("/runs/{id}/approve") { call.respond(s.factory.approveRun(call.requireUser(s), uuidParam("id"))) }
+    // "Update from base branch" (docs/ARCHITECTURE.md §6 "Retrying a run", "Update and merge"): owner only.
+    post("/runs/{id}/update") { call.respond(s.factory.updateRun(call.requireUser(s), uuidParam("id"))) }
     // "Try it on the sandbox VM" (docs/SANDBOX-VMS.md "Preview"): the run's owner or an admin.
     post("/runs/{id}/sandbox-vm/preview") { call.respond(s.runs.toDto(s.sandboxVms.startPreview(call.requireUser(s), uuidParam("id")))) }
     delete("/runs/{id}/sandbox-vm/preview") { call.respond(s.runs.toDto(s.sandboxVms.releasePreview(call.requireUser(s), uuidParam("id")))) }

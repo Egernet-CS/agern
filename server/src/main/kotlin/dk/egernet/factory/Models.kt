@@ -415,7 +415,26 @@ data class RunDto(
     val updateAvailable: Boolean = false,
     /** The run's update rounds, oldest first. */
     val updates: List<RunUpdateDto> = emptyList(),
+    /** True when the owner can bring the branch up to date with its target now ("Update from base branch"). */
+    val updateOnDemand: Boolean = false,
+    /** Other active runs of the project when this run started (a warning, docs/ARCHITECTURE.md §6 "Other active runs"). */
+    val overlaps: List<RunOverlapDto> = emptyList(),
 )
+
+/**
+ * Another run that was active in the same project when a run started. [references]: the new issue names that run's issue,
+ * or that run's spec names the new issue; [files]: paths both specs name (filled in after the new run's spec). Issue
+ * titles and paths are untrusted text.
+ */
+@Serializable
+data class RunOverlapDto(
+    val runId: String, val issueNumber: Int, val issueTitle: String, val owner: String, val status: String,
+    val references: Boolean = false, val files: List<String> = emptyList(),
+)
+
+/** A pull request merged into the target that came in with an update round; [url] only when GitHub gave one. Untrusted text. */
+@Serializable
+data class RunUpdatePullDto(val number: Int, val title: String, val url: String? = null)
 
 /**
  * One update round of a run ("Update and merge"): Agern merged [target] into the run's branch, the builder resolved what
@@ -425,7 +444,7 @@ data class RunDto(
 @Serializable
 data class RunUpdateDto(
     val number: Int, val round: Int, val maxRounds: Int,
-    /** `owner` or `release` (automatic, in a building release). */
+    /** `owner`, `release` (automatic, in a building release) or `base_moved` (automatic, the target moved). */
     val trigger: String,
     val target: String,
     /** The merge refusal that caused the update. */
@@ -447,6 +466,8 @@ data class RunUpdateDto(
     val endedAt: String? = null,
     /** One line for people, composed by the server. */
     val summary: String,
+    /** The pull requests that came in with the merge (from the incoming commit subjects, at most 10). */
+    val pulls: List<RunUpdatePullDto> = emptyList(),
 )
 
 /** What a run works on (docs/ARCHITECTURE.md §6 "Bringing a release up to date"). */
