@@ -7,7 +7,7 @@ import { SandboxVmLogBlock } from '../sandboxvm/SandboxVmLog';
 import { MessageAttachments } from './attachments';
 import { GeneratedImages } from './generated';
 import { Markdown } from './Markdown';
-import { toolArgs, toolDisplayName, toolSummary, type Item, type ToolProgress } from './model';
+import { compactLabel, toolArgs, toolDisplayName, toolSummary, type Item, type ToolProgress } from './model';
 
 const PREVIEW_LINES = 3;
 
@@ -161,6 +161,17 @@ const TranscriptItem = memo(function TranscriptItem({ item, me, sessionId }: { i
       );
     case 'status':
       return <div className="t-meta t-meta--status">— session {item.status} —</div>;
+    case 'compact':
+      return (
+        <div className="t-compact">
+          <div className="t-compact-line">
+            <span className="t-compact-rule" aria-hidden />
+            <span className="t-compact-label">{compactLabel(item)}</span>
+            <span className="t-compact-rule" aria-hidden />
+          </div>
+          <div className="t-compact-note">The agent continues from a summary. Earlier messages stay visible but are no longer in its context word for word.</div>
+        </div>
+      );
     case 'images':
       return <GeneratedImages sessionId={sessionId} payload={item.images} me={me} />;
     default:
@@ -172,12 +183,26 @@ const TranscriptItem = memo(function TranscriptItem({ item, me, sessionId }: { i
   }
 });
 
+/**
+ * The items of a transcript. Everything before the last compaction divider is dimmed in one group: the agent no
+ * longer has those messages word for word (they stay readable and interactive).
+ */
 export function TranscriptItems({ items, me, sessionId }: { items: Item[]; me?: string; sessionId: string }) {
+  let last = -1;
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (items[i].k === 'compact') {
+      last = i;
+      break;
+    }
+  }
+  const render = (list: Item[]) => list.map((it) => <TranscriptItem key={it.id} item={it} me={me} sessionId={sessionId} />);
+  if (last <= 0) return <>{render(items)}</>;
   return (
     <>
-      {items.map((it) => (
-        <TranscriptItem key={it.id} item={it} me={me} sessionId={sessionId} />
-      ))}
+      <div className="t-compacted" role="group" aria-label="Earlier messages, compacted">
+        {render(items.slice(0, last))}
+      </div>
+      {render(items.slice(last))}
     </>
   );
 }

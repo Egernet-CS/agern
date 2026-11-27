@@ -26,6 +26,7 @@ export type Item =
   | { k: 'system'; id: string; level: 'info' | 'warn' | 'error'; text: string; sandbox?: SandboxLog; deploy?: DeployLog; sandboxVm?: SandboxVmLog }
   | { k: 'status'; id: string; status: string }
   | { k: 'images'; id: string; images: ImagesPayload }
+  | { k: 'compact'; id: string; trigger: 'auto' | 'manual' | null; preTokens: number | null; postTokens: number | null }
   | { k: 'unknown'; id: string; label: string; json: string };
 
 export type TranscriptSummary = {
@@ -41,7 +42,16 @@ export type TranscriptSummary = {
   checkout: CheckoutInfo | null;
   /** Live estimate of the tokens the model has thought so far in the current message (null when not thinking). */
   thinkingTokens: number | null;
+  /**
+   * How full the agent's context is: `used` from the latest main-thread assistant usage (or a compaction's
+   * `post_tokens`), `window` from the `contextWindow` of a result's `modelUsage`. Null while unknown.
+   */
+  context: ContextUsage;
+  /** True while the CLI reports that it is compacting the conversation. */
+  compacting: boolean;
 };
+
+export type ContextUsage = { used: number | null; window: number | null };
 
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -238,11 +248,90 @@ export function checkoutOf(v: unknown): CheckoutInfo | undefined {
   };
 }
 
+// ---------------------------------------------------------------- context and compaction
+
+/** Token counts the way the meter shows them: `950`, `48k`, `312k`, `1M`, `1.5M`. */
+export function formatTokens(n: number): string {
+  const v = Number.isFinite(n) ? Math.max(0, n) : 0;
+  if (v < 1000) return String(Math.round(v));
+  if (v < 999_500) return `${Math.round(v / 1000)}k`;
+  return `${String(Math.round(v / 100_000) / 10)}M`;
+}
+
+/** The divider text of a `compact` item. */
+export function compactLabel(c: { trigger: 'auto' | 'manual' | null; preTokens: number | null; postTokens: number | null }): string {
+  let s = 'Conversation compacted here';
+  if (c.trigger) s += ` (${c.trigger})`;
+  if (c.preTokens != null && c.postTokens != null) s += ` — ${formatTokens(c.preTokens)} → ${formatTokens(c.postTokens)} tokens`;
+  else if (c.preTokens != null && c.trigger) s += ` — was ${formatTokens(c.preTokens)} tokens`;
+  return s;
+}
+
+/** The meter of [context]: null while the used amount is unknown; without a window only the used amount. */
+export function contextMeter(context: ContextUsage): { label: string; percent: number | null; warn: boolean } | null {
+  const { used, window } = context;
+  if (used == null) return null;
+  if (window == null || window <= 0) return { label: formatTokens(used), percent: null, warn: false };
+  return { label: `${formatTokens(used)} / ${formatTokens(window)}`, percent: Math.min(100, Math.round((used / window) * 100)), warn: used / window >= 0.8 };
+}
+
+/** A chat message that is the CLI's `/compact [what to keep]` command (case-sensitive, after trimming). */
+export function isCompactCommand(text: string): boolean {
+  return /^\/compact(\s|$)/.test(text.trim());
+}
+
+const tokenCount = (v: unknown): number | null => {
+  const n = num(v);
+  return n != null && n >= 0 ? n : null;
+};
+
+/** The `compact_metadata` of a `compact_boundary` event, defensively (unknown parts null). */
+export function compactOf(v: unknown): { trigger: 'auto' | 'manual' | null; preTokens: number | null; postTokens: number | null } {
+  const m = isObj(v) ? v : {};
+  return {
+    trigger: m.trigger === 'auto' || m.trigger === 'manual' ? m.trigger : null,
+    preTokens: tokenCount(m.pre_tokens),
+    postTokens: tokenCount(m.post_tokens),
+  };
+}
+
+/** The context a main-thread assistant message reports (input + cache read + cache creation), or null. */
+function contextOfAssistant(p: Obj, msg: Obj): number | null {
+  if (p.parent_tool_use_id != null || msg.model === '<synthetic>' || !isObj(msg.usage)) return null;
+  const u = msg.usage;
+  const sum = (num(u.input_tokens) ?? 0) + (num(u.cache_read_input_tokens) ?? 0) + (num(u.cache_creation_input_tokens) ?? 0);
+  return sum > 0 ? sum : null;
+}
+
+/** The context window of a result's `modelUsage` for [model] (exact key, `model[…]` key, else the largest), or null. */
+function contextWindowOf(modelUsage: Obj, model: string | null): number | null {
+  const windowOf = (v: unknown): number | null => {
+    const w = isObj(v) ? num(v.contextWindow) : null;
+    return w != null && w > 0 ? w : null;
+  };
+  const entries = Object.entries(modelUsage);
+  if (model) {
+    const exact = windowOf(modelUsage[model]);
+    if (exact != null) return exact;
+    for (const [k, v] of entries) {
+      const w = k.startsWith(`${model}[`) ? windowOf(v) : null;
+      if (w != null) return w;
+    }
+  }
+  let best: number | null = null;
+  for (const [, v] of entries) {
+    const w = windowOf(v);
+    if (w != null && (best == null || w > best)) best = w;
+  }
+  return best;
+}
+
 export function buildTranscript(events: FactoryEvent[], partials: unknown[]): { items: Item[]; summary: TranscriptSummary } {
   const items: Item[] = [];
   const tools = new Map<string, Extract<Item, { k: 'tool' }>>();
   const blocksPerMessage = new Map<string, number>();
-  const summary: TranscriptSummary = { model: null, costUsd: null, turns: null, status: null, turnOpen: false, turnStartedAt: null, lastActivity: null, checkout: null, thinkingTokens: null };
+  const summary: TranscriptSummary = { model: null, costUsd: null, turns: null, status: null, turnOpen: false, turnStartedAt: null, lastActivity: null, checkout: null, thinkingTokens: null, context: { used: null, window: null }, compacting: false };
+  let contextModel: string | null = null;
   const forwarded = new Map<string, Forwarded>();
 
   for (const ev of events) {
@@ -281,6 +370,7 @@ export function buildTranscript(events: FactoryEvent[], partials: unknown[]): { 
         const st = isObj(p) ? str(p.status) : null;
         if (st) summary.status = st as SessionStatus;
         if (st === 'stopped' || st === 'failed') {
+          summary.compacting = false;
           items.push({ k: 'status', id, status: st });
           summary.turnOpen = false;
         }
@@ -315,6 +405,11 @@ export function buildTranscript(events: FactoryEvent[], partials: unknown[]): { 
         const msg = p.message;
         const msgId = str(msg.id);
         if (str(msg.model)) summary.model = summary.model ?? str(msg.model);
+        const used = contextOfAssistant(p, msg);
+        if (used != null) {
+          summary.context.used = used;
+          contextModel = str(msg.model) ?? contextModel;
+        }
         const content = Array.isArray(msg.content) ? msg.content : [];
         if (msgId) blocksPerMessage.set(msgId, (blocksPerMessage.get(msgId) ?? 0) + content.length);
         content.forEach((b, i) => {
@@ -352,9 +447,18 @@ export function buildTranscript(events: FactoryEvent[], partials: unknown[]): { 
         summary.costUsd = num(p.total_cost_usd) ?? summary.costUsd;
         summary.turns = num(p.num_turns) ?? summary.turns;
         summary.turnOpen = false;
+        summary.compacting = false;
+        if (isObj(p.modelUsage)) summary.context.window = contextWindowOf(p.modelUsage, contextModel) ?? summary.context.window;
         items.push({ k: 'result', id, ok, subtype: str(p.subtype) ?? 'result', costUsd: num(p.total_cost_usd), turns: num(p.num_turns), durationMs: num(p.duration_ms), text: str(p.result) });
       } else if (t === 'stream_event' || t === 'tool_progress' || t === 'response_length') {
         // Live-only progress; stored ones (partials should not be; heartbeats of older versions) are skipped.
+      } else if (t === 'system' && p.subtype === 'compact_boundary') {
+        const c = compactOf(p.compact_metadata);
+        summary.context.used = c.postTokens;
+        summary.compacting = false;
+        items.push({ k: 'compact', id, ...c });
+      } else if (t === 'system' && p.subtype === 'status') {
+        summary.compacting = p.status === 'compacting';
       } else if (t === 'system') {
         const sub = str(p.subtype) ?? 'system';
         if (sub !== 'hook_response' && sub !== 'status' && !TRANSIENT_SYSTEM_SUBTYPES.has(sub)) items.push({ k: 'unknown', id, label: `system.${sub}`, json: compactJson(p, 160) });

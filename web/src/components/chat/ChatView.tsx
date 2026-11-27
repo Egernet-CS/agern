@@ -5,7 +5,7 @@ import { cost, duration, modelLabel } from '../../lib/format';
 import { useSessionStream } from '../../lib/realtime';
 import { useNow } from '../../lib/useNow';
 import { DraftChips, MessageAttachments, useAttachmentDrafts } from './attachments';
-import { attachmentsOf, buildTranscript } from './model';
+import { attachmentsOf, buildTranscript, contextMeter, isCompactCommand, type ContextUsage } from './model';
 import { Prompt } from './Prompt';
 import { TranscriptItems } from './Transcript';
 import { useStickToBottom } from './useStickToBottom';
@@ -35,6 +35,25 @@ function Spinner({ since, label, canInterrupt, activity, thinkingTokens }: { sin
         {canInterrupt ? ' · esc to interrupt' : ''})
       </span>
     </div>
+  );
+}
+
+const COMPACT_ATTACHMENTS = '/compact does not take attachments. Remove them, or send them in a normal message.';
+
+/** The chat footer's context meter: "312k / 1M · 31%", amber and "· nearly full" from 80% (docs/ARCHITECTURE.md §10). */
+function ContextItem({ context }: { context: ContextUsage }) {
+  const meter = contextMeter(context);
+  const value = !meter ? '—' : meter.percent == null ? meter.label : `${meter.label} · ${meter.percent}%${meter.warn ? ' · nearly full' : ''}`;
+  const n = (v: number) => Math.round(v).toLocaleString('en-US');
+  const title = !meter || context.used == null
+    ? 'How much of the agent’s context is used: not known yet'
+    : context.window == null
+      ? `${n(context.used)} tokens in the agent’s context`
+      : `${n(context.used)} of ${n(context.window)} tokens in the agent’s context (${meter.percent}%)${meter.warn ? ' — Agern’s agent compacts automatically near the limit; you can compact now.' : ''}`;
+  return (
+    <span className={`cf-item cf-context ${meter?.warn ? 'cf-context--warn' : ''}`} title={title}>
+      <span className="cf-k">context</span> {value}
+    </span>
   );
 }
 
@@ -111,6 +130,10 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header,
         setError('/factory commands do not take attachments. Remove them, or send them in a normal message.');
         return false;
       }
+      if (attachments.length && isCompactCommand(text)) {
+        setError(COMPACT_ATTACHMENTS);
+        return false;
+      }
       setSending({ text, attachments });
       stickNow();
       try {
@@ -125,6 +148,19 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header,
     },
     [sessionId, att, stickNow],
   );
+
+  // The Compact button: a plain `/compact`, shown and sent like a typed one (attachment drafts stay for the next message).
+  const compact = useCallback(async () => {
+    setError(null);
+    setSending({ text: '/compact', attachments: [] });
+    stickNow();
+    try {
+      await api.sendInput(sessionId, '/compact', []);
+    } catch (e) {
+      setSending(null);
+      setError(e instanceof ApiError ? e.message : 'Could not compact.');
+    }
+  }, [sessionId, stickNow]);
 
   const steer = useCallback(
     async (text: string) => {
@@ -261,6 +297,7 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header,
               canInterrupt={canDrive || canTalk}
               activity={isChat ? null : session?.lastActivity ?? null}
               thinkingTokens={summary.thinkingTokens}
+              label={summary.compacting ? 'Compacting' : undefined}
             />
           )}
         </div>
@@ -332,6 +369,25 @@ export function ChatView({ sessionId, session, disabledReason, embedded, header,
         <span className="cf-item"><span className="cf-k">model</span> {modelLabel(model)}</span>
         <span className="cf-item"><span className="cf-k">cost</span> {cost(costUsd)}</span>
         <span className="cf-item"><span className="cf-k">turns</span> {turns ?? '—'}</span>
+        {isChat && <ContextItem key="context" context={summary.context} />}
+        {isChat && canCompose && (
+          <button
+            type="button"
+            className="cf-compact"
+            aria-label="Compact conversation"
+            disabled={working || !!sending || summary.context.used == null}
+            title={
+              working || sending
+                ? 'Wait for the agent to finish, or interrupt it'
+                : summary.context.used == null
+                  ? 'Nothing to compact yet'
+                  : 'Summarise the conversation to free up context. To say what to keep, type /compact <what to keep>'
+            }
+            onClick={() => void compact()}
+          >
+            Compact
+          </button>
+        )}
         <span className={`cf-conn cf-conn--${stream.conn}`}>
           <span aria-hidden>●</span> {stream.conn === 'live' ? 'live' : stream.conn}
         </span>

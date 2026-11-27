@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { FactoryEvent } from '../../api/types';
-import { buildTranscript, deployLogOf, fitWidth, sandboxLogOf, sandboxVmLogOf, toolArgs, toolSummary } from './model.ts';
+import { buildTranscript, compactLabel, contextMeter, deployLogOf, fitWidth, formatTokens, isCompactCommand, sandboxLogOf, sandboxVmLogOf, toolArgs, toolSummary } from './model.ts';
 
 const exec = 'mcp__factory__factory_sandbox_exec';
 const wait = 'mcp__factory__factory_sandbox_wait';
@@ -241,4 +241,106 @@ test('sandbox VM tool calls are summarised', () => {
   assert.equal(toolSummary(vwait, result({ handle: 'vm-2', running: true, elapsedMs: 4200 })), 'Still running after 4 s');
   assert.equal(toolSummary(vexec, { text: 'Call factory_sandbox_vm_deploy first.', isError: true, images: 0 }), null);
   assert.equal(toolSummary(vexec, { text: 'not json', isError: false, images: 0 }), null);
+});
+
+// ---------------------------------------------------------------- context and compaction
+
+const ev = (seq: number, type: string, payload: unknown) => ({ seq, sessionId: 's', ts: '2026-01-01T00:00:00Z', type, payload }) as FactoryEvent;
+const boundary = (seq: number, compact_metadata?: unknown) => claude(seq, { type: 'system', subtype: 'compact_boundary', uuid: 'u', session_id: 's', compact_metadata });
+const assistant = (seq: number, usage: unknown, extra: Record<string, unknown> = {}, model = 'claude-opus-5-5') =>
+  claude(seq, { type: 'assistant', message: { id: `m${seq}`, model, content: [{ type: 'text', text: 'hi' }], usage }, parent_tool_use_id: null, ...extra });
+const resultEv = (seq: number, modelUsage?: unknown) => claude(seq, { type: 'result', subtype: 'success', num_turns: 1, total_cost_usd: 0.1, modelUsage });
+const status = (seq: number, s: unknown, extra: Record<string, unknown> = {}) => claude(seq, { type: 'system', subtype: 'status', status: s, ...extra });
+const summaryOf = (events: FactoryEvent[]) => buildTranscript(events, []).summary;
+
+test('a compact_boundary becomes a compact item, reading its metadata defensively', () => {
+  const { items } = buildTranscript(
+    [
+      boundary(1, { trigger: 'auto', pre_tokens: 640_000, post_tokens: 48_000 }),
+      boundary(2, { trigger: 'manual', pre_tokens: 640_000, post_tokens: 48_000 }),
+      boundary(3, { trigger: 'manual', pre_tokens: 640_000 }),
+      boundary(4),
+      boundary(5, { trigger: 'later', pre_tokens: '640000', post_tokens: -5 }),
+      boundary(6, 'nonsense'),
+    ],
+    [],
+  );
+  assert.deepEqual(items, [
+    { k: 'compact', id: 'e1', trigger: 'auto', preTokens: 640_000, postTokens: 48_000 },
+    { k: 'compact', id: 'e2', trigger: 'manual', preTokens: 640_000, postTokens: 48_000 },
+    { k: 'compact', id: 'e3', trigger: 'manual', preTokens: 640_000, postTokens: null },
+    { k: 'compact', id: 'e4', trigger: null, preTokens: null, postTokens: null },
+    { k: 'compact', id: 'e5', trigger: null, preTokens: null, postTokens: null },
+    { k: 'compact', id: 'e6', trigger: null, preTokens: null, postTokens: null },
+  ]);
+  assert.ok(items.every((i) => i.k !== 'unknown'));
+});
+
+test('the divider text names what is known', () => {
+  assert.equal(compactLabel({ trigger: 'auto', preTokens: 640_000, postTokens: 48_000 }), 'Conversation compacted here (auto) — 640k → 48k tokens');
+  assert.equal(compactLabel({ trigger: 'manual', preTokens: 640_000, postTokens: null }), 'Conversation compacted here (manual) — was 640k tokens');
+  assert.equal(compactLabel({ trigger: 'auto', preTokens: null, postTokens: null }), 'Conversation compacted here (auto)');
+  assert.equal(compactLabel({ trigger: 'auto', preTokens: null, postTokens: 48_000 }), 'Conversation compacted here (auto)');
+  assert.equal(compactLabel({ trigger: null, preTokens: 640_000, postTokens: 48_000 }), 'Conversation compacted here — 640k → 48k tokens');
+  assert.equal(compactLabel({ trigger: null, preTokens: null, postTokens: null }), 'Conversation compacted here');
+});
+
+test('token counts are shown as integers, thousands and millions', () => {
+  const cases: [number, string][] = [
+    [0, '0'], [950, '950'], [1000, '1k'], [48_000, '48k'], [312_400, '312k'], [999_499, '999k'],
+    [999_500, '1M'], [1_000_000, '1M'], [1_500_000, '1.5M'],
+  ];
+  for (const [n, s] of cases) assert.equal(formatTokens(n), s, String(n));
+});
+
+test('the context used is the sum of the input counters of the latest main-thread assistant message', () => {
+  assert.equal(summaryOf([assistant(1, { input_tokens: 10, cache_read_input_tokens: 300_000, cache_creation_input_tokens: 2_000, output_tokens: 50 })]).context.used, 302_010);
+  assert.equal(summaryOf([assistant(1, { input_tokens: 5, cache_read_input_tokens: 'x' })]).context.used, 5);
+  const base = assistant(1, { input_tokens: 100_000 });
+  assert.equal(summaryOf([base, assistant(2, { input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, {}, '<synthetic>')]).context.used, 100_000);
+  assert.equal(summaryOf([base, assistant(2, { input_tokens: 7_000 }, { parent_tool_use_id: 'toolu_1' })]).context.used, 100_000);
+  assert.equal(summaryOf([base, assistant(2, { input_tokens: 0 })]).context.used, 100_000);
+  assert.equal(summaryOf([base, assistant(2, undefined)]).context.used, 100_000);
+  assert.equal(summaryOf([]).context.used, null);
+});
+
+test('the context window comes from the modelUsage of the conversation model', () => {
+  const a = assistant(1, { input_tokens: 1_000 });
+  const w = (n: number) => ({ inputTokens: 1, contextWindow: n });
+  assert.equal(summaryOf([a, resultEv(2, { 'claude-haiku-5-5': w(200_000), 'claude-opus-5-5': w(1_000_000) })]).context.window, 1_000_000);
+  assert.equal(summaryOf([a, resultEv(2, { 'claude-opus-5-5[1m]': w(1_000_000), 'claude-haiku-5-5': w(200_000) })]).context.window, 1_000_000);
+  assert.equal(summaryOf([a, resultEv(2, { 'other-a': w(200_000), 'other-b': w(500_000), 'bad': { contextWindow: -1 } })]).context.window, 500_000);
+  assert.equal(summaryOf([a, resultEv(2, { 'claude-opus-5-5': w(1_000_000) }), resultEv(3, {})]).context.window, 1_000_000);
+  assert.equal(summaryOf([a, resultEv(2)]).context.window, null);
+});
+
+test('a compaction sets the context to its post_tokens, and the next message updates it again', () => {
+  const a = assistant(1, { input_tokens: 900_000 });
+  assert.equal(summaryOf([a, boundary(2, { trigger: 'auto', pre_tokens: 900_000, post_tokens: 90_000 })]).context.used, 90_000);
+  assert.equal(summaryOf([a, boundary(2, { trigger: 'auto', pre_tokens: 900_000 })]).context.used, null);
+  assert.equal(summaryOf([a, boundary(2, {}), assistant(3, { input_tokens: 95_000 })]).context.used, 95_000);
+});
+
+test('the meter shows used / window and percent, warning from 80%', () => {
+  assert.equal(contextMeter({ used: null, window: 1_000_000 }), null);
+  assert.deepEqual(contextMeter({ used: 312_000, window: null }), { label: '312k', percent: null, warn: false });
+  assert.deepEqual(contextMeter({ used: 312_000, window: 1_000_000 }), { label: '312k / 1M', percent: 31, warn: false });
+  assert.deepEqual(contextMeter({ used: 800_000, window: 1_000_000 }), { label: '800k / 1M', percent: 80, warn: true });
+  assert.deepEqual(contextMeter({ used: 1_200_000, window: 1_000_000 }), { label: '1.2M / 1M', percent: 100, warn: true });
+});
+
+test('compacting is true while the CLI says so', () => {
+  const on = status(1, 'compacting');
+  assert.equal(summaryOf([on]).compacting, true);
+  assert.equal(summaryOf([on, boundary(2, {})]).compacting, false);
+  assert.equal(summaryOf([on, resultEv(2)]).compacting, false);
+  assert.equal(summaryOf([on, status(2, null, { compact_result: 'success' })]).compacting, false);
+  assert.equal(summaryOf([on, ev(2, 'status', { status: 'stopped' })]).compacting, false);
+  assert.equal(summaryOf([on, ev(2, 'status', { status: 'running' })]).compacting, true);
+  assert.equal(buildTranscript([on], []).items.length, 0);
+});
+
+test('only /compact itself is the compact command', () => {
+  for (const t of ['/compact', '/compact x', '  /compact\nx']) assert.equal(isCompactCommand(t), true, t);
+  for (const t of ['/compacted', '/Compact', 'say /compact']) assert.equal(isCompactCommand(t), false, t);
 });
