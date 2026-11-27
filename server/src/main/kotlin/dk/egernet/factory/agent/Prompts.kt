@@ -28,6 +28,7 @@ class Prompts(private val org: String) {
         if (!workspace.isNullOrBlank()) append(workspace.trimEnd()).append('\n')
         append("Write everything that ends up in the repository or on GitHub (specs, code comments, commit messages, ")
         append("summaries) in English, unless the issue itself is written in another language; then use that language.\n")
+        append(PROJECT_FILES_PARAGRAPH)
         if (!mayInstallSoftware) {
             append("\n## Software installation policy\n\n")
             append("Do NOT install system-wide software (no `brew install`, `apt-get`, `sudo`, global `npm -g`/`pip install --user`, ")
@@ -36,5 +37,15 @@ class Prompts(private val org: String) {
             append("If you need a tool that is not installed, call `factory_request_software` with its name and why you need it, ")
             append("tell the user, and continue with what you can do without it.\n")
         }
+    }
+
+    companion object {
+        /** Every role's paragraph about project files (docs/ARCHITECTURE.md §5 "Project files"). */
+        const val PROJECT_FILES_PARAGRAPH = "\n## Project files\n\n" +
+            "Files the project needs but must not keep in git (vendor SDKs, licensed libraries, large binaries, test data), if " +
+            "it has any, are at `\$AGERN_PROJECT_FILES` (`/project-files` inside a sandbox). They are read-only. Never copy, move, " +
+            "unpack or commit them into the repository, and never attach them to issues, pull requests or comments; unpack or copy " +
+            "them outside the working directory (e.g. under /tmp) when a build needs that. `factory_list_project_files` lists them " +
+            "(names, sizes, hashes, notes).\n"
     }
 }

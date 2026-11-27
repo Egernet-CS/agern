@@ -70,6 +70,8 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.put
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
@@ -147,6 +149,8 @@ class Orchestrator(
     private val clock: java.time.Clock = java.time.Clock.systemUTC(),
     /** Sandbox VMs (docs/SANDBOX-VMS.md); null in setups without them. */
     private val vms: dk.egernet.factory.sandboxvm.SandboxVmManager? = null,
+    /** The project file store (docs/ARCHITECTURE.md §5 "Project files"); null in setups without it. */
+    private val projectFiles: dk.egernet.factory.files.ProjectFiles? = null,
 ) {
     private val log = LoggerFactory.getLogger(Orchestrator::class.java)
     private val jobs = ConcurrentHashMap<UUID, Job>()
@@ -974,8 +978,11 @@ class Orchestrator(
 
             // 2. The sandbox decision, made again as at the run's start; only the builder uses it.
             val definitionRef = sandboxDefinitionRef(start, owner, id, memberReleaseBase(start), base.baseRef, base.targetBranch, base.defaultBranch, home)
-            val sandbox = sandboxes.prepare(runId, start.repo, base.worktree, definitionRef, home, definitionRepo = prRepo(start), runDir = base.root)
-            val ctx = base.copy(sandbox = sandbox)
+            val sandbox = sandboxes.prepare(
+                runId, start.repo, base.worktree, definitionRef, home, definitionRepo = prRepo(start), runDir = base.root, projectFiles = base.projectFilesDir,
+            )
+            val runFiles = base.projectFiles?.let { withContext(Dispatchers.IO) { markRequired(runId, it, sandbox) } }
+            val ctx = base.copy(sandbox = sandbox, projectFiles = runFiles)
 
             // 3. The builder: a new round of stages, resuming the latest builder conversation.
             val eff = preferences.effective(owner.id)
@@ -1021,7 +1028,12 @@ class Orchestrator(
             runs.recordUpdateBuilder(u.id, state.head, commits)
             publish(runId)
 
-            // 5. Push (a fast-forward of the remote branch), then the migrations as the merge gate will see them.
+            // 5. Push (a fast-forward of the remote branch), then the migrations as the merge gate will see them. Never a
+            // project file (docs/ARCHITECTURE.md §6 "Project file guard").
+            withContext(Dispatchers.IO) { projectFileGuard(runs.get(runId)!!, ctx.worktree, ctx.baseRef, home, b.session.id) }?.let { blocked ->
+                bestEffort { agents.systemEvent(b.session.id, "error", blocked) }
+                throw UpdateFailed(blocked)
+            }
             withContext(Dispatchers.IO) {
                 withNetworkRetry(runId) {
                     try {
@@ -1238,7 +1250,7 @@ class Orchestrator(
             plan.restore.forEach { append("Restore `${plain(it)}` exactly as on `$t`: `${c.git} checkout ${c.baseRef} -- ${plain(it)}`\n") }
         }
         append(migrationLine(c))
-        append(sandboxLine(c)).append('\n')
+        append(sandboxLine(c)).append(projectFilesLine(c)).append('\n')
         append("Build and run the tests, fix whatever the merge broke, and commit everything to `${c.branch}`. Do not push, rebase, amend ")
         append("or force anything: commits that are on GitHub must stay as they are. The factory pushes, runs the reviewers and the ")
         append("approver again and merges.\n\n")
@@ -1405,6 +1417,8 @@ class Orchestrator(
             val ctx = runContext(start, owner)
             val home = workspaces.home(owner.username)
             val head = withContext(Dispatchers.IO) { workspaces.git.head(ctx.worktree, home) }
+            // Never a project file (docs/ARCHITECTURE.md §6 "Project file guard"): the follow-up fails like a push failure.
+            withContext(Dispatchers.IO) { projectFileGuard(start, ctx.worktree, ctx.baseRef, home, advisor) }?.let { throw IllegalStateException(it) }
             withContext(Dispatchers.IO) {
                 workspaces.git.push(id, ctx.worktree, ctx.branch, home)
                 runs.headSeenAt(runId, head, now())
@@ -1472,7 +1486,7 @@ class Orchestrator(
         if (!withContext(Dispatchers.IO) { java.nio.file.Files.isDirectory(ctx.worktree) }) {
             throw conflict("The run's worktree is gone, so the agent cannot work on it", "run_worktree_missing")
         }
-        return AdvisorLaunch(ctx.root, run.id, advisorContext(runs.get(run.id)!!, ctx))
+        return AdvisorLaunch(ctx.root, run.id, advisorContext(runs.get(run.id)!!, ctx), ctx.projectFilesDir)
     }
 
     /**
@@ -1505,6 +1519,8 @@ class Orchestrator(
                 inRelease = releaseName != null,
             )
         } ?: parentBlock(owner, run.repo)
+        val files = runCatching { ensureProjectFiles(run) }
+            .onFailure { log.warn("Run {}: preparing its project files failed: {}", run.id, it.message) }.getOrNull()
         RunContext(
             run.id, run.repo,
             issue ?: GhIssue(run.issueNumber, run.issueTitle, "open", createdAt = "", updatedAt = "", htmlUrl = ""),
@@ -1512,6 +1528,7 @@ class Orchestrator(
             run.sandboxJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunSandboxDto.serializer(), it) }.getOrNull() },
             root = workspaces.runDir(run.ownerUsername, run.repo, run.id), gitRepo = prRepo(run), memberDir = run.targetDir,
             workspaceBlock = block, contextRepos = run.contextRepos,
+            projectFiles = files?.first, projectFilesDir = files?.second,
         )
     }
 
@@ -1588,7 +1605,9 @@ class Orchestrator(
         append(c.releaseNote)
         append(c.workspaceBlock)
         append("Inspect the change with `${c.git} diff ${c.baseRef}...HEAD` and `${c.git} log ${c.baseRef}..HEAD`, and by reading the code.\n")
-        append("This run has no sandbox at this point: build and run checks on the host.\n\n")
+        append("This run has no sandbox at this point: build and run checks on the host.\n")
+        append(projectFilesLine(c, sandboxNow = false))
+        append('\n')
         append(c.issueText)
         append("\n<spec>\n").append(specText(run.id)?.trim().orEmpty().ifEmpty { "(none)" }).append("\n</spec>\n")
         val builder = stages.filter { it.role == "builder" && it.sessionId != null }.maxByOrNull { it.round }
@@ -1714,7 +1733,15 @@ class Orchestrator(
      * The worktree reapers' test: a run that is not live keeps nothing — and its sandbox (normally long gone) is removed
      * here, before the reaper deletes the worktree the sandbox would bind-mount.
      */
-    private fun keepWorktree(runId: UUID): Boolean = isLive(runId).also { live -> if (!live) sandboxes.releaseNow(runId) }
+    private fun keepWorktree(runId: UUID): Boolean = isLive(runId).also { live ->
+        if (!live) {
+            sandboxes.releaseNow(runId)
+            runs.get(runId)?.let { projectFiles?.removeSnapshot(filesRepo(it), runId) }
+        }
+    }
+
+    /** At server start: removes the project file snapshots of runs that are not live. Blocking. */
+    fun reapProjectFileSnapshots(): List<UUID> = projectFiles?.reapSnapshots(::isLive).orEmpty()
 
     /** At server start: removes the worktrees of runs that have ended (and prunes stale worktree entries). Blocking. */
     fun reapWorktrees(): List<UUID> = workspaces.reapAllRunWorktrees(::keepWorktree)
@@ -1768,7 +1795,11 @@ class Orchestrator(
         // run that is the member's base branch (fetched), never its release branch.
         val memberBase = memberReleaseBase(run)
         val definitionRef = sandboxDefinitionRef(run, owner, id, memberBase, baseRef, target, repoInfo.defaultBranch, home)
-        val sandbox = sandboxes.prepare(run.id, run.repo, worktree, definitionRef, home, definitionRepo = prRepo(run), runDir = root)
+        // The project files the run gets: a snapshot made now (a step retry keeps its own when it still exists).
+        val files = withContext(Dispatchers.IO) { runs.get(run.id)!!.let { if (resuming) ensureProjectFiles(it) else snapshotProjectFiles(it) } }
+        val sandbox = sandboxes.prepare(run.id, run.repo, worktree, definitionRef, home, definitionRepo = prRepo(run), runDir = root, projectFiles = files?.second)
+        val runFiles = files?.let { withContext(Dispatchers.IO) { markRequired(run.id, it.first, sandbox) } }
+        requireProjectFiles(sandbox, runFiles)
         // The sandbox VM's decision: from the same commit and for the same repository as the sandbox's (docs/SANDBOX-VMS.md).
         val sandboxVm = vms?.prepare(run.id, worktree, definitionRef, home, prRepo(run))
         // Images selected for the issue in a chat go into the agents' working directory (docs/ARCHITECTURE.md §6 "Generated images").
@@ -1777,7 +1808,7 @@ class Orchestrator(
         val ctx = RunContext(
             run.id, run.repo, issue, issueText(issue, comments), branch, baseRef, target, worktree, releaseName, memberBase ?: repoInfo.defaultBranch, sandbox,
             prepared, root = root, gitRepo = prRepo(run), memberDir = run.targetDir, workspaceBlock = setUp.block,
-            contextRepos = runs.get(run.id)!!.contextRepos, sandboxVm = sandboxVm,
+            contextRepos = runs.get(run.id)!!.contextRepos, sandboxVm = sandboxVm, projectFiles = runFiles, projectFilesDir = files?.second,
         )
         val imageNotes = (if (prepared.isEmpty()) emptyList()
             else listOf("info" to "Prepared images: ${prepared.size} (${prepared.joinToString(", ") { it.meta.name ?: it.meta.purpose }})")) +
@@ -1921,6 +1952,20 @@ class Orchestrator(
                 runs.setBuilderSummary(run.id, builderSummary)
             }
 
+            // Never publish a project file (docs/ARCHITECTURE.md §6 "Project file guard").
+            val blocked = withContext(Dispatchers.IO) {
+                projectFileGuard(runs.get(run.id)!!, worktree, baseRef, home, builderSessionId ?: lastBuilderSession(run.id))
+            }
+            if (blocked != null) {
+                sandboxes.release(run.id)
+                vms?.releaseBuild(run.id)
+                REVIEWER_ROLES.forEach { skipStage(run.id, it) }
+                skipStage(run.id, "approver")
+                runs.setFailure(run.id, FailureKind.PROJECT_FILE_COMMITTED, null)
+                (builderSessionId ?: lastBuilderSession(run.id))?.let { sid -> bestEffort { agents.systemEvent(sid, "error", blocked) } }
+                withContext(Dispatchers.IO) { needsHuman(runs.get(run.id)!!, owner, blocked) }
+                return
+            }
             withContext(Dispatchers.IO) {
                 withNetworkRetry(run.id) {
                     try {
@@ -2114,11 +2159,15 @@ class Orchestrator(
         val target = setUp.repoInfo.defaultBranch
         val defaultRef = setUp.defaultRef
         val start = setUp.start
+        val files = withContext(Dispatchers.IO) { snapshotProjectFiles(runs.get(run.id)!!) }
         // The sandbox decision is the default branch's, as for release runs (docs/ARCHITECTURE.md §5 "The run's decision").
-        val sandbox = sandboxes.prepare(run.id, run.repo, root, defaultRef, home)
+        val sandbox = sandboxes.prepare(run.id, run.repo, root, defaultRef, home, projectFiles = files?.second)
+        val runFiles = files?.let { withContext(Dispatchers.IO) { markRequired(run.id, it.first, sandbox) } }
         publish(run.id)
+        requireProjectFiles(sandbox, runFiles)
         val ctx = RunContext(
             run.id, run.repo, null, "", branch, setUp.baseRef, releaseBranch, root, release.name, target, sandbox, root = root,
+            projectFiles = runFiles, projectFilesDir = files?.second,
         )
         val notes = (sandbox.takeIf { sandboxes.enabled }?.let { listOf((if (it.state == "approved") "info" else "warn") to "Sandbox: ${it.reason}") }
             ?: emptyList()) + setUp.submoduleErrors.map { (where, out) -> "warn" to "Submodules of `$where` could not be fetched: ${out.trim().takeLast(300)}" }
@@ -2169,7 +2218,7 @@ class Orchestrator(
             }
             finishStage(run.id, "builder", round, null, firstParagraph(summary), emptyList())
             if (head != lastPushed) {
-                pushSync(run.id, id, root, home, releaseBranch, target, head, lastPushed)
+                pushSync(run.id, id, root, home, releaseBranch, target, head, lastPushed, ctx.baseRef, builderSessionId)
                 lastPushed = head
                 syncPushedComment(runs.get(run.id)!!, owner, client, release, target, head, round)
             }
@@ -2272,7 +2321,13 @@ class Orchestrator(
      */
     private suspend fun pushSync(
         runId: UUID, id: AgentIdentity, root: Path, home: Path, releaseBranch: String, target: String, head: String, lastPushed: String?,
+        baseRef: String, warnSession: UUID?,
     ) {
+        val blocked = withContext(Dispatchers.IO) { projectFileGuard(runs.get(runId)!!, root, baseRef, home, warnSession) }
+        if (blocked != null) {
+            warnSession?.let { sid -> bestEffort { agents.systemEvent(sid, "error", blocked) } }
+            throw StageFailed(syncFailure(releaseBranch, target, blocked, lastPushed, null))
+        }
         withContext(Dispatchers.IO) {
             withNetworkRetry(runId) {
                 try {
@@ -2545,6 +2600,9 @@ class Orchestrator(
         val contextRepos: List<String> = emptyList(),
         /** The run's sandbox VM decision; null when the run has none (sync runs, setups without sandbox VMs). */
         val sandboxVm: dk.egernet.factory.RunSandboxVmDto? = null,
+        /** The project files the run got and where its snapshot is (docs/ARCHITECTURE.md §5 "Project files"). */
+        val projectFiles: dk.egernet.factory.RunProjectFilesDto? = null,
+        val projectFilesDir: Path? = null,
     ) {
         /** The issue's number (0 for a sync run, whose prompts never name one). */
         val issueNumber: Int get() = issue?.number ?: 0
@@ -2600,7 +2658,7 @@ class Orchestrator(
                     prompt = attemptPrompt, contextRepos = ctx.contextRepos,
                     jsonSchema = schema, disallowedTools = disallowed, resumeClaudeSessionId = attemptResume,
                     title = "$role · ${ctx.tag}" + if (round > 0) " · round $round" else "",
-                    extraTools = extraTools, notes = notes, sandboxScope = sandboxScope,
+                    extraTools = extraTools, notes = notes, sandboxScope = sandboxScope, projectFilesDir = ctx.projectFilesDir,
                 ),
             ) { session ->
                 runs.startStage(st.id, session.id, session.model)
@@ -3345,6 +3403,8 @@ class Orchestrator(
         sandboxes.releaseNow(runId)
         vms?.releaseAll(runId)
         val run = runs.get(runId) ?: return
+        projectFiles?.removeSnapshot(filesRepo(run), runId)
+        warnedBlobs.remove(runId)
         val owner = users.byId(run.ownerId) ?: return
         // Member worktrees of a workspace run first, then the run's own worktree.
         var bundles = emptyList<dk.egernet.factory.agent.SubmoduleBundle>()
@@ -3440,7 +3500,7 @@ class Orchestrator(
         |
         |${c.workspaceBlock}${c.issueText}${c.imagesBlock}
         |${if (c.memberDir == null) "Your working directory is a checkout of the repository at `${c.baseRef}`." else "The target member `${c.memberDir}` is checked out at `${c.baseRef}`."} Explore it (read-only) before writing.
-        |${specSandboxLine(c)}${specSandboxVmLine(c)}Your final message must be the spec in Markdown and nothing else: it is posted verbatim as a comment on the issue
+        |${specSandboxLine(c)}${specSandboxVmLine(c)}${projectFilesLine(c)}Your final message must be the spec in Markdown and nothing else: it is posted verbatim as a comment on the issue
         |and handed to the builder.
     """.trimMargin()
 
@@ -3450,7 +3510,7 @@ class Orchestrator(
         |${c.workspaceBlock}${worktreeSentence(c)} on branch `${c.branch}`, created from `${c.baseRef}`. Commit your work to this branch.
         |Do not push, open pull requests or merge: the factory does that after you finish.
         |${migrationLine(c)}
-        |${sandboxLine(c)}${sandboxVmLine(c)}
+        |${sandboxLine(c)}${sandboxVmLine(c)}${projectFilesLine(c)}
         |${c.releaseNote}${c.issueText}${c.imagesBlock}
         |<spec>
         |$spec
@@ -3477,7 +3537,7 @@ class Orchestrator(
         append("(`${c.git} log HEAD..${c.baseRef}`), merge it in and resolve any conflicts.\n")
         append("Do not push, open pull requests or merge: the factory does that after you finish.\n")
         append(migrationLine(c)).append('\n')
-        append(sandboxLine(c)).append(sandboxVmLine(c)).append('\n')
+        append(sandboxLine(c)).append(sandboxVmLine(c)).append(projectFilesLine(c)).append('\n')
         previous.builderSummary?.takeIf { it.isNotBlank() }?.let {
             append("<previous_builder_summary>\n").append(it.take(4000)).append("\n</previous_builder_summary>\n\n")
         }
@@ -3520,7 +3580,7 @@ class Orchestrator(
         append("If you are convinced a finding is wrong, do not change the code for it; explain why in your final summary ")
         append("so the reviewers see your reasoning.\n")
         append(migrationLine(c)).append('\n')
-        append(sandboxLine(c)).append(sandboxVmLine(c)).append('\n')
+        append(sandboxLine(c)).append(sandboxVmLine(c)).append(projectFilesLine(c)).append('\n')
         for ((role, v) in changes) {
             append("### Reviewer: $role — ${v.verdict}\n${v.summary}\n")
             v.findings.forEach { f -> append("- [${f.severity}] ${f.file ?: "(general)"}: ${f.detail}\n") }
@@ -3584,6 +3644,157 @@ class Orchestrator(
         }
     }
 
+    /**
+     * The task prompts' line about the run's project files (docs/ARCHITECTURE.md §5 "Project files"), ending in a line
+     * break; empty when the run has none, so prompts stay as they were. [sandboxNow]: the agent has the run's sandbox
+     * (default: the build sandbox is approved).
+     */
+    private fun projectFilesLine(c: RunContext, sandboxNow: Boolean = c.sandbox?.state == "approved" && sandboxes.enabled): String {
+        val files = c.projectFiles?.files.orEmpty()
+        val dir = c.projectFilesDir
+        if (files.isEmpty() || dir == null) return ""
+        return buildString {
+            append("Project files: read-only at `$dir`")
+            if (sandboxNow) append(" (`${dk.egernet.factory.files.ProjectFiles.SANDBOX_PATH}` in the sandbox)")
+            append(", also in `\$${dk.egernet.factory.files.ProjectFiles.ENV}`; never copy them into the repository: ")
+            append(files.take(MAX_PROMPT_FILES).joinToString(", ") {
+                "${MigrationCheck.safe(it.name)} (${dk.egernet.factory.files.ProjectFiles.humanSize(it.size)}, sha256 ${it.sha256.take(12)})"
+            })
+            if (files.size > MAX_PROMPT_FILES) append(", and ${files.size - MAX_PROMPT_FILES} more")
+            append(".\n")
+        }
+    }
+
+    // ------------------------------------------------------------ project files (docs/ARCHITECTURE.md §5 "Project files")
+
+    /** The repository whose project files a run gets: the one it changes (whose sandbox definition it uses). */
+    private fun filesRepo(run: RunRecord): String = run.targetRepo ?: run.repo
+
+    /**
+     * Creates run [run]'s project files snapshot (again) and records it, with the hashes that changed since the previous
+     * run of the same repository; null without a file store. Blocking.
+     */
+    private fun snapshotProjectFiles(run: RunRecord): Pair<dk.egernet.factory.RunProjectFilesDto, Path>? {
+        val pf = projectFiles ?: return null
+        val repo = filesRepo(run)
+        val files = pf.snapshot(run.id, repo)
+        val previous = runs.previousProjectFiles(repo, run.id)?.files.orEmpty().associate { it.name.lowercase() to it.sha256 }
+        val dto = dk.egernet.factory.RunProjectFilesDto(repo, files.map { f ->
+            f.copy(previousSha256 = previous[f.name.lowercase()]?.takeIf { it != f.sha256 })
+        })
+        runs.setProjectFiles(run.id, dto)
+        return dto to pf.snapshotDir(repo, run.id)
+    }
+
+    /** The run's snapshot as recorded when its directory still exists, else made again from the current files. Blocking. */
+    private fun ensureProjectFiles(run: RunRecord): Pair<dk.egernet.factory.RunProjectFilesDto, Path>? {
+        val pf = projectFiles ?: return null
+        val repo = filesRepo(run)
+        val recorded = run.projectFiles
+        if (recorded != null && pf.hasSnapshot(repo, run.id)) return recorded to pf.snapshotDir(repo, run.id)
+        return snapshotProjectFiles(run)
+    }
+
+    /** Marks the files the run's approved sandbox definition names as `required`, and records that. Blocking. */
+    private fun markRequired(
+        runId: UUID, files: dk.egernet.factory.RunProjectFilesDto, sandbox: dk.egernet.factory.RunSandboxDto?,
+    ): dk.egernet.factory.RunProjectFilesDto {
+        val named = sandbox?.takeIf { it.state == "approved" }?.files.orEmpty().map { it.lowercase() }.toSet()
+        val marked = files.copy(files = files.files.map { it.copy(required = it.name.lowercase() in named) })
+        if (marked != files) runs.setProjectFiles(runId, marked)
+        return marked
+    }
+
+    /** Fails the run early when its approved sandbox definition names project files that are not uploaded. */
+    private fun requireProjectFiles(sandbox: dk.egernet.factory.RunSandboxDto?, files: dk.egernet.factory.RunProjectFilesDto?) {
+        if (!sandboxes.enabled || sandbox?.state != "approved" || projectFiles == null) return
+        val have = files?.files.orEmpty().map { it.name.lowercase() }.toSet()
+        val missing = sandbox.files.filter { it.lowercase() !in have }
+        if (missing.isEmpty()) return
+        throw StageFailed(
+            "${dk.egernet.factory.sandbox.SANDBOX_FILE} needs project file(s) " + missing.joinToString(", ") { "`${MigrationCheck.safe(it)}`" } +
+                " that are not uploaded. Upload them on the project's Files page and start the run again.",
+        )
+    }
+
+    /** The session of the run's latest builder, if any. */
+    private fun lastBuilderSession(runId: UUID): UUID? =
+        runs.stages(runId).filter { it.role == "builder" && it.sessionId != null }.maxByOrNull { it.round }?.sessionId
+
+    /** Per run: the new blobs a large-file warning was given for (each is reported once per run). */
+    private val warnedBlobs = ConcurrentHashMap<UUID, MutableSet<String>>()
+
+    /**
+     * The check before a push of [run]'s branch in [worktree] (docs/ARCHITECTURE.md §6 "Project file guard"): the text
+     * why it must not be pushed when a new blob is one of the project files (the current ones or the run's snapshot), else
+     * null. Large new files that are no project file get a `warn` event in [warnSession]. A failing check fails closed:
+     * [StageFailed] for the push step. Blocking.
+     */
+    private fun projectFileGuard(run: RunRecord, worktree: Path, baseRef: String, home: Path, warnSession: UUID?): String? {
+        val pf = projectFiles ?: return null
+        val repo = filesRepo(run)
+        try {
+            val blobs = workspaces.git.newBlobs(worktree, baseRef, home)
+            if (blobs.isEmpty()) return null
+            val snapshot = pf.snapshotDir(repo, run.id)
+            val candidates = (
+                pf.files(repo).map { ProjectFileGuard.Candidate(it.name, it.size, it.sha256, pf.blobFile(repo, it.sha256)) } +
+                    run.projectFiles?.files.orEmpty().map { ProjectFileGuard.Candidate(it.name, it.size, it.sha256, snapshot.resolve(it.name)) }
+                ).filter { java.nio.file.Files.isRegularFile(it.file, java.nio.file.LinkOption.NOFOLLOW_LINKS) }
+            val ids = ProjectFileGuard.toHash(blobs, candidates).associate { it.sha256 to workspaces.git.blobId(worktree, it.file, home) }
+            val matches = ProjectFileGuard.matches(blobs, candidates, ids)
+            if (matches.isNotEmpty()) {
+                log.warn("Run {}: not pushed, the branch contains {} project file(s)", run.id, matches.size)
+                return ProjectFileGuard.blockedText(matches)
+            }
+            val warned = warnedBlobs.computeIfAbsent(run.id) { ConcurrentHashMap.newKeySet() }
+            val large = ProjectFileGuard.large(blobs, matches, warned)
+            if (large.isNotEmpty()) {
+                warned += large.map { it.sha }
+                warnSession?.let { sid -> bestEffort { agents.systemEvent(sid, "warn", ProjectFileGuard.largeText(large)) } }
+            }
+            return null
+        } catch (e: Exception) {
+            log.warn("Run {}: the project file check before the push failed: {}", run.id, e.message)
+            throw StageFailed(ProjectFileGuard.failedText(e.message), kind = FailureKind.STEP, step = FailedStep.PUSH, cause = e)
+        }
+    }
+
+    /**
+     * `factory_list_project_files` (docs/ARCHITECTURE.md §7): a run's snapshot when [runId] is set (stage agents and the
+     * advisor), else [repo]'s current files (a chat). Names, sizes, hashes and notes only. Blocking.
+     */
+    fun projectFilesTool(runId: UUID?, repo: String): String {
+        val pf = projectFiles ?: return "{}"
+        val run = runId?.let { runs.get(it) }
+        val filesRepo = run?.let { filesRepo(it) } ?: repo
+        val current = pf.files(filesRepo).associateBy { it.name.lowercase() }
+        data class Entry(val name: String, val size: Long, val sha256: String, val version: Int)
+        val (path, entries) = if (run != null) {
+            pf.snapshotDir(filesRepo, run.id) to run.projectFiles?.files.orEmpty().map { Entry(it.name, it.size, it.sha256, it.version) }
+        } else {
+            pf.currentDir(filesRepo) to current.values.sortedBy { it.name.lowercase() }.map { Entry(it.name, it.size, it.sha256, it.version) }
+        }
+        val sandboxPath = run?.let { r ->
+            r.sandboxJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunSandboxDto.serializer(), it) }.getOrNull() }
+        }?.takeIf { it.state == "approved" && sandboxes.enabled }?.let { dk.egernet.factory.files.ProjectFiles.SANDBOX_PATH }
+        return kotlinx.serialization.json.buildJsonObject {
+            put("path", path.toString())
+            if (sandboxPath != null) put("sandboxPath", sandboxPath)
+            put("readOnly", true)
+            put("files", kotlinx.serialization.json.buildJsonArray {
+                for (e in entries) add(kotlinx.serialization.json.buildJsonObject {
+                    // Note and uploader of the same content when it is still the current version.
+                    val meta = current[e.name.lowercase()]?.takeIf { it.sha256 == e.sha256 }
+                    put("name", e.name); put("size", e.size); put("sha256", e.sha256); put("version", e.version)
+                    put("note", meta?.note); put("uploadedBy", meta?.uploadedByUsername); put("uploadedAt", meta?.uploadedAt?.iso())
+                })
+            })
+            put("note", "Read-only files of the project. Never copy, move, unpack or commit them into the repository, and never " +
+                "attach them to issues, pull requests or comments. Unpack or copy them outside the working directory when a build needs that.")
+        }.toString()
+    }
+
     /** Whether this run's builder gets the sandbox VM tools: the feature on and the run's definition approved. */
     private fun sandboxVmOn(c: RunContext) = vms?.enabled == true && c.sandboxVm?.state == "approved"
 
@@ -3622,6 +3833,7 @@ class Orchestrator(
         append("`scripts/check-migrations.sh`, `scripts/check-migrations.sh $defaultRef` must pass.\n")
         append("4. Build the project and run its tests.\n")
         append(sandboxLine(c))
+        append(projectFilesLine(c))
         append("5. If it cannot be done safely (a conflict you cannot resolve with confidence, or checks you cannot get to pass), put ")
         append("the branch back (`git merge --abort`, or `git reset --hard $start`) and explain precisely what is left. Nothing is ")
         append("pushed then.\n\n")
@@ -3637,7 +3849,7 @@ class Orchestrator(
         append("amend, rebase or reset: the merge is already pushed. Do not push. The migration rule still holds: this release's own ")
         append("migrations need versions above every migration on `$defaultRef`, and those must stay unchanged. If you are convinced a ")
         append("finding is wrong, do not change the code for it; explain why in your final summary.\n")
-        append(sandboxLine(c)).append('\n')
+        append(sandboxLine(c)).append(projectFilesLine(c)).append('\n')
         for ((role, v) in changes) {
             append("### Reviewer: $role — ${v.verdict}\n${v.summary}\n")
             v.findings.forEach { f -> append("- [${f.severity}] ${f.file ?: "(general)"}: ${f.detail}\n") }
@@ -3686,7 +3898,7 @@ class Orchestrator(
         |
         |${c.workspaceBlock}Inspect the change with `${c.git} diff ${c.baseRef}...HEAD`, `${c.git} log ${c.baseRef}..HEAD` and by reading the code; run tests or
         |the app where that helps your review.
-        |${if (role in SCREENSHOT_ROLES) uiReviewNote(c) + (if (reviewSandbox) reviewSandboxLine(c) else "") else ""}
+        |${if (role in SCREENSHOT_ROLES) uiReviewNote(c) + (if (reviewSandbox) reviewSandboxLine(c) else "") else ""}${projectFilesLine(c, sandboxNow = reviewSandbox)}
         |${c.releaseNote}${c.issueText}
         |<spec>
         |$spec
@@ -3788,6 +4000,8 @@ class Orchestrator(
 
         /** How often a builder that ended unfinished (no commits, uncommitted changes) is resumed to finish and commit. */
         const val MAX_FINISH_RESUMES = 2
+        /** At most this many project files are named in a task prompt. */
+        const val MAX_PROMPT_FILES = 50
 
         /** The prompt of a stage resumed after the Claude API was unreachable (docs/ARCHITECTURE.md §6 "Transient failures"). */
         const val CONTINUE_PROMPT = "Message from Agern: the connection to the Claude API was lost while you were working and is " +
