@@ -694,24 +694,37 @@ repo lower-cased with runs of other characters as `-` (at most 100 characters).
   no setup log is written. Info event: `Sandbox from prepared image <key> (prepared <instant>)` (`Review sandbox from …`,
   ``Platform `<name>` from …``).
 - *Prepare.* Otherwise (`Preparing sandbox image (setup) …`, plus `The prepared image <key> from <instant> is older
-  than <n> days.` for an expired one) the container is created from the base image as before; after a successful setup
-  and hand-over, unless the sandbox was released or stopped meanwhile, it is committed (`podman commit`, never
-  `--include-volumes`, never `--pause`) with labels `agern.prepared=<key>`, `agern.prepared.repo`, `.platform`,
-  `.definition` and `.base` (all server values; the commit refuses others than `[A-Za-z0-9._:/@-]`). Info event:
-  `Prepared image <key> stored in <s> s; …`, feed change `prepared`; the expired image it replaced is removed
-  best-effort, without force. A failed commit only warns (`Could not store the prepared image …`); a failed or
-  timed-out setup never commits.
+  than <n> days.` for an expired one) the image is made in a **dedicated preparation container**, before the run's own
+  network and services exist, never in a run's container: `agern-prepare-<runId>-<platform>` (review sandbox:
+  `agern-review-prepare-<runId>`; labels `agern.run`, `agern.repo`, `agern.role=prepare`) on a network of the same name,
+  from the base image with the definition's env, `user:` mapping and limits. Its `/workspace` is a fresh **read-only
+  export of the committed tree** of the commit the definition was read from (`GitOps.exportTree`: `git archive` of
+  that commit, extracted with `tar` into `<FACTORY_DATA_DIR>/sandbox-prepare/<random>`): no uncommitted, untracked or
+  ignored files of any worktree, no submodule content. It has **no cache volumes** and none of the run's services.
+  `prepare-user.sh`, setup (its log as before) and the hand-over of the home run there; then, unless the sandbox was
+  released or stopped meanwhile, it is committed (`podman commit`, never `--include-volumes`, never `--pause`) with
+  labels `agern.prepared=<key>`, `agern.prepared.repo`, `.platform`, `.definition` and `.base` (all server values; the
+  commit refuses others than `[A-Za-z0-9._:/@-]`). The preparation container, its network and the export are removed
+  whatever happens (also by a release or an admin's stop, which remove the container). Info event: `Prepared image
+  <key> stored in <s> s; …`, feed change `prepared`; the expired image it replaced is removed best-effort, without
+  force. The run's container then starts from the image like a reused one (`startedFrom: prepared`). A failed or
+  timed-out setup never commits and fails the creation as before. A failed commit only warns (`Could not store the
+  prepared image …`); that run's container then runs setup itself, as without prepared images.
+  *Why a separate container:* the prepared image is shared by every later run of the repo, so nothing an agent can
+  write (its worktree, which it edits before its first command and which a review sandbox mounts too; the cache
+  volumes its builds fill; its services) may influence the root setup whose result they start from. The agent itself
+  still runs on the host as the same OS user (see above), so this is about what the *sandbox* passes on, not a
+  boundary against the agent process.
 - *One at a time.* Preparing one image name is serialised in the server by a per-name mutex, held from "missing or
   stale" until after the commit or failure. A second sandbox needing it says `Waiting for another sandbox to finish
   preparing image <key> …`, waits at most the command limit (holding only its slot) and checks again: it reuses the
   image, or prepares it itself when the first failed. After the time-out it undoes its attempt and answers `Another run
   is still preparing this project's sandbox image (more than <n> minutes). Nothing was run. …`.
 - *Isolation.* Each run still has its own containers, network, services and worktree mount. A commit captures only the
-  container's root file system — not the worktree, cache volumes or `/run/agern-review` (mounts), not service data
-  (other containers), not processes — and the container never had Agern's environment. A prepared image is shared only
-  between sandboxes of the same repo, platform and approved definition. What setup wrote outside the image (worktree,
-  caches, services) happens only in the preparing sandbox; what it read from `/workspace` is frozen until the image is
-  prepared again: the contract for authors is in [SANDBOXES.md](SANDBOXES.md) "Prepared images".
+  preparation container's root file system — not the read-only export (a mount), not processes — and the container
+  never had Agern's environment. A prepared image is shared only between sandboxes of the same repo, platform and
+  approved definition, and is made only from committed content of the definition's commit. The contract for authors
+  (setup cannot write `/workspace`, has no caches and no services) is in [SANDBOXES.md](SANDBOXES.md) "Prepared images".
 - *Lifetime.* Podman's store (labels, creation time) is the only record; nothing is in the database. The server never
   reuses an image older than the max age; the daily prune removes unused ones (§9), an admin can remove all unused ones
   (`DELETE /api/admin/sandboxes/prepared`, `agern sandbox prune --prepared`). The base image is pulled only when
@@ -749,8 +762,8 @@ so an app that needs the project's toolchain or its database can be looked at an
   `factory_sandbox_info` says so.
 - *Creation and sharing.* Lazily, by the first review-scoped `factory_sandbox_exec` of a round, in the same order as
   the build sandbox (network, services, cache volumes, container, readiness checks, `prepare-user.sh`, setup as root).
-  It uses the `default` key, so it starts from the image the builder's sandbox prepared (and the builder's sandbox from
-  one the review sandbox prepared); only without one does setup run here. After setup only the user's home is handed
+  It uses the `default` key, so it starts from the image prepared for the builder's sandbox (and the builder's sandbox
+  from one prepared for the review sandbox); without one, the image is prepared first in a preparation container. After setup only the user's home is handed
   over (`/workspace` is read-only). Both UI reviewers of the round use the
   same container — two first calls create it once — and commands stay one at a time: foreground calls queue, a
   background command refuses the others. Reviewers start a long-running app detached inside a foreground command with
@@ -833,6 +846,10 @@ run --detach --name agern-review-<id> --label agern.run=<id> --label agern.repo=
     # from a prepared image: <image> is localhost/agern-prepared/<slug>:<key> and --pull=never
 image exists <image>  ;  image inspect <image>                     # base image id and prepared image (JSON: Id, Created, Size, Labels)
 pull --quiet <image>                                               # base image missing from the store, before the key
+network create --label agern.run=<id> --label agern.repo=<repo> --label agern.role=prepare-network agern-prepare-<id>-<platform>
+run … --name agern-prepare-<id>-<platform> --label agern.role=prepare … --network agern-prepare-<id>-<platform>
+    …(limits, user mapping, env as the sandbox container)… --pull=missing --workdir /workspace --entrypoint sh
+    --mount type=bind,source=<data dir>/sandbox-prepare/<random>,target=/workspace,readonly=true <image> -c "<keep-alive>"   # preparation, no caches
 commit --quiet --change "LABEL agern.prepared=<key>" --change "LABEL agern.prepared.repo=<repo>" --change "LABEL agern.prepared.platform=<p>"
     --change "LABEL agern.prepared.definition=<sha256>" --change "LABEL agern.prepared.base=<image>" <container> localhost/agern-prepared/<slug>:<key>
 images --filter label=agern.prepared --format '{{.ID}}'  ;  image inspect <id> …   # admin overview
@@ -841,7 +858,7 @@ exec --workdir / agern-run-<id>-<svc> sh -c <ready.command>                     
 logs --tail 30 agern-run-<id>-<svc>                                                              # when it never passes
 exec --workdir /workspace <container> sh -c <prepare-user.sh> agern-user <n> <name or ''> [<cache path> …]   # with `user`, as root
 exec --workdir /workspace <container> sh -c '{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; exec sh -lc "$1"' sh <setup>   # as root
-exec --workdir /workspace <container> sh -c 'uid=$1; shift; find "$@" -xdev ! -user "$uid" -exec chown -h "$uid:$uid" {} + 2>/dev/null || true' agern-hand-over <n> <home> /workspace   # with `user`, after setup
+exec --workdir /workspace <container> sh -c 'uid=$1; shift; find "$@" -xdev ! -user "$uid" -exec chown -h "$uid:$uid" {} + 2>/dev/null || true' agern-hand-over <n> <home> /workspace   # with `user`, after setup (preparation container: <home> only)
 exec [--user <n>:<n> --env HOME=<home> --env USER=<name> --env LOGNAME=<name>] --workdir /workspace <container>
     sh -c '{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; exec sh -lc "$1"' sh <command>   # every command
 restart --time 0 <container>                                       # after a command timed out

@@ -77,9 +77,10 @@ Every key, with its default. Only `image` is required.
 # It needs a POSIX sh.
 image: docker.io/library/eclipse-temurin:21-jdk
 
-# Shell script, run as root in a fresh container (sh -lc, in /workspace, time limit as for commands).
-# Install system packages here. The result is stored as a prepared image that later sandboxes start
-# from, so it runs once per project, image and definition, not per run (see "Prepared images").
+# Shell script, run as root in a separate preparation container (sh -lc, time limit as for commands),
+# where /workspace is a read-only copy of this file's commit, not the run's worktree. Install system
+# packages here. The result is stored as a prepared image that later sandboxes start from, so it runs
+# once per project, image and definition, not per run (see "Prepared images").
 # Optional; at most 32 KiB.
 setup: |
   apt-get update && apt-get install -y --no-install-recommends git
@@ -156,13 +157,12 @@ toolchain or its database can be started for review. What to know when you write
   — and starts its own copy of every service, with your readiness checks. It does not share data with the
   builder's services.
 - **Setup.** The review sandbox starts from the project's prepared image (the same one the builder's
-  sandbox uses, see "Prepared images"), so setup does not run again. Only when there is none yet does
-  setup run here, as root, with `/workspace` read-only, and its result is stored for later sandboxes: it
-  must not write into `/workspace` (install into the image's system directories, the user's home or a
-  cache instead). Afterwards only the user's home is handed over to `user:`.
+  sandbox uses). When there is none yet, it is prepared first, in the same separate preparation
+  container as for the builder (see "Prepared images"), never in the review sandbox itself.
 - **A browser.** To take screenshots inside the container the reviewers need a headless browser there:
-  install one in `setup` (e.g. Chromium, or Playwright's browser into a `caches:` path such as
-  `/home/<user>/.cache/ms-playwright`, so it is downloaded once per project).
+  install one in `setup` into the image (e.g. Chromium from the distribution), or let a command download
+  Playwright's browser into a `caches:` path such as `/home/<user>/.cache/ms-playwright`, so it is
+  downloaded once per project. Setup itself cannot fill a cache (see "Prepared images").
 - **Output directory.** The only directory the container can write on the host is `/run/agern-review`
   (`.agern-run/review` in the agents' working directory, git-ignored); screenshots go there and are
   attached from the host. It is deleted with the sandbox. Do not use `/run/agern-review` in `caches:`.
@@ -202,10 +202,12 @@ Setting up a container (pulling the image, `apt-get update`, installing packages
 runtime) takes minutes and gives the same result every time, as long as the image and the file do not
 change. So Agern does it once:
 
-- The **first** sandbox of a project with a `setup` script runs it as described above. When setup has
-  succeeded, Agern stores that container's file system as a local image, a *prepared image*
-  (`localhost/agern-prepared/<project>:<key>`). The run page says `Preparing sandbox image (setup) …`
-  and then `Prepared image <key> stored in … s`.
+- The **first** sandbox of a project with a `setup` script prepares the image in a separate,
+  throwaway *preparation container* (described below), never in a run's own container. When setup has
+  succeeded there, Agern stores that container's file system as a local image, a *prepared image*
+  (`localhost/agern-prepared/<project>:<key>`), removes the preparation container, and starts the
+  run's sandbox from the image. The run page says `Preparing sandbox image (setup) …`, shows the setup
+  log, and then `Prepared image <key> stored in … s`.
 - **Later** sandboxes with the same key start from that image and skip setup: other runs, the next
   issue of a release, the review sandbox, a container recreated after an admin's stop or after a run
   made room for a platform. The run page says `Sandbox from prepared image <key> (prepared <date>)`.
@@ -223,18 +225,33 @@ change. So Agern does it once:
 - A failed setup never stores anything. When two runs need the same missing image at the same time,
   the second waits for the first (at most the command limit) and starts from its image.
 
+**Where setup runs.** A prepared image is shared by every later run of the project, so what goes into
+it must not depend on anything a run's agent could have written. Setup therefore never runs in a run's
+worktree. The preparation container is created from the base image with the file's `env` and `user`,
+and it differs from a sandbox in these ways:
+
+- `/workspace` is a **read-only copy of the committed tree** of the commit this file was read from (the
+  default branch, as approved), exported fresh for each preparation: no uncommitted or untracked
+  files, no build output, no `node_modules`, no submodule content. Setup may read files from it (for
+  example a version from a lock file), but it cannot write there.
+- **No cache volumes** are mounted (a cache is written by the runs' builds, so setup must not trust
+  it), **no services** run, and it has a network of its own (outbound access as usual).
+- When setup has finished, only the user's home is handed over to `user:`; then the container is
+  committed and removed.
+
 What this means for your `setup` script — **setup must only install into the image**:
 
 - A prepared image keeps the container's own file system after setup: system directories, `/opt`, the
   user's home.
-- It does **not** keep what setup wrote into `/workspace` (the worktree is mounted, not copied), into a
-  `caches:` path (a volume) or into `/run/agern-review`, nor anything it did to a service (a database
-  it created or migrated), nor processes it started. Such effects happen only in the sandbox that
-  prepares the image; later sandboxes do not see them. Do these things in the build (or in the
-  Verification commands) instead.
-- What setup *reads* from `/workspace` (for example a version number in a lock file) is frozen in the
-  image until it is prepared again: after a change that matters, ask an admin to remove the prepared
-  images.
+- Setup must not write into `/workspace` (read-only there) and cannot reach the services. Do such work
+  in the build (or in the Verification commands) instead. Processes setup starts end with the
+  preparation container.
+- What setup writes into a `caches:` path lands in the image, where the sandbox's cache volume is then
+  mounted over it; it is not visible to the runs. Download what a build needs into a cache from the
+  build, or install it elsewhere from setup.
+- What setup reads from `/workspace` comes from the default branch's committed tree when the image was
+  prepared, not from the run's branch; it changes when the image is prepared again (a new approval, a
+  new base image, the max age, or an admin removing the prepared images).
 
 **Caches versus prepared images.** Both survive between runs. `caches:` volumes hold downloads that the
 build itself fills and updates (Gradle, npm, pip), are shared by all runs of the project and are mounted
@@ -281,7 +298,7 @@ libraries, is the common one. Then set `user`:
 - `user: <uid>` (1–60000) runs as that uid: under the image's name for it, or as a new account `sandbox`.
 
 The setup script still runs as **root**, before the commands. The user owns its home directory and the
-cache directories; whatever setup leaves in the home directory or in `/workspace` is handed to the user
+cache directories; whatever setup leaves in the home directory (or, with prepared images off, in `/workspace`) is handed to the user
 afterwards. Inside the container the user is uid *n*, and on the host it is the factory's service user,
 so everything the build writes in `/workspace` stays editable by the agent. (Technically: `--userns
 keep-id:uid=<n>,gid=<n>`; container root is then an unprivileged subordinate id.) The first sandbox of
@@ -293,10 +310,10 @@ Point cache paths at the user's home, e.g. `/home/ubuntu/.gradle`, not `/root/.g
 
 Each path in `caches` is a named volume of the project (one per platform), kept between runs and
 removed only by an admin (`agern sandbox prune --caches`, which also removes the unused prepared
-images, since a setup script may have filled a cache that is then gone). Use them for downloads that are
-safe to reuse: `~/.gradle`, `~/.m2`, `~/.npm`, `~/.cache/pip`, `~/.cache/ms-playwright`. What setup
-writes into a cache path is not part of the prepared image (see "Prepared images"): a browser that setup
-downloads into a cache is there as long as the volume is. Do not use them for
+images, so a project starts from scratch). Use them for downloads that are safe to reuse: `~/.gradle`,
+`~/.m2`, `~/.npm`, `~/.cache/pip`, `~/.cache/ms-playwright`. They are filled by the runs' commands, not
+by setup: the preparation container that runs setup has no cache volumes (see "Prepared images"), and
+what it writes into a cache path is hidden by the volume in the sandboxes. Do not use them for
 build output that belongs to a run (that stays in `/workspace`) or for anything secret. Several runs of a
 project can use a cache at the same time; tools whose caches are not safe for concurrent use (few are)
 need their own locking.
