@@ -1063,7 +1063,7 @@ guard").
 
 **Storage.** One store per repository, keyed by the bare repository name (a workspace's chats use the workspace
 repository's, a workspace run its target member's, below); a renamed repository does not take its files along. The
-metadata is in PostgreSQL (migration `V32__project_files.sql`: `project_files`, unique on `(repo, lower(name))`;
+metadata is in PostgreSQL (migration `V33__project_files.sql`: `project_files`, unique on `(repo, lower(name))`;
 `project_file_uploads`; `project_file_managers`; the column `runs.project_files`), the bytes only on disk under
 `$FACTORY_DATA_DIR/project-files/<repo>/`:
 
