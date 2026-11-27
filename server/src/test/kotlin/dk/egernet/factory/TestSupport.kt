@@ -242,6 +242,14 @@ class FakeGitOps : GitOps {
     val files = java.util.concurrent.ConcurrentHashMap<String, String>()
     /** Every [readFile], as `"<ref>:<path>"`. */
     val reads = CopyOnWriteArrayList<String>()
+    /** Every [exportTree], as `"<ref> <dest>"`; the export holds [files] (committed content). */
+    val exports = CopyOnWriteArrayList<String>()
+    override fun exportTree(dir: Path, ref: String, dest: Path, home: Path): String {
+        exports += "$ref $dest"
+        Files.createDirectories(dest)
+        for ((path, content) in files) Files.createDirectories(dest.resolve(path).parent).also { Files.writeString(dest.resolve(path), content) }
+        return "e".repeat(40)
+    }
     override fun readFile(dir: Path, ref: String, path: String, home: Path, maxBytes: Int): String? {
         reads += "$ref:$path"
         return files[path]

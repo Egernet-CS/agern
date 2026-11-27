@@ -92,9 +92,11 @@ class PodmanIntegrationTest {
         val names = listOf(runA, runB, runC).flatMap { listOf(SandboxManager.containerName(it), SandboxManager.serviceContainerName(it, "web")) } +
             "agern-it-anon-$runA" + SandboxManager.platformContainerName(runC, "alt") +
             listOf(runD).flatMap { listOf(SandboxManager.reviewContainerName(it), SandboxManager.reviewServiceContainerName(it, "web")) } +
-            listOf(runE, runF, runH).map { SandboxManager.containerName(it) } + SandboxManager.reviewContainerName(runG)
+            listOf(runF, runH).map { SandboxManager.containerName(it) } + SandboxManager.reviewContainerName(runG) +
+            SandboxManager.prepareName(runE, "default")
         runCatching { rt.removeContainers(names) }
-        for (r in listOf(runA, runB, runC, runE, runF, runH)) runCatching { rt.removeNetwork(SandboxManager.networkName(r)) }
+        runCatching { rt.removeNetwork(SandboxManager.prepareName(runE, "default")) }
+        for (r in listOf(runA, runB, runC, runF, runH)) runCatching { rt.removeNetwork(SandboxManager.networkName(r)) }
         for (r in listOf(runD, runG)) runCatching { rt.removeNetwork(SandboxManager.reviewNetworkName(r)) }
         for (i in preparedImages.reversed()) runCatching { podman("rmi", "--force", i) }
         for (v in listOf(SandboxManager.cacheVolumeName(repo, "/cache"), SandboxManager.cacheVolumeName(repo, "/cache", "alt"))) {
@@ -386,13 +388,15 @@ class PodmanIntegrationTest {
 
     /**
      * Prepared images (docs/ARCHITECTURE.md §5 "Prepared images"), with `user:` (keep-id) as the server does it: setup
-     * runs in a fresh container, which is committed; a second sandbox on another worktree starts from the image with
-     * `--pull=never`. Only the container's own file system is in the image: not what setup wrote to the worktree, a cache
-     * volume or the review output directory.
+     * runs in the dedicated preparation container ([SandboxManager.prepareSpec]: a read-only export as `/workspace`, no
+     * caches, its own network), which is committed; a second sandbox on a worktree starts from the image with
+     * `--pull=never`. Only the container's own file system is in the image: not the export, a cache or the review
+     * output directory.
      */
     @Test
     fun `a prepared image keeps what setup installed and nothing from mounts`() {
-        val wt1 = Files.createDirectories(base.resolve("prep/one"))
+        val wt1 = Files.createDirectories(base.resolve("prep/export"))
+        Files.writeString(wt1.resolve("committed.txt"), "committed")
         val wt2 = Files.createDirectories(base.resolve("prep/two"))
         val out = Files.createDirectories(base.resolve("prep/review-out"))
         val d = def.copy(services = emptyList(), user = SandboxUser("builder", 1000), setup = "unused")
@@ -404,23 +408,28 @@ class PodmanIntegrationTest {
         }
         fun handOver(c: String, vararg paths: String) =
             rt.exec(c, listOf("sh", "-c", SandboxManager.HAND_OVER_SCRIPT, "agern-hand-over", "1000") + paths, SandboxManager.WORKDIR, 120_000)
-        fun startFrom(run: UUID, spec: ContainerSpec): Long {
-            rt.createNetwork(SandboxManager.networkName(run), SandboxManager.labels(run, repo, "network"))
+        fun startFrom(run: UUID, spec: ContainerSpec, network: String = SandboxManager.networkName(run)): Long {
+            rt.createNetwork(network, SandboxManager.labels(run, repo, "network"))
             rt.ensureVolume(cache, linkedMapOf("agern.repo" to repo, "agern.cache" to "/cache"))
             val t0 = System.nanoTime()
             rt.startContainer(spec)
             return (System.nanoTime() - t0) / 1_000_000
         }
 
-        // 1. The first sandbox: from the base image, setup (as root) writes into the image, the worktree and the cache.
+        // 1. The preparation container: from the base image, the export read-only at /workspace, no cache volume. Setup (as
+        // root) reads the export, cannot write it, and writes into the image and into the cache path (not a volume here).
         if (rt.imageInfo(image) == null) rt.pullImage(image)
         val baseId = rt.imageInfo(image)!!.id
-        val first = SandboxManager.containerName(runE)
-        println("first container with keep-id started in ${startFrom(runE, SandboxManager.commandSpec(runE, repo, wt1, d, null))} ms")
+        val first = SandboxManager.prepareName(runE, "default")
+        val prepSpec = SandboxManager.prepareSpec(runE, repo, first, wt1, d, null, image)
+        assertTrue(PodmanRuntime.runArgs(cfg, prepSpec).none { it.startsWith("type=volume") }, "no cache volume in the preparation container")
+        println("preparation container with keep-id started in ${startFrom(runE, prepSpec, first)} ms")
         prepareUser(first)
+        assertEquals("committed", ok(first, "cat /workspace/committed.txt"))
+        assertTrue(sh(first, "echo ws > /workspace/setup-ws.txt").exitCode != 0, "the export is read-only")
         ok(first, "mkdir -p /opt/agern-it && echo baked > /opt/agern-it/marker && echo tool > /home/builder/tool.txt && " +
-            "echo ws > /workspace/setup-ws.txt && echo cached > /cache/setup-cache.txt")
-        handOver(first, "/home/builder", SandboxManager.WORKDIR)
+            "mkdir -p /cache && echo cached > /cache/setup-cache.txt")
+        handOver(first, "/home/builder")
         val key = SandboxManager.preparedKey(repo, "default", "0".repeat(64), baseId)
         val name = SandboxManager.preparedImageName(repo, key)
         preparedImages += name
@@ -436,10 +445,9 @@ class PodmanIntegrationTest {
         assertTrue(java.time.Duration.between(info.createdAt, java.time.Instant.now()).abs() < java.time.Duration.ofMinutes(10), "created ${info.createdAt}")
         assertTrue(rt.listPreparedImages().any { it.id == info.id && it.labels["agern.prepared"] == key }, "listed among the prepared images")
         assertFalse(rt.removeImage(info.id), "in use by the first container, so not removed")
-        assertTrue(Files.exists(wt1.resolve("setup-ws.txt")), "setup's worktree file is in the first worktree")
-        // A fresh cache volume for the next sandbox, so a file in it could only come from the image.
+        assertFalse(Files.exists(wt1.resolve("setup-ws.txt")))
         rt.removeContainers(listOf(first))
-        rt.removeNetwork(SandboxManager.networkName(runE))
+        rt.removeNetwork(first)
         podman("volume", "rm", "--force", cache)
 
         // 2. A second sandbox on another worktree from the prepared image, never pulled.
@@ -450,8 +458,8 @@ class PodmanIntegrationTest {
         prepareUser(second)
         assertEquals("baked", ok(second, "cat /opt/agern-it/marker"))
         assertEquals("tool", rt.exec(second, SandboxManager.shellCommand("cat /home/builder/tool.txt"), SandboxManager.WORKDIR, 30_000, builder).output.trim())
-        assertEquals("absent", ok(second, "test -e /workspace/setup-ws.txt && echo present || echo absent"), "worktree files are not in the image")
-        assertEquals("absent", ok(second, "test -e /cache/setup-cache.txt && echo present || echo absent"), "cache files are not in the image")
+        assertEquals("absent", ok(second, "test -e /workspace/committed.txt && echo present || echo absent"), "the export is not in the image")
+        assertEquals("absent", ok(second, "test -e /cache/setup-cache.txt && echo present || echo absent"), "the cache volume hides what setup wrote there")
         assertFalse(Files.exists(wt2.resolve("setup-ws.txt")))
         assertTrue(ok(second, "env").lines().none { it.startsWith("FACTORY_") || it.startsWith("GITHUB") }, "no environment from Agern")
         rt.removeContainers(listOf(second))

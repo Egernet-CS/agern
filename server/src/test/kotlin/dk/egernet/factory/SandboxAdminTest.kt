@@ -187,7 +187,7 @@ class SandboxAdminTest {
         runBlocking { withTimeout(5_000) { while (frames.size < 5) kotlinx.coroutines.delay(20) } }
         collector.cancel()
         // Each container's setup stored a prepared image (the default image's and the platform's).
-        assertEquals(listOf("created", "prepared", "created", "prepared", "stopped"), frames.take(5))
+        assertEquals(listOf("prepared", "created", "prepared", "created", "stopped"), frames.take(5))
     }
 
     @Test

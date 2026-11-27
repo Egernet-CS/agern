@@ -122,7 +122,7 @@ class ReleaseSandboxTest {
         assertTrue(whileSecond.contains("agern-run-${runIds[1]}"), whileSecond.toString())
         // The first issue's sandbox ran setup and stored a prepared image; the second started from it: one setup in the release.
         assertEquals(1, rt.execs.count { it.second == "echo setup" }, rt.execs.toString())
-        assertEquals(listOf("agern-run-${runIds[0]}"), rt.calls.filter { it.startsWith("commit ") }.map { it.split(' ')[1] })
+        assertEquals(listOf("agern-prepare-${runIds[0]}-default"), rt.calls.filter { it.startsWith("commit ") }.map { it.split(' ')[1] })
         val prepared = rt.images.keys.single()
         assertTrue(prepared.startsWith("localhost/agern-prepared/demo-app:"), prepared)
         assertEquals(prepared, rt.started.single { it.name == "agern-run-${runIds[1]}" }.image)

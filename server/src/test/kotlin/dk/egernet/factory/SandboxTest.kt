@@ -150,7 +150,8 @@ class SandboxTest {
 
     @Test
     fun `an approved definition gives the builder a lazily created sandbox, removed after the merge`() {
-        val w = world()
+        // Prepared images off: this checks the run's own containers with setup run in them (prepared images: below).
+        val w = world { it.copy(sandbox = it.sandbox.copy(preparedMaxAgeDays = 0)) }
         w.sandboxFile(definition)
         approve(w)
         val rt = w.sandboxRuntime
@@ -920,7 +921,8 @@ class SandboxTest {
 
     @Test
     fun `a sandbox that cannot be created or set up is removed and the slot freed`() {
-        val w = world()
+        // Prepared images off: setup in the run's own container (a failed preparation: see the prepared image tests).
+        val w = world { it.copy(sandbox = it.sandbox.copy(preparedMaxAgeDays = 0)) }
         w.sandboxFile(definition)
         approve(w)
         val answers = CopyOnWriteArrayList<ToolAnswer>()
@@ -989,7 +991,8 @@ class SandboxTest {
 
     @Test
     fun `platforms get their own containers on first use, share network and services, and are removed with the run`() {
-        val w = world { it.copy(sandbox = it.sandbox.copy(maxConcurrent = 3)) }
+        // Prepared images off: this checks the run's own containers with setup run in them (prepared images: below).
+        val w = world { it.copy(sandbox = it.sandbox.copy(maxConcurrent = 3, preparedMaxAgeDays = 0)) }
         w.sandboxFile(platformDefinition)
         approve(w, platformDefinition)
         val rt = w.sandboxRuntime
@@ -1162,7 +1165,8 @@ class SandboxTest {
 
     @Test
     fun `a run's sandbox is always removed before its worktree, also by the reapers at server start`() {
-        val w = world()
+        // Prepared images off: only the run's own containers, which bind-mount its worktree.
+        val w = world { it.copy(sandbox = it.sandbox.copy(preparedMaxAgeDays = 0)) }
         w.git.deleteWorktrees = true
         w.sandboxFile(definition)
         approve(w)
@@ -1465,25 +1469,62 @@ class SandboxTest {
         w.sandboxFile(preparedDefinition)
         approve(w, preparedDefinition)
         val rt = w.sandboxRuntime
-        val first = runOnce(w, 1)
+        // What setup sees in /workspace: listed when it runs. The agent writes into its worktree before its first command.
+        val seenBySetup = CopyOnWriteArrayList<String>()
+        rt.onExec = { container, cmd, _ ->
+            if (cmd.startsWith("echo setting up")) {
+                val src = rt.started.last { it.name == container }.mounts.single { it.target == "/workspace" }.source
+                java.nio.file.Files.walk(java.nio.file.Path.of(src)).use { st -> st.filter { java.nio.file.Files.isRegularFile(it) }.forEach { seenBySetup += java.nio.file.Path.of(src).relativize(it).toString() } }
+            }
+            ExecResult(0, "ran: $cmd\n", false, false, 5)
+        }
+        script(w) { p ->
+            // Planted before the first sandbox command: a root setup reading the worktree would run it.
+            java.nio.file.Files.writeString(p.spec.workDir.resolve("planted.sh"), "echo owned")
+            java.nio.file.Files.createDirectories(p.spec.workDir.resolve("node_modules/.bin"))
+            java.nio.file.Files.writeString(p.spec.workDir.resolve("node_modules/.bin/playwright"), "echo owned")
+            exec(w, p, "make")
+            "ok"
+        }
+        val first = start(w, 1).id
+        assertEquals(RunStatus.MERGED, w.awaitRun(first, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
         val key = keyOf(w, preparedDefinition)
         val name = SandboxManager.preparedImageName("demo-app", key)
         assertEquals("localhost/agern-prepared/demo-app:$key", name)
         assertEquals(16, key.length)
 
-        // First: pulled the base image once, ran setup and the hand-over, then committed the container.
+        // First: pulled the base image once, ran setup and the hand-over in a dedicated preparation container on its own
+        // network, with a clean read-only export of the definition's commit as /workspace and no caches; committed it and
+        // removed it; the run's own container then started from the image.
+        val prep = "agern-prepare-$first-default"
         assertEquals(listOf("pull $jdk21"), rt.calls.filter { it.startsWith("pull ") })
-        assertEquals(listOf("commit agern-run-$first $name"), rt.calls.filter { it.startsWith("commit ") })
+        assertEquals(listOf("commit $prep $name"), rt.calls.filter { it.startsWith("commit ") })
+        val prepSpec = rt.started.single { it.name == prep }
+        assertEquals(jdk21, prepSpec.image)
+        assertEquals("missing", prepSpec.pull)
+        assertEquals(prep, prepSpec.network)
+        assertEquals("prepare", prepSpec.labels["agern.role"])
+        val export = prepSpec.mounts.single()
+        assertEquals("/workspace", export.target)
+        assertTrue(export.readOnly && !export.volume, export.toString())
+        val worktree = w.services.workspaces.runDir("alice", "demo-app", first).toAbsolutePath().normalize().toString()
+        assertTrue(export.source != worktree && !export.source.startsWith(worktree), export.source)
+        assertEquals(listOf(".agern/sandbox.yml"), seenBySetup, "setup saw only the committed tree, nothing of the run's worktree")
+        assertFalse(java.nio.file.Files.exists(java.nio.file.Path.of(export.source)), "the export is removed afterwards")
+        assertTrue(w.git.exports.single().startsWith("origin/main "), w.git.exports.toString())
+        assertTrue(rt.calls.contains("network create $prep") && rt.calls.contains("network rm $prep"), rt.calls.toString())
+        assertFalse(rt.containers.containsKey(prep))
         val firstMain = rt.started.single { it.name == "agern-run-$first" }
-        assertEquals(jdk21, firstMain.image)
-        assertEquals("missing", firstMain.pull)
+        assertEquals(name, firstMain.image)
+        assertEquals("never", firstMain.pull)
+        assertEquals(worktree, firstMain.mounts[0].source)
         val image = rt.images.getValue(name)
         assertEquals(SandboxManager.preparedLabels(key, "demo-app", "default", SandboxDefinitions.sha256(preparedDefinition), jdk21), image.labels)
         assertEquals(mapOf("agern.prepared" to key, "agern.prepared.repo" to "demo-app", "agern.prepared.platform" to "default",
             "agern.prepared.definition" to SandboxDefinitions.sha256(preparedDefinition), "agern.prepared.base" to jdk21), image.labels)
-        // Isolation: the committed container carried only the definition's env; the worktree and caches were mounts.
+        // Isolation: the committed container carried only the definition's env and the export; no worktree, no caches.
         assertEquals(mapOf("CI" to "true"), image.spec!!.env)
-        assertEquals(listOf(false, true), image.spec!!.mounts.map { it.volume })
+        assertEquals(prepSpec, image.spec)
         val firstTexts = systemTexts(w, first)
         assertTrue(firstTexts.contains("Preparing sandbox image (setup) …"), firstTexts.toString())
         assertTrue(firstTexts.any { it.startsWith("Prepared image $key stored in ") && it.endsWith(" s; later sandboxes of this project start from it.") }, firstTexts.toString())
@@ -1505,12 +1546,14 @@ class SandboxTest {
         assertEquals(w.services.workspaces.runDir("alice", "demo-app", second).toAbsolutePath().normalize().toString(), main.mounts[0].source)
         assertEquals("agern-run-$second", main.network)
         assertEquals(mapOf("CI" to "true"), main.env)
-        assertEquals(firstMain.copy(name = main.name, labels = main.labels, network = main.network, mounts = main.mounts, image = name, pull = "never"), main,
-            "everything else as for a sandbox from the base image")
+        assertEquals(firstMain.copy(name = main.name, labels = main.labels, network = main.network, mounts = main.mounts), main,
+            "the same as the first run's container")
+        assertEquals(1, w.git.exports.size, "prepared once")
         assertTrue(rt.started.any { it.name == "agern-run-$second-postgres" && it.image == "docker.io/library/postgres:17" && it.pull == "missing" })
         assertEquals(1, rt.execs.count { it.second == "echo setting up\n" }, "setup ran once over both runs")
-        assertEquals(listOf("agern-run-$first", "agern-run-$second"), rt.internal.filter { it.startsWith("prepare-user ") }.map { it.split(' ')[1] })
-        assertEquals(listOf("agern-run-$first"), rt.internal.filter { it.startsWith("hand-over ") }.map { it.split(' ')[1] })
+        assertEquals(listOf(prep, "agern-run-$first", "agern-run-$second"), rt.internal.filter { it.startsWith("prepare-user ") }.map { it.split(' ')[1] })
+        // Only the home: the export is read-only.
+        assertEquals(listOf("hand-over $prep 1000 /home/builder"), rt.internal.filter { it.startsWith("hand-over ") })
         val texts = systemTexts(w, second)
         val reused = texts.single { it.startsWith("Sandbox from prepared image ") }
         assertTrue(Regex("Sandbox from prepared image $key \\(prepared \\d{4}-\\d\\d-\\d\\dT[^)]+\\)").matches(reused), reused)
@@ -1582,7 +1625,7 @@ class SandboxTest {
         val second = runOnce(w, 2)
         val k2 = keyOf(w, preparedDefinition)
         assertTrue(k1 != k2)
-        assertEquals(jdk21, rt.started.single { it.name == "agern-run-$second" }.image)
+        assertEquals(SandboxManager.preparedImageName("demo-app", k2), rt.started.single { it.name == "agern-run-$second" }.image)
         assertTrue(systemTexts(w, second).contains("Preparing sandbox image (setup) …"))
         val changed = preparedDefinition.replace("echo setting up", "echo setting up again")
         w.sandboxFile(changed)
@@ -1591,7 +1634,7 @@ class SandboxTest {
         val k3 = keyOf(w, changed)
         assertTrue(k3 != k2)
         assertEquals(listOf(k1, k2, k3).map { "localhost/agern-prepared/demo-app:$it" }.toSet(), rt.images.keys)
-        assertEquals(jdk21, rt.started.single { it.name == "agern-run-$third" }.image)
+        assertEquals(SandboxManager.preparedImageName("demo-app", k3), rt.started.single { it.name == "agern-run-$third" }.image)
         assertEquals(3, rt.calls.count { it.startsWith("commit ") })
     }
 
@@ -1609,7 +1652,8 @@ class SandboxTest {
         val second = runOnce(w, 2)
         val texts = systemTexts(w, second)
         assertTrue(texts.contains("Preparing sandbox image (setup) … The prepared image $key from ${old.createdAt.iso()} is older than 7 days."), texts.toString())
-        assertEquals(jdk21, rt.started.single { it.name == "agern-run-$second" }.image)
+        assertEquals(jdk21, rt.started.single { it.name == "agern-prepare-$second-default" }.image)
+        assertEquals(name, rt.started.single { it.name == "agern-run-$second" }.image)
         assertEquals(2, rt.execs.count { it.second == "echo setting up\n" })
         assertTrue(rt.calls.contains("rmi ${old.id}"), rt.calls.toString())
         assertTrue(rt.images.getValue(name).id != old.id)
@@ -1641,10 +1685,14 @@ class SandboxTest {
         assertTrue(answers[0].isError && answers[0].text.contains("setup script failed (exit 2)") && answers[0].text.contains("unable to locate package"), answers[0].text)
         assertTrue(answers[1].isError && answers[1].text.contains("setup script failed (timed out)"), answers[1].text)
         assertFalse(answers[2].isError, answers[2].text)
-        assertEquals(3, setupLogs(w, run.id).size, "the setup log is kept as before")
+        // The third attempt's commit failed: its own container ran setup itself, so four setup logs.
+        assertEquals(4, setupLogs(w, run.id).size, "the setup log is kept as before")
+        assertEquals(listOf("agern-prepare-${run.id}-default", "agern-prepare-${run.id}-default", "agern-prepare-${run.id}-default", "agern-run-${run.id}"),
+            rt.execs.filter { it.second.startsWith("echo setting up") }.map { it.first })
         // Only the third attempt (setup passed) tried to commit; nothing was stored.
-        assertEquals(listOf("commit agern-run-${run.id} ${SandboxManager.preparedImageName("demo-app", keyOf(w, preparedDefinition))}"),
+        assertEquals(listOf("commit agern-prepare-${run.id}-default ${SandboxManager.preparedImageName("demo-app", keyOf(w, preparedDefinition))}"),
             rt.calls.filter { it.startsWith("commit ") })
+        assertTrue(rt.containers.keys.none { it.startsWith("agern-prepare-") } && rt.networks.keys.none { it.startsWith("agern-prepare-") })
         assertTrue(rt.images.isEmpty())
         val texts = systemTexts(w, run.id)
         assertTrue(texts.contains("Could not store the prepared image ${keyOf(w, preparedDefinition)}: no space left on device. This sandbox works; " +
@@ -1698,7 +1746,7 @@ class SandboxTest {
             assertFalse(answers[1]!!.isError, answers[1]!!.text)
             assertFalse(answers[2]!!.isError, answers[2]!!.text)
             assertEquals(1, rt.execs.count { it.second == "echo setting up\n" })
-            assertEquals(listOf("agern-run-${ids.first}"), rt.calls.filter { it.startsWith("commit ") }.map { it.split(' ')[1] })
+            assertEquals(listOf("agern-prepare-${ids.first}-default"), rt.calls.filter { it.startsWith("commit ") }.map { it.split(' ')[1] })
             assertEquals(SandboxManager.preparedImageName("demo-app", keyOf(w, preparedDefinition)), rt.started.single { it.name == "agern-run-${ids.second}" }.image)
             val key = keyOf(w, preparedDefinition)
             assertTrue(systemTexts(w, ids.second).contains("Waiting for another sandbox to finish preparing image $key …"))
@@ -1711,7 +1759,7 @@ class SandboxTest {
             assertTrue(answers[1]!!.isError && answers[1]!!.text.contains("setup script failed (exit 2)"), answers[1]!!.text)
             assertFalse(answers[2]!!.isError, answers[2]!!.text)
             assertEquals(2, rt.execs.count { it.second == "echo setting up\n" })
-            assertEquals(listOf("agern-run-${ids.second}"), rt.calls.filter { it.startsWith("commit ") }.map { it.split(' ')[1] })
+            assertEquals(listOf("agern-prepare-${ids.second}-default"), rt.calls.filter { it.startsWith("commit ") }.map { it.split(' ')[1] })
             assertTrue(systemTexts(w, ids.second).contains("Preparing sandbox image (setup) …"))
         }
 
@@ -1757,8 +1805,13 @@ class SandboxTest {
         val first = start(w2, 1)
         assertEquals(RunStatus.MERGED, w2.awaitRun(first.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
         val key2 = keyOf(w2, preparedDefinition)
-        assertEquals(listOf("commit agern-review-${first.id} ${SandboxManager.preparedImageName("demo-app", key2)}"), rt2.calls.filter { it.startsWith("commit ") })
+        assertEquals(listOf("commit agern-review-prepare-${first.id} ${SandboxManager.preparedImageName("demo-app", key2)}"), rt2.calls.filter { it.startsWith("commit ") })
         assertTrue(stageTexts(w2, first.id, "ux").contains("Preparing sandbox image (setup) …"))
+        // Prepared in its own container from the clean export, not in the review sandbox over the run's worktree.
+        val prepMount = rt2.started.single { it.name == "agern-review-prepare-${first.id}" }.mounts.single()
+        assertTrue(prepMount.readOnly && prepMount.target == "/workspace", prepMount.toString())
+        assertFalse(prepMount.source.startsWith(w2.services.workspaces.runDir("alice", "demo-app", first.id).toAbsolutePath().normalize().toString()))
+        assertEquals(SandboxManager.preparedImageName("demo-app", key2), rt2.started.single { it.name == "agern-review-${first.id}" }.image)
         val second = runOnce(w2, 2)
         assertEquals(SandboxManager.preparedImageName("demo-app", key2), rt2.started.single { it.name == "agern-run-$second" }.image)
         assertEquals(1, rt2.execs.count { it.second == "echo setting up\n" })
@@ -1779,7 +1832,7 @@ class SandboxTest {
         assertTrue(main != debian)
         assertEquals(setOf(main, debian).map { SandboxManager.preparedImageName("demo-app", it) }.toSet(), rt.images.keys)
         assertEquals("debian12", rt.images.getValue(SandboxManager.preparedImageName("demo-app", debian)).labels["agern.prepared.platform"])
-        assertEquals(listOf("agern-run-$first", "agern-run-$first--debian12"), rt.calls.filter { it.startsWith("commit ") }.map { it.split(' ')[1] })
+        assertEquals(listOf("agern-prepare-$first-default", "agern-prepare-$first-debian12"), rt.calls.filter { it.startsWith("commit ") }.map { it.split(' ')[1] })
         val second = runOnce(w, 2, also = both)
         assertEquals(SandboxManager.preparedImageName("demo-app", debian), rt.started.single { it.name == "agern-run-$second--debian12" }.image)
         assertEquals(SandboxManager.preparedImageName("demo-app", main), rt.started.single { it.name == "agern-run-$second" }.image)

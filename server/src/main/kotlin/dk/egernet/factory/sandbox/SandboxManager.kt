@@ -175,6 +175,8 @@ class SandboxManager(
     private class RunSandbox(
         val runId: UUID, val repo: String, val worktree: Path, val plan: Plan, @Volatile var info: RunSandboxDto,
         val runDir: Path? = null, val review: Boolean = false, val parent: RunSandbox? = null,
+        /** The commit the definition was read from, and the git home: what a prepared image is made from ([prepareImage]). */
+        val definitionRef: String? = null, val gitHome: Path? = null,
     ) {
         /**
          * Serialises creation and commands: one command at a time per run. Taken by the tool call (waiting for a
@@ -190,6 +192,8 @@ class SandboxManager(
         val commands = LinkedHashMap<String, Command>()
         /** The run's network and services exist. */
         @Volatile var infra = false
+        /** Preparation containers (and networks, same names) of this sandbox that exist now ([prepareImage]). */
+        val preparing: MutableSet<String> = ConcurrentHashMap.newKeySet()
         /** When the network and services were created (null while there are none). */
         @Volatile var createdAt: Instant? = null
         /** Command containers that exist now, by platform key. */
@@ -215,11 +219,17 @@ class SandboxManager(
 
     /** Every container a run can have, existing or not (removal ignores missing ones). */
     private fun names(rs: RunSandbox): List<String> {
-        if (rs.review) return listOf(reviewContainerName(rs.runId)) + rs.definition?.services.orEmpty().map { reviewServiceContainerName(rs.runId, it.name) }
+        if (rs.review) {
+            return listOf(reviewContainerName(rs.runId)) + rs.definition?.services.orEmpty().map { reviewServiceContainerName(rs.runId, it.name) } +
+                prepareNames(rs)
+        }
         val def = rs.definition ?: return listOf(containerName(rs.runId))
         return listOf(containerName(rs.runId)) + def.platforms.map { platformContainerName(rs.runId, it.name) } +
-            def.services.map { serviceContainerName(rs.runId, it.name) }
+            def.services.map { serviceContainerName(rs.runId, it.name) } + prepareNames(rs)
     }
+
+    /** The preparation containers that exist now (being prepared in: [prepareImage] removes them when it ends). */
+    private fun prepareNames(rs: RunSandbox): List<String> = rs.preparing.toList()
 
     private fun boxName(rs: RunSandbox, key: String) = when {
         rs.review -> reviewContainerName(rs.runId)
@@ -245,7 +255,8 @@ class SandboxManager(
     suspend fun prepare(
         runId: UUID, repo: String, worktree: Path, baseRef: String, home: Path, definitionRepo: String = repo, runDir: Path = worktree,
     ): RunSandboxDto {
-        suspend fun record(info: RunSandboxDto, available: Plan.Available?, repo: String, worktree: Path) = recordDecision(runId, info, available, repo, worktree, runDir)
+        suspend fun record(info: RunSandboxDto, available: Plan.Available?, repo: String, worktree: Path) =
+            recordDecision(runId, info, available, repo, worktree, runDir, baseRef, home)
         if (!enabled) {
             return record(RunSandboxDto("disabled", "Sandboxes are switched off on this server (FACTORY_SANDBOX=off).", null, null), null, repo, worktree)
         }
@@ -292,10 +303,11 @@ class SandboxManager(
     }
 
     private suspend fun recordDecision(
-        runId: UUID, info: RunSandboxDto, available: Plan.Available?, repo: String, worktree: Path, runDir: Path,
+        runId: UUID, info: RunSandboxDto, available: Plan.Available?, repo: String, worktree: Path, runDir: Path, definitionRef: String, home: Path,
     ): RunSandboxDto {
         withContext(Dispatchers.IO) { runs.setSandbox(runId, info) }
-        if (enabled) sandboxes[runId] = RunSandbox(runId, repo, worktree, available ?: Plan.Unavailable(info.reason), info, runDir)
+        if (enabled) sandboxes[runId] = RunSandbox(runId, repo, worktree, available ?: Plan.Unavailable(info.reason), info, runDir,
+            definitionRef = definitionRef, gitHome = home)
         return info
     }
 
@@ -424,7 +436,8 @@ class SandboxManager(
     private fun reviewSandbox(build: RunSandbox, plan: Plan.Available): RunSandbox? {
         if (build.released) return null
         val rs = reviews.computeIfAbsent(build.runId) {
-            RunSandbox(build.runId, build.repo, build.worktree, plan, build.info, build.runDir, review = true, parent = build)
+            RunSandbox(build.runId, build.repo, build.worktree, plan, build.info, build.runDir, review = true, parent = build,
+                definitionRef = build.definitionRef, gitHome = build.gitHome)
         }
         if (build.released || rs.parent !== build) {
             if (reviews.remove(build.runId, rs)) dropReview(rs)
@@ -770,6 +783,10 @@ class SandboxManager(
             }
         }
         var prep: Prep? = null
+        /** The image name's preparation lock, while this attempt holds it. */
+        var held: Mutex? = null
+        /** The image was prepared by this attempt (this container starts from it). */
+        var preparedNow = false
         try {
             // Before the network and services: a sandbox waiting for another one's preparation holds nothing but its slot.
             if (setup != null && sc.preparedMaxAgeDays > 0) {
@@ -782,9 +799,34 @@ class SandboxManager(
                         return "Another run is still preparing this project's sandbox image (more than $minutes minute${if (minutes == 1L) "" else "s"}). " +
                             "Nothing was run. " + if (rs.review) REVIEW_ON_HOST else "Try again in a few minutes; meanwhile continue with work that needs no build."
                     }
-                    is Prep.Prepare -> publishSystem(sessionId, systemPayload("info", "Preparing sandbox image (setup) …" + (p.stale?.let {
-                        " The prepared image ${p.key} from ${it.createdAt.iso()} is older than ${sc.preparedMaxAgeDays} days."
-                    } ?: "")))
+                    is Prep.Prepare -> {
+                        held = p.lock
+                        publishSystem(sessionId, systemPayload("info", "Preparing sandbox image (setup) …" + (p.stale?.let {
+                            " The prepared image ${p.key} from ${it.createdAt.iso()} is older than ${sc.preparedMaxAgeDays} days."
+                        } ?: "")))
+                        val result = prepareImage(rs, plan, key, platform, image, setup, p, generation, sessionId)
+                        if (rs.released) {
+                            teardown(rs)
+                            return if (rs.review) "The review round ended while its review sandbox was being created." else "The run ended while its sandbox was being created."
+                        }
+                        if (rs.generation.get() != generation) {
+                            undo()
+                            return "An admin stopped this run's ${if (rs.review) "review " else ""}sandbox while it was being created. Nothing was run; " +
+                                "the next command creates it again."
+                        }
+                        when (result) {
+                            is Prepared.Stored -> {
+                                prep = Prep.Reuse(p.key, p.image, result.createdAt)
+                                preparedNow = true
+                            }
+                            // Not stored (the commit failed): this container runs setup itself, as without prepared images.
+                            Prepared.NotStored -> prep = null
+                            is Prepared.Failed -> {
+                                undo()
+                                return result.message
+                            }
+                        }
+                    }
                     is Prep.Reuse -> {}
                 }
             }
@@ -853,9 +895,9 @@ class SandboxManager(
                 box!!.user = ExecUser(u.uid, u.uid, line[1], line.drop(2).joinToString(" "))
             }
             if (reuse != null) {
-                box!!.startedFrom = STARTED_REUSED
+                box!!.startedFrom = if (preparedNow) STARTED_PREPARED else STARTED_REUSED
                 box!!.preparedKey = reuse.key
-                publishSystem(sessionId, systemPayload("info", "$label from prepared image ${reuse.key} (prepared ${reuse.createdAt.iso()})"))
+                if (!preparedNow) publishSystem(sessionId, systemPayload("info", "$label from prepared image ${reuse.key} (prepared ${reuse.createdAt.iso()})"))
             } else if (setup != null) {
                 val r = withContext(Dispatchers.IO) { rt.exec(name, shellCommand(setup), WORKDIR, execCapMs) }
                 logEvent(sessionId, "setup", setup, r, execCapMs, platformLabel(rs, def, key), rs.review)
@@ -875,7 +917,6 @@ class SandboxManager(
                     }
                 }
                 box!!.startedFrom = STARTED_SETUP
-                (prep as? Prep.Prepare)?.let { storePrepared(rs, plan, key, image, name, box!!, it, generation, sessionId) }
             }
             val who = box!!.user?.let { ", commands as ${it.name} (uid ${it.uid})" } ?: ""
             val readOnly = if (rs.review) ", $WORKDIR read-only" + (if (rs.outputDir != null) ", output in $REVIEW_OUTPUT_HOST" else ", no output directory") else ""
@@ -892,7 +933,7 @@ class SandboxManager(
             publishSystem(sessionId, systemPayload("warn", "Could not create $what: ${e.message}"))
             return "Could not create $what: ${e.message}"
         } finally {
-            (prep as? Prep.Prepare)?.lock?.unlock()
+            held?.unlock()
         }
     }
 
@@ -933,37 +974,116 @@ class SandboxManager(
         return Prep.Prepare(pkey, name, lock, current)
     }
 
+    /** What [prepareImage] achieved. */
+    private sealed interface Prepared {
+        data class Stored(val createdAt: Instant) : Prepared
+        /** Setup passed but the commit failed: nothing stored. */
+        data object NotStored : Prepared
+        /** The error for the agent (setup, `user:` or the preparation container failed). */
+        data class Failed(val message: String) : Prepared
+    }
+
     /**
-     * After a successful setup: commits container [name] to the prepared image of [prep] — unless the sandbox was
-     * released or stopped meanwhile — and removes the expired image it replaced. A failure leaves the sandbox usable.
+     * Prepares the image of [prep] in a **dedicated, throwaway container** (docs/ARCHITECTURE.md §5 "Prepared images"),
+     * never in the run's own: its `/workspace` is a clean, read-only export of the commit the approved definition was read
+     * from (only committed content of the base branch, nothing an agent wrote into a worktree), it has no cache volumes,
+     * none of the run's services and a network of its own. So nothing an agent controls can steer the root setup whose
+     * result later runs start from. Runs `prepare-user.sh` and setup there (the setup log goes to the transcript as
+     * before), hands the home over, commits the container and removes it, its network and the export, whatever happens.
      */
-    private suspend fun storePrepared(
-        rs: RunSandbox, plan: Plan.Available, key: String, image: String, name: String, box: Box, prep: Prep.Prepare, generation: Int, sessionId: UUID,
-    ) {
-        if (rs.released || rs.generation.get() != generation) return
+    private suspend fun prepareImage(
+        rs: RunSandbox, plan: Plan.Available, key: String, platform: SandboxPlatform?, image: String, setup: String, prep: Prep.Prepare,
+        generation: Int, sessionId: UUID,
+    ): Prepared {
         val rt = runtime!!
-        val t0 = System.currentTimeMillis()
+        val def = plan.definition
+        val name = if (rs.review) reviewPrepareName(rs.runId) else prepareName(rs.runId, key)
+        val ref = rs.definitionRef
+        val home = rs.gitHome
+        if (ref == null || home == null) return Prepared.Failed("Could not create the sandbox: the commit its definition came from is unknown.")
+        val export = cfg.dataDir.resolve("sandbox-prepare").resolve(UUID.randomUUID().toString())
+        fun gone() = rs.released || rs.generation.get() != generation
         try {
-            withContext(Dispatchers.IO) { rt.commitContainer(name, prep.image, preparedLabels(prep.key, rs.repo, key, plan.sha256, image)) }
-        } catch (e: Exception) {
-            if (rs.released || rs.generation.get() != generation) return
-            log.warn("Storing prepared image {} for run {} failed: {}", prep.image, rs.runId, e.message)
-            publishSystem(sessionId, systemPayload("warn", "Could not store the prepared image ${prep.key}: ${e.message}. This sandbox works; " +
-                "the next one runs the setup script again."))
-            return
-        }
-        box.startedFrom = STARTED_PREPARED
-        box.preparedKey = prep.key
-        log.info("Prepared image {} stored for {} ({}) in {} ms", prep.image, rs.repo, key, System.currentTimeMillis() - t0)
-        publishSystem(sessionId, systemPayload("info", "Prepared image ${prep.key} stored in ${(System.currentTimeMillis() - t0) / 1000.0} s; " +
-            "later sandboxes of this project start from it."))
-        announce(rs, "prepared")
-        // The commit moved the name to the new image; the expired one is now unused (best-effort, never forced).
-        prep.stale?.let { old ->
-            withContext(Dispatchers.IO) {
-                runCatching { if (rt.imageInfo(prep.image)?.id != old.id) rt.removeImage(old.id) }
-                    .onFailure { log.debug("Removing the replaced prepared image {} failed: {}", old.id, it.message) }
+            val sha = try {
+                withContext(Dispatchers.IO) {
+                    java.nio.file.Files.createDirectories(export.parent)
+                    git.exportTree(rs.worktree, ref, export, home)
+                }
+            } catch (e: Exception) {
+                log.warn("Exporting {} of run {} to prepare a sandbox image failed: {}", ref, rs.runId, e.message)
+                return Prepared.Failed("Could not prepare the sandbox image: exporting $ref failed (${e.message}).")
             }
+            rs.preparing += name
+            withContext(Dispatchers.IO) {
+                rt.createNetwork(name, labels(rs.runId, rs.repo, "prepare-network"))
+                rt.startContainer(prepareSpec(rs.runId, rs.repo, name, export, def, platform, image))
+            }
+            if (gone()) return Prepared.NotStored
+            val u = def.user
+            var home2: String? = null
+            if (u != null) {
+                val r = withContext(Dispatchers.IO) {
+                    rt.exec(name, listOf("sh", "-c", PREPARE_USER_SCRIPT, "agern-user", u.uid.toString(), u.name.orEmpty()) + def.caches, WORKDIR, 120_000)
+                }
+                val line = r.output.lineSequence().map { it.trim() }.lastOrNull { it.startsWith("AGERN_USER ") }?.split(' ')
+                if (r.timedOut || r.exitCode != 0 || line == null || line.size < 3) {
+                    return Prepared.Failed("Could not prepare the sandbox's user '${u.display}' (" + (if (r.timedOut) "timed out" else "exit ${r.exitCode}") + "): " +
+                        r.output.trim().takeLast(2000) + "\nThe definition comes from the default branch and needs an admin's approval to change; " +
+                        "report the problem in your summary.")
+                }
+                home2 = line.drop(2).joinToString(" ")
+            }
+            val r = withContext(Dispatchers.IO) { rt.exec(name, shellCommand(setup), WORKDIR, execCapMs) }
+            if (gone()) return Prepared.NotStored
+            logEvent(sessionId, "setup", setup, r, execCapMs, platformLabel(rs, def, key), rs.review)
+            if (r.timedOut || r.exitCode != 0) {
+                return Prepared.Failed("The ${if (rs.review) "review sandbox's" else if (key == DEFAULT) "sandbox's" else "platform `$key`'s"} setup script failed (" +
+                    (if (r.timedOut) "timed out" else "exit ${r.exitCode}") +
+                    "), so the container was removed. Output (tail):\n" + r.output.takeLast(4000) +
+                    "\nSetup runs in a clean, read-only copy of the definition's commit ($WORKDIR is read-only there, and it has no caches " +
+                    "and no services). The definition comes from the default branch and needs an admin's approval to change; report the problem in your summary.")
+            }
+            // Setup runs as root: hand what it left in the user's home to the user (the export is read-only).
+            if (u != null && home2 != null) {
+                withContext(Dispatchers.IO) {
+                    runCatching { rt.exec(name, listOf("sh", "-c", HAND_OVER_SCRIPT, "agern-hand-over", u.uid.toString(), home2), WORKDIR, 600_000) }
+                }
+            }
+            if (gone()) return Prepared.NotStored
+            val t0 = System.currentTimeMillis()
+            try {
+                withContext(Dispatchers.IO) { rt.commitContainer(name, prep.image, preparedLabels(prep.key, rs.repo, key, plan.sha256, image)) }
+            } catch (e: Exception) {
+                if (gone()) return Prepared.NotStored
+                log.warn("Storing prepared image {} for run {} failed: {}", prep.image, rs.runId, e.message)
+                publishSystem(sessionId, systemPayload("warn", "Could not store the prepared image ${prep.key}: ${e.message}. This sandbox works; " +
+                    "the next one runs the setup script again."))
+                return Prepared.NotStored
+            }
+            val createdAt = runCatching { withContext(Dispatchers.IO) { rt.imageInfo(prep.image)?.createdAt } }.getOrNull() ?: Instant.now()
+            log.info("Prepared image {} stored for {} ({}) from {} {} in {} ms", prep.image, rs.repo, key, ref, sha, System.currentTimeMillis() - t0)
+            publishSystem(sessionId, systemPayload("info", "Prepared image ${prep.key} stored in ${(System.currentTimeMillis() - t0) / 1000.0} s; " +
+                "later sandboxes of this project start from it."))
+            announce(rs, "prepared")
+            // The commit moved the name to the new image; the expired one is now unused (best-effort, never forced).
+            prep.stale?.let { old ->
+                withContext(Dispatchers.IO) {
+                    runCatching { if (rt.imageInfo(prep.image)?.id != old.id) rt.removeImage(old.id) }
+                        .onFailure { log.debug("Removing the replaced prepared image {} failed: {}", old.id, it.message) }
+                }
+            }
+            return Prepared.Stored(createdAt)
+        } catch (e: Exception) {
+            if (gone()) return Prepared.NotStored
+            log.warn("Preparing sandbox image {} for run {} failed: {}", prep.image, rs.runId, e.message)
+            return Prepared.Failed("Could not create ${if (rs.review) "the review sandbox" else if (key == DEFAULT) "the sandbox" else "platform `$key`"}: ${e.message}")
+        } finally {
+            withContext(NonCancellable + Dispatchers.IO) {
+                runCatching { rt.removeContainers(listOf(name)) }.onFailure { log.warn("Removing preparation container {} failed: {}", name, it.message) }
+                runCatching { rt.removeNetwork(name) }.onFailure { log.warn("Removing preparation network {} failed: {}", name, it.message) }
+                runCatching { export.toFile().deleteRecursively() }
+            }
+            rs.preparing -= name
         }
     }
 
@@ -1072,6 +1192,7 @@ class SandboxManager(
         if (rs.created || rs.slotsHeld.get() > 0) {
             runCatching { rt.removeContainers(names(rs)) }.onFailure { log.warn("Removing the sandbox of run {} failed: {}", rs.runId, it.message) }
             runCatching { rt.removeNetwork(netName(rs)) }.onFailure { log.warn("Removing the network of run {} failed: {}", rs.runId, it.message) }
+            // A preparation's network goes when its preparation ends (prepareImage removes it whatever happens).
         }
         rs.boxes.clear()
         rs.infra = false
@@ -1183,8 +1304,9 @@ class SandboxManager(
                 val images = try {
                     rt.listPreparedImages()
                 } catch (e: Exception) {
+                    log.warn("Listing prepared sandbox images for removal failed: {}", e.message)
                     throw dk.egernet.factory.ApiException(io.ktor.http.HttpStatusCode.BadGateway, "sandbox_runtime_error",
-                        "Could not list the prepared images: ${e.message}")
+                        "Could not list the prepared images; the server log has the details.")
                 }
                 var removed = 0
                 var kept = 0
@@ -1382,6 +1504,26 @@ class SandboxManager(
             mounts = listOf(SandboxMount(worktree.toAbsolutePath().normalize().toString(), WORKDIR, volume = false, readOnly = true)) +
                 listOfNotNull(outputDir?.let { SandboxMount(it.toAbsolutePath().normalize().toString(), REVIEW_OUTPUT, volume = false) }) +
                 def.caches.map { SandboxMount(cacheVolumeName(repo, it), it, volume = true) },
+            workdir = WORKDIR, cpus = def.cpus, memoryBytes = def.memoryBytes, entrypoint = "sh", command = keepAlive,
+            keepIdUid = def.user?.uid, user = if (def.user != null) "0:0" else null,
+        )
+
+        /** The throwaway container a prepared image is made in, and its network (same name): per run and platform. */
+        fun prepareName(runId: UUID, platform: String) = "agern-prepare-$runId-$platform"
+        /** The review sandbox's preparation container and network (the review prefix: removed like the review sandbox). */
+        fun reviewPrepareName(runId: UUID) = "${REVIEW_PREFIX}prepare-$runId"
+
+        /**
+         * The preparation container ([prepareName]): [image] with the definition's env, `user:` mapping and limits, on its
+         * own network [name], `/workspace` the read-only [export] of the definition's commit — no worktree, no cache volumes.
+         */
+        fun prepareSpec(runId: UUID, repo: String, name: String, export: Path, def: SandboxDefinition, platform: SandboxPlatform?, image: String) = ContainerSpec(
+            name = name,
+            image = image,
+            labels = labels(runId, repo, "prepare").also { l -> platform?.let { l["agern.platform"] = it.name } },
+            network = name,
+            env = def.env,
+            mounts = listOf(SandboxMount(export.toAbsolutePath().normalize().toString(), WORKDIR, volume = false, readOnly = true)),
             workdir = WORKDIR, cpus = def.cpus, memoryBytes = def.memoryBytes, entrypoint = "sh", command = keepAlive,
             keepIdUid = def.user?.uid, user = if (def.user != null) "0:0" else null,
         )

@@ -129,6 +129,16 @@ interface GitOps {
     fun archiveHead(worktree: Path, sha: String, file: Path, home: Path) {
         throw GitException("git archive is not supported here")
     }
+    /**
+     * Writes the committed tree of [ref] (resolved in the repository of [dir]) into the new, empty directory [dest]
+     * (`git archive` extracted with `tar`): only committed content, nothing of a worktree's uncommitted or untracked
+     * files, no submodule content. Returns the commit id. Used to prepare a sandbox image from a clean tree
+     * (docs/ARCHITECTURE.md §5 "Prepared images"). Throws [GitException] when git or tar fails.
+     */
+    fun exportTree(dir: Path, ref: String, dest: Path, home: Path): String {
+        Files.createDirectories(dest)
+        return "0".repeat(40)
+    }
     /** True when `git status --porcelain` of [worktree] lists anything (uncommitted or untracked changes). */
     fun isDirty(worktree: Path, home: Path): Boolean = false
     /**
@@ -494,6 +504,28 @@ class CliGitOps(
     override fun archiveHead(worktree: Path, sha: String, file: Path, home: Path) {
         require(SHA_RE.matches(sha)) { "Invalid commit id" }
         git(worktree, home, null, "archive", "--format=tar.gz", "-o", file.toAbsolutePath().toString(), sha, timeoutSec = 600)
+    }
+
+    override fun exportTree(dir: Path, ref: String, dest: Path, home: Path): String {
+        if (ref.isBlank() || ref.startsWith("-") || '\u0000' in ref) throw GitException("Invalid ref")
+        val sha = git(dir, home, null, "rev-parse", "--verify", "--quiet", "$ref^{commit}", timeoutSec = 60).trim()
+        if (!SHA_RE.matches(sha)) throw GitException("git rev-parse $ref: unexpected output")
+        Files.createDirectories(dest)
+        val tar = Files.createTempFile(dest.toAbsolutePath().parent, "export-", ".tar")
+        try {
+            git(dir, home, null, "archive", "--format=tar", "-o", tar.toAbsolutePath().toString(), sha, timeoutSec = 600)
+            val p = ProcessBuilder("tar", "-x", "--no-same-owner", "-f", tar.toAbsolutePath().toString(), "-C", dest.toAbsolutePath().toString())
+                .redirectErrorStream(true).also { it.environment().clear(); it.environment()["PATH"] = path }.start()
+            val out = p.inputStream.bufferedReader().readText()
+            if (!p.waitFor(600, TimeUnit.SECONDS)) {
+                p.destroyForcibly()
+                throw GitException("tar timed out while extracting $ref")
+            }
+            if (p.exitValue() != 0) throw GitException("tar failed while extracting $ref: ${out.takeLast(1000).trim()}")
+        } finally {
+            Files.deleteIfExists(tar)
+        }
+        return sha
     }
 
     override fun isDirty(worktree: Path, home: Path): Boolean =
