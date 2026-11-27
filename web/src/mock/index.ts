@@ -49,6 +49,7 @@ import {
   retryReleaseIssue,
   retryOptionsFor,
   retryRun,
+  updateRunFromBase,
   approveRelease,
   checkRelease,
   syncRelease,
@@ -562,6 +563,11 @@ export const mockApi: Api = {
       const r = run(id);
       approveRun(r, me());
       return r;
+    }),
+  updateRun: (id) =>
+    ok(() => {
+      needClaude();
+      return updateRunFromBase(run(id), me());
     }),
   mergeAnywayRun: (id, headSha) =>
     ok(() => {

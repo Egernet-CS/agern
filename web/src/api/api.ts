@@ -247,6 +247,12 @@ export interface Api {
   run(id: string): Promise<Run>;
   approveRun(id: string): Promise<Run>;
   /**
+   * "Update from base branch", owner only: an update round on the same run (now `building`). 409 `update_unavailable` /
+   * `base_not_moved` / `review_in_progress` / `agent_busy` / `run_worktree_missing` / `active_run_exists` /
+   * `pull_request_closed`; 422 `claude_credential_required`.
+   */
+  updateRun(id: string): Promise<Run>;
+  /**
    * Owner only: merges although the checks on `headSha` have not passed (docs/ARCHITECTURE.md §6 "Checks before a
    * merge"). 409 `run_not_overridable` / `checks_changed` / `review_required` / `review_in_progress` / `agent_busy`.
    */
