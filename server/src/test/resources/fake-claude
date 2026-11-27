@@ -73,7 +73,8 @@ Behaviour
   current tool round of the same turn (with --replay-user-messages it is echoed back with "isReplay": true
   at that moment), and one that arrives after the last tool round starts a further turn with its own
   `result`. The process exits when stdin is closed.
-    - spec-writer: prints a small spec
+    - spec-writer: prints a small spec; with "fake:partial" in the issue it has a "## Delivery plan" ("**This run:** the
+        first step." and two remaining steps), so the run is a partial delivery
     - builder in an update round (prompt contains "This is update round"): when a merge is in progress (MERGE_HEAD),
       keeps both sides of every unmerged file (drops the conflict marker lines), adds them and concludes the merge with
       `git commit --no-edit` ("Merged and resolved (fake): <files>"); without one it makes no commit ("Verified the
@@ -923,7 +924,11 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
         return
     if role == "spec-writer":
         checkpoint()
-        text = "## Summary\nA fake spec.\n\n## Acceptance criteria\n- [ ] Something happens\n"
+        text = "## Summary\nA fake spec.\n\n"
+        if "fake:partial" in prompt:
+            text += ("## Delivery plan\n**This run:** the first step.\n**Remaining:**\n"
+                     "- the second step\n- the third step\n\n")
+        text += "## Acceptance criteria\n- [ ] Something happens\n"
         prepared = prepared_report(prompt)
         if prepared:
             text += "\n## Images" + prepared + "\n"

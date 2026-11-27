@@ -253,12 +253,24 @@ class RunChecksTest {
     }
 
     @Test
-    fun `a pull request closed on GitHub is not merged`() {
+    fun `a pull request closed on GitHub while waiting is not merged and cancels the run`() {
         val run = waitingRun("Closed")
         gh.closePull(run.prNumber!!)
         val done = ended(run.id)
-        assertEquals(RunStatus.NEEDS_HUMAN, done.status)
-        assertTrue(done.error!!.contains("is no longer open on GitHub (closed)"), done.error)
+        assertEquals(RunStatus.CANCELLED, done.status)
+        assertEquals("Pull request #${run.prNumber} was closed on GitHub without being merged.", done.error)
+        assertTrue(gh.actions.none { it.startsWith("merge demo-app") })
+    }
+
+    @Test
+    fun `a pull request merged on GitHub while waiting ends the run merged on GitHub`() {
+        val run = waitingRun("Merged outside")
+        gh.mergeOnGitHub(run.prNumber!!, by = "carol")
+        val done = ended(run.id)
+        assertEquals(RunStatus.MERGED, done.status)
+        assertTrue(done.mergedOnGitHub)
+        assertEquals("carol", done.mergedBy)
+        assertTrue(gh.actions.none { it.startsWith("merge demo-app") || it.startsWith("close demo-app") })
     }
 
     // ------------------------------------------------------------ waiting state
@@ -311,7 +323,8 @@ class RunChecksTest {
             .jsonObject["result"]!!.jsonObject["tools"]!!.jsonArray.map { it.jsonObject }
         val approve = tools.single { it["name"]!!.jsonPrimitive.content == "factory_approve_run" }
         // `update` starts "Update and merge" (a new review and approval); it never merges past the checks.
-        assertEquals(setOf("runId", "update"), approve["inputSchema"]!!.jsonObject["properties"]!!.jsonObject.keys)
+        // `closeIssue` only chooses the issue's fate (docs/ARCHITECTURE.md §6 "Partial delivery").
+        assertEquals(setOf("runId", "update", "closeIssue"), approve["inputSchema"]!!.jsonObject["properties"]!!.jsonObject.keys)
         assertTrue(approve["description"]!!.jsonPrimitive.content.contains("waits for the checks"))
         assertTrue(tools.none { t -> t["name"]!!.jsonPrimitive.content.let { it.contains("anyway") || it.contains("override") } })
         val help = runBlocking { s.factory.handleCommand(chat, alice, "/factory help") }

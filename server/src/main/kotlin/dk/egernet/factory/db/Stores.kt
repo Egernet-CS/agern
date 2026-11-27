@@ -424,6 +424,12 @@ data class RunRecord(
     val maxUpdateRounds: Int = 0,
     /** JSON list of [dk.egernet.factory.RunOverlapDto]: other active runs of the project when the run started. */
     val overlapsJson: String? = null,
+    /** A partial delivery (docs/ARCHITECTURE.md §6 "Partial delivery"): merging it leaves the issue open. */
+    val partial: Boolean = false,
+    /** Who marked the run partial or complete on the run page; null when the spec decided (or nobody changed it). */
+    val partialSetBy: String? = null,
+    /** JSON of [dk.egernet.factory.RunDeliveryDto]: the spec's Delivery plan; null when the spec has none. */
+    val deliveryJson: String? = null,
 ) {
     val isSync: Boolean get() = kind == dk.egernet.factory.RunKind.SYNC
 
@@ -445,6 +451,10 @@ data class RunRecord(
     /** [overlapsJson] decoded; empty when there is none (or it cannot be read). */
     val overlaps: List<dk.egernet.factory.RunOverlapDto>
         get() = overlapsJson?.let { runCatching { AppJson.decodeFromString(overlapListSer, it) }.getOrNull() }.orEmpty()
+
+    /** [deliveryJson] decoded; null when there is none (or it cannot be read). */
+    val delivery: dk.egernet.factory.RunDeliveryDto?
+        get() = deliveryJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunDeliveryDto.serializer(), it) }.getOrNull() }
 }
 
 internal val overlapListSer = ListSerializer(dk.egernet.factory.RunOverlapDto.serializer())
@@ -561,7 +571,7 @@ class RunStore(private val db: Db) {
     private val screenshots = ScreenshotStore(db)
     private val images = ImageStore(db)
     private val findingsSer = ListSerializer(FindingDto.serializer())
-    private val select = """SELECT r.*, r.other_runs::text AS other_runs_text, u.username AS owner_username, u.display_name AS owner_display_name
+    private val select = """SELECT r.*, r.other_runs::text AS other_runs_text, r.delivery::text AS delivery_text, u.username AS owner_username, u.display_name AS owner_display_name
         FROM runs r JOIN users u ON u.id = r.owner_id"""
 
     private fun map(rs: ResultSet) = RunRecord(
@@ -578,6 +588,7 @@ class RunStore(private val db: Db) {
         rs.getString("checks"), rs.instantOrNull("checks_waiting_since"), rs.instantOrNull("checks_deadline"),
         rs.getString("merge_approved_by"), rs.runWait(), rs.getString("kind"), rs.getString("sync_pushed_sha"),
         rs.getString("sandbox_vm"), rs.getInt("update_rounds"), rs.getInt("max_update_rounds"), rs.getString("other_runs_text"),
+        rs.getBoolean("partial"), rs.getString("partial_set_by"), rs.getString("delivery_text"),
     )
 
     private fun mapStage(rs: ResultSet) = StageRecord(
@@ -654,7 +665,7 @@ class RunStore(private val db: Db) {
     fun latestSyncs(releaseIds: Collection<UUID>): Map<UUID, RunRecord> {
         if (releaseIds.isEmpty()) return emptyMap()
         return db.query(
-            "SELECT DISTINCT ON (r.release_id) r.*, r.other_runs::text AS other_runs_text, u.username AS owner_username, u.display_name AS owner_display_name " +
+            "SELECT DISTINCT ON (r.release_id) r.*, r.other_runs::text AS other_runs_text, r.delivery::text AS delivery_text, u.username AS owner_username, u.display_name AS owner_display_name " +
                 "FROM runs r JOIN users u ON u.id = r.owner_id WHERE r.kind = 'sync' AND r.release_id IN (" +
                 releaseIds.joinToString(",") { "?" } + ") ORDER BY r.release_id, r.created_at DESC",
             *releaseIds.toTypedArray(), map = ::map,
@@ -907,6 +918,31 @@ class RunStore(private val db: Db) {
         error, id,
     ) == 1
 
+    /**
+     * The spec's Delivery plan of run [id] ([delivery], null: none) and whether the run is a partial delivery, as the spec
+     * decides it; clears who set it (docs/ARCHITECTURE.md §6 "Partial delivery").
+     */
+    fun setDelivery(id: UUID, partial: Boolean, delivery: dk.egernet.factory.RunDeliveryDto?) = db.update(
+        "UPDATE runs SET partial = ?, partial_set_by = NULL, delivery = ?, updated_at = now() WHERE id = ?",
+        partial, delivery?.let { JsonbParam(AppJson.encodeToString(dk.egernet.factory.RunDeliveryDto.serializer(), it)) }, id,
+    )
+
+    /** The run owner [setBy] marks run [id] as a partial delivery or a complete one; the plan stays as it is. */
+    fun setPartial(id: UUID, partial: Boolean, setBy: String) = db.update(
+        "UPDATE runs SET partial = ?, partial_set_by = ?, updated_at = now() WHERE id = ?", partial, setBy, id,
+    )
+
+    /**
+     * The runs of [repo] whose pull request may have been merged or closed on GitHub outside Agern (docs/ARCHITECTURE.md
+     * §6 "Pull requests merged or closed on GitHub"): runs with a pull request, not sync runs, in a status the outside
+     * check may end (`approving` and `waiting_for_checks` are left to their merge gate).
+     */
+    fun eligibleForOutsideCheck(repo: String): List<RunRecord> = db.query(
+        """$select WHERE r.repo = ? AND r.pr_number IS NOT NULL AND r.kind = 'issue'
+           AND r.status IN ('queued','spec','building','reviewing','needs_human','ready') ORDER BY r.created_at""",
+        repo, map = ::map,
+    )
+
     /** Records that the run's pull request was merged on GitHub, by [mergedBy] when known. */
     fun setMergedOnGitHub(id: UUID, mergedBy: String?) = db.update(
         "UPDATE runs SET merged_on_github = true, merged_by = ?, updated_at = now() WHERE id = ?", mergedBy, id,
@@ -1072,6 +1108,7 @@ class RunStore(private val db: Db) {
             updateRounds = r.updateRounds, maxUpdateRounds = r.maxUpdateRounds, updateAvailable = r.updateAvailable,
             updates = updates(r.id).map { it.toDto() },
             updateOnDemand = r.updateOnDemand, overlaps = r.overlaps,
+            partial = r.partial, partialSetBy = r.partialSetBy, delivery = r.delivery,
         )
     }
 

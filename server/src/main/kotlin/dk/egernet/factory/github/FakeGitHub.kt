@@ -214,7 +214,9 @@ class FakeGitHub(private val org: String) : GitHub {
      * `{"statuses": {"ci/lint": "success"}, "checkRuns": [{"name": "build", "status": "completed", "conclusion": "failure"}]}`,
      * optionally with `"workflowRuns": [{"id": 1, "name": "CI", "workflow_id": 7, "status": "queued"}]`.
      * Checks set with [setStatus], [setCheckRun] or [setWorkflowRun] take precedence. `"conflict": true` makes pull
-     * requests with that head conflict, exactly like an entry of [conflicting], while the file says so.
+     * requests with that head conflict, exactly like an entry of [conflicting], while the file says so. `"pull": "merged"`
+     * (optionally with `"mergedBy": "carol"`) or `"pull": "closed"` merges or closes an open pull request with that head on
+     * its next read, as a person on GitHub would ([mergeOnGitHub], [closePull]).
      */
     @Volatile var checksDir: java.nio.file.Path? = null
 
@@ -222,6 +224,8 @@ class FakeGitHub(private val org: String) : GitHub {
     private data class ChecksFile(
         val statuses: Map<String, String> = emptyMap(), val checkRuns: List<GhCheckRun> = emptyList(),
         val workflowRuns: List<GhWorkflowRun> = emptyList(), val conflict: Boolean = false,
+        /** `merged` or `closed`: what a person did to the open pull request of this head on GitHub. */
+        val pull: String? = null, val mergedBy: String? = null,
     )
 
     /** Whether pull requests from [head] of [repo] conflict: an entry of [conflicting], or the checks file says so. */
@@ -240,6 +244,9 @@ class FakeGitHub(private val org: String) : GitHub {
         pullMeta.getValue(number).mergedBy = by
         applyMerge(pullMeta.getValue(number), number, "rebase")
     }
+
+    /** Lets tests make updating a pull request's title and body fail with this HTTP status (e.g. 502). */
+    @Volatile var updatePullFailure: Int? = null
 
     /** Lets tests make requesting reviewers fail with this HTTP status (e.g. 422 for an unknown reviewer). */
     @Volatile var requestReviewersFailure: Int? = null
@@ -599,6 +606,14 @@ class FakeGitHub(private val org: String) : GitHub {
                 throw failure(502, "GET pull request", "GitHub GET pull request failed: 502 Bad Gateway", "Bad Gateway")
             }
             val m = pullMeta[number]?.takeIf { it.repo == repo } ?: return@synchronized null
+            if (m.state == "open" && !m.merged) {
+                checksFile(repo, m.head)?.let { f ->
+                    when (f.pull) {
+                        "merged" -> mergeOnGitHub(number, f.mergedBy ?: "someone")
+                        "closed" -> closePull(number)
+                    }
+                }
+            }
             val computing = mergeableComputing > 0
             if (computing) mergeableComputing--
             val clean = !conflicts(repo, m.head)
@@ -625,6 +640,7 @@ class FakeGitHub(private val org: String) : GitHub {
         override fun updatePull(org: String, repo: String, number: Int, title: String, body: String) = synchronized(this@FakeGitHub) {
             outage()
             repo(org, repo)
+            updatePullFailure?.let { throw failure(it, "update pull request", "GitHub update pull request failed: $it") }
             val m = pullMeta[number]?.takeIf { it.repo == repo } ?: throw GitHubException(404, "Not Found")
             m.title = title
             pullBodies[number] = body

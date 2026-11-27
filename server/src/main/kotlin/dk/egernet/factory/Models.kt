@@ -419,7 +419,25 @@ data class RunDto(
     val updateOnDemand: Boolean = false,
     /** Other active runs of the project when this run started (a warning, docs/ARCHITECTURE.md §6 "Other active runs"). */
     val overlaps: List<RunOverlapDto> = emptyList(),
+    /** A partial delivery (docs/ARCHITECTURE.md §6 "Partial delivery"): merging it leaves the issue open. */
+    val partial: Boolean = false,
+    /** Who marked the run partial or complete on the run page; null when the spec decided. */
+    val partialSetBy: String? = null,
+    /** The spec's Delivery plan; null when the spec has none. Untrusted text from the agent: render as plain text. */
+    val delivery: RunDeliveryDto? = null,
 )
+
+/** A spec's Delivery plan (docs/ARCHITECTURE.md §6 "Partial delivery"): what this run delivers and the steps that remain. */
+@Serializable
+data class RunDeliveryDto(val delivers: String, val remaining: List<String>)
+
+/** Body of `PUT /api/runs/{id}/partial`. */
+@Serializable
+data class PartialReq(val partial: Boolean)
+
+/** Body of `POST /api/runs/{id}/approve`; [closeIssue] null = as the run is marked (a run not marked partial closes it). */
+@Serializable
+data class ApproveReq(val closeIssue: Boolean? = null)
 
 /**
  * Another run that was active in the same project when a run started. [references]: the new issue names that run's issue,
