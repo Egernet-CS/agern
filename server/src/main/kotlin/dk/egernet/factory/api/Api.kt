@@ -77,6 +77,8 @@ import io.ktor.websocket.close
 import dk.egernet.factory.mcp.McpAuth
 import dk.egernet.factory.mcp.McpServer
 import io.ktor.server.response.respondTextWriter
+import io.ktor.server.response.respondOutputStream
+import io.ktor.utils.io.jvm.javaio.toInputStream
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
 import kotlinx.coroutines.withTimeoutOrNull
@@ -648,6 +650,7 @@ private fun Route.projectRoutes(s: Services) {
     delete("/projects/{repo}/sandbox-vm/approval") { call.respond(s.sandboxVms.revoke(call.requireUser(s), repoParam())) }
     post("/projects/{repo}/sandbox-vm/check") { call.respond(s.sandboxVms.check(call.requireUser(s), repoParam())) }
     delete("/projects/{repo}/sandbox-vm/lease") { call.respond(s.sandboxVms.forceRelease(call.requireUser(s), repoParam())) }
+    projectFileRoutes(s)
     // Project icons (docs/ARCHITECTURE.md §8 "Project icons"): admins set them, everyone who sees the repo sees them.
     put("/projects/{repo}/icon") {
         val u = call.requireAdmin(s)
@@ -692,6 +695,95 @@ private fun Route.projectRoutes(s: Services) {
             cacheControl = if (current) IMMUTABLE else "private, no-cache",
             csp = if (m.mediaType == SvgIcons.MEDIA_TYPE) ProjectIcons.SVG_CSP else STORED_FILE_CSP,
         )
+    }
+}
+
+// ------------------------------------------------------------------ project files (docs/ARCHITECTURE.md §5 "Project files", §8)
+
+private fun Route.projectFileRoutes(s: Services) {
+    val pf = s.projectFiles
+    get("/projects/{repo}/files") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        call.respond(withContext(Dispatchers.IO) { pf.list(u, repo) })
+    }
+    post("/projects/{repo}/file-uploads") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        // Visibility and rights before the body is read.
+        withContext(Dispatchers.IO) { pf.requireManager(u, repo) }
+        val req = call.receive<dk.egernet.factory.CreateProjectFileUploadReq>()
+        val (dto, created) = withContext(Dispatchers.IO) { pf.createUpload(u, repo, req.name, req.size, req.sha256, req.note) }
+        call.respond(if (created) HttpStatusCode.Created else HttpStatusCode.OK, dto)
+    }
+    get("/projects/{repo}/file-uploads/{id}") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        val id = uuidParam("id")
+        call.respond(withContext(Dispatchers.IO) { pf.upload(u, repo, id) })
+    }
+    put("/projects/{repo}/file-uploads/{id}") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        val id = uuidParam("id")
+        val offset = call.request.queryParameters["offset"]?.toLongOrNull()?.takeIf { it >= 0 }
+            ?: throw badRequest("offset must be the number of bytes the upload has received")
+        withContext(Dispatchers.IO) { pf.requireManager(u, repo) }
+        // Streamed straight to the part file through a fixed buffer; never the whole body in memory.
+        val body = call.receiveChannel().toInputStream()
+        call.respond(withContext(Dispatchers.IO) { body.use { pf.append(u, repo, id, offset, it) } })
+    }
+    post("/projects/{repo}/file-uploads/{id}/complete") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        val id = uuidParam("id")
+        call.respond(withContext(Dispatchers.IO) { pf.complete(u, repo, id, call.remote()) })
+    }
+    delete("/projects/{repo}/file-uploads/{id}") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        val id = uuidParam("id")
+        withContext(Dispatchers.IO) { pf.discard(u, repo, id) }
+        call.respond(HttpStatusCode.NoContent)
+    }
+    put("/projects/{repo}/files/{id}") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        val id = uuidParam("id")
+        withContext(Dispatchers.IO) { pf.requireManager(u, repo) }
+        val req = call.receive<dk.egernet.factory.UpdateProjectFileReq>()
+        call.respond(withContext(Dispatchers.IO) { pf.update(u, repo, id, req.note, req.downloadable, call.remote()) })
+    }
+    delete("/projects/{repo}/files/{id}") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        val id = uuidParam("id")
+        withContext(Dispatchers.IO) { pf.delete(u, repo, id, call.remote()) }
+        call.respond(HttpStatusCode.NoContent)
+    }
+    // The only route that returns a project file's bytes: an opaque download, streamed from disk.
+    get("/projects/{repo}/files/{id}/content") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        val id = uuidParam("id")
+        val (f, input) = withContext(Dispatchers.IO) { pf.openForDownload(u, repo, id, call.remote()) }
+        input.use { ins ->
+            call.response.header("X-Content-Type-Options", "nosniff")
+            call.response.header(HttpHeaders.CacheControl, "private, no-store")
+            call.response.header("Content-Security-Policy", STORED_FILE_CSP)
+            call.response.header(HttpHeaders.ContentDisposition, contentDisposition("attachment", f.name.substringAfterLast('/')))
+            call.respondOutputStream(ContentType.Application.OctetStream, HttpStatusCode.OK, f.size) {
+                dk.egernet.factory.files.ProjectFiles.copy(ins, this)
+            }
+        }
+    }
+    put("/projects/{repo}/file-managers") {
+        val u = call.requireUser(s)
+        val repo = repoParam()
+        withContext(Dispatchers.IO) { pf.requireVisible(u, repo) }
+        if (!u.isAdmin) throw forbidden("Only admins can choose who manages a project's files")
+        val req = call.receive<dk.egernet.factory.ProjectFileManagersReq>()
+        call.respond(withContext(Dispatchers.IO) { pf.setManagers(u, repo, req.usernames, call.remote()) })
     }
 }
 
@@ -1141,6 +1233,17 @@ private fun Route.adminRoutes(s: Services) {
         val runId = uuidParam("runId")
         s.sandboxes.stop(admin, runId)
         call.respond(s.sandboxes.overview(admin))
+    }
+    // Project files (docs/ARCHITECTURE.md §5 "Project files"): counts per repository and the explicit clean-up.
+    get("/admin/project-files") {
+        call.requireAdmin(s)
+        call.respond(withContext(Dispatchers.IO) { s.projectFiles.overview() })
+    }
+    delete("/admin/project-files/{repo}") {
+        val admin = call.requireAdmin(s)
+        val repo = repoParam()
+        withContext(Dispatchers.IO) { s.projectFiles.purge(admin, repo, call.remote()) }
+        call.respond(HttpStatusCode.NoContent)
     }
     get("/admin/software-requests") { call.requireAdmin(s); call.respond(s.softwareRequests.all()) }
     post("/admin/software-requests/{id}") {

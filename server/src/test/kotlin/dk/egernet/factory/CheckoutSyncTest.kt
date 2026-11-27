@@ -205,6 +205,104 @@ class CheckoutSyncTest {
         assertNull(sync())
     }
 
+    // ------------------------------------------------------------ following a base branch other than the default
+
+    /** Pushes `dev` (main plus one commit adding `dev.txt`) to origin and fetches it into the checkout; returns its sha. */
+    private fun pushDev(): String {
+        gitIn(upstream, "checkout", "-q", "-b", "dev")
+        Files.writeString(upstream.resolve("dev.txt"), "dev\n")
+        gitIn(upstream, "add", "dev.txt")
+        gitIn(upstream, "commit", "-q", "-m", "Add dev.txt")
+        gitIn(upstream, "push", "-q", "origin", "dev")
+        gitIn(upstream, "checkout", "-q", "main")
+        gitIn(main, "fetch", "-q", "origin")
+        return gitIn(upstream, "rev-parse", "dev").trim()
+    }
+
+    private fun followed() = runCatching { gitIn(main, "config", "--get", "agern.followed-branch").trim() }.getOrNull()
+    private fun current() = gitIn(main, "symbolic-ref", "--short", "HEAD").trim()
+    private fun switch(base: String = "dev") = git.syncCheckout(null, main, base, home, fetch = true, switchFrom = "main")
+
+    @Test
+    fun `a clean checkout on the followed branch is switched to the base branch and reported`() {
+        setUp()
+        val old = head(main)
+        val dev = pushDev()
+        val s = assertNotNull(switch())
+        assertEquals(CheckoutState("dev", "dev", dev, 0, 0, "updated", null, old, switchedFrom = "main"), s)
+        assertEquals("dev", current())
+        assertTrue(Files.exists(main.resolve("dev.txt")))
+        assertEquals("dev", followed())
+        // Following the base from now on: a later commit on dev is fast-forwarded as usual.
+        assertEquals(CheckoutState("dev", "dev", dev, 0, 0, "current", null, null), switch())
+
+        // Back to the default branch: dev is what Agern followed last, so it switches back (the local main exists).
+        val back = assertNotNull(git.syncCheckout(null, main, "main", home, fetch = true, switchFrom = "main"))
+        assertEquals("main", back.branch)
+        assertEquals("main", current())
+        assertEquals("dev", back.switchedFrom)
+        assertEquals("updated", back.status)
+        assertEquals("main", followed())
+    }
+
+    @Test
+    fun `a checkout already on the base branch records it as followed`() {
+        setUp()
+        val dev = pushDev()
+        gitIn(main, "checkout", "-q", "-b", "dev", "--track", "origin/dev")
+        assertNull(followed())
+        assertEquals(CheckoutState("dev", "dev", dev, 0, 0, "current", null, null), switch())
+        assertEquals("dev", followed())
+    }
+
+    @Test
+    fun `a dirty checkout, unpushed commits, another branch or a detached HEAD are never switched`() {
+        setUp()
+        pushDev()
+        // Dirty.
+        Files.writeString(main.resolve("README.md"), "changed\n")
+        var before = snapshot()
+        var s = assertNotNull(switch())
+        assertEquals("other_branch", s.reason)
+        assertNull(s.switchedFrom)
+        assertEquals(before, snapshot())
+        gitIn(main, "checkout", "-q", "--", "README.md")
+        // An untracked file counts too.
+        Files.writeString(main.resolve("notes.txt"), "mine\n")
+        before = snapshot()
+        assertNull(assertNotNull(switch()).switchedFrom)
+        assertEquals(before, snapshot())
+        Files.delete(main.resolve("notes.txt"))
+        // Unpushed commits on main.
+        Files.writeString(main.resolve("local.txt"), "local\n")
+        gitIn(main, "add", "local.txt")
+        gitIn(main, "commit", "-q", "-m", "Local work")
+        before = snapshot()
+        assertNull(assertNotNull(switch()).switchedFrom)
+        assertEquals(before, snapshot())
+        gitIn(main, "reset", "-q", "--hard", "origin/main")
+        // The user's own branch (pushed, clean): not the branch Agern followed.
+        gitIn(main, "checkout", "-q", "-b", "mine")
+        gitIn(main, "push", "-q", "origin", "mine")
+        before = snapshot()
+        s = assertNotNull(switch())
+        assertEquals("mine", s.branch)
+        assertNull(s.switchedFrom)
+        assertEquals(before, snapshot())
+        // A detached HEAD.
+        gitIn(main, "checkout", "-q", "--detach", "origin/main")
+        before = snapshot()
+        s = assertNotNull(switch())
+        assertNull(s.branch)
+        assertNull(s.switchedFrom)
+        assertEquals(before, snapshot())
+        // Without switchFrom nothing is ever switched (workspace members).
+        gitIn(main, "checkout", "-q", "main")
+        before = snapshot()
+        assertNull(assertNotNull(git.syncCheckout(null, main, "dev", home, fetch = true)).switchedFrom)
+        assertEquals(before, snapshot())
+    }
+
     // ------------------------------------------------------------ the note for the agent
 
     private fun behind(reason: String, behind: Int = 1, ahead: Int = 0, branch: String? = "main") =
@@ -234,6 +332,18 @@ class CheckoutSyncTest {
         val long = "b".repeat(300)
         val cut = checkoutNote(behind("other_branch", branch = long))!!
         assertTrue(cut.contains("`${"b".repeat(100)}`") && !cut.contains("b".repeat(101)), cut)
+    }
+
+    @Test
+    fun `the note after a switch names both branches and the new HEAD`() {
+        val n = checkoutNote(CheckoutState("dev", "dev", "1234567890", 0, 0, "updated", null, "abcdef0123", switchedFrom = "main"))!!
+        assertTrue(
+            n.contains(
+                "Agern switched this checkout from `main` to `dev`, the project's base branch (HEAD 1234567). Files you read earlier " +
+                    "in this conversation may have changed: read them again before relying on them.",
+            ),
+            n,
+        )
     }
 
     @Test

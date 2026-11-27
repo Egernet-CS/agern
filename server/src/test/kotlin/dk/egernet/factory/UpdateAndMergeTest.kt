@@ -300,6 +300,26 @@ class UpdateAndMergeTest {
     private fun comments(n: Int) = gh.client("fake-alice").listComments("test-org", "demo-app", n).map { it.body ?: "" }
 
     @Test
+    fun `an update round that would push a project file is not pushed and needs a human again`() {
+        conflictOnMerge()
+        val bytes = "licensed sdk".toByteArray()
+        world.uploadProjectFile("demo-app", "vendor/sdk.zip", bytes)
+        onUpdateBuilder = {
+            git.headSha = "merged-by-builder-000000000000000000000"
+            git.newBlobsAnswer = listOf(dk.egernet.factory.git.NewBlob(gitBlobId(bytes), bytes.size.toLong(), "libs/sdk.zip"))
+        }
+        val run = start()
+        eventually("the automatic round ran") { s.runs.updates(run.id).isNotEmpty() }
+        val done = awaitUpdated(run.id)
+        assertEquals(RunStatus.NEEDS_HUMAN, done.status)
+        // Only the run's own push: nothing of the update round reached GitHub.
+        assertEquals(1, git.pushes.size, git.pushes.toString())
+        assertTrue(done.error!!.contains("Not pushed: the branch contains project file `vendor/sdk.zip`"), done.error)
+        assertTrue(s.runs.updates(run.id).all { it.status == UpdateStatus.FAILED })
+        assertTrue(merges().isEmpty())
+    }
+
+    @Test
     fun `a merge that fails without a conflict is a step to retry, as before`() {
         gh.failMerge = true
         val run = await(start().id)

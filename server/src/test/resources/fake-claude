@@ -23,6 +23,7 @@ Behaviour
                                  "echo deployed" on the first listed target, else "kiosk") like a real agent (tool_use +
                                  tool_result events) and appends "Deploy targets: <answer>" and "Deploy exec: <answer>"
                                  to the reply, each marked " (error)" when the tool answered with an error
+    - text containing "fake:project-files" -> appends the project files report (see the builder's "fake:project-files")
     - "forward <runId> <role>: <message>" -> passes <message> to that run's agent through the MCP tool
                                  factory_send_to_agent and reports the tool's answer
     - "file issue: <title>" -> creates a bug issue with that title through the MCP tool
@@ -118,6 +119,11 @@ Behaviour
         purpose "app icon" (and "issueNumber" from a "#<n>" in the message) and appends "Image tool: <answer>" to the reply;
         in a builder's prompt the builder calls it too, copies the first returned path to assets/fake-icon.png, commits
         it with its usual commit and appends "Image tool: <answer>" to its result
+    - "fake:project-files" makes the builder (and a chat, for a message containing it) call the MCP tool
+        factory_list_project_files and append "Project files tool: <answer>"; then, for every file the answer lists, read
+        $AGERN_PROJECT_FILES/<name> and append "PROJECT FILE ok <name> <bytes> sha256:<hex>" (or "PROJECT FILE missing
+        <name>"); then try to create a file in $AGERN_PROJECT_FILES and append "PROJECT FILES writable: no" (or "yes",
+        removing the file again)
     - a spec-writer or builder whose prompt has an <images> block appends "PREPARED ok <path> <bytes>" or
         "PREPARED missing <path>" per listed "path:" line
     - "fake:busy-<role>" makes that (stream-json) role work in Bash steps of ~0.4 s for up to ~2 minutes,
@@ -500,6 +506,48 @@ def generate_fake_image(text, req_id=2):
         return "Image tool failed: %s" % e, True
 
 
+def project_files_report(req_id=7):
+    """fake:project-files: the MCP tool's answer, every listed file read from $AGERN_PROJECT_FILES, and a write attempt."""
+    lines = []
+    try:
+        mcp_call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake-claude", "version": "0"}}, 1)
+        answer, is_error = mcp_tool_roundtrip("factory_list_project_files", {}, req_id)
+    except Exception as e:  # noqa
+        answer, is_error = "MCP call failed: %s" % e, True
+    lines.append("Project files tool: " + answer + (" (error)" if is_error else ""))
+    base = os.environ.get("AGERN_PROJECT_FILES", "")
+    names = []
+    try:
+        names = [f["name"] for f in json.loads(answer).get("files", [])]
+    except Exception:  # noqa
+        pass
+    import hashlib
+    for name in names:
+        path = os.path.join(base, name)
+        try:
+            with open(path, "rb") as f:
+                h = hashlib.sha256()
+                n = 0
+                while True:
+                    chunk = f.read(1 << 16)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+                    n += len(chunk)
+            lines.append("PROJECT FILE ok %s %d sha256:%s" % (name, n, h.hexdigest()))
+        except OSError:
+            lines.append("PROJECT FILE missing %s" % name)
+    probe = os.path.join(base or ".", "fake-claude-write-probe")
+    try:
+        with open(probe, "w") as f:
+            f.write("x")
+        os.remove(probe)
+        lines.append("PROJECT FILES writable: yes")
+    except OSError:
+        lines.append("PROJECT FILES writable: no")
+    return "\n".join(lines)
+
+
 def prepared_report(prompt):
     """The <images> block of a task prompt: one line per listed path, whether the file is there."""
     block = re.search(r"<images>(.*?)</images>", prompt, re.S)
@@ -761,6 +809,8 @@ def chat_mode():
             reply += "\nImage tool: " + answer
         if "fake:deploy" in content and mcp_config:
             reply += "\n" + fake_deploy()
+        if "fake:project-files" in content and mcp_config:
+            reply += "\n" + project_files_report()
         if "slow" in content and not forward:
             chunks = ["%d " % i for i in range(1, 41)]
             ok, sent = stream_text("".join(chunks), chunk_delay=0.25, chunks=chunks,
@@ -888,6 +938,8 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
                 except Exception as e:  # noqa
                     image_report += "\nCopying the image failed: %s" % e
         image_report += prepared_report(prompt)
+        if "fake:project-files" in prompt and mcp_config:
+            image_report += "\n" + project_files_report()
         # A workspace run commits in the target member's worktree (its prompt names it), else in the working directory.
         d = target_dir(prompt)
         if "This is update round" in prompt and is_git(d):

@@ -344,6 +344,8 @@ class FakeGitHub(private val org: String) : GitHub {
         const val FAKE_REQUEST_ID = "FAKE:0000:0000"
         fun seeded(org: String): FakeGitHub = FakeGitHub(org).apply {
             addRepo("demo-app", "A small demo web app used to try Agern without GitHub", private = false)
+            // A second branch to choose as the project's base branch (docs/ARCHITECTURE.md §6 "Base branch").
+            synchronized(this) { branches.getOrPut("demo-app") { mutableSetOf() } += "dev" }
             addRepo("private-lab", "Only visible to alice", private = true, visibleTo = setOf("alice"))
             addIssue("demo-app", "Add a dark mode toggle", "Users want a dark mode. Add a toggle in the header that remembers the choice.", listOf("enhancement"))
             addIssue("demo-app", "Crash when the list is empty", "Opening the list view with no items throws a TypeError.", listOf("bug"))

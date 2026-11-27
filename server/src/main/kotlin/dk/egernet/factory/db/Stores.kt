@@ -430,8 +430,14 @@ data class RunRecord(
     val partialSetBy: String? = null,
     /** JSON of [dk.egernet.factory.RunDeliveryDto]: the spec's Delivery plan; null when the spec has none. */
     val deliveryJson: String? = null,
+    /** JSON of [dk.egernet.factory.RunProjectFilesDto]: the project files the run got; null for runs from before. */
+    val projectFilesJson: String? = null,
 ) {
     val isSync: Boolean get() = kind == dk.egernet.factory.RunKind.SYNC
+
+    /** [projectFilesJson] decoded; null when there is none (or it cannot be read). */
+    val projectFiles: dk.egernet.factory.RunProjectFilesDto?
+        get() = projectFilesJson?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunProjectFilesDto.serializer(), it) }.getOrNull() }
 
     /** [sandboxVmJson] decoded; null when there is none (or it cannot be read). */
     val sandboxVm: dk.egernet.factory.RunSandboxVmDto?
@@ -589,6 +595,7 @@ class RunStore(private val db: Db) {
         rs.getString("merge_approved_by"), rs.runWait(), rs.getString("kind"), rs.getString("sync_pushed_sha"),
         rs.getString("sandbox_vm"), rs.getInt("update_rounds"), rs.getInt("max_update_rounds"), rs.getString("other_runs_text"),
         rs.getBoolean("partial"), rs.getString("partial_set_by"), rs.getString("delivery_text"),
+        projectFilesJson = rs.getString("project_files"),
     )
 
     private fun mapStage(rs: ResultSet) = StageRecord(
@@ -965,6 +972,22 @@ class RunStore(private val db: Db) {
         JsonbParam(AppJson.encodeToString(dk.egernet.factory.RunSandboxVmDto.serializer(), info)), id,
     )
 
+    /** Records the project files the run got (docs/ARCHITECTURE.md §5 "Project files"). */
+    fun setProjectFiles(id: UUID, files: dk.egernet.factory.RunProjectFilesDto) = db.update(
+        "UPDATE runs SET project_files = ?, updated_at = now() WHERE id = ?",
+        JsonbParam(AppJson.encodeToString(dk.egernet.factory.RunProjectFilesDto.serializer(), files)), id,
+    )
+
+    /**
+     * The project files the most recent run before [before] recorded for files repository [filesRepo] (a run's
+     * `target_repo`, else its `repo`); null when there is none.
+     */
+    fun previousProjectFiles(filesRepo: String, before: UUID): dk.egernet.factory.RunProjectFilesDto? = db.queryOne(
+        """SELECT project_files FROM runs WHERE COALESCE(target_repo, repo) = ? AND project_files IS NOT NULL AND id <> ?
+           AND created_at <= (SELECT created_at FROM runs WHERE id = ?) ORDER BY created_at DESC LIMIT 1""",
+        filesRepo, before, before,
+    ) { rs -> rs.getString("project_files")?.let { runCatching { AppJson.decodeFromString(dk.egernet.factory.RunProjectFilesDto.serializer(), it) }.getOrNull() } }
+
     fun setSandbox(id: UUID, info: dk.egernet.factory.RunSandboxDto) = db.update(
         "UPDATE runs SET sandbox = ?, updated_at = now() WHERE id = ?",
         JsonbParam(AppJson.encodeToString(dk.egernet.factory.RunSandboxDto.serializer(), info)), id,
@@ -1109,6 +1132,7 @@ class RunStore(private val db: Db) {
             updates = updates(r.id).map { it.toDto() },
             updateOnDemand = r.updateOnDemand, overlaps = r.overlaps,
             partial = r.partial, partialSetBy = r.partialSetBy, delivery = r.delivery,
+            projectFiles = r.projectFiles,
         )
     }
 

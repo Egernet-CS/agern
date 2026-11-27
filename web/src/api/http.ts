@@ -37,10 +37,10 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
 const enc = encodeURIComponent;
 
-/** Raw-body upload with progress (fetch cannot report upload progress). */
+/** Raw-body upload with progress (fetch cannot report upload progress). [body]: a file or a slice of one. */
 function upload<T>(
   path: string,
-  file: File,
+  body: Blob,
   opts?: { onProgress?: (loaded: number, total: number) => void; signal?: AbortSignal; method?: 'POST' | 'PUT' },
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -50,7 +50,7 @@ function upload<T>(
     xhr.setRequestHeader('X-Factory-Request', '1');
     xhr.setRequestHeader('Accept', 'application/json');
     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-    xhr.upload.onprogress = (e) => opts?.onProgress?.(e.loaded, e.lengthComputable ? e.total : file.size);
+    xhr.upload.onprogress = (e) => opts?.onProgress?.(e.loaded, e.lengthComputable ? e.total : body.size);
     xhr.onload = () => {
       let data: unknown;
       try {
@@ -66,8 +66,12 @@ function upload<T>(
     };
     xhr.onerror = () => reject(new ApiError(0, 'network', 'The upload did not reach the factory server.'));
     xhr.onabort = () => reject(new ApiError(0, 'aborted', 'Upload cancelled'));
+    if (opts?.signal?.aborted) {
+      reject(new ApiError(0, 'aborted', 'Upload cancelled'));
+      return;
+    }
     opts?.signal?.addEventListener('abort', () => xhr.abort());
-    xhr.send(file);
+    xhr.send(body);
   });
 }
 const get = <T>(p: string) => request<T>('GET', p);
@@ -183,6 +187,20 @@ export const httpApi: Api = {
   releaseSandboxVmLease: (repo) => del(`/api/projects/${enc(repo)}/sandbox-vm/lease`),
   startSandboxVmPreview: (runId) => post(`/api/runs/${enc(runId)}/sandbox-vm/preview`),
   releaseSandboxVmPreview: (runId) => del(`/api/runs/${enc(runId)}/sandbox-vm/preview`),
+
+  projectFiles: (repo) => get(`/api/projects/${enc(repo)}/files`),
+  createProjectFileUpload: (repo, body) => post(`/api/projects/${enc(repo)}/file-uploads`, body),
+  projectFileUpload: (repo, id) => get(`/api/projects/${enc(repo)}/file-uploads/${enc(id)}`),
+  putProjectFileChunk: (repo, id, offset, chunk, opts) =>
+    upload(`/api/projects/${enc(repo)}/file-uploads/${enc(id)}?offset=${offset}`, chunk, { ...opts, method: 'PUT' }),
+  completeProjectFileUpload: (repo, id) => post(`/api/projects/${enc(repo)}/file-uploads/${enc(id)}/complete`),
+  cancelProjectFileUpload: (repo, id) => del(`/api/projects/${enc(repo)}/file-uploads/${enc(id)}`),
+  updateProjectFile: (repo, id, body) => put(`/api/projects/${enc(repo)}/files/${enc(id)}`, body),
+  deleteProjectFile: (repo, id) => del(`/api/projects/${enc(repo)}/files/${enc(id)}`),
+  projectFileUrl: (repo, id) => `/api/projects/${enc(repo)}/files/${enc(id)}/content`,
+  setProjectFileManagers: (repo, usernames) => put(`/api/projects/${enc(repo)}/file-managers`, { usernames }),
+  adminProjectFiles: () => get('/api/admin/project-files'),
+  adminDeleteProjectFiles: (repo) => del(`/api/admin/project-files/${enc(repo)}`),
 
   projectRuns: (repo) => get(`/api/projects/${enc(repo)}/runs`),
   startRun: (repo, issueNumber) => post(`/api/projects/${enc(repo)}/runs`, { issueNumber }),

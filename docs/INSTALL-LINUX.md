@@ -262,15 +262,28 @@ gives up on that version with a warning in the journal (`journalctl -u agern-upg
 
 ## 9. Backup and restore
 
-Back up two things, and keep them apart:
+Back up three things, and keep the key apart from the rest:
 
 1. **The database**, e.g. nightly: `sudo -u postgres pg_dump -Fc factory > /var/backups/agern-db-$(date +%F).dump`
 2. **`/etc/agern/agern.env`** — above all `FACTORY_MASTER_KEY`. Every stored Claude credential,
    GitHub token and 2FA secret in the database is encrypted with it; a database backup without
    the key is useless, and the key plus the database gives access to everyone's credentials.
    Store it in your password manager or secrets store, not next to the database dumps.
+3. **`/var/lib/agern/project-files`**, the projects' uploaded files (vendor SDKs, licensed libraries,
+   test data; [ARCHITECTURE.md §5 "Project files"](ARCHITECTURE.md#project-files)). They exist nowhere
+   else — not in git, and no agent can recreate them — and their names, hashes and permissions are in
+   the database while their bytes are only here, so back this directory up **together with** the
+   database dump (right after it, from the same moment) and restore both. It is plain files and hard
+   links (`rsync -aH` or `tar` keep them; `runs/` holds the snapshots of running runs and can be
+   left out). Nothing in it is encrypted: protect the backup like the files themselves.
 
-`/var/lib/agern` holds clones and caches that agents recreate; include it only if you want
+The project files count against the disk of `/var/lib/agern`: by default at most 1 GiB per file,
+5 GiB per project and 20 GiB for all projects (`FACTORY_PROJECT_FILES_MAX_FILE_MB`,
+`FACTORY_PROJECT_FILES_MAX_PROJECT_MB`, `FACTORY_PROJECT_FILES_MAX_TOTAL_MB` in `agern.env`), and an
+upload is refused when it would leave less than 256 MiB free. Size the disk, and the backup, for the
+total limit. The admin page's "Project files" card shows what each project uses.
+
+The rest of `/var/lib/agern` holds clones and caches that agents recreate; include it only if you want
 interrupted chat sessions to resume after a restore. On a VM, snapshots/backups of the whole
 machine (e.g. Proxmox `vzdump`) complement but do not replace a database dump.
 

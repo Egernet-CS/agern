@@ -1209,6 +1209,29 @@ export function setProjectIconFromRepository(repo: string, rawPath: string) {
 const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 const TEAM_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/;
 
+/** The branches every mock project has on "GitHub" (a base branch must be one of them). */
+const MOCK_BRANCHES = ['main', 'dev', 'staging'];
+const BRANCH_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
+
+/** The base branch of a settings request, checked like the server (ARCHITECTURE §6 "Base branch"); null when blank. */
+function validBaseBranch(raw: string | null | undefined): string | null {
+  const b = (raw ?? '').trim();
+  if (!b) return null;
+  const bad = (why: string) => new MockError(400, 'bad_request', `baseBranch: '${b.slice(0, 100)}' ${why}`);
+  if (!BRANCH_RE.test(b)) throw bad('is not a valid branch name (letters, digits, `.`, `_`, `-` and `/`, at most 200)');
+  if (b.includes('..') || b.includes('//')) throw bad('must not contain `..` or `//`');
+  if (b.endsWith('/') || b.endsWith('.') || b.endsWith('.lock')) throw bad('must not end in `/`, `.` or `.lock`');
+  if (b.split('/').some((c) => c.startsWith('.'))) throw bad('must not have a path component starting with `.`');
+  if (b.startsWith('factory/')) throw bad("must not be one of Agern's own `factory/` branches");
+  return b;
+}
+
+/** The base branch new single runs of [repo] use now (ARCHITECTURE §6 "Base branch"). */
+function baseBranchOf(repo: string): string {
+  const p = db.projects.find((x) => x.name === repo);
+  return p?.settings.baseBranch ?? p?.defaultBranch ?? 'main';
+}
+
 /** The project's merge policy now (ARCHITECTURE §6 "Merge policy"). */
 export function policyOf(repo: string): MergePolicy {
   return db.projects.find((x) => x.name === repo)?.settings.mergePolicy ?? 'automatic';
@@ -1232,11 +1255,14 @@ export function setProjectSettings(repo: string, body: Partial<ProjectSettings>)
     if (out.length > 15) throw new MockError(400, 'bad_request', `${field}: at most 15 entries`);
     return out;
   };
-  p.settings = {
-    mergePolicy: body.mergePolicy,
-    reviewers: list(body.reviewers, LOGIN_RE, 'GitHub login', 'reviewers'),
-    teamReviewers: list(body.teamReviewers, TEAM_RE, 'team slug', 'teamReviewers'),
-  };
+  const reviewers = list(body.reviewers, LOGIN_RE, 'GitHub login', 'reviewers');
+  const teamReviewers = list(body.teamReviewers, TEAM_RE, 'team slug', 'teamReviewers');
+  let baseBranch = validBaseBranch(body.baseBranch);
+  if (baseBranch === p.defaultBranch) baseBranch = null;
+  if (baseBranch && !MOCK_BRANCHES.includes(baseBranch)) {
+    throw new MockError(422, 'base_branch_not_found', `Branch \`${baseBranch}\` does not exist in ${ORG}/${repo}.`);
+  }
+  p.settings = { mergePolicy: body.mergePolicy, reviewers, teamReviewers, baseBranch };
   for (const r of db.releases.values()) if (r.repo === repo) touchRelease(r);
 }
 
@@ -1362,8 +1388,9 @@ function makeRun(repo: string, issue: Issue, owner: User, createdMs: number, sta
     stages: [],
     sandbox: runSandboxFor(repo),
     sandboxVm: runSandboxVmFor(repo),
+    projectFiles: null,
     releaseId: release?.id ?? null,
-    baseBranch: release ? `release/${release.name}` : null,
+    baseBranch: release ? `release/${release.name}` : baseBranchOf(repo),
     conversation: { sessionId: null, review: 'none', followUpFrom: null },
     // The policy in force now, fixed for the run; a release run merges into its release branch as `automatic`.
     mergePolicy: release ? 'automatic' : policyOf(repo),
@@ -2401,7 +2428,7 @@ function seed() {
     activeAgents: 0,
     activeRuns: 0,
     iconUrl: null,
-    settings: { mergePolicy: 'automatic', reviewers: [], teamReviewers: [] },
+    settings: { mergePolicy: 'automatic', reviewers: [], teamReviewers: [], baseBranch: null },
   });
   db.projects = [
     proj('web-shop', 'Storefront and checkout for egernet.dk', 'Kotlin', 9, 4),

@@ -65,6 +65,11 @@ export type ProjectSettings = {
   reviewers: string[];
   /** Team slugs of the organisation requested as reviewers (policy `github` only). */
   teamReviewers: string[];
+  /**
+   * The branch new runs start from, open their pull request against and merge into (ARCHITECTURE §6 "Base branch");
+   * null = the repository's default branch.
+   */
+  baseBranch: string | null;
 };
 
 /** A member repository of a workspace, as the caller sees it. */
@@ -534,7 +539,10 @@ export type Run = {
   sandbox: RunSandbox | null;
   /** The release this run builds an issue of; null for a single run. */
   releaseId: string | null;
-  /** The branch the run branches from and merges into (`release/<name>`); null for a single run (default branch). */
+  /**
+   * The branch the run branches from and merges into: the project's base branch, `release/<name>` for a release run, or
+   * the member's base. Always set on runs started since base branches exist; null on older single runs (default branch).
+   */
   baseBranch: string | null;
   /** The owner's conversation with the advisor while the run needs a human. Always present. */
   conversation: RunConversation;
@@ -584,6 +592,8 @@ export type Run = {
   partialSetBy?: string | null;
   /** The spec's Delivery plan; null when the spec has none. Untrusted text from the agent: plain text only. */
   delivery?: RunDelivery | null;
+  /** The project files the run got, fixed when it starts; null for older runs. */
+  projectFiles?: RunProjectFiles | null;
 };
 
 /** A spec's Delivery plan: what this run delivers and the steps that remain. */
@@ -673,7 +683,9 @@ export const BLOCKING_CHECK_STATES: RunChecks['state'][] = ['failed', 'pending',
 
 export type FailureKind =
   | 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other'
-  | 'submodule_commit_missing' | 'checks' | 'migration_conflict' | 'merge_conflict';
+  | 'submodule_commit_missing' | 'checks' | 'migration_conflict' | 'merge_conflict'
+  /** The builder committed a project file (they are never committed or sent to GitHub). */
+  | 'project_file_committed';
 export type FailedStep = 'push' | 'pull_request' | 'merge';
 
 /**
@@ -719,6 +731,8 @@ export type RunSandbox = {
   platformsUsed: string[];
   /** The ux and ui-design reviewers ran the app in a read-only review sandbox at least once (absent for older runs). */
   reviewUsed?: boolean;
+  /** Project files the definition requires (`files:`); absent for older runs. */
+  files?: string[];
 };
 
 /** A sidecar's readiness check: run inside the service until it exits 0, for at most `timeoutSeconds`. */
@@ -743,6 +757,8 @@ export type SandboxDefinition = {
   platforms: SandboxPlatform[];
   /** Null: commands run as root inside the container. */
   user: SandboxUser | null;
+  /** Project files the sandbox needs (`files:`), by name. */
+  files?: string[];
 };
 
 export type SandboxApproval = { sha256: string; content: string; approvedBy: Owner; approvedAt: string };
@@ -765,7 +781,67 @@ export type SandboxStatus = {
   approval: SandboxApproval | null;
   /** Who can approve (the admins), so a non-admin knows whom to ask. */
   approvers: Owner[];
+  /** Names in the definition's `files` that are not uploaded to the project's files. */
+  missingFiles?: string[];
 };
+
+// ---------------------------------------------------------------- project files
+
+/**
+ * A file of the project's file store: uploaded once per project, handed read-only to every chat and run of the project,
+ * never committed or sent to GitHub. `sha256` is computed by the server; a replacement keeps the id and bumps `version`.
+ */
+export type ProjectFile = {
+  id: string;
+  name: string;
+  size: number;
+  sha256: string;
+  version: number;
+  note: string | null;
+  /** Whether people who can see the project may download it through the browser (default off). */
+  downloadable: boolean;
+  uploadedBy: Owner | null;
+  uploadedAt: string;
+};
+
+/** An open (resumable) upload. `received`: bytes the server has, the offset of the next chunk. */
+export type ProjectFileUpload = {
+  id: string;
+  name: string;
+  size: number;
+  received: number;
+  /** The expected SHA-256 given when it was created. */
+  sha256: string | null;
+  note: string | null;
+  createdBy: Owner | null;
+  createdAt: string;
+  touchedAt: string;
+  expiresAt: string;
+  /** The id of the file it replaces (same name). */
+  replaces: string | null;
+};
+
+export type ProjectFilesUsage = { files: number; projectBytes: number; totalBytes: number };
+export type ProjectFilesLimits = { maxFileBytes: number; maxProjectBytes: number; maxTotalBytes: number; maxFiles: number };
+
+/** `GET /api/projects/{repo}/files`. `canManage`: an admin or one of `managers`. */
+export type ProjectFiles = {
+  repo: string;
+  canManage: boolean;
+  files: ProjectFile[];
+  managers: Owner[];
+  usage: ProjectFilesUsage;
+  limits: ProjectFilesLimits;
+  /** Open uploads (managers only). */
+  uploads: ProjectFileUpload[];
+};
+
+/** A project file as a run got it. `required`: named by the sandbox definition; `previousSha256`: it changed since the previous run. */
+export type RunProjectFile = { name: string; size: number; sha256: string; version: number; required: boolean; previousSha256: string | null };
+export type RunProjectFiles = { repo: string; files: RunProjectFile[] };
+
+export type AdminProjectFilesRepo = { repo: string; files: number; bytes: number };
+export type AdminProjectFiles = { totalBytes: number; limits: ProjectFilesLimits; repos: AdminProjectFilesRepo[] };
 
 /** A target of a valid `.agern/deploy.yml` (docs/DEPLOY.md). */
 export type DeployTarget = {
@@ -1039,7 +1115,8 @@ export type EventType = 'user' | 'claude' | 'system' | 'status' | 'images' | 'ch
 
 /**
  * Payload of a `checkout` event: the state of the owner's main checkout after the server synced it with
- * `origin/<defaultBranch>` (docs/ARCHITECTURE.md §8). `branch` null = detached HEAD.
+ * `origin/<defaultBranch>` (docs/ARCHITECTURE.md §8), the branch it follows: the project's base branch. `branch` null =
+ * detached HEAD.
  */
 export type CheckoutInfo = {
   branch: string | null;
@@ -1050,6 +1127,8 @@ export type CheckoutInfo = {
   status: 'current' | 'updated' | 'behind';
   reason: 'other_branch' | 'local_changes' | 'local_commits' | 'update_failed' | null;
   updatedFrom: string | null;
+  /** The branch Agern switched the checkout from to the project's base branch (`defaultBranch`); absent or null otherwise. */
+  switchedFrom?: string | null;
 };
 
 export type FactoryEvent = {

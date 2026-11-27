@@ -9,7 +9,8 @@ import kotlin.io.path.name
  * `FACTORY_SANDBOX=fake` (development and end-to-end tests only, together with FACTORY_DEV_FAKE_GITHUB): a runtime that
  * keeps its "containers" in memory and only pretends to run commands, so the sandbox UI can be developed and tested
  * without Podman. Nothing is executed: a command is split at `&&`, `;` and newlines and each part is answered from a
- * tiny repertoire — `echo …` prints its words, `ls` lists the worktree's top level, `seq N` prints 1..N (long output),
+ * tiny repertoire — `echo …` prints its words, `ls` lists the worktree's top level (`ls /project-files` the files of the
+ * project files mount), `seq N` prints 1..N (long output),
  * `sleep N` waits (up to the time limit), `exit N` / `false` end with that exit code; anything else prints a line saying
  * what would have run.
  */
@@ -43,7 +44,7 @@ class DevFakeSandboxRuntime : SandboxRuntime {
             val words = part.split(Regex("\\s+"))
             when (words[0]) {
                 "echo" -> out.append(words.drop(1).joinToString(" ") { it.trim('"', '\'') }).append('\n')
-                "ls" -> out.append(listWorktree(spec)).append('\n')
+                "ls" -> out.append(if (words.getOrNull(1)?.trimEnd('/') == SandboxManager.PROJECT_FILES) listProjectFiles(spec) else listWorktree(spec)).append('\n')
                 "seq" -> (1..(words.getOrNull(1)?.toIntOrNull() ?: 10).coerceIn(0, 200_000)).forEach { out.append(it).append('\n') }
                 "sleep" -> {
                     val ms = ((words.getOrNull(1)?.toDoubleOrNull() ?: 1.0) * 1000).toLong()
@@ -67,6 +68,16 @@ class DevFakeSandboxRuntime : SandboxRuntime {
     private fun listWorktree(spec: ContainerSpec): String {
         val src = spec.mounts.firstOrNull { !it.volume && it.target == SandboxManager.WORKDIR }?.source ?: return ""
         return runCatching { Files.list(Path.of(src)).use { s -> s.map { it.name }.sorted().toList() } }.getOrDefault(emptyList()).joinToString("\n")
+    }
+
+    /** `ls /project-files`: the files of the mount at [SandboxManager.PROJECT_FILES], as relative paths (recursively). */
+    private fun listProjectFiles(spec: ContainerSpec): String {
+        val src = spec.mounts.firstOrNull { !it.volume && it.target == SandboxManager.PROJECT_FILES }?.source
+            ?: return "ls: cannot access '${SandboxManager.PROJECT_FILES}': No such file or directory"
+        val root = Path.of(src)
+        return runCatching {
+            Files.walk(root).use { s -> s.filter { Files.isRegularFile(it) }.map { root.relativize(it).toString() }.sorted().toList() }
+        }.getOrDefault(emptyList()).joinToString("\n")
     }
 
     override fun restartContainer(name: String) {}

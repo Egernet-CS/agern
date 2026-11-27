@@ -5,7 +5,7 @@ when something does not work.}
 
 \section{Back up}\label{sec:backup}
 
-Back up two things, and keep them apart.
+Back up two things, and keep them apart (plus the project files, below, which go with the database).
 
 \begin{enumerate}
   \item \textbf{The database}, for example every night (as a cron job or systemd timer):
@@ -19,8 +19,17 @@ sudo -u postgres pg_dump -Fc factory > /var/backups/agern-db-$(date +%F).dump
     next to the dumps.
 \end{enumerate}
 
-The data directory \file{/var/lib/agern} holds checkouts and caches that agents recreate. Include
-it only if you want interrupted chats to resume after a restore. Snapshots of the whole virtual
+One part of the data directory must be backed up as well: \file{/var/lib/agern/project-files}, the
+files uploaded on the projects' \ui{Files} pages (section~\ref{sec:project-files}). They exist
+nowhere else and no agent can recreate them, and their names and hashes are in the database while
+their bytes are only in this directory, so copy it right after the database dump and restore the
+two together (\cmd{rsync -aH} or \cmd{tar} keep its hard links). Plan disk space for them: by
+default a project may store 5~GB and all projects together 20~GB, as set by
+\envvar{FACTORY_PROJECT_FILES_MAX_FILE_MB}, \envvar{FACTORY_PROJECT_FILES_MAX_PROJECT_MB} and
+\envvar{FACTORY_PROJECT_FILES_MAX_TOTAL_MB}.
+
+The rest of the data directory \file{/var/lib/agern} holds checkouts and caches that agents
+recreate. Include it only if you want interrupted chats to resume after a restore. Snapshots of the whole virtual
 machine are a good addition to, not a replacement for, the database dump.
 
 \section{Restore on a new machine}\label{sec:restore}

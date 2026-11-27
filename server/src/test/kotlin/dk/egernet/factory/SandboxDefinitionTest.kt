@@ -47,6 +47,25 @@ class SandboxDefinitionTest {
     }
 
     @Test
+    fun `files names project files the run needs`() {
+        val d = valid("image: quay.io/fedora/fedora:41\nfiles: [ vendor/sdk.zip, licence.lic ]")
+        assertEquals(listOf("vendor/sdk.zip", "licence.lic"), d.files)
+        assertTrue(valid("image: quay.io/fedora/fedora:41").files.isEmpty())
+        val errs = errors(
+            "image: quay.io/fedora/fedora:41\nfiles: [ ok.zip, ../up, OK.zip, /abs ]",
+        )
+        assertTrue(errs.any { it.startsWith("files[1]: '../up' is not a project file name") }, errs.toString())
+        assertTrue(errs.any { it == "files[2]: 'OK.zip' is listed twice" }, errs.toString())
+        assertTrue(errs.any { it.startsWith("files[3]: '/abs'") }, errs.toString())
+        assertTrue(errors("image: quay.io/fedora/fedora:41\nfiles: vendor/sdk.zip").single().startsWith("files: must be a list"))
+        assertTrue(errors("image: quay.io/fedora/fedora:41\nfiles: [ ${(1..51).joinToString(", ") { "f$it" }} ]").contains("files: at most 50 project files"))
+        // The mount point cannot be a cache.
+        assertTrue(errors("image: quay.io/fedora/fedora:41\ncaches: [ /project-files/x ]").single().contains("may not be a cache"))
+        // The key is part of the content hash: adding it needs a new approval.
+        assertTrue(SandboxDefinitions.sha256("image: a\n") != SandboxDefinitions.sha256("image: a\nfiles: [ x ]\n"))
+    }
+
+    @Test
     fun `only image is required and limits default to the server's`() {
         val d = valid("image: quay.io/fedora/fedora:41")
         assertNull(d.setup)

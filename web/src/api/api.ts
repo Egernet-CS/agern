@@ -1,4 +1,5 @@
 import type {
+  AdminProjectFiles,
   AgentMessage,
   AgentSession,
   Attachment,
@@ -18,6 +19,9 @@ import type {
   LoginStep,
   IssueKind,
   Project,
+  ProjectFile,
+  ProjectFiles,
+  ProjectFileUpload,
   ProjectSettings,
   Release,
   ReleaseMode,
@@ -237,6 +241,41 @@ export interface Api {
   startSandboxVmPreview(runId: string): Promise<Run>;
   /** Owner or admin: ends the run's preview (the VM's `reset` runs); the preview becomes `released`. 404 when none is active. */
   releaseSandboxVmPreview(runId: string): Promise<Run>;
+
+  /** The project's files, managers, usage and limits (anyone who can see the project; 404 otherwise). */
+  projectFiles(repo: string): Promise<ProjectFiles>;
+  /**
+   * Manager: starts an upload (201), or answers the caller's open upload with the same name, size and SHA-256 (200, resume
+   * at its `received`). An existing name replaces that file. 400 `invalid_file_name`, 409 `name_conflict` /
+   * `too_many_files`, 413 `file_too_large` / `project_quota_exceeded` / `total_quota_exceeded`, 422 `empty_file`, 507.
+   */
+  createProjectFileUpload(repo: string, body: { name: string; size: number; sha256?: string; note?: string }): Promise<ProjectFileUpload>;
+  /** Manager: an open upload with its current `received`. */
+  projectFileUpload(repo: string, id: string): Promise<ProjectFileUpload>;
+  /** Manager: appends [chunk] at [offset]. 409 `upload_offset_mismatch` (offset is not `received`) / `upload_busy`. */
+  putProjectFileChunk(
+    repo: string,
+    id: string,
+    offset: number,
+    chunk: Blob,
+    opts?: { onProgress?: (loaded: number, total: number) => void; signal?: AbortSignal },
+  ): Promise<ProjectFileUpload>;
+  /** Manager: verifies and publishes a complete upload. 409 `upload_incomplete`, 422 `checksum_mismatch`. */
+  completeProjectFileUpload(repo: string, id: string): Promise<ProjectFile>;
+  /** Manager: cancels an open upload (its bytes are deleted). */
+  cancelProjectFileUpload(repo: string, id: string): Promise<void>;
+  /** Manager: changes a file's note (empty clears it) and whether it can be downloaded. */
+  updateProjectFile(repo: string, id: string, body: { note?: string; downloadable?: boolean }): Promise<ProjectFile>;
+  /** Manager: deletes a file; runs that already started keep their copy. */
+  deleteProjectFile(repo: string, id: string): Promise<void>;
+  /** URL of a file's bytes (only when it is downloadable; 403 `download_disabled` otherwise). */
+  projectFileUrl(repo: string, id: string): string;
+  /** Admin: replaces the project's file managers. 400 for unknown usernames. */
+  setProjectFileManagers(repo: string, usernames: string[]): Promise<ProjectFiles>;
+  /** Admin: the file store's usage per repository. */
+  adminProjectFiles(): Promise<AdminProjectFiles>;
+  /** Admin: deletes every file (and open upload) of a repository. */
+  adminDeleteProjectFiles(repo: string): Promise<void>;
 
   projectRuns(repo: string): Promise<Run[]>;
   startRun(repo: string, issueNumber: number): Promise<Run>;

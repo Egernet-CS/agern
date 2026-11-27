@@ -55,6 +55,8 @@ data class SandboxDefinition(
     val platforms: List<SandboxPlatform> = emptyList(),
     /** Null: commands run as root inside the container (the service user on the host), as before `user:` existed. */
     val user: SandboxUser? = null,
+    /** Project files the run needs (`files:`), by name; a run fails early when one is not uploaded. */
+    val files: List<String> = emptyList(),
 ) {
     /** True when the file asked for more than the server allows. */
     val capped: Boolean get() = (requestedCpus != null && requestedCpus > cpus) || (requestedMemoryBytes != null && requestedMemoryBytes > memoryBytes)
@@ -75,6 +77,7 @@ object SandboxDefinitions {
     const val MAX_SETUP_CHARS = 32 * 1024
     const val MAX_SERVICES = 5
     const val MAX_CACHES = 10
+    const val MAX_FILES = 50
     const val MAX_ENV = 100
     const val MAX_READY_COMMAND_CHARS = 4096
     const val DEFAULT_READY_TIMEOUT_SECONDS = 60
@@ -85,7 +88,7 @@ object SandboxDefinitions {
     /** What `factory_sandbox_exec` calls the top-level image when a `platform` is named explicitly. */
     const val DEFAULT_PLATFORM = "default"
 
-    private val TOP_KEYS = listOf("image", "setup", "env", "services", "caches", "resources", "platforms", "user")
+    private val TOP_KEYS = listOf("image", "setup", "env", "services", "caches", "resources", "platforms", "user", "files")
     private val SERVICE_KEYS = listOf("image", "env", "ready")
     private val READY_KEYS = listOf("command", "timeoutSeconds")
     private val PLATFORM_KEYS = listOf("image", "setup")
@@ -96,7 +99,7 @@ object SandboxDefinitions {
     private val SERVICE_NAME_RE = Regex("^[a-z][a-z0-9-]{0,30}$")
     private val RESERVED_SERVICE_NAMES = setOf("localhost", "sandbox", "workspace", "host", "gateway")
     private val CACHE_PATH_RE = Regex("^/[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$")
-    private val FORBIDDEN_CACHE_ROOTS = listOf("/workspace", "/proc", "/sys", "/dev", "/run", "/etc", "/bin", "/sbin", "/usr", "/lib", "/lib64", "/boot")
+    private val FORBIDDEN_CACHE_ROOTS = listOf("/workspace", "/project-files", "/proc", "/sys", "/dev", "/run", "/etc", "/bin", "/sbin", "/usr", "/lib", "/lib64", "/boot")
 
     // registry[:port]/path[:tag][@sha256:digest] — the reference grammar of the OCI distribution spec, lower-case path.
     private val HOST_RE = Regex("^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]{1,5})?$")
@@ -244,6 +247,24 @@ object SandboxDefinitions {
             }
         }
 
+        val files = mutableListOf<String>()
+        top.get<YamlNode>("files")?.takeUnless { it is YamlNull }?.let { node ->
+            val l = node as? YamlList
+            if (l == null) errors += "files: must be a list of project file names, e.g. [ vendor/sdk.zip ]"
+            else {
+                if (l.items.size > MAX_FILES) errors += "files: at most $MAX_FILES project files"
+                l.items.forEachIndexed { i, item ->
+                    val name = scalar(item, "files[$i]", errors) ?: return@forEachIndexed
+                    val why = dk.egernet.factory.files.ProjectFiles.validateName(name)
+                    when {
+                        why != null -> errors += "files[$i]: '$name' is not a project file name: $why"
+                        files.any { it.equals(name, ignoreCase = true) } -> errors += "files[$i]: '$name' is listed twice"
+                        else -> files += name
+                    }
+                }
+            }
+        }
+
         if (errors.isNotEmpty() || image == null) return ParsedDefinition.Invalid(hash, errors.ifEmpty { listOf("image: required") })
         return ParsedDefinition.Valid(
             hash,
@@ -251,7 +272,7 @@ object SandboxDefinitions {
                 image = image, setup = setup, env = env, services = services, caches = caches,
                 requestedCpus = cpus, requestedMemoryBytes = memory,
                 cpus = minOf(cpus ?: cfg.maxCpus, cfg.maxCpus), memoryBytes = minOf(memory ?: cfg.maxMemoryBytes, cfg.maxMemoryBytes),
-                platforms = platforms, user = user,
+                platforms = platforms, user = user, files = files,
             ),
         )
     }

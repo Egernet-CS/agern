@@ -64,6 +64,12 @@ data class Config(
     val screenshotMaxCount: Int = 12,
     /** FACTORY_IMAGE_MAX_*: limits on image generation (docs/ARCHITECTURE.md §6 "Generated images"). */
     val imageLimits: ImageLimits = ImageLimits(),
+    /** FACTORY_PROJECT_FILES_MAX_FILE_MB: largest single project file (docs/ARCHITECTURE.md §5 "Project files"). */
+    val projectFilesMaxFileBytes: Long = 1024L shl 20,
+    /** FACTORY_PROJECT_FILES_MAX_PROJECT_MB: all files of one project together. */
+    val projectFilesMaxProjectBytes: Long = 5120L shl 20,
+    /** FACTORY_PROJECT_FILES_MAX_TOTAL_MB: all projects' files together. */
+    val projectFilesMaxTotalBytes: Long = 20480L shl 20,
     /** FACTORY_SANDBOX*: per-run build/test sandboxes (docs/ARCHITECTURE.md §5 "Sandboxes"). */
     val sandbox: SandboxConfig = SandboxConfig(),
     /** FACTORY_DEPLOY*: per-project SSH deploy targets (docs/DEPLOY.md, docs/ARCHITECTURE.md §5 "Deploy targets"). */
@@ -128,7 +134,9 @@ data class Config(
             "maxAgentsPerUser=$maxAgentsPerUser, chatIdleMinutes=$chatIdleMinutes, stageTimeoutMs=$stageTimeoutMs, networkRetryMaxMs=$networkRetryMaxMs, maxUpdateRounds=$maxUpdateRounds, fakeGithub=$fakeGithub, " +
             "githubStatusUrl=${githubStatusUrl ?: "off"}, " +
             "attachments=${attachmentMaxCount}x${attachmentMaxBytes shr 20}MB/${attachmentMaxMessageBytes shr 20}MB, " +
-            "screenshots=${screenshotMaxCount}x${screenshotMaxBytes shr 20}MB, images=$imageLimits, sandbox=$sandbox, deploy=$deploy, sandboxVm=$sandboxVm)"
+            "screenshots=${screenshotMaxCount}x${screenshotMaxBytes shr 20}MB, images=$imageLimits, " +
+            "projectFiles=${projectFilesMaxFileBytes shr 20}MB/${projectFilesMaxProjectBytes shr 20}MB/${projectFilesMaxTotalBytes shr 20}MB, " +
+            "sandbox=$sandbox, deploy=$deploy, sandboxVm=$sandboxVm)"
 
     companion object {
         fun defaultAgentPath(): String =
@@ -232,6 +240,9 @@ data class Config(
                     maxPerStage = intIn(get("FACTORY_IMAGE_MAX_PER_STAGE"), "FACTORY_IMAGE_MAX_PER_STAGE", 12, 1..200),
                     maxEdge = intIn(get("FACTORY_IMAGE_MAX_EDGE"), "FACTORY_IMAGE_MAX_EDGE", 2048, 256..4096),
                 ),
+                projectFilesMaxFileBytes = mb(get("FACTORY_PROJECT_FILES_MAX_FILE_MB"), "FACTORY_PROJECT_FILES_MAX_FILE_MB", 1024, 1L..102_400L),
+                projectFilesMaxProjectBytes = mb(get("FACTORY_PROJECT_FILES_MAX_PROJECT_MB"), "FACTORY_PROJECT_FILES_MAX_PROJECT_MB", 5120, 1L..1_048_576L),
+                projectFilesMaxTotalBytes = mb(get("FACTORY_PROJECT_FILES_MAX_TOTAL_MB"), "FACTORY_PROJECT_FILES_MAX_TOTAL_MB", 20480, 1L..1_048_576L),
                 sandbox = sandbox,
                 deploy = deploy,
                 sandboxVm = sandboxVm,
@@ -246,6 +257,12 @@ data class Config(
             ).also {
                 require(it.attachmentMaxMessageBytes >= it.attachmentMaxBytes) {
                     "FACTORY_ATTACHMENT_MAX_MESSAGE_MB must be at least FACTORY_ATTACHMENT_MAX_MB"
+                }
+                require(it.projectFilesMaxProjectBytes >= it.projectFilesMaxFileBytes) {
+                    "FACTORY_PROJECT_FILES_MAX_PROJECT_MB must be at least FACTORY_PROJECT_FILES_MAX_FILE_MB"
+                }
+                require(it.projectFilesMaxTotalBytes >= it.projectFilesMaxProjectBytes) {
+                    "FACTORY_PROJECT_FILES_MAX_TOTAL_MB must be at least FACTORY_PROJECT_FILES_MAX_PROJECT_MB"
                 }
             }
         }
@@ -271,9 +288,9 @@ data class Config(
             return n
         }
 
-        private fun mb(v: String?, name: String, default: Long): Long {
+        private fun mb(v: String?, name: String, default: Long, range: LongRange = 1L..512L): Long {
             val n = if (v == null) default else v.toLongOrNull() ?: throw IllegalArgumentException("$name must be a whole number of megabytes")
-            require(n in 1..512) { "$name must be between 1 and 512" }
+            require(n in range) { "$name must be between ${range.first} and ${range.last}" }
             return n shl 20
         }
 

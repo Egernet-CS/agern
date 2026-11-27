@@ -296,6 +296,15 @@ class FakeGitOps : GitOps {
         pushes += branch
     }
     override fun listWorktrees(mainDir: Path, home: Path): List<dk.egernet.factory.git.WorktreeInfo> = emptyList()
+    /** What [newBlobs] answers (the blobs a push would publish); while [newBlobsError] is set it throws instead. */
+    @Volatile var newBlobsAnswer: List<dk.egernet.factory.git.NewBlob> = emptyList()
+    @Volatile var newBlobsError: String? = null
+    override fun newBlobs(worktree: Path, baseRef: String, home: Path): List<dk.egernet.factory.git.NewBlob> {
+        newBlobsError?.let { throw dk.egernet.factory.git.GitException(it) }
+        return newBlobsAnswer
+    }
+    /** The SHA-1 git blob id of [file]'s content, as `git hash-object` computes it (streamed). */
+    override fun blobId(worktree: Path, file: Path, home: Path): String = gitBlobId(file)
     /** When set, [removeWorktree] deletes the directory (like the real one) and records it in [removedWorktrees]. */
     @Volatile var deleteWorktrees = false
     val removedWorktrees = CopyOnWriteArrayList<Path>()
@@ -425,6 +434,8 @@ class TestWorld(
     imageProviders: List<dk.egernet.factory.images.ImageProvider>? = null,
     /** Git operations to use instead of [FakeGitOps] or [realGit] (e.g. real git with local remotes). */
     gitOps: GitOps? = null,
+    /** The project file store's free-space probe (null: the real file system's). */
+    projectFilesFreeSpace: ((Path) -> Long)? = null,
 ) {
     val dataDir: Path = Files.createTempDirectory("agern-test")
     val cfg = tweak(testConfig(dataDir, twoFactor).let { if (sandbox) it.copy(sandbox = it.sandbox.copy(mode = "podman")) else it })
@@ -448,6 +459,7 @@ class TestWorld(
         deployTransport = if (cfg.deploy.enabled) deployTransport else null,
         sandboxVmTransport = if (cfg.sandboxVm.enabled) vmTransport else null,
         onBackgroundFailure = { backgroundFailures += it },
+        projectFilesFreeSpace = projectFilesFreeSpace,
     )
 
     init {
@@ -675,4 +687,23 @@ class FakeSandboxRuntime : dk.egernet.factory.sandbox.SandboxRuntime {
     override fun listContainers() = containers.map { (n, r) -> dk.egernet.factory.sandbox.LabelledResource(n, r) }
     override fun listNetworks() = networks.map { (n, r) -> dk.egernet.factory.sandbox.LabelledResource(n, r) }
     override fun exposedPorts(image: String) = if (image.contains("postgres")) listOf("5432/tcp") else emptyList()
+}
+
+/** The SHA-1 git object id of [file] as a blob (`git hash-object`), streamed. */
+fun gitBlobId(file: Path): String {
+    val md = java.security.MessageDigest.getInstance("SHA-1")
+    md.update("blob ${Files.size(file)}\u0000".toByteArray())
+    Files.newInputStream(file).use { ins ->
+        val buf = ByteArray(1 shl 16)
+        while (true) { val n = ins.read(buf); if (n < 0) break; md.update(buf, 0, n) }
+    }
+    return md.digest().joinToString("") { "%02x".format(it) }
+}
+
+/** The SHA-1 git object id of [bytes] as a blob. */
+fun gitBlobId(bytes: ByteArray): String {
+    val md = java.security.MessageDigest.getInstance("SHA-1")
+    md.update("blob ${bytes.size}\u0000".toByteArray())
+    md.update(bytes)
+    return md.digest().joinToString("") { "%02x".format(it) }
 }

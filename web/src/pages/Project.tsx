@@ -5,10 +5,12 @@ import { ChatView } from '../components/chat/ChatView';
 import { IssueImagesDialog } from '../components/images/IssueImagesDialog';
 import { REVIEWERS, roundName } from '../components/pipeline/model';
 import { deploySummary } from '../components/deploy/DeployBits';
+import { filesSummary } from '../components/files/FilesBits';
 import { sandboxSummary } from '../components/sandbox/SandboxBits';
 import { sandboxVmSummary } from '../components/sandboxvm/SandboxVmBits';
 import { ProjectIconControl } from '../components/ui/ProjectIconControl';
 import { MergePolicyControl } from '../components/ui/MergePolicyControl';
+import { BaseBranchControl } from '../components/ui/BaseBranchControl';
 import { Dialog, Empty, ErrorBox, KindBadge, Loading, Notice, ProjectIcon, ReleaseStatusPill, RoleBadge, RunStatusPill, SessionStatusPill } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
@@ -128,6 +130,15 @@ export function ProjectPage() {
           <MergePolicyControl
             repo={repo}
             settings={p.settings}
+            isAdmin={me.isAdmin}
+            onChanged={(np) => project.setData((old) => ({ ...np, workspace: old?.workspace ?? np.workspace }))}
+          />
+        )}
+        {p?.settings && (
+          <BaseBranchControl
+            repo={repo}
+            settings={p.settings}
+            defaultBranch={p.defaultBranch}
             isAdmin={me.isAdmin}
             onChanged={(np) => project.setData((old) => ({ ...np, workspace: old?.workspace ?? np.workspace }))}
           />
@@ -1119,6 +1130,40 @@ function SandboxVmSection({ repo }: { repo: string }) {
   );
 }
 
+/** The project's files in one row, linking to the Files page (every project has one). */
+function FilesSection({ repo }: { repo: string }) {
+  const reconnects = useFeedReconnects();
+  const q = useAsync(() => api.projectFiles(repo), [repo, reconnects]);
+  return (
+    <>
+      <div className="panel-head">
+        <h2>Files</h2>
+      </div>
+      {q.loading && !q.data && <Loading />}
+      {q.error && !q.data && (
+        <p className="form-error pad" role="alert">
+          Could not read the project’s files: {q.error.message}{' '}
+          <button type="button" className="btn btn--ghost btn--sm" onClick={q.reload}>Retry</button>
+        </p>
+      )}
+      {q.data && (
+        <ul className="run-list">
+          <li>
+            <Link to={`/p/${repo}/files`} className="run-row pf-row">
+              <div className="rr-top">
+                <span className="rr-title">Project files</span>
+              </div>
+              <div className="rr-bot">
+                <span className="rr-line">{filesSummary(q.data)}</span>
+              </div>
+            </Link>
+          </li>
+        </ul>
+      )}
+    </>
+  );
+}
+
 export function runStageLine(r: Run): string {
   const running = r.stages.filter((s) => s.status === 'running').map((s) => s.role);
   if (r.status === 'reviewing') {
@@ -1249,6 +1294,7 @@ function ActivityPanel({
       {ownSandbox && <SandboxSection repo={repo} />}
       <DeploySection repo={repo} />
       <SandboxVmSection repo={repo} />
+      <FilesSection repo={repo} />
       <div className="panel-head">
         <h2>Runs</h2>
       </div>
