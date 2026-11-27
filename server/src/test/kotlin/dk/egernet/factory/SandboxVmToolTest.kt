@@ -295,6 +295,8 @@ class SandboxVmToolTest {
             w.vmTransport.onExec = { _, _, _ -> throw DeployException("host_key", "Host key of staging does not match the pinned key") }
             answers["broken"] = call(w, p, "factory_sandbox_vm_exec", buildJsonObject { put("command", "true") })
             answers["bad"] = call(w, p, "factory_sandbox_vm_exec", buildJsonObject { put("command", " ") })
+            // The builder commits before it ends, so it is not resumed to finish.
+            w.git.dirty = false
         }
         val runId = start(w)
         w.awaitRun(runId, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)

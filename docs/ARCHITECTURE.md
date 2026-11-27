@@ -1046,6 +1046,11 @@ reaches the default branch only through the owner's approval of the release (§6
   builder session) whose CLI is launched with `--resume <claudeSessionId of the previous builder>`.
   At most `maxFixRounds` (default 2) fix rounds; if reviewers still want changes after the last one,
   the approver is `skipped` and the run goes to `needs_human`.
+- **The session ends with the turn.** Agern closes a builder's stdin at its first `result`, so anything it left running
+  in the background (subagents, background commands) is stopped; `builder.md` and `spec-writer.md` tell the agent to
+  wait for every subagent first. A builder of the build/review loop (initial build, continued build, fix round) that
+  still ends with no commits or with uncommitted changes gets a *finish resume* ("Worktrees and branches", *No
+  commits*).
 - **Rounds** are numbered by fix rounds: `Run.round` and `Stage.round` are `0` for the initial
   build/review, `1..maxRounds` for fix rounds. The UI shows "build" for round 0 and "fix round N of
   max" after. Later rounds are follow-up reviews of conversation changes ("follow-up N", §6 "Conversation at needs
@@ -1135,12 +1140,32 @@ reaches the default branch only through the owner's approval of the release (§6
     `needs_human` run is still alive and keeps its worktree until it is approved or cancelled. `ready` (merge policy
     `github`) removes the worktree like an unmerged end; the pushed branch and the open pull request stay. Submodule commits
     found on no remote-tracking branch of their submodule are saved as git bundles first (§6 "Submodule pointers").
+    A non-sync run that *fails* with uncommitted changes in its worktree (`git status --porcelain`, ignored files
+    excluded) has them committed first, after the sandbox and VM are released: `git add -A` and one commit by Agern
+    (`--no-verify`) on the run's local branch, "WIP: uncommitted work of Agern run <runId>, saved when the run failed",
+    whose body quotes the failure and says the commit is unchecked. It is never pushed, so the rule above keeps the
+    branch; the run error and the issue comment end with "Uncommitted work in the run's worktree was saved as commit
+    `<sha>` on the local branch `<branch>` (not pushed); retry the run with "Continue" to go on from it.", and the run's
+    last builder session gets the same sentence as a `warn` event. Nothing is saved during a merge (`MERGE_HEAD` or
+    unmerged paths), for cancelled, restarted or `needs_human` runs, or when git fails (logged; the run fails as it
+    would have).
   - *GitHub:* the remote branch and the open pull request of a failed or cancelled run are left untouched — they
     may hold useful commits, and only a human decides to close them. The issue gets a comment "run … failed: <reason>"
     or "… was cancelled by …", which names that pull request. A later run of the issue opens its own pull request,
     whose body lists the earlier runs' unmerged pull requests ("close them if this one supersedes them").
   - *No commits.* When the builder makes no commits, the stage summary and the run error carry the first paragraph of
     the builder's final message (e.g. why the issue cannot be built yet), and so does the issue comment.
+    *Finish resume:* a builder of the build/review loop that ends successfully without commits or with uncommitted
+    changes is first resumed (a new builder session on the same stage row, `--resume` with its Claude session,
+    `parentSessionId` the previous builder session) with "Message from Agern: your session ended when your last turn
+    ended, but the work is not finished: …", after a `warn` event on the previous session ("… resuming it to finish
+    and commit (attempt N of 2)"). It stops when the branch has commits and a clean tree, after
+    `MAX_FINISH_RESUMES` (2) resumes, or after one resume when the tree is clean and there are still no commits. Then:
+    commits and a clean tree go on as usual; commits and a dirty tree go on too, with a `warn` "The builder left
+    uncommitted changes in the worktree; they are not part of the pull request."; no commits and a clean tree fail as
+    `blocked` (above); no commits and a dirty tree fail as `other` ("The builder made no commits on <branch> and left
+    uncommitted changes, also after being asked to finish N time(s). …"), and the work is saved as a WIP commit (*When
+    a run ends*) so that `continue` is recommended. Update rounds and sync runs get no finish resume.
   - *Continuing* (§6 "Retrying a run") is the one exception to "never reuses": the continuing run's **new** branch
     and worktree start at the tip of the failed run's branch; the failed run's branch itself is not changed. A step
     retry re-creates the failed run's **own** worktree `runs/<runId>` on its own branch (the run is live again, so the
@@ -1323,14 +1348,15 @@ was refused: <error>"); `step` when a step retry is possible; `start_over` when
 `start_over` for a cancelled run (continuing stays available); `start_over` when the builder made no commits
 (`blocked`, it reported why); `continue` for the interruptions `time_limit`, `usage_limit`, `restart` and
 `api_unreachable` (e.g. "Stopped by the stage time limit after 4 commits; continue from them."); `continue` for any
-other failure whose branch has commits. Commits are counted in the owner's clone as `git rev-list --count <branch>
+other failure whose branch has commits. A run that failed with uncommitted work has it saved as a local commit
+("Worktrees and branches", *When a run ends*), so `continue` is available for it. Commits are counted in the owner's clone as `git rev-list --count <branch>
 --not <base>` (the local branch, else `origin/<branch>` after a best-effort fetch).
 
 *Failure kinds* (`failureKind`, recorded when a run fails): `time_limit`, `usage_limit`, `credentials`,
 `api_unreachable` (the stage error or exception matches e.g. "Can't reach the API", "Unable to connect to API",
 `ECONNREFUSED`, `ENOTFOUND`, `ETIMEDOUT`, `ConnectException`, or is an I/O exception), `restart` (failed by a server
 restart: "Server restarted while the run was in progress; retry it to continue or start over."), `blocked` (no
-commits), `step` (with `failedStep`), `other`; and, on a `needs_human` run whose merge was refused,
+commits and nothing uncommitted), `step` (with `failedStep`), `other`; and, on a `needs_human` run whose merge was refused,
 `submodule_commit_missing` (with `failedStep` `merge`, §6 "Submodule pointers"), `checks` (with `failedStep`
 `merge`: the checks failed, did not finish in time or could not be read, §6 "Checks before a merge"),
 `migration_conflict` (no `failedStep`) and `merge_conflict` (with `failedStep` `merge`), the two that make "Update and

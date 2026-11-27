@@ -183,6 +183,9 @@ class PipelineTest {
         val done = world.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
         assertEquals(RunStatus.FAILED, done.status)
         assertTrue(done.error!!.contains("no commits"))
+        // Asked once to finish before the run fails as blocked.
+        assertEquals(FailureKind.BLOCKED, done.failureKind)
+        assertEquals(2, world.launcher.byRole("builder").size)
     }
 
     @Test

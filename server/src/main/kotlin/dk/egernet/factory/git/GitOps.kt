@@ -130,6 +130,12 @@ interface GitOps {
     /** True when `git status --porcelain` of [worktree] lists anything (uncommitted or untracked changes). */
     fun isDirty(worktree: Path, home: Path): Boolean = false
     /**
+     * Commits every uncommitted change of [worktree] (`git add -A`, so ignored files stay out) as Agern, without hooks,
+     * with [message] (docs/ARCHITECTURE.md §6 "Worktrees and branches"). Returns the new HEAD; null when there is nothing
+     * to commit or a merge is in progress (`MERGE_HEAD` or unmerged paths). Throws [GitException] when git fails.
+     */
+    fun commitAll(worktree: Path, message: String, home: Path): String? = null
+    /**
      * The paths HEAD of [worktree] changes relative to its merge base with [baseRef] (`git diff --name-only
      * <baseRef>...HEAD`, renames as their new path, deletions included). Null when it cannot be told (the default for
      * implementations that do not support it); throws [GitException] when git fails.
@@ -475,6 +481,17 @@ class CliGitOps(
 
     override fun isDirty(worktree: Path, home: Path): Boolean =
         git(worktree, home, null, "status", "--porcelain", timeoutSec = 120).isNotBlank()
+
+    override fun commitAll(worktree: Path, message: String, home: Path): String? {
+        if (gitStatus(worktree, home, null, "rev-parse", "-q", "--verify", "MERGE_HEAD", timeoutSec = 60).first == 0) return null
+        if (unmergedPaths(worktree, home).isNotEmpty()) return null
+        if (git(worktree, home, null, "status", "--porcelain", timeoutSec = 120).isBlank()) return null
+        git(worktree, home, null, "add", "-A", timeoutSec = 300)
+        if (gitStatus(worktree, home, null, "diff", "--cached", "--quiet", timeoutSec = 120).first == 0) return null
+        // The message is one argv element: no shell sees it.
+        git(worktree, home, null, "commit", "--no-verify", "-q", "-m", message, timeoutSec = 300)
+        return git(worktree, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim()
+    }
 
     override fun changedFiles(worktree: Path, baseRef: String, home: Path): List<String> {
         require(!baseRef.startsWith("-")) { "Invalid ref" }

@@ -1627,7 +1627,7 @@ class Orchestrator(
             // The log names the exception's class; the run's error keeps a message people can read, and is the class
             // name (never "null") for an exception without one, e.g. java.net.ConnectException from HttpClient.
             log.warn("Run {} failed: {}", runId, Transient.describe(e))
-            val reason = sf?.message ?: e.message?.takeIf { it.isNotBlank() } ?: Transient.describe(e)
+            var reason = sf?.message ?: e.message?.takeIf { it.isNotBlank() } ?: Transient.describe(e)
             val kind = sf?.kind?.takeIf { it != FailureKind.OTHER }
                 ?: if (Transient.isTransient(e) || FailureKind.looksUnreachable(reason)) FailureKind.API_UNREACHABLE else FailureKind.OTHER
             runs.setFailure(runId, kind, sf?.step)
@@ -1635,6 +1635,8 @@ class Orchestrator(
             // then the worktree.
             withContext(NonCancellable) { sandboxes.release(runId) }
             vms?.releaseBuild(runId)
+            // Uncommitted work survives the worktree as a local commit, so "Continue" can go on from it.
+            withContext(Dispatchers.IO) { runs.get(runId)?.let { saveUncommittedWork(it, reason) } }?.let { reason += it }
             withContext(Dispatchers.IO) { cleanupWorktree(runId, merged = false) }
             fail(runId, reason)
             withContext(Dispatchers.IO) { commentEnded(runId, "**Agern:** run `$runId` failed: $reason") }
@@ -1649,6 +1651,37 @@ class Orchestrator(
             vms?.releaseBuild(runId)
         }
         settled(runId)
+    }
+
+    /**
+     * Commits the uncommitted changes of a failed run's worktree to its local branch, as Agern and never pushed, before the
+     * worktree is removed (docs/ARCHITECTURE.md §6 "Worktrees and branches"). Returns the sentence to append to the
+     * failure reason, or null when nothing was saved (clean or missing worktree, merge in progress, sync run, git error).
+     * Blocking; never throws.
+     */
+    private fun saveUncommittedWork(run: RunRecord, reason: String): String? = runCatching {
+        if (run.isSync) return null
+        val branch = run.branch ?: return null
+        val owner = users.byId(run.ownerId) ?: return null
+        val worktree = worktreeOf(run)
+        if (!java.nio.file.Files.isDirectory(worktree)) return null
+        val message = "WIP: uncommitted work of Agern run ${run.id}, saved when the run failed\n\n" +
+            "The run failed with: ${reason.lineSequence().first().take(300)}\n\n" +
+            "This commit was made by Agern, not by the builder. It holds everything that was uncommitted in the\n" +
+            "worktree when the run failed, finished or not. Check it before building on it.\n"
+        val sha = workspaces.withRepoLock(owner.username, run.repo) {
+            workspaces.git.commitAll(worktree, message, workspaces.home(owner.username))
+        } ?: return null
+        val sentence = " Uncommitted work in the run's worktree was saved as commit `${sha.take(7)}` on the local branch `$branch` " +
+            "(not pushed); retry the run with \"Continue\" to go on from it."
+        log.info("Run {}: saved uncommitted work as {} on {}", run.id, sha, branch)
+        runs.stages(run.id).filter { it.role == "builder" && it.sessionId != null }.maxByOrNull { it.round }?.sessionId?.let { sid ->
+            bestEffort { agents.systemEvent(sid, "warn", sentence.trim()) }
+        }
+        sentence
+    }.getOrElse { e ->
+        log.warn("Run {}: saving its uncommitted work failed: {}", run.id, e.message)
+        null
     }
 
     private fun fail(runId: UUID, reason: String) {
@@ -1830,23 +1863,59 @@ class Orchestrator(
                     previous != null -> continuePrompt(ctx, spec, previous, inherited)
                     else -> buildPrompt(ctx, spec)
                 }
-                val b = stage(run.id, "builder", round, owner, ctx, prompt,
+                val builderTools = (if (sandboxes.enabled) dk.egernet.factory.sandbox.SandboxManager.TOOLS else emptySet()) +
+                    dk.egernet.factory.images.ImageService.TOOLS +
+                    (if (sandboxVmOn(ctx)) dk.egernet.factory.sandboxvm.SandboxVmManager.TOOLS else emptySet())
+                var b = stage(run.id, "builder", round, owner, ctx, prompt,
                     resume = builderClaudeSession, parent = builderSessionId,
-                    extraTools = (if (sandboxes.enabled) dk.egernet.factory.sandbox.SandboxManager.TOOLS else emptySet()) +
-                        dk.egernet.factory.images.ImageService.TOOLS +
-                        (if (sandboxVmOn(ctx)) dk.egernet.factory.sandboxvm.SandboxVmManager.TOOLS else emptySet()),
+                    extraTools = builderTools,
                     notes = sandboxNotes(ctx) + (if (round == 0) imageNotes else emptyList()) +
                         (if (round == 0 && previous != null) listOf("info" to "Continues run ${previous.id} from branch ${previous.branch} ($inherited commit(s))") else emptyList()))
                 builderClaudeSession = b.claudeSessionId ?: builderClaudeSession
                 builderSessionId = b.session.id
+                // The session ends with the builder's turn, and with it anything it left running in the background: a
+                // builder that ended without commits or with uncommitted changes is resumed to finish and commit
+                // (docs/ARCHITECTURE.md §6 "Worktrees and branches").
+                var ahead: Int
+                var dirty: Boolean
+                var resumes = 0
+                while (true) {
+                    ahead = withContext(Dispatchers.IO) { workspaces.git.commitsAhead(worktree, baseRef, home) }
+                    dirty = withContext(Dispatchers.IO) { runCatching { workspaces.git.isDirty(worktree, home) }.getOrDefault(false) }
+                    if (ahead > 0 && !dirty) break
+                    if (resumes >= MAX_FINISH_RESUMES) break
+                    if (ahead == 0 && !dirty && resumes >= 1) break
+                    val claude = builderClaudeSession ?: break
+                    val previousSession = b.session.id
+                    resumes++
+                    agents.systemEvent(previousSession, "warn",
+                        "The builder ended its turn with ${unfinishedState(ahead, dirty)}; resuming it to finish and commit " +
+                            "(attempt $resumes of $MAX_FINISH_RESUMES).")
+                    b = stage(run.id, "builder", round, owner, ctx, finishPrompt(ctx, ahead, dirty),
+                        resume = claude, parent = previousSession, extraTools = builderTools)
+                    builderClaudeSession = b.claudeSessionId ?: builderClaudeSession
+                    builderSessionId = b.session.id
+                }
                 builderSummary = b.resultText?.trim() ?: ""
                 withContext(Dispatchers.IO) { submoduleCommitsWarning(root, worktree, home) }?.let { agents.systemEvent(b.session.id, "warn", it) }
-                val ahead = withContext(Dispatchers.IO) { workspaces.git.commitsAhead(worktree, baseRef, workspaces.home(owner.username)) }
                 if (ahead == 0) {
                     // The builder's own words say why (e.g. the issue is blocked on another one); show them with the failure.
                     val why = firstParagraph(builderSummary).takeIf { it.isNotEmpty() }
+                    if (dirty) {
+                        // Not blocked: unfinished. The failure path saves the uncommitted work as a commit, so "Continue" is offered.
+                        finishStage(run.id, "builder", round, null,
+                            "No commits on the branch; uncommitted changes left." + (why?.let { " $it" } ?: ""), emptyList(), failed = true)
+                        throw StageFailed(
+                            "The builder made no commits on $branch and left uncommitted changes, also after being asked to finish " +
+                                "$resumes time(s)" + (why?.let { ". The builder said: $it" } ?: ""),
+                            kind = FailureKind.OTHER,
+                        )
+                    }
                     finishStage(run.id, "builder", round, null, why?.let { "No commits on the branch. $it" } ?: "No commits on the branch", emptyList(), failed = true)
                     throw StageFailed("The builder made no commits on $branch" + (why?.let { ". The builder said: $it" } ?: ""), kind = FailureKind.BLOCKED)
+                }
+                if (dirty) {
+                    agents.systemEvent(b.session.id, "warn", "The builder left uncommitted changes in the worktree; they are not part of the pull request.")
                 }
                 finishStage(run.id, "builder", round, null, firstParagraph(builderSummary), emptyList())
                 runs.setBuilderSummary(run.id, builderSummary)
@@ -3418,6 +3487,32 @@ class Orchestrator(
         append("how you verified it, and anything left open.")
     }
 
+    /** What a builder left unfinished, for the finish resume's events and prompt. */
+    private fun unfinishedState(ahead: Int, dirty: Boolean): String = when {
+        ahead == 0 && dirty -> "no commits and uncommitted changes"
+        ahead == 0 -> "no commits"
+        else -> "uncommitted changes"
+    }
+
+    /**
+     * The prompt of a builder resumed because its session ended with no commits or with uncommitted changes
+     * (docs/ARCHITECTURE.md §6 "Worktrees and branches").
+     */
+    private fun finishPrompt(c: RunContext, ahead: Int, dirty: Boolean): String {
+        val state = when {
+            ahead == 0 && dirty -> "the branch has no commits and the working tree has uncommitted changes"
+            ahead == 0 -> "the branch has no commits"
+            else -> "the working tree has uncommitted changes"
+        }
+        return "Message from Agern: your session ended when your last turn ended, but the work is not finished: $state. " +
+            "Agern only takes over what is committed. Anything you had running in the background (subagents, background " +
+            "commands) was stopped when the session ended and will not report back; whatever it wrote so far is in the " +
+            "working directory. Look at `${c.git} status` and the diff, finish what is missing yourself — without background " +
+            "subagents or background tasks — run the checks, and commit so that the working tree is clean (remove files " +
+            "that do not belong to the change). If you cannot build this at all, say why and leave the working tree clean. " +
+            "End with the complete summary the task asks for, covering all of your work."
+    }
+
     private fun fixPrompt(c: RunContext, round: Int, maxRounds: Int, changes: Map<String, Verdict>) = buildString {
         append("The reviewers requested changes. This is fix round $round of at most $maxRounds.\n")
         append(c.workspaceBlock)
@@ -3690,6 +3785,9 @@ class Orchestrator(
         /** [url] when it is safe to link to (`https://`, no spaces or Markdown-breaking characters), else null. */
         fun safeUrl(url: String?): String? =
             url?.takeIf { it.startsWith("https://") && it.length <= 2000 && it.none { c -> c.isWhitespace() || c in "<>\"()[]`" } }
+
+        /** How often a builder that ended unfinished (no commits, uncommitted changes) is resumed to finish and commit. */
+        const val MAX_FINISH_RESUMES = 2
 
         /** The prompt of a stage resumed after the Claude API was unreachable (docs/ARCHITECTURE.md §6 "Transient failures"). */
         const val CONTINUE_PROMPT = "Message from Agern: the connection to the Claude API was lost while you were working and is " +
