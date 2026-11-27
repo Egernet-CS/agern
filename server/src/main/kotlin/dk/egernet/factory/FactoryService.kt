@@ -235,6 +235,8 @@ class FactoryService(
         if (state !in setOf("open", "closed", "all")) throw badRequest("state must be open, closed or all")
         withContext(Dispatchers.IO) { access.requireVisible(user, repo) }
         val client = access.requireClient(user)
+        // Runs whose pull request was merged or closed on GitHub end in the background; the answer does not wait.
+        orchestrator.checkOutsideLater(repo)
         val active = runs.activeRunsByIssue(repo)
         val planned = withContext(Dispatchers.IO) { releases.releaseByIssue(repo) }
         val counts = withContext(Dispatchers.IO) { images.countsByIssue(repo) }
@@ -298,15 +300,34 @@ class FactoryService(
         return r
     }
 
+    /**
+     * A visible run as `GET /api/runs/{id}` answers it: its pull request is checked first (throttled), so a run whose pull
+     * request was merged or closed on GitHub already shows as ended (docs/ARCHITECTURE.md §6 "Pull requests merged or
+     * closed on GitHub").
+     */
+    suspend fun getRun(user: UserRecord, runId: UUID): RunDto {
+        val r = visibleRun(user, runId)
+        if (orchestrator.outsideEligible(r)) orchestrator.checkOutside(runId)
+        return runs.toDto(runs.get(runId) ?: r)
+    }
+
     suspend fun listRuns(user: UserRecord, repo: String?, activeOnly: Boolean, statuses: Set<String>? = null): List<RunDto> {
+        if (repo != null) orchestrator.checkOutsideLater(repo)
         val list = runs.list(repo, activeOnly, statuses = statuses)
         val visible = withContext(Dispatchers.IO) { list.filter { access.canSee(user, it.repo, it.contextRepos) } }
         return visible.map { runs.toDto(it) }
     }
 
-    suspend fun approveRun(user: UserRecord, runId: UUID): RunDto {
+    /** [closeIssue]: false keeps the issue open (partial delivery), true closes it, null merges as the run is marked. */
+    suspend fun approveRun(user: UserRecord, runId: UUID, closeIssue: Boolean? = null): RunDto {
         visibleRun(user, runId)
-        return runs.toDto(orchestrator.approve(user, runId))
+        return runs.toDto(orchestrator.approve(user, runId, closeIssue))
+    }
+
+    /** The owner marks a `needs_human` run as a partial delivery or a complete one (docs/ARCHITECTURE.md §6 "Partial delivery"). */
+    suspend fun setRunPartial(user: UserRecord, runId: UUID, partial: Boolean): RunDto {
+        visibleRun(user, runId)
+        return runs.toDto(orchestrator.setPartial(user, runId, partial))
     }
 
     /** "Update from base branch" (docs/ARCHITECTURE.md §6 "Retrying a run"): owner only; the run, now `building`. */
@@ -438,10 +459,19 @@ class FactoryService(
                 }
             }
             "approve" -> {
+                val usage = "Usage: /factory approve [runId] [update] [keep-open|close]"
                 val args = parts.drop(1)
-                val update = args.any { it.equals("update", ignoreCase = true) }
-                val rest = args.filterNot { it.equals("update", ignoreCase = true) }
-                if (rest.size > 1) return "Usage: /factory approve [runId] [update]"
+                val words = setOf("update", "keep-open", "close")
+                fun has(w: String) = args.any { it.equals(w, ignoreCase = true) }
+                val update = has("update")
+                if (has("keep-open") && has("close")) return usage
+                val closeIssue = when {
+                    has("keep-open") -> false
+                    has("close") -> true
+                    else -> null
+                }
+                val rest = args.filterNot { it.lowercase() in words }
+                if (rest.size > 1) return usage
                 val id = rest.firstOrNull()?.let { parseUuid(it) } ?: run {
                     val candidates = runs.list(repo, activeOnly = true).filter { it.status == RunStatus.NEEDS_HUMAN && it.ownerId == owner.id }
                     when (candidates.size) {
@@ -452,7 +482,7 @@ class FactoryService(
                     }
                 }
                 if (update) return retryCommand(owner, repo, listOf(id.toString(), "update"))
-                val r = approveRun(owner, id)
+                val r = approveRun(owner, id, closeIssue)
                 approvedRunReply(r) + updateHint(r)
             }
             "cancel" -> {
@@ -560,11 +590,11 @@ class FactoryService(
 
     /**
      * `factory_approve_run`: a plain approval (merge as it is, with the hint when an update is possible), or with [update]
-     * "Update and merge" exactly as `/factory approve <runId> update`.
+     * "Update and merge" exactly as `/factory approve <runId> update`. [closeIssue] as for [approveRun]; ignored with [update].
      */
-    suspend fun approveRunTool(owner: UserRecord, repo: String, runId: UUID, update: Boolean): String {
+    suspend fun approveRunTool(owner: UserRecord, repo: String, runId: UUID, update: Boolean, closeIssue: Boolean? = null): String {
         if (update) return retryCommand(owner, repo, listOf(runId.toString(), "update"))
-        val r = approveRun(owner, runId)
+        val r = approveRun(owner, runId, closeIssue)
         return approvedRunReply(r) + updateHint(r)
     }
 
@@ -607,6 +637,9 @@ class FactoryService(
             val c = r.checks
             if (r.status == RunStatus.WAITING_FOR_CHECKS && c != null) {
                 return "Run ${r.id} is waiting for checks on `${c.sha.take(7)}` (${c.detail}); it merges by itself when they pass."
+            }
+            if (r.status == RunStatus.MERGED && r.partial && r.releaseId == null) {
+                return "Run ${r.id}: merged — issue #${r.issueNumber} stays open (partial delivery)"
             }
             return "Run ${r.id}: ${r.status}" + (r.error?.let { " — $it" } ?: "")
         }
@@ -707,9 +740,10 @@ class FactoryService(
             |Factory commands (handled by Agern, not sent to Claude):
             |  /factory run <issue>       start a pipeline run for an issue in this project
             |  /factory status            list recent runs in this project
-            |  /factory approve [runId] [update]   merge a run that waits for a human (owner only; not when the project merges
-            |                             on GitHub); with update: merge the target into its branch, let the builder
-            |                             resolve the conflict, review and merge
+            |  /factory approve [runId] [update] [keep-open|close]   merge a run that waits for a human (owner only; not when
+            |                             the project merges on GitHub); keep-open: merge and keep the issue open (partial
+            |                             delivery), close: merge and close it (default: as the run is marked); with update:
+            |                             merge the target into its branch, let the builder resolve the conflict, review and merge
             |  /factory cancel <runId>    cancel a run (owner or admin)
             |  /factory retry <runId> [update|step|continue|over]   retry a failed run, or update and merge one (owner only);
             |                             without a mode: the options

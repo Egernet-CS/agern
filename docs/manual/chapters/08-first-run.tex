@@ -90,7 +90,17 @@ page lists it under \ui{needs human} as well.
   \item When you are satisfied, choose \ui{Approve \& merge}. If the approver advised against it,
     Agern asks once more (\ui{Merge against the approver's advice?}); \ui{Merge anyway} squash-merges
     the pull request, \ui{Don't merge} keeps waiting. \cmd{/factory approve} in the chat does the same.
+  \item If the run delivers only part of the issue, choose \ui{Merge \& keep issue open} instead: the
+    pull request is merged, and the issue stays open for the rest of the work. Agern comments on the
+    issue with what was delivered and what remains. A run the spec-writer already split into steps is
+    marked as a \ui{Partial delivery} and offers \ui{Merge \& close issue} the other way round; \ui{Mark
+    as partial delivery} and \ui{Mark as complete} change it without merging. In the chat, add
+    \cmd{keep-open} or \cmd{close} to \cmd{/factory approve}.
 \end{enumerate}
+
+If someone merges or closes the run's pull request on GitHub instead, Agern notices it the next
+time the run or the project is opened: the run ends as \ui{merged} (``Merged on GitHub by
+@\ldots'') or \ui{cancelled}, and Agern does not merge it a second time.
 
 \screenshot{51-run-needs-human-desktop}{A run waiting for its owner after the approver escalated.}{run-needs-human}
 
@@ -135,7 +145,8 @@ reached, or the server restarts while it runs. The run page shows the error in r
 \section{The merged result}\label{sec:merged}
 
 A run that the approver (or you) approved ends as \ui{merged} (figure~\ref{fig:run-merged}). The
-pull request is squash-merged into the default branch, the issue is closed on GitHub, and the run
+pull request is squash-merged into the default branch, the issue is closed on GitHub (unless the run
+was a partial delivery), and the run
 page keeps the whole history: every stage, its transcript, findings and screenshots, and the cost.
 
 \screenshot{31-run-merged-desktop}{A merged run, here with the warning that a UI change was reviewed without screenshots.}{run-merged}

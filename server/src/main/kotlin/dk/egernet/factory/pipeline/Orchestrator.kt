@@ -45,6 +45,7 @@ import dk.egernet.factory.db.UserStore
 import dk.egernet.factory.forbidden
 import dk.egernet.factory.github.Access
 import dk.egernet.factory.github.GhIssue
+import dk.egernet.factory.github.GhPullInfo
 import dk.egernet.factory.github.ChecksSummary
 import dk.egernet.factory.github.GitHubClient
 import dk.egernet.factory.github.GitHubException
@@ -475,11 +476,18 @@ class Orchestrator(
         // is the member's base; a single run's is the project's base branch, fixed for the run.
         val base = (if (releaseId != null) baseBranch else null) ?: member?.first?.baseBranch ?: baseBranch
             ?: withContext(Dispatchers.IO) { singleRunBase(client, repoInfo, continuesFrom) }
-        val run = runs.createIfNoActive(
-            repo, issueNumber, issue.title, issueKindFromLabels(issue.labels.map { it.name }), eff.maxFixRounds, owner.id, startedBySession,
-            releaseId, base, continuesFrom?.id, continuesFrom?.spec, member?.first?.repository,
-            member?.first?.directory, member?.second.orEmpty(), policy, maxUpdateRounds = cfg.maxUpdateRounds,
-        ) ?: throw conflict("Issue #$issueNumber already has an active run", "active_run_exists")
+        val tryCreate = {
+            runs.createIfNoActive(
+                repo, issueNumber, issue.title, issueKindFromLabels(issue.labels.map { it.name }), eff.maxFixRounds, owner.id, startedBySession,
+                releaseId, base, continuesFrom?.id, continuesFrom?.spec, member?.first?.repository,
+                member?.first?.directory, member?.second.orEmpty(), policy, maxUpdateRounds = cfg.maxUpdateRounds,
+            )
+        }
+        // The active run's pull request may have been merged or closed on GitHub: that ends it, and the issue is free again.
+        val run = tryCreate() ?: run {
+            val active = runs.activeRunFor(repo, issueNumber)?.let { runs.get(it) }
+            if (active != null && outsideEligible(active) && checkOutside(active.id, force = true) != Outside.NONE) tryCreate() else null
+        } ?: throw conflict("Issue #$issueNumber already has an active run", "active_run_exists")
         for (role in listOf("spec-writer", "builder") + REVIEWER_ROLES + "approver") runs.createStage(run.id, role, 0, eff.model(role))
         // A warning, never a block: the other active runs of the project (docs/ARCHITECTURE.md §6 "Other active runs").
         withContext(Dispatchers.IO) { recordOverlaps(run.id, repo, issue) }
@@ -755,12 +763,19 @@ class Orchestrator(
      * then merged, needs a human again, or is `waiting_for_checks` with a job that merges it when they pass. Never for a
      * run of policy `github` (409 `merge_on_github`, whatever its status; docs/ARCHITECTURE.md §6 "Merge policy").
      */
-    suspend fun approve(user: UserRecord, runId: UUID): RunRecord {
-        val run = runs.get(runId) ?: throw notFound("Run not found")
-        if (run.ownerId != user.id) throw forbidden("Only the owner of this run can approve it")
-        if (run.mergePolicy == MergePolicy.GITHUB) throw mergeOnGitHub(run)
+    suspend fun approve(user: UserRecord, runId: UUID, closeIssue: Boolean? = null): RunRecord {
+        val found = runs.get(runId) ?: throw notFound("Run not found")
+        if (found.ownerId != user.id) throw forbidden("Only the owner of this run can approve it")
+        if (found.mergePolicy == MergePolicy.GITHUB) throw mergeOnGitHub(found)
+        // Merged or closed on GitHub meanwhile: never a second merge (docs/ARCHITECTURE.md §6 "Pull requests merged or closed on GitHub").
+        val run = refuseIfEndedOutside(found)
         if (run.status != RunStatus.NEEDS_HUMAN) throw conflict("Run is ${run.status}, not needs_human")
         if (run.prNumber == null) throw conflict("Run has no pull request to merge")
+        // The owner's choice for the issue is the run's partial flag (docs/ARCHITECTURE.md §6 "Partial delivery").
+        if (closeIssue != null) {
+            if (!closeIssue && (run.releaseId != null || run.isSync)) throw partialNotSupported()
+            applyPartial(user, run, partial = !closeIssue)
+        }
         startMerging(runId)
         publish(runId)
         runs.setMergeApprovedBy(runId, user.username)
@@ -793,6 +808,7 @@ class Orchestrator(
         if (run.ownerId != user.id) throw forbidden("Only the owner of this run can merge it")
         if (run.mergePolicy == MergePolicy.GITHUB) throw mergeOnGitHub(run)
         if (headSha.isBlank()) throw badRequest("headSha must not be empty")
+        refuseIfEndedOutside(run)
         requireOverridable(run, headSha)
         if (run.status == RunStatus.WAITING_FOR_CHECKS) {
             jobs[runId]?.let { it.cancel(); it.join() }
@@ -897,7 +913,10 @@ class Orchestrator(
     suspend fun cancel(user: UserRecord, runId: UUID, byRelease: Boolean = false): RunRecord {
         val run = runs.get(runId) ?: throw notFound("Run not found")
         if (run.ownerId != user.id && !user.isAdmin && !byRelease) throw forbidden("Only the owner or an admin can cancel this run")
-        if (run.status in RunStatus.TERMINAL) throw conflict("Run is already ${run.status}")
+        // A pull request merged or closed on GitHub ends the run as such first; the read uses the owner's token.
+        if (outsideEligible(run)) checkOutside(runId, force = true)
+        val now = runs.get(runId) ?: throw notFound("Run not found")
+        if (now.status in RunStatus.TERMINAL) throw conflict("Run is already ${now.status}")
         val ended = endRun(runId, merged = false, proceed = { it.status !in RunStatus.TERMINAL }) {
             runs.setStatus(runId, RunStatus.CANCELLED, "Cancelled by ${user.username}")
         }
@@ -943,6 +962,7 @@ class Orchestrator(
         val run = runs.get(runId) ?: throw notFound("Run not found")
         if (run.ownerId != owner.id) throw forbidden("Only the owner of this run can update and merge it")
         if (owner.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
+        refuseIfEndedOutside(run)
         val (before, round) = talkLocks.computeIfAbsent(runId) { Mutex() }.withLock {
             val r = runs.get(runId) ?: throw notFound("Run not found")
             if (!r.updateAvailable) throw updateUnavailable(r)
@@ -1000,7 +1020,7 @@ class Orchestrator(
         val run = runs.get(runId) ?: throw notFound("Run not found")
         if (run.ownerId != owner.id) throw forbidden("Only the owner of this run can update it")
         if (owner.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
-        if (!run.updateOnDemand) throw onDemandUnavailable(run)
+        if (!refuseIfEndedOutside(run).updateOnDemand) throw onDemandUnavailable(runs.get(runId) ?: run)
         if (run.updateAvailable) return update(owner, runId)
         val client = access.requireClient(owner)
         val target = targetOf(run, owner)
@@ -1896,6 +1916,7 @@ class Orchestrator(
         append("Run `${run.id}` in ${org}/${c.repo} for issue #${run.issueNumber}. Status: needs a human.\n")
         append("Needs a human because: ${run.error?.trim().orEmpty().ifEmpty { "(no reason recorded)" }}\n")
         append("Branch `${c.branch}`, created from `${c.baseRef}`; pull request ${run.prUrl ?: "(none)"}; it merges into `${c.targetBranch}`.\n")
+        if (run.partial && run.releaseId == null) append("Delivery: partial — the issue stays open after the merge.\n")
         append(c.releaseNote)
         append(c.workspaceBlock)
         append("Inspect the change with `${c.git} diff ${c.baseRef}...HEAD` and `${c.git} log ${c.baseRef}..HEAD`, and by reading the code.\n")
@@ -2128,6 +2149,7 @@ class Orchestrator(
                     runs.finishStage(it.id, "skipped", null, "Spec reused from run ${previous?.id ?: run.continuesRunId}", emptyList())
                 }
                 publish(run.id)
+                applyDeliveryPlan(runs.get(run.id)!!, spec, null)
                 bestEffort {
                     withContext(Dispatchers.IO) {
                         client.comment(org, run.repo, run.issueNumber,
@@ -2157,6 +2179,7 @@ class Orchestrator(
             withContext(Dispatchers.IO) { blockedBy(run, client, spec, specRes.session.id) }?.let { why ->
                 throw StageFailed(why, kind = FailureKind.BLOCKED)
             }
+            applyDeliveryPlan(runs.get(run.id)!!, spec, specRes.session.id)
         }
         if (!resuming) withContext(Dispatchers.IO) { overlapFiles(run.id, spec) }
 
@@ -2280,8 +2303,8 @@ class Orchestrator(
                     val lead = when {
                         releaseName != null && run.targetRepo != null -> "Issue $org/${run.repo}#${issue.number} · release `$releaseName`"
                         releaseName != null -> "Issue #${issue.number} · release `$releaseName`"
-                        run.targetRepo != null -> "Closes $org/${run.repo}#${issue.number}"
-                        else -> "Closes #${issue.number}"
+                        // A partial delivery must not close the issue either (docs/ARCHITECTURE.md §6 "Partial delivery").
+                        else -> lead(run, run.partial)
                     }
                     val earlier = runs.earlierUnmergedPulls(run.repo, run.issueNumber, run.id, run.targetRepo)
                         .takeIf { it.isNotEmpty() }
@@ -2419,6 +2442,109 @@ class Orchestrator(
         log.info("Run {}: blocked on {}", run.id, open)
         val reason = b.reason.ifEmpty { "the spec gives no reason" }.trimEnd('.')
         return "Blocked on " + open.joinToString(", ") { "#$it (open)" } + ": $reason. Start the run again when the blocking issue is merged."
+    }
+
+    // ------------------------------------------------------------ partial delivery (docs/ARCHITECTURE.md §6 "Partial delivery")
+
+    /** The issue reference of a single run's pull request: `#N`, or `<org>/<repo>#N` for a workspace member run. */
+    private fun issueRef(run: RunRecord): String = if (run.targetRepo != null) "$org/${run.repo}#${run.issueNumber}" else "#${run.issueNumber}"
+
+    /** The first line of a single run's pull request body: `Closes <ref>`, or `Part of <ref>` for a partial delivery. */
+    private fun lead(run: RunRecord, partial: Boolean): String = (if (partial) "Part of " else "Closes ") + issueRef(run)
+
+    /**
+     * After the spec of [run] is stored (written by its spec-writer, [sessionId], or reused from the run it continues):
+     * its Delivery plan ([DeliveryPlan]) decides whether the run is a partial delivery. Only a single run can be one; a
+     * release run's plan is stored but ignored. Never on a step retry (the run keeps what it had).
+     */
+    private fun applyDeliveryPlan(run: RunRecord, spec: String, sessionId: UUID?) {
+        if (run.isSync) return
+        val plan = DeliveryPlan.parse(spec) ?: return
+        val dto = dk.egernet.factory.RunDeliveryDto(plan.delivers, plan.remaining)
+        val (partial, level, text) = when {
+            !plan.partial -> Triple(false, "warn", "The spec has a Delivery plan without remaining steps; the run is treated as a complete delivery.")
+            run.releaseId != null -> Triple(
+                false, "warn",
+                "The spec plans a partial delivery, which is not supported in a release: the issue is closed when the release is merged.",
+            )
+            else -> Triple(
+                true, "info",
+                "Partial delivery: this run covers part of #${run.issueNumber} (${plan.remaining.size} step(s) remain); the issue stays open after the merge.",
+            )
+        }
+        runs.setDelivery(run.id, partial, dto)
+        log.info("Run {}: delivery plan with {} remaining step(s); partial = {}", run.id, plan.remaining.size, partial)
+        sessionId?.let { sid -> bestEffort { agents.systemEvent(sid, level, text) } }
+        publish(run.id)
+    }
+
+    /**
+     * The owner marks a `needs_human` single run as a partial delivery ([partial] true) or a complete one
+     * (docs/ARCHITECTURE.md §6 "Partial delivery"). Owner only (403, admins included); 409 `partial_not_supported` for a
+     * release or sync run, 409 `run_not_waiting` unless the run needs a human. The pull request's first line is rewritten
+     * first; a GitHub failure answers 502 and changes nothing.
+     */
+    suspend fun setPartial(user: UserRecord, runId: UUID, partial: Boolean): RunRecord {
+        val run = runs.get(runId) ?: throw notFound("Run not found")
+        if (run.ownerId != user.id) throw forbidden("Only the owner of this run can change whether it is a partial delivery")
+        if (run.releaseId != null || run.isSync) throw partialNotSupported()
+        if (run.status != RunStatus.NEEDS_HUMAN) throw conflict("Run is ${run.status}, not needs_human", "run_not_waiting")
+        applyPartial(user, run, partial)
+        return runs.get(runId)!!
+    }
+
+    /** 409 `partial_not_supported`: a release or sync run cannot be a partial delivery. */
+    private fun partialNotSupported() =
+        conflict("A release run's issue is closed by its release; partial delivery does not apply.", "partial_not_supported")
+
+    /** Stores [partial] for [run] as set by [user] after rewriting its pull request's lead; a no-op when it already is. */
+    private suspend fun applyPartial(user: UserRecord, run: RunRecord, partial: Boolean) {
+        if (run.partial == partial || run.releaseId != null || run.isSync) return
+        run.prNumber?.let { pr -> withContext(Dispatchers.IO) { rewriteLead(run, pr, partial) } }
+        runs.setPartial(run.id, partial, user.username)
+        log.info("Run {}: marked as a {} delivery by {}", run.id, if (partial) "partial" else "complete", user.username)
+        publish(run.id)
+    }
+
+    /**
+     * Replaces the first line of pull request [pr]'s body when it is exactly the other lead of [run] (`Closes …` ↔ `Part
+     * of …`): GitHub itself closes an issue named by `Closes` when the pull request merges. Any other body is left as it
+     * is. A GitHub failure is a 502. Blocking.
+     */
+    private fun rewriteLead(run: RunRecord, pr: Int, partial: Boolean) {
+        val client = gh(owner(run))
+        try {
+            val info = client.getPull(org, prRepo(run), pr) ?: return
+            val body = info.body ?: return
+            val firstEnd = body.indexOf('\n').let { if (it < 0) body.length else it }
+            if (body.substring(0, firstEnd).trimEnd('\r') != lead(run, !partial)) return
+            client.updatePull(org, prRepo(run), pr, info.title.ifEmpty { prTitle(run, run.issueTitle) }, lead(run, partial) + body.substring(firstEnd))
+        } catch (e: ApiException) {
+            throw e
+        } catch (e: Exception) {
+            log.warn("Run {}: rewriting the lead of pull request {} failed: {}", run.id, prRef(run, pr), Transient.describe(e))
+            throw ApiException(
+                io.ktor.http.HttpStatusCode.BadGateway, "github_error",
+                "Could not update pull request ${prRef(run, pr)} on GitHub: ${e.message ?: Transient.describe(e)}",
+            )
+        }
+    }
+
+    /**
+     * The issue comment of a partial run's merge: [firstSentence], then what was delivered and what remains (from the
+     * spec's plan, as parsed and capped), or who marked the run partial when the spec names no remaining steps.
+     */
+    private fun partialComment(run: RunRecord, firstSentence: String): String = buildString {
+        append(firstSentence).append(" This is a partial delivery: the issue stays open.")
+        val plan = run.delivery?.takeIf { it.remaining.isNotEmpty() }
+        if (plan == null) {
+            append("\n\nThe run owner (@${mdText(run.partialSetBy ?: run.ownerUsername)}) marked this run as a partial delivery; ")
+            append("the spec names no remaining steps.")
+            return@buildString
+        }
+        if (plan.delivers.isNotBlank()) append("\n\n**Delivered:** ").append(plan.delivers)
+        append("\n\n**Remaining:**")
+        plan.remaining.forEach { append("\n- ").append(it) }
     }
 
     /**
@@ -3141,7 +3267,8 @@ class Orchestrator(
                 "**Agern: needs a human.** $reason\n\nPull request: ${run.prUrl ?: "(none)"}\n\n" + if (run.mergePolicy == MergePolicy.GITHUB) {
                     "This project merges on GitHub: the pull request can be reviewed and merged there; Agern does not merge it."
                 } else {
-                    "The run owner (@${owner.githubLogin ?: owner.username}) can merge it with `/factory approve ${run.id}` in the Agern chat or the Approve button on the run page."
+                    "The run owner (@${owner.githubLogin ?: owner.username}) can merge it with `/factory approve ${run.id}` in the Agern chat or the Approve button on the run page." +
+                        (if (runs.get(run.id)?.partial == true && run.releaseId == null) " This run is a partial delivery: merging it keeps the issue open." else "")
                 },
             )
         }
@@ -3262,7 +3389,8 @@ class Orchestrator(
         val run = runs.get(runId) ?: return
         // Still waiting (the job goes on, e.g. a merge anyway stopped it): a release must never see this as settled.
         if (run.status == RunStatus.WAITING_FOR_CHECKS) return
-        if (run.status == RunStatus.MERGED) run.advisorSessionId?.let { agents.endAdvisor(it) }
+        // Merged, or cancelled because the gate found the pull request closed on GitHub: the conversation is over.
+        if (run.status == RunStatus.MERGED || run.status == RunStatus.CANCELLED) run.advisorSessionId?.let { agents.endAdvisor(it) }
         publish(runId)
         settled(runId)
     }
@@ -3297,6 +3425,11 @@ class Orchestrator(
         if (policyRefuses(run, owner, run.mergeApprovedBy)) return MergeStep.Done
         val client = gh(owner)
         val pr = run.prNumber ?: run { needsHuman(run, owner, "There is no pull request to merge."); return MergeStep.Done }
+        // The pull request first: one merged or closed on GitHub meanwhile ends the run before any guard could start an
+        // update round on it (docs/ARCHITECTURE.md §6 "Pull requests merged or closed on GitHub").
+        val firstRead = readPullForGate(run, client, pr, rethrowTransient) ?: return MergeStep.Wait
+        notOpenAtGate(run, owner, client, pr, firstRead, mergedMeanwhile)?.let { return it }
+        var read: GhPullInfo? = firstRead
         // One comparison of the branch with its target per evaluation: the migration guard and the freshness check.
         val cmp = comparisonForGate(run, owner, client)
         // Keeping single runs up to date (docs/ARCHITECTURE.md §6 "Checks before a merge", freshness).
@@ -3328,31 +3461,11 @@ class Orchestrator(
             // A person approved: their decision (GitHub may still refuse it).
         }
         for (attempt in 1..MAX_HEAD_MOVES) {
-            val info = try {
-                client.getPull(org, prRepo(run), pr)
-            } catch (e: Exception) {
-                if (rethrowTransient && Transient.isTransient(e)) throw e
-                // Transient (5xx, network): wait and read again at the next poll.
-                log.info("Run {}: reading pull request {} failed, evaluating again later: {}", run.id, pr, e.message)
-                val sha = runs.get(runId)?.checks?.sha.orEmpty()
-                recordChecks(runId, ChecksSummary(ReleaseChecksState.UNKNOWN, "Could not read the pull request: ${e.message}".take(500)), sha)
-                return MergeStep.Wait
+            // The first attempt uses the read above; after a head move the pull request is read again.
+            val info = read ?: (readPullForGate(run, client, pr, rethrowTransient) ?: return MergeStep.Wait).also {
+                notOpenAtGate(run, owner, client, pr, it, mergedMeanwhile)?.let { done -> return done }
             }
-            if (mergedMeanwhile && info != null && info.merged) {
-                log.info("Run {}: pull request {} was merged by the request whose answer was lost", run.id, pr)
-                afterMerge(run, client, pr, approvalText(runId))
-                return MergeStep.Done
-            }
-            if (info == null || info.state != "open") {
-                val why = when {
-                    info == null -> "not found"
-                    info.merged -> "merged"
-                    else -> "closed"
-                }
-                runs.setFailure(run.id, null, FailedStep.MERGE)
-                needsHuman(run, owner, "Pull request ${prRef(run, pr)} is no longer open on GitHub ($why), so Agern did not merge it.")
-                return MergeStep.Done
-            }
+            read = null
             val sha = info.head.sha
             val ev = evaluateChecks(run, client, sha)
             val checks = recordChecks(runId, ev.summary, sha)
@@ -3393,6 +3506,56 @@ class Orchestrator(
             }
         }
         return MergeStep.Wait
+    }
+
+    /**
+     * The pull request [pr] of [run] as the merge gate reads it; null when the read failed for a transient reason (the
+     * caller waits and evaluates again; recorded as unknown checks), or rethrown with [rethrowTransient]. A pull request
+     * that does not exist is returned as a placeholder with state `missing`. Blocking.
+     */
+    private fun readPullForGate(run: RunRecord, client: GitHubClient, pr: Int, rethrowTransient: Boolean): GhPullInfo? = try {
+        client.getPull(org, prRepo(run), pr) ?: GhPullInfo(number = pr, htmlUrl = run.prUrl ?: "", state = MISSING_PULL)
+    } catch (e: Exception) {
+        if (rethrowTransient && Transient.isTransient(e)) throw e
+        // Transient (5xx, network): wait and read again at the next poll.
+        log.info("Run {}: reading pull request {} failed, evaluating again later: {}", run.id, pr, e.message)
+        val sha = runs.get(run.id)?.checks?.sha.orEmpty()
+        recordChecks(run.id, ChecksSummary(ReleaseChecksState.UNKNOWN, "Could not read the pull request: ${e.message}".take(500)), sha)
+        null
+    }
+
+    /**
+     * The merge gate's answer for a pull request that is not open: merged by this run's own lost request
+     * ([mergedMeanwhile]) → [afterMerge]; merged on GitHub → `merged` on GitHub; closed → `cancelled`; not found → needs
+     * a human. Null while it is open. Runs inside the run's job: never [endRun]. Blocking.
+     */
+    private fun notOpenAtGate(run: RunRecord, owner: UserRecord, client: GitHubClient, pr: Int, info: GhPullInfo, mergedMeanwhile: Boolean): MergeStep? {
+        if (info.state == MISSING_PULL) {
+            runs.setFailure(run.id, null, FailedStep.MERGE)
+            needsHuman(run, owner, "Pull request ${prRef(run, pr)} is no longer open on GitHub (not found), so Agern did not merge it.")
+            return MergeStep.Done
+        }
+        if (info.merged && mergedMeanwhile) {
+            log.info("Run {}: pull request {} was merged by the request whose answer was lost", run.id, pr)
+            afterMerge(run, client, pr, approvalText(run.id))
+            return MergeStep.Done
+        }
+        if (info.state == "open" && !info.merged) return null
+        val by = info.mergedBy?.login
+        log.info("Run {}: the merge gate found pull request {} {} on GitHub", run.id, prRef(run, pr), if (info.merged) "merged" else "closed")
+        if (info.merged) {
+            cleanupWorktree(run.id, merged = true)
+            runs.setMergedOnGitHub(run.id, by)
+            runs.setFailure(run.id, null, null)
+            runs.setStatus(run.id, RunStatus.MERGED, clearError = true)
+        } else {
+            cleanupWorktree(run.id, merged = false)
+            runs.setFailure(run.id, null, null)
+            runs.setStatus(run.id, RunStatus.CANCELLED, closedOutsideText(run, pr))
+        }
+        runs.closeOpenStages(run.id)
+        endedOutside(runs.get(run.id) ?: run, client, pr, info.merged, by)
+        return MergeStep.Done
     }
 
     /**
@@ -3600,6 +3763,9 @@ class Orchestrator(
                     "**Agern: merged** pull request #$pr into `${run.baseBranch}`$approval. " +
                         "The issue stays open until the release is merged into `$defaultBranch`.")
             }
+        } else if (runs.get(run.id)?.partial == true) {
+            // A partial delivery (docs/ARCHITECTURE.md §6 "Partial delivery"): the issue stays open, with what remains.
+            bestEffort { client.comment(org, run.repo, run.issueNumber, partialComment(runs.get(run.id)!!, "**Agern: merged** pull request ${prRef(run, pr)}$approval.")) }
         } else {
             // A single run on a base other than the default branch says where it merged (docs/ARCHITECTURE.md §6 "Base branch").
             val into = run.baseBranch?.takeIf { run.targetRepo == null }?.let { base ->
@@ -3671,14 +3837,14 @@ class Orchestrator(
 
     /**
      * One round of the follower: every run that has a pull request and is `ready`, or `needs_human` under policy
-     * `github`, has its pull request read once with its owner's token. Merged → `merged` (on GitHub, by whom GitHub
-     * says); closed → `cancelled`; open or unreadable → unchanged (tried again next round). One run's failure never stops
-     * the round.
+     * `github`, has its pull request read once with its owner's token ([checkOutside]). Merged → `merged` (on GitHub, by
+     * whom GitHub says); closed → `cancelled`; open or unreadable → unchanged (tried again next round). One run's failure
+     * never stops the round.
      */
     suspend fun followOnce() = followLock.withLock {
         for (run in withContext(Dispatchers.IO) { runs.followable() }) {
             try {
-                follow(run)
+                checkOutside(run.id, force = true)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -3687,40 +3853,158 @@ class Orchestrator(
         }
     }
 
-    private suspend fun follow(run: RunRecord) {
-        val pr = run.prNumber ?: return
-        val owner = users.byId(run.ownerId) ?: run { log.warn("Run {}: its owner no longer exists; not followed", run.id); return }
-        val client = access.client(owner) ?: run { log.info("Run {}: its owner has no GitHub token; not followed now", run.id); return }
-        val info = withContext(Dispatchers.IO) { client.getPull(org, prRepo(run), pr) }
-            ?: run { log.info("Run {}: pull request {} could not be read", run.id, prRef(run, pr)); return }
-        if (info.state == "open" && !info.merged) return
+    // ------------------------------------------------------------ pull requests merged or closed on GitHub (§6)
+
+    /** What [checkOutside] found: nothing to do, or the run's pull request was merged or closed on GitHub (and the run ended). */
+    enum class Outside { NONE, MERGED, CLOSED }
+
+    /**
+     * Without `force`, [checkOutside] reads a run's pull request at most once per this many milliseconds (any viewer can
+     * trigger it, and it uses the owner's token). Tests set 0.
+     */
+    @Volatile var outsideCheckMillis = 15_000L
+    private val outsideReadAt = ConcurrentHashMap<UUID, Long>()
+    private val outsideLocks = ConcurrentHashMap<UUID, Mutex>()
+
+    /**
+     * Whether [run] may be ended by [checkOutside]: a run with a pull request, not a sync run, in a status whose pull
+     * request nobody else reads. `approving` and `waiting_for_checks` are left to their merge gate ([mergeStep]).
+     */
+    fun outsideEligible(run: RunRecord): Boolean = run.prNumber != null && !run.isSync && run.status in OUTSIDE_ELIGIBLE
+
+    /**
+     * Reads the pull request of run [runId] with its owner's token and ends the run when it was merged (`merged`, on
+     * GitHub, by whom) or closed (`cancelled`) on GitHub outside Agern (docs/ARCHITECTURE.md §6 "Pull requests merged or
+     * closed on GitHub"). Only for [outsideEligible] runs; one check per run at a time; without [force] at most once per
+     * [outsideCheckMillis]. Never throws for a GitHub problem (logged; the run stays as it is).
+     */
+    suspend fun checkOutside(runId: UUID, force: Boolean = false): Outside =
+        outsideLocks.computeIfAbsent(runId) { Mutex() }.withLock {
+            val run = runs.get(runId) ?: return@withLock Outside.NONE
+            if (!outsideEligible(run)) return@withLock Outside.NONE
+            val now = System.nanoTime()
+            if (!force) {
+                val last = outsideReadAt[runId]
+                if (last != null && (now - last) / 1_000_000 < outsideCheckMillis) return@withLock Outside.NONE
+            }
+            outsideReadAt[runId] = now
+            try {
+                checkOutsideNow(run)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                log.warn("Checking the pull request of run {} on GitHub failed: {}", runId, Transient.describe(e))
+                Outside.NONE
+            }
+        }
+
+    /** [checkOutside] in the background, in the services' scope, for the eligible runs of [repo]; the answer does not wait. */
+    fun checkOutsideLater(repo: String) {
+        scope.launch {
+            try {
+                val list = withContext(Dispatchers.IO) { runs.eligibleForOutsideCheck(repo) }
+                for (r in list) checkOutside(r.id)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                log.warn("Checking the pull requests of {} on GitHub failed: {}", repo, Transient.describe(e))
+            }
+        }
+    }
+
+    private suspend fun checkOutsideNow(run: RunRecord): Outside {
+        val pr = run.prNumber ?: return Outside.NONE
+        val owner = users.byId(run.ownerId) ?: run { log.info("Run {}: its owner no longer exists; pull request not checked", run.id); return Outside.NONE }
+        val client = access.client(owner) ?: run { log.info("Run {}: its owner has no GitHub token; pull request not checked", run.id); return Outside.NONE }
+        val info = try {
+            withContext(Dispatchers.IO) { client.getPull(org, prRepo(run), pr) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log.info("Run {}: reading pull request {} failed: {}", run.id, prRef(run, pr), Transient.describe(e))
+            return Outside.NONE
+        } ?: run { log.info("Run {}: pull request {} could not be read", run.id, prRef(run, pr)); return Outside.NONE }
+        if (info.state == "open" && !info.merged) return Outside.NONE
         val merged = info.merged
         val by = info.mergedBy?.login
-        val closedText = "Pull request ${prRef(run, pr)} was closed on GitHub without being merged."
         val changed = when (run.status) {
             RunStatus.READY -> withContext(Dispatchers.IO) {
-                if (merged) runs.readyToMerged(run.id, by) else runs.readyToCancelled(run.id, closedText)
+                if (merged) runs.readyToMerged(run.id, by) else runs.readyToCancelled(run.id, closedOutsideText(run, pr))
             }
-            RunStatus.NEEDS_HUMAN -> endRun(run.id, merged, proceed = { it.status == RunStatus.NEEDS_HUMAN }) {
-                if (merged) {
-                    runs.setMergedOnGitHub(run.id, by)
-                    runs.setFailure(run.id, null, null)
-                    runs.setStatus(run.id, RunStatus.MERGED, clearError = true)
-                } else {
-                    runs.setStatus(run.id, RunStatus.CANCELLED, closedText)
+            else -> {
+                // A pipeline whose job is cancelled here may have moved on to its approver meanwhile: nothing drives it
+                // after the cancel, so it ends as well (its gate would have found the same pull request).
+                val pipeline = run.status in PIPELINE_STATUSES
+                endRun(run.id, merged, proceed = { r ->
+                    r.prNumber == pr && (r.status in OUTSIDE_ELIGIBLE && r.status != RunStatus.READY ||
+                        pipeline && r.status in setOf(RunStatus.APPROVING, RunStatus.WAITING_FOR_CHECKS))
+                }) {
+                    if (merged) {
+                        runs.setMergedOnGitHub(run.id, by)
+                        runs.setFailure(run.id, null, null)
+                        runs.setStatus(run.id, RunStatus.MERGED, clearError = true)
+                    } else {
+                        runs.setFailure(run.id, null, null)
+                        runs.setStatus(run.id, RunStatus.CANCELLED, closedOutsideText(run, pr))
+                    }
                 }
             }
-            else -> false
         }
-        if (!changed) return
-        log.info("Run {}: pull request {} was {} on GitHub", run.id, prRef(run, pr), if (merged) "merged" else "closed")
-        withContext(Dispatchers.IO) {
-            bestEffort { client.removeLabel(org, run.repo, run.issueNumber, "needs-human") }
-            // Agern did not merge it: the pointer bump is opened for a human, never merged.
-            if (merged && run.targetRepo != null && run.releaseId == null) bumpPointerSafely(run, client, pr, autoMerge = false)
-            if (merged) closeAfterGitHubMerge(run, client, pr, by)
+        if (changed) {
+            log.info("Run {}: pull request {} was {} on GitHub{}", run.id, prRef(run, pr), if (merged) "merged" else "closed", by?.let { " by $it" }.orEmpty())
+            withContext(Dispatchers.IO) { endedOutside(runs.get(run.id) ?: run, client, pr, merged, by) }
         }
         publish(run.id)
+        if (runs.get(run.id)?.status in RunStatus.TERMINAL) settled(run.id)
+        return when {
+            !changed -> Outside.NONE
+            merged -> Outside.MERGED
+            else -> Outside.CLOSED
+        }
+    }
+
+    /** The error of a run whose pull request [pr] was closed on GitHub without being merged. */
+    private fun closedOutsideText(run: RunRecord, pr: Int) = "Pull request ${prRef(run, pr)} was closed on GitHub without being merged."
+
+    /**
+     * Housekeeping after [run]'s pull request [pr] was merged ([merged], by [by]) or closed on GitHub: Agern's own
+     * `needs-human` label goes; a single workspace member run opens its pointer bump for a human; a partial delivery gets
+     * its comment and stays open; any other single run merged into a non-default base has its issue closed, as GitHub does
+     * that only for the default branch (§6 "Base branch"). Blocking; never throws.
+     */
+    private fun endedOutside(run: RunRecord, client: GitHubClient, pr: Int, merged: Boolean, by: String?) {
+        bestEffort { client.removeLabel(org, run.repo, run.issueNumber, "needs-human") }
+        if (!merged) return
+        // Agern did not merge it: the pointer bump is opened for a human, never merged.
+        if (run.targetRepo != null && run.releaseId == null) bumpPointerSafely(run, client, pr, autoMerge = false)
+        if (run.partial && run.releaseId == null) {
+            val who = by?.let { " by @${mdText(it)}" }.orEmpty()
+            bestEffort { client.comment(org, run.repo, run.issueNumber, partialComment(run, "**Agern:** pull request ${prRef(run, pr)} was merged on GitHub$who.")) }
+        } else {
+            // GitHub closes the issue itself only for a merge into the default branch (§6 "Base branch").
+            closeAfterGitHubMerge(run, client, pr, by)
+        }
+    }
+
+    /**
+     * Before an owner's action on [run] (approve, merge anyway, update): an eligible run's pull request is checked now. 409
+     * `pull_request_merged` when the run is merged on GitHub (found now or earlier), 409 `pull_request_closed` when the
+     * check just found it closed; otherwise the run as it is now.
+     */
+    private suspend fun refuseIfEndedOutside(run: RunRecord): RunRecord {
+        val found = if (outsideEligible(run)) checkOutside(run.id, force = true) else Outside.NONE
+        val now = runs.get(run.id) ?: throw notFound("Run not found")
+        val ref = now.prNumber?.let { prRef(now, it) } ?: "(none)"
+        if (now.status == RunStatus.MERGED && now.mergedOnGitHub) {
+            throw conflict(
+                "Pull request $ref was already merged on GitHub${now.mergedBy?.let { " by @$it" }.orEmpty()}; run ${now.id} is merged and nothing was merged again.",
+                "pull_request_merged",
+            )
+        }
+        if (found == Outside.CLOSED) {
+            throw conflict("Pull request $ref was closed on GitHub without being merged; run ${now.id} is cancelled.", "pull_request_closed")
+        }
+        return now
     }
 
     /**
@@ -4467,7 +4751,9 @@ class Orchestrator(
     ) = buildString {
         append("Decide whether the pull request for issue #${c.issueNumber} in ${org}/${c.repo} may be squash-merged into `${c.targetBranch}`.\n")
         append(c.releaseNote)
-        append(policyParagraph(c, policy)).append('\n')
+        val run = runs.get(c.runId)?.takeIf { it.partial && it.releaseId == null && !it.isSync }
+        append(policyParagraph(c, policy, partial = run != null)).append('\n')
+        run?.let { append(partialParagraph(it)).append('\n') }
         append("Branch `${c.branch}`; pull request ${prUrl ?: "(none)"}; fix rounds used: $round of $maxRounds.\n")
         extra?.let { append(it).append('\n') }
         append(c.workspaceBlock)
@@ -4481,8 +4767,23 @@ class Orchestrator(
         append("</reviews>\n\nAnswer through the structured output: verdict `APPROVE` or `ESCALATE` and a summary.")
     }
 
-    /** What the approver's verdict does under the run's merge [policy] (docs/ARCHITECTURE.md §6 "Merge policy"). */
-    private fun policyParagraph(c: RunContext, policy: String): String = when (policy) {
+    /** The approver's paragraph for a partial delivery (docs/ARCHITECTURE.md §6 "Partial delivery"). */
+    private fun partialParagraph(run: RunRecord): String {
+        val n = "#${run.issueNumber}"
+        val first = if (run.partialSetBy != null && run.delivery?.remaining.isNullOrEmpty()) {
+            "Partial delivery: the run owner marked this run as covering only part of issue $n."
+        } else {
+            "Partial delivery: this run delivers only the part of issue $n that the spec's Delivery plan names under \"This run\"."
+        }
+        return "$first Judge the change against the spec's stated scope, not against the whole issue; the remaining steps are not " +
+            "a reason to escalate. The pull request says `${lead(run, true)}` and the issue stays open after the merge."
+    }
+
+    /**
+     * What the approver's verdict does under the run's merge [policy] (docs/ARCHITECTURE.md §6 "Merge policy"); [partial]:
+     * the run is a partial delivery, whose merge leaves the issue open.
+     */
+    private fun policyParagraph(c: RunContext, policy: String, partial: Boolean = false): String = when (policy) {
         MergePolicy.OWNER_APPROVES ->
             "Merge policy: the run owner approves every merge. You cannot merge: your verdict is a recommendation to the owner. " +
                 "`APPROVE` = you recommend merging; `ESCALATE` = you recommend not merging as it stands. Write the summary for the " +
@@ -4495,6 +4796,9 @@ class Orchestrator(
             "Merge policy: automatic. `APPROVE` squash-merges the pull request into the release branch `${c.targetBranch}` " +
                 "immediately, without a human looking at it (the issue stays open until the release is merged); `ESCALATE` asks " +
                 "the run owner to decide."
+        } else if (partial) {
+            "Merge policy: automatic. `APPROVE` squash-merges the pull request immediately, without a human looking at it (the " +
+                "issue stays open: partial delivery); `ESCALATE` asks the run owner to decide."
         } else {
             "Merge policy: automatic. `APPROVE` squash-merges the pull request and closes the issue immediately, without a human " +
                 "looking at it; `ESCALATE` asks the run owner to decide."
@@ -4503,6 +4807,15 @@ class Orchestrator(
 
     companion object {
         val READ_ONLY_TOOLS = listOf("Edit", "Write", "NotebookEdit")
+
+        /** [readPullForGate]'s state for a pull request GitHub does not find. */
+        private const val MISSING_PULL = "missing"
+
+        /** The statuses [checkOutside] may end a run from. */
+        val OUTSIDE_ELIGIBLE = setOf(RunStatus.QUEUED, RunStatus.SPEC, RunStatus.BUILDING, RunStatus.REVIEWING, RunStatus.NEEDS_HUMAN, RunStatus.READY)
+
+        /** The statuses of a run whose pipeline job is at work (before its approver). */
+        private val PIPELINE_STATUSES = setOf(RunStatus.QUEUED, RunStatus.SPEC, RunStatus.BUILDING, RunStatus.REVIEWING)
 
         /** The summary of the spec-writer and approver stages of a sync run. */
         const val SYNC_SKIPPED_STAGE = "Not used when bringing a release up to date"

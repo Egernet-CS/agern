@@ -1928,6 +1928,31 @@ html.app-locked #root {
 .run-overlaps-list li + li {
   margin-top: 4px;
 }
+/* A partial delivery (docs/ARCHITECTURE.md §6 "Partial delivery"): the issue stays open, with the spec's plan. */
+.run-delivery {
+  margin: 12px 0 0;
+  overflow-wrap: anywhere;
+}
+.run-delivery .notice-text p {
+  margin: 0;
+}
+.run-delivery .notice-text p + p,
+.run-delivery-list {
+  margin-top: 6px;
+}
+.run-delivery-label {
+  color: var(--text);
+}
+.run-delivery-list {
+  margin-bottom: 0;
+  padding-left: 18px;
+}
+.run-delivery-list li + li {
+  margin-top: 4px;
+}
+.approve-outcome {
+  font-weight: 600;
+}
 .rounds {
   display: flex;
   flex-direction: column;

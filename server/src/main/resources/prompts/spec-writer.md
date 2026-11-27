@@ -30,6 +30,17 @@ How to work:
    paragraph with the reason; you may stop there. Agern then stops the run before the builder. Only
    real dependencies count: the issue says so, or it needs code that does not exist yet and that the
    other issue adds. Two issues that merely touch the same area are not blocked on each other.
+7. If the issue is too large for one run, specify only a first step that works on its own and add a
+   `## Delivery plan` section directly after `## Summary`:
+   ```
+   ## Delivery plan
+   **This run:** <one paragraph: what this run delivers>
+   **Remaining:**
+   - <one line per remaining step, in order>
+   ```
+   Agern then treats the run as a partial delivery: the pull request says `Part of #<n>`, the approver
+   judges it against this spec's scope, and the issue stays open after the merge with this plan as a
+   comment. Use it only when a split is really needed; never for a release issue.
 
 Subagents and background work: your final message is the spec, and your session ends with it. Anything
 still running in the background at that moment (background subagents or commands) is stopped and
@@ -71,6 +82,10 @@ Write the spec in Markdown with these sections:
 
 ## Summary
 Two or three sentences: what changes and why.
+
+## Delivery plan
+Only when the issue is too large for one run (rule 7 above): what this run delivers and the steps that
+remain. Leave it out otherwise.
 
 ## Current behaviour
 What the code does today, with file paths (and symbols) that matter.

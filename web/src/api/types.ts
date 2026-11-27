@@ -586,8 +586,20 @@ export type Run = {
   updateOnDemand?: boolean;
   /** Other active runs of the project when this run started (a warning). Issue titles and paths are untrusted text. */
   overlaps?: RunOverlap[];
+  /** A partial delivery (docs/ARCHITECTURE.md §6 "Partial delivery"): merging it leaves the issue open. */
+  partial?: boolean;
+  /** Who marked the run partial or complete on the run page; null when the spec decided. */
+  partialSetBy?: string | null;
+  /** The spec's Delivery plan; null when the spec has none. Untrusted text from the agent: plain text only. */
+  delivery?: RunDelivery | null;
   /** The project files the run got, fixed when it starts; null for older runs. */
   projectFiles?: RunProjectFiles | null;
+};
+
+/** A spec's Delivery plan: what this run delivers and the steps that remain. */
+export type RunDelivery = {
+  delivers: string;
+  remaining: string[];
 };
 
 /** Another run that was active in the same project when a run started. */

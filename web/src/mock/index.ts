@@ -56,6 +56,7 @@ import {
   syncRelease,
   setReleaseMode,
   approveRun,
+  setRunPartial,
   mergeAnywayRun,
   approveSandbox,
   cancelRun,
@@ -579,10 +580,16 @@ export const mockApi: Api = {
         : [],
     ),
   run: (id) => ok(() => (needGithub(), run(id))),
-  approveRun: (id) =>
+  approveRun: (id, closeIssue) =>
     ok(() => {
       const r = run(id);
-      approveRun(r, me());
+      approveRun(r, me(), closeIssue);
+      return r;
+    }),
+  setRunPartial: (id, partial) =>
+    ok(() => {
+      const r = run(id);
+      setRunPartial(r, me(), partial);
       return r;
     }),
   updateRun: (id) =>

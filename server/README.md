@@ -78,7 +78,8 @@ tests `FACTORY_2FA=off` is accepted when `dev` is the only provider.
   * pipeline: the spec-writer prints a small spec, the builder commits to `AGERN_FAKE.md`,
     reviewers answer PASS and the approver APPROVE. Put `fake:changes` in the issue body for one
     round of CHANGES, `fake:always-changes` to exhaust the fix rounds (→ `needs_human`),
-    `fake:escalate` for an approver ESCALATE, `fake:fail-<role>` to make a stage fail,
+    `fake:escalate` for an approver ESCALATE, `fake:partial` for a spec with a Delivery plan (a partial
+    delivery: the issue stays open after the merge), `fake:fail-<role>` to make a stage fail,
     `fake:hang-<role>` to make it hang (try the stage time limit or Cancel), `fake:slow` to make every
     stage take ~1.5 s so the diagram can be watched advancing, `fake:markdown` to have reviewers and
     the approver write their summaries and findings in Markdown, `fake:busy-<role>` (spec-writer, builder) to

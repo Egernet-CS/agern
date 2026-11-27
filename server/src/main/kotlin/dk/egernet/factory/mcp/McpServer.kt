@@ -107,8 +107,13 @@ class McpServer(
                 "on GitHub (merge policy `github`): their pull requests are reviewed and merged there. With update: true, " +
                 "\"Update and merge\" instead: for a finished run whose merge was refused because its target branch moved (a " +
                 "migration or merge conflict), Agern merges the target into the run's branch, the builder resolves the conflict, " +
-                "the reviewers and the approver run again and the pull request is merged.",
+                "the reviewers and the approver run again and the pull request is merged. closeIssue chooses the issue's fate: " +
+                "false merges and keeps the issue open (a partial delivery: the pull request says `Part of #N` and Agern comments " +
+                "what was delivered and what remains), true merges and closes it; omitted, the run is merged as it is marked, " +
+                "which closes the issue unless the run is a partial delivery. Ignored with update: true.",
             schema(Triple("runId", "string", "Run id"), Triple("update", "boolean", "Update and merge instead of merging as it is"),
+                Triple("closeIssue", "boolean", "false: merge and keep the issue open (partial delivery); true: merge and close it; " +
+                    "omitted: as the run is marked, which closes unless the run is a partial delivery"),
                 required = listOf("runId"))),
         Tool("factory_cancel_run", "Cancel a pipeline run.",
             schema(Triple("runId", "string", "Run id"), required = listOf("runId"))),
@@ -410,7 +415,12 @@ class McpServer(
                     val runId = uuid("runId")
                     val run = factory.visibleRun(owner, runId)
                     if (grant.personal != null && run.repo != repo) return toolError("Run belongs to another project")
-                    factory.approveRunTool(owner, run.repo, runId, args["update"]?.jsonPrimitive?.contentOrNull == "true")
+                    // A tri-state: read only when present.
+                    val closeIssue = args["closeIssue"]?.let { el ->
+                        if (el is kotlinx.serialization.json.JsonNull) null
+                        else (el as? JsonPrimitive)?.takeIf { !it.isString }?.booleanOrNull ?: return toolError("closeIssue must be true or false")
+                    }
+                    factory.approveRunTool(owner, run.repo, runId, args["update"]?.jsonPrimitive?.contentOrNull == "true", closeIssue)
                 }
                 "factory_cancel_run" -> {
                     val runId = uuid("runId")

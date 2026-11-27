@@ -24,6 +24,10 @@ Wait until `http://127.0.0.1:$PORT/` answers (a few seconds), then take screensh
 - Useful pages: `/` (projects), `/p/web-shop` (a project with issues and runs), `/agents`
   (live agents; click a run to open its run page), `/settings`, `/admin`. A merged run with the
   warning "UI change reviewed without screenshots" is in `/p/design-system` (issue #12).
+  Partial deliveries are in `/p/web-shop`: issue #70 has a `needs_human` partial run (the approver
+  escalated; its delivery plan, "Mark as complete", "Merge & close issue"), issue #71 a merged one
+  that left its issue open. Any other `needs_human` run (e.g. `/p/billing-service`, issue #17) shows
+  "Merging closes issue #N." with "Mark as partial delivery" and "Merge & keep issue open".
   A workspace project (several repositories side by side) is `/p/shop-workspace`: its members are in
   the "agents & runs" pane, its issues show their member, and issue #5 has a merged workspace run.
   As `observer` (bob) the member `ios` is marked "no access".

@@ -125,6 +125,16 @@ private suspend fun ApplicationCall.retryReq(): dk.egernet.factory.RetryReq {
         throw badRequest("Invalid retry request: expected {\"mode\": \"update\" | \"step\" | \"continue\" | \"start_over\" | \"recommended\"}")
     }
 }
+/** The optional body of an approval; no body or an empty one is `{}`: merge as the run is marked. */
+private suspend fun ApplicationCall.approveReq(): dk.egernet.factory.ApproveReq {
+    val text = receiveText()
+    if (text.isBlank()) return dk.egernet.factory.ApproveReq()
+    return try {
+        AppJson.decodeFromString(dk.egernet.factory.ApproveReq.serializer(), text)
+    } catch (e: Exception) {
+        throw badRequest("Invalid approval: expected {\"closeIssue\": true | false}")
+    }
+}
 @Serializable data class CreateSessionReq(val model: String? = null)
 @Serializable data class TalkReq(val text: String = "")
 @Serializable data class MergeAnywayReq(val headSha: String = "")
@@ -785,9 +795,10 @@ private fun Route.runRoutes(s: Services) {
         statuses?.firstOrNull { it !in RunStatus.ALL }?.let { throw badRequest("Unknown run status '$it'") }
         call.respond(s.factory.listRuns(u, null, q["active"] == "true", statuses?.takeIf { it.isNotEmpty() }))
     }
+    // Checks the run's pull request on GitHub first (throttled), so an outside merge or close shows at once.
     get("/runs/{id}") {
         val u = call.requireUser(s)
-        call.respond(s.runs.toDto(s.factory.visibleRun(u, uuidParam("id"))))
+        call.respond(s.factory.getRun(u, uuidParam("id")))
     }
     // A stage screenshot (docs/ARCHITECTURE.md §6 "Screenshots"): visible to whoever may see the run.
     get("/runs/{id}/screenshots/{sid}") {
@@ -801,7 +812,19 @@ private fun Route.runRoutes(s: Services) {
         val name = "screenshot-${role ?: "stage"}-${m.id.toString().take(8)}.${dk.egernet.factory.agent.Screenshots.extension(m.mediaType)}"
         call.respondStoredFile(bytes, m.mediaType, "inline", name)
     }
-    post("/runs/{id}/approve") { call.respond(s.factory.approveRun(call.requireUser(s), uuidParam("id"))) }
+    // Owner only; the optional body chooses the issue's fate (docs/ARCHITECTURE.md §6 "Partial delivery").
+    post("/runs/{id}/approve") {
+        val u = call.requireUser(s)
+        val id = uuidParam("id")
+        call.respond(s.factory.approveRun(u, id, call.approveReq().closeIssue))
+    }
+    // The owner marks a run that needs a human as a partial delivery (the issue stays open) or a complete one.
+    put("/runs/{id}/partial") {
+        val u = call.requireUser(s)
+        val id = uuidParam("id")
+        val req = call.receive<dk.egernet.factory.PartialReq>()
+        call.respond(s.factory.setRunPartial(u, id, req.partial))
+    }
     // "Update from base branch" (docs/ARCHITECTURE.md §6 "Retrying a run", "Update and merge"): owner only.
     post("/runs/{id}/update") { call.respond(s.factory.updateRun(call.requireUser(s), uuidParam("id"))) }
     // "Try it on the sandbox VM" (docs/SANDBOX-VMS.md "Preview"): the run's owner or an admin.
