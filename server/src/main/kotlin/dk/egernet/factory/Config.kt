@@ -374,12 +374,18 @@ data class SandboxConfig(
     val execTimeoutMs: Long = 30 * 60_000L,
     /** FACTORY_SANDBOX_MAX_PLATFORMS: platforms a definition may name besides its default image (0 forbids them). */
     val maxPlatforms: Int = 4,
+    /**
+     * FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS: how long a prepared image (a container committed after its setup script ran,
+     * docs/SANDBOXES.md "Prepared images") is reused before setup runs again; 0 switches prepared images off.
+     */
+    val preparedMaxAgeDays: Int = 7,
 ) {
     val enabled: Boolean get() = mode != "off"
 
     override fun toString() = if (!enabled) "off" else
         "SandboxConfig(mode=$mode, podman=$podmanBin, url=${podmanUrl ?: "-"}, cgroupParent=${cgroupParent ?: "-"}, registries=$registries, maxCpus=$maxCpus, " +
-            "maxMemory=${formatMemory(maxMemoryBytes)}, maxConcurrent=$maxConcurrent, execTimeoutMs=$execTimeoutMs, maxPlatforms=$maxPlatforms)"
+            "maxMemory=${formatMemory(maxMemoryBytes)}, maxConcurrent=$maxConcurrent, execTimeoutMs=$execTimeoutMs, maxPlatforms=$maxPlatforms, " +
+            "preparedMaxAgeDays=$preparedMaxAgeDays)"
 
     companion object {
         val DEFAULT_REGISTRIES = listOf("docker.io", "ghcr.io", "quay.io", "mcr.microsoft.com")
@@ -411,6 +417,10 @@ data class SandboxConfig(
                 it.toIntOrNull() ?: throw IllegalArgumentException("FACTORY_SANDBOX_MAX_PLATFORMS must be a whole number")
             } ?: 4
             require(platforms in 0..20) { "FACTORY_SANDBOX_MAX_PLATFORMS must be between 0 and 20" }
+            val preparedDays = get("FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS")?.trim()?.let {
+                it.toIntOrNull() ?: throw IllegalArgumentException("FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS must be a whole number of days")
+            } ?: 7
+            require(preparedDays in 0..365) { "FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS must be between 0 and 365 (0 switches prepared images off)" }
             val cgroupParent = get("FACTORY_SANDBOX_CGROUP_PARENT")?.trim()?.takeIf { it.isNotEmpty() }
             if (cgroupParent != null) {
                 require(CGROUP_PARENT_RE.matches(cgroupParent) && "/../" !in "$cgroupParent/" && !cgroupParent.endsWith(".slice")) {
@@ -428,6 +438,7 @@ data class SandboxConfig(
                 maxConcurrent = concurrent,
                 execTimeoutMs = execMinutes * 60_000L,
                 maxPlatforms = platforms,
+                preparedMaxAgeDays = preparedDays,
             )
         }
 

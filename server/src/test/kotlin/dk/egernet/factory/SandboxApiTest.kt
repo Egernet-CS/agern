@@ -149,4 +149,37 @@ class SandboxApiTest {
             contentType(ContentType.Application.Json); setBody("""{"sha256":"$sha1"}""")
         }.status.value)
     }
+
+    @Test
+    fun `admins list and remove prepared images, others are refused`() = testApplication {
+        application { agernModule(s) }
+        val alice = login("alice", "pw-a")
+        val root = login("root", "pw-r")
+        val rt = world.sandboxRuntime
+        val labels = mapOf("agern.prepared" to "0123456789abcdef", "agern.prepared.repo" to "demo-app", "agern.prepared.platform" to "default",
+            "agern.prepared.definition" to "d".repeat(64), "agern.prepared.base" to "docker.io/library/node:22")
+        rt.images["localhost/agern-prepared/demo-app:0123456789abcdef"] = FakeSandboxRuntime.Image("img-a", java.time.Instant.now(), labels, 1000)
+        rt.images["localhost/agern-prepared/demo-app:fedcba9876543210"] = FakeSandboxRuntime.Image("img-b", java.time.Instant.now().minusSeconds(3600),
+            labels + ("agern.prepared" to "fedcba9876543210"), 500)
+        rt.inUse += "img-b"
+
+        val overview = AppJson.parseToJsonElement(root.get("/api/admin/sandboxes").bodyAsText()).jsonObject
+        assertEquals(listOf("0123456789abcdef", "fedcba9876543210"), overview["prepared"]!!.jsonArray.map { it.jsonObject.str("key") }, "newest first")
+        assertEquals("1500", overview.str("preparedBytes"))
+        assertEquals("7", overview["limits"]!!.jsonObject.str("preparedMaxAgeDays"))
+        overview["prepared"]!!.jsonArray[0].jsonObject.let {
+            assertEquals("demo-app", it.str("repo"))
+            assertEquals("default", it.str("platform"))
+            assertEquals("docker.io/library/node:22", it.str("baseImage"))
+            assertEquals("false", it.str("expired"))
+        }
+
+        assertEquals(403, alice.delete("/api/admin/sandboxes/prepared") { header("X-Factory-Request", "1") }.status.value)
+        assertEquals(2, rt.images.size)
+        // Not taken for a run id; the image in use stays listed.
+        val r = root.delete("/api/admin/sandboxes/prepared") { header("X-Factory-Request", "1") }
+        assertEquals(200, r.status.value, r.bodyAsText())
+        assertEquals(listOf("fedcba9876543210"), AppJson.parseToJsonElement(r.bodyAsText()).jsonObject["prepared"]!!.jsonArray.map { it.jsonObject.str("key") })
+        assertEquals(setOf("localhost/agern-prepared/demo-app:fedcba9876543210"), rt.images.keys)
+    }
 }

@@ -28,6 +28,30 @@ data class ContainerSpec(
     val keepIdUid: Int? = null,
     /** `--user` for the container's main process; null = the image's. */
     val user: String? = null,
+    /**
+     * `--pull=<pull>`: `missing` (pull the image only when the local store lacks it) or `never` (a prepared image, which
+     * exists only locally). No other value: never `always`.
+     */
+    val pull: String = PULL_MISSING,
+) {
+    init {
+        require(pull == PULL_MISSING || pull == PULL_NEVER) { "pull must be '$PULL_MISSING' or '$PULL_NEVER'" }
+    }
+
+    companion object {
+        const val PULL_MISSING = "missing"
+        const val PULL_NEVER = "never"
+    }
+}
+
+/** An image in the runtime's local store, as `podman image inspect` describes it. */
+data class LocalImage(
+    val id: String,
+    val createdAt: java.time.Instant,
+    /** As the runtime reports it: including layers shared with other images. */
+    val sizeBytes: Long,
+    val labels: Map<String, String> = emptyMap(),
+    val tags: List<String> = emptyList(),
 )
 
 /** Who a command runs as inside the container: `--user <uid>:<gid>` plus HOME, USER and LOGNAME. */
@@ -86,6 +110,22 @@ interface SandboxRuntime {
     fun logs(name: String, lines: Int): String
     /** Ports the image declares (`EXPOSE`), e.g. `5432/tcp`; empty when unknown. */
     fun exposedPorts(image: String): List<String>
+
+    // Prepared images (docs/ARCHITECTURE.md §5 "Prepared images").
+
+    /** The image [image] (a reference or an id) in the local store, or null when it is not there. Never pulls. */
+    fun imageInfo(image: String): LocalImage?
+    /** Pulls [image] into the local store. */
+    fun pullImage(image: String)
+    /**
+     * Commits [container]'s own file system (never its bind mounts or volumes; the container is not paused) to [image]
+     * with [labels]. Label values must be plain (`[A-Za-z0-9._:/@-]`).
+     */
+    fun commitContainer(container: String, image: String, labels: Map<String, String>)
+    /** The local images labelled `agern.prepared`. */
+    fun listPreparedImages(): List<LocalImage>
+    /** Removes the image with id [id] without force: false when a container uses it (or it is gone). */
+    fun removeImage(id: String): Boolean
 }
 
 class SandboxRuntimeException(message: String) : RuntimeException(message)

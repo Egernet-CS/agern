@@ -149,6 +149,43 @@ class PodmanRuntime(
         emptyList()
     }
 
+    override fun imageInfo(image: String): LocalImage? {
+        val exists = runner.run(imageExistsArgs(cfg, image), 60_000, 4096)
+        if (exists.timedOut) throw SandboxRuntimeException("podman image exists timed out")
+        if (exists.exitCode == 1) return null
+        if (exists.exitCode != 0) throw SandboxRuntimeException("podman image exists failed (exit ${exists.exitCode}): ${exists.output.trim().takeLast(1000)}")
+        return parseImagesJson(call(imageInspectArgs(cfg, listOf(image)), 60_000, "image inspect").output).firstOrNull()
+    }
+
+    override fun pullImage(image: String) {
+        call(pullArgs(cfg, image), timeoutMs = 20 * 60_000L, what = "pull $image")
+    }
+
+    override fun commitContainer(container: String, image: String, labels: Map<String, String>) {
+        call(commitArgs(cfg, container, image, labels), timeoutMs = 20 * 60_000L, what = "commit $container")
+    }
+
+    override fun listPreparedImages(): List<LocalImage> {
+        val ids = call(listPreparedArgs(cfg), 60_000, "images").output.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.distinct().toList()
+        if (ids.isEmpty()) return emptyList()
+        // One inspect for all; when one of them vanished in between, one by one (skipping the gone ones).
+        return try {
+            parseImagesJson(call(imageInspectArgs(cfg, ids), 60_000, "image inspect").output)
+        } catch (e: SandboxRuntimeException) {
+            ids.mapNotNull { id -> runCatching { parseImagesJson(call(imageInspectArgs(cfg, listOf(id)), 60_000, "image inspect").output).firstOrNull() }.getOrNull() }
+        }
+    }
+
+    override fun removeImage(id: String): Boolean {
+        val r = runner.run(removeImageArgs(cfg, id), 120_000, 16 * 1024)
+        if (r.timedOut) throw SandboxRuntimeException("podman rmi timed out")
+        if (r.exitCode == 0) return true
+        val out = r.output.lowercase()
+        // Podman: exit 2 "image is in use by a container", exit 1 "image not known".
+        if ("in use" in out || "not known" in out || "no such image" in out) return false
+        throw SandboxRuntimeException("podman rmi failed (exit ${r.exitCode}): ${r.output.trim().takeLast(1000)}")
+    }
+
     companion object {
         /** `podman` or `podman --url <url>`. */
         fun base(cfg: SandboxConfig): List<String> =
@@ -180,7 +217,7 @@ class PodmanRuntime(
                 "--memory", SandboxConfig.formatMemory(s.memoryBytes),
                 "--memory-swap", SandboxConfig.formatMemory(s.memoryBytes),
                 "--stop-timeout", "5",
-                "--pull=missing",
+                "--pull=${s.pull}",
             )
             cfg.cgroupParent?.let { a += listOf("--cgroup-parent", it) }
             s.workdir?.let { a += listOf("--workdir", it) }
@@ -241,6 +278,64 @@ class PodmanRuntime(
         fun exposedPortsArgs(cfg: SandboxConfig, image: String) =
             base(cfg) + listOf("image", "inspect", "--format", "{{json .Config.ExposedPorts}}", image)
 
+        fun imageExistsArgs(cfg: SandboxConfig, image: String) = base(cfg) + listOf("image", "exists", image)
+
+        fun imageInspectArgs(cfg: SandboxConfig, images: List<String>) = base(cfg) + listOf("image", "inspect") + images
+
+        fun pullArgs(cfg: SandboxConfig, image: String) = base(cfg) + listOf("pull", "--quiet", image)
+
+        /** What a label value of a prepared image may contain (they all come from the server: names, hashes, references). */
+        private val LABEL_VALUE_RE = Regex("^[A-Za-z0-9._:/@-]*$")
+        private val LABEL_KEY_RE = Regex("^[a-z0-9][a-z0-9._-]*$")
+
+        /**
+         * `podman commit`: only the container's own file system (never `--include-volumes`, so neither the worktree bind
+         * mount nor cache volumes), without `--pause`, the labels as `--change "LABEL k=v"`.
+         */
+        fun commitArgs(cfg: SandboxConfig, container: String, image: String, labels: Map<String, String>): List<String> {
+            for ((k, v) in labels) {
+                require(LABEL_KEY_RE.matches(k)) { "label key '$k' is not allowed" }
+                require(LABEL_VALUE_RE.matches(v)) { "label value of '$k' is not allowed" }
+            }
+            return base(cfg) + listOf("commit", "--quiet") + labels.flatMap { (k, v) -> listOf("--change", "LABEL $k=$v") } + listOf(container, image)
+        }
+
+        fun listPreparedArgs(cfg: SandboxConfig) =
+            base(cfg) + listOf("images", "--filter", "label=$LABEL_PREPARED", "--format", "{{.ID}}")
+
+        fun removeImageArgs(cfg: SandboxConfig, id: String) = base(cfg) + listOf("rmi", id)
+
+        /**
+         * `podman image inspect` output: a JSON array of objects with `Id`, `Created` (RFC 3339), `Size`, `Labels` (or
+         * `Config.Labels`) and `RepoTags`. Read tolerantly: an entry without id or time is skipped.
+         */
+        fun parseImagesJson(out: String): List<LocalImage> {
+            val text = out.trim()
+            if (text.isEmpty() || text == "null") return emptyList()
+            val arr = try {
+                kotlinx.serialization.json.Json.parseToJsonElement(text) as? kotlinx.serialization.json.JsonArray
+            } catch (e: Exception) {
+                null
+            } ?: throw SandboxRuntimeException("podman image inspect: unexpected output: ${text.take(500)}")
+            fun str(o: kotlinx.serialization.json.JsonObject?, k: String) =
+                ((o?.get(k) as? kotlinx.serialization.json.JsonPrimitive)?.takeIf { it.isString || it.content != "null" })?.content
+            fun labels(el: kotlinx.serialization.json.JsonElement?) = (el as? kotlinx.serialization.json.JsonObject)?.mapNotNull { (k, v) ->
+                (v as? kotlinx.serialization.json.JsonPrimitive)?.content?.let { k to it }
+            }?.toMap()
+            return arr.mapNotNull { el ->
+                val o = el as? kotlinx.serialization.json.JsonObject ?: return@mapNotNull null
+                val id = str(o, "Id")?.removePrefix("sha256:")?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+                val created = str(o, "Created")?.let { c ->
+                    runCatching { java.time.OffsetDateTime.parse(c).toInstant() }.getOrNull() ?: runCatching { java.time.Instant.parse(c) }.getOrNull()
+                } ?: return@mapNotNull null
+                val size = str(o, "Size")?.toLongOrNull() ?: 0L
+                val lab = labels(o["Labels"])?.takeIf { it.isNotEmpty() }
+                    ?: labels((o["Config"] as? kotlinx.serialization.json.JsonObject)?.get("Labels")) ?: emptyMap()
+                val tags = (o["RepoTags"] as? kotlinx.serialization.json.JsonArray)?.mapNotNull { (it as? kotlinx.serialization.json.JsonPrimitive)?.content }.orEmpty()
+                LocalImage(id, created, size, lab, tags)
+            }
+        }
+
         fun formatCpus(c: Double): String = if (c == Math.floor(c)) c.toLong().toString() else "%.2f".format(java.util.Locale.ROOT, c).trimEnd('0')
 
         fun parseLabelled(out: String): List<LabelledResource> = out.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.mapNotNull { line ->
@@ -254,3 +349,5 @@ class PodmanRuntime(
 const val LABEL_RUN = "agern.run"
 const val LABEL_REPO = "agern.repo"
 const val LABEL_ROLE = "agern.role"
+/** Marks a prepared image (its value: the key); docs/ARCHITECTURE.md §5 "Prepared images". */
+const val LABEL_PREPARED = "agern.prepared"

@@ -624,6 +624,20 @@ data class RunSandboxDto(
     val platformsUsed: List<String> = emptyList(),
     /** A review sandbox of the run was created at least once (the ux and ui-design reviewers ran the app in it). */
     val reviewUsed: Boolean = false,
+    /**
+     * Startup of the build sandbox, recorded at its first command (null for older runs and before): milliseconds from the
+     * first builder stage's start to that command (null when the start is unknown).
+     */
+    val firstCommandMs: Long? = null,
+    /** How long creating the container that first command ran in took, in milliseconds. */
+    val createMs: Long? = null,
+    /**
+     * How that container was made: `reused` (from a prepared image), `prepared` (setup ran and the image was stored),
+     * `setup` (setup ran, nothing stored) or `plain` (no setup script).
+     */
+    val startedFrom: String? = null,
+    /** The prepared image's key (with `reused` and `prepared`), else null. */
+    val preparedKey: String? = null,
 )
 
 /** A sidecar's readiness check (`ready:`). */
@@ -859,6 +873,19 @@ data class RunningSandboxDto(
 data class SandboxServerLimitsDto(
     val maxCpus: Double, val maxMemory: String, val maxConcurrent: Int, val execTimeoutMinutes: Long, val registries: List<String>,
     val maxPlatforms: Int = 4,
+    /** FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS: days a prepared image is reused (0: prepared images off). */
+    val preparedMaxAgeDays: Int = 7,
+)
+
+/**
+ * A prepared image in the runtime's store (docs/ARCHITECTURE.md §5 "Prepared images"): a sandbox container committed
+ * after its setup script ran. [sizeBytes] as the runtime reports it, including layers shared with the base image;
+ * [expired]: older than the max age, so it is never started again (prepared anew; removed by the prune timer).
+ */
+@Serializable
+data class PreparedImageDto(
+    val repo: String, val platform: String, val key: String, val definition: String, val baseImage: String,
+    val createdAt: String, val sizeBytes: Long, val expired: Boolean,
 )
 
 /** `GET /api/admin/sandboxes`: the runtime, its limits and the sandboxes that exist. */
@@ -871,6 +898,10 @@ data class SandboxOverviewDto(
     val limits: SandboxServerLimitsDto,
     /** Oldest first. */
     val sandboxes: List<RunningSandboxDto>,
+    /** Prepared images, newest first. */
+    val prepared: List<PreparedImageDto> = emptyList(),
+    /** The sum of their [PreparedImageDto.sizeBytes]. */
+    val preparedBytes: Long = 0,
 )
 
 /** `GET /api/admin/sandboxes/pending`: a project whose valid `.agern/sandbox.yml` is not approved in this exact version. */

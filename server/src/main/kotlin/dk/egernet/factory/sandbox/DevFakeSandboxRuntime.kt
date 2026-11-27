@@ -16,6 +16,8 @@ import kotlin.io.path.name
 class DevFakeSandboxRuntime : SandboxRuntime {
     private val containers = ConcurrentHashMap<String, ContainerSpec>()
     private val networks = ConcurrentHashMap<String, String>()
+    /** Committed (prepared) images by name; base images are always "present" (see [imageInfo]). */
+    private val images = ConcurrentHashMap<String, LocalImage>()
 
     override fun createNetwork(name: String, labels: Map<String, String>) {
         networks[name] = labels[LABEL_RUN] ?: ""
@@ -86,4 +88,32 @@ class DevFakeSandboxRuntime : SandboxRuntime {
     override fun listNetworks() = networks.map { (n, r) -> LabelledResource(n, r) }
 
     override fun exposedPorts(image: String) = if (image.contains("postgres")) listOf("5432/tcp") else emptyList()
+
+    override fun imageInfo(image: String): LocalImage? {
+        images[image]?.let { return it }
+        images.values.firstOrNull { it.id == image }?.let { return it }
+        if (image.startsWith("localhost/")) return null
+        // Any other reference counts as pulled, with an id derived from its name.
+        return LocalImage(SandboxDefinitions.sha256("fake-image $image"), java.time.Instant.EPOCH, 300L shl 20, tags = listOf(image))
+    }
+
+    override fun pullImage(image: String) {}
+
+    override fun commitContainer(container: String, image: String, labels: Map<String, String>) {
+        Thread.sleep(150)
+        val spec = containers[container] ?: throw SandboxRuntimeException("no such container: $container")
+        val base = imageInfo(spec.image)
+        images[image] = LocalImage(
+            SandboxDefinitions.sha256("fake-commit $container $image ${System.nanoTime()}"), java.time.Instant.now(),
+            (base?.sizeBytes ?: 0L) + (420L shl 20), labels, listOf(image),
+        )
+    }
+
+    override fun listPreparedImages() = images.values.filter { LABEL_PREPARED in it.labels }
+
+    override fun removeImage(id: String): Boolean {
+        val (name, img) = images.entries.firstOrNull { it.value.id == id }?.toPair() ?: return false
+        if (containers.values.any { it.image == name || it.image == img.id }) return false
+        return images.remove(name, img)
+    }
 }

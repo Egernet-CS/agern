@@ -1113,6 +1113,11 @@ private fun Route.adminRoutes(s: Services) {
     // Sandboxes (docs/ARCHITECTURE.md §5 "Sandboxes", §8).
     get("/admin/sandboxes") { call.respond(s.sandboxes.overview(call.requireAdmin(s))) }
     get("/admin/sandboxes/pending") { call.respond(s.sandboxes.pending(call.requireAdmin(s))) }
+    // A constant segment: never taken for a run id (Ktor prefers it over the `{runId}` parameter below).
+    delete("/admin/sandboxes/prepared") {
+        val admin = call.requireAdmin(s)
+        call.respond(s.sandboxes.removePrepared(admin))
+    }
     delete("/admin/sandboxes/{runId}") {
         val admin = call.requireAdmin(s)
         val runId = uuidParam("runId")

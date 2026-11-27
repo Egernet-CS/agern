@@ -120,6 +120,13 @@ class ReleaseSandboxTest {
         val (_, whileSecond) = seen.single { it.first == "Second" }
         assertTrue(whileSecond.none { it.contains(runIds[0].toString()) }, whileSecond.toString())
         assertTrue(whileSecond.contains("agern-run-${runIds[1]}"), whileSecond.toString())
+        // The first issue's sandbox ran setup and stored a prepared image; the second started from it: one setup in the release.
+        assertEquals(1, rt.execs.count { it.second == "echo setup" }, rt.execs.toString())
+        assertEquals(listOf("agern-run-${runIds[0]}"), rt.calls.filter { it.startsWith("commit ") }.map { it.split(' ')[1] })
+        val prepared = rt.images.keys.single()
+        assertTrue(prepared.startsWith("localhost/agern-prepared/demo-app:"), prepared)
+        assertEquals(prepared, rt.started.single { it.name == "agern-run-${runIds[1]}" }.image)
+        assertEquals(listOf("prepared", "reused"), runIds.map { s.runs.toDto(s.runs.get(it)!!).sandbox!!.startedFrom })
         // Nothing is left and no slot is held; the issues stay open (release runs do not close them).
         assertTrue(rt.containers.isEmpty() && rt.networks.isEmpty(), rt.calls.toString())
         assertEquals(0, s.sandboxes.inUse())

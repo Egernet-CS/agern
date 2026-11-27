@@ -124,14 +124,21 @@ class SandboxAdminTest {
         assertFailsWith<ApiException> { runBlocking { s.sandboxes.stop(root, run.id) } }.also { assertEquals(404, it.status.value) }
         stopped.countDown()
 
-        // The run goes on; the next command created a fresh sandbox (setup ran again) and it is removed at the end.
+        // The run goes on; the next command created a fresh sandbox (from the image prepared by the first one, so setup did
+        // not run again) and it is removed at the end.
         val done = world.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
         assertEquals(RunStatus.MERGED, done.status, done.error)
         assertEquals(listOf(false, false), answers.map { it.first }, answers.toString())
-        assertEquals(listOf("echo setting up", "make build", "echo setting up", "make test"), rt.execs.map { it.second })
+        assertEquals(listOf("echo setting up", "make build", "make test"), rt.execs.map { it.second })
+        assertEquals(2, rt.started.count { it.name == "agern-run-${run.id}" })
+        assertEquals("never", rt.started.last { it.name == "agern-run-${run.id}" }.pull)
         val builder = s.runs.stages(run.id).single { it.role == "builder" }.sessionId!!
         val texts = s.events.list(builder, 0, 1000).filter { it.type == "system" }.map { it.payload.jsonObject["text"]!!.jsonPrimitive.content }
-        assertTrue(texts.any { it.startsWith("An admin (root) stopped this run's sandbox") }, texts.toString())
+        assertTrue(texts.any {
+            it == "An admin (root) stopped this run's sandbox: its containers and network were removed (cache volumes are kept). " +
+                "The run continues; the next sandbox command creates a new sandbox."
+        }, texts.toString())
+        assertTrue(texts.any { it.startsWith("Sandbox from prepared image ") }, texts.toString())
         assertEquals(0, s.sandboxes.inUse())
     }
 
@@ -177,9 +184,10 @@ class SandboxAdminTest {
         assertEquals(0, s.sandboxes.inUse())
         stopped.countDown()
         world.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
-        runBlocking { withTimeout(5_000) { while (frames.size < 3) kotlinx.coroutines.delay(20) } }
+        runBlocking { withTimeout(5_000) { while (frames.size < 5) kotlinx.coroutines.delay(20) } }
         collector.cancel()
-        assertEquals(listOf("created", "created", "stopped"), frames.take(3))
+        // Each container's setup stored a prepared image (the default image's and the platform's).
+        assertEquals(listOf("created", "prepared", "created", "prepared", "stopped"), frames.take(5))
     }
 
     @Test

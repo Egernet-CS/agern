@@ -139,8 +139,11 @@ class PodmanRuntimeTest {
             PodmanRuntime.runArgs(cfg, manager.serviceSpec(runId, "r", def.services[0], def)),
             PodmanRuntime.runArgs(cfg, ContainerSpec("n", "docker.io/library/x", mapOf("agern.run" to "x"), "net", cpus = 1.0, memoryBytes = 1L shl 30,
                 mounts = listOf(SandboxMount("/w", "/workspace", volume = false, readOnly = true)))),
+            PodmanRuntime.runArgs(cfg, manager.mainSpec(runId, "r", Paths.get("/w"), def).copy(image = "localhost/agern-prepared/r:0123456789abcdef", pull = "never")),
+            PodmanRuntime.commitArgs(cfg, "agern-run-x", "localhost/agern-prepared/r:0123456789abcdef", mapOf("agern.prepared" to "0123456789abcdef")),
+            PodmanRuntime.pullArgs(cfg, "docker.io/library/x"),
         ).flatten()
-        for (bad in listOf("--privileged", "--cap-add", "--device", "--userns=host", "--pid", "--ipc", "--uts", "--security-opt=seccomp=unconfined", "host")) {
+        for (bad in listOf("--pull=always", "--include-volumes", "--pause", "--privileged", "--cap-add", "--device", "--userns=host", "--pid", "--ipc", "--uts", "--security-opt=seccomp=unconfined", "host")) {
             assertFalse(all.any { it == bad || it.startsWith("$bad=") }, "found $bad")
         }
         assertFalse(all.any { it.contains("label=disable") || it.contains("unconfined") })
@@ -236,5 +239,77 @@ class PodmanRuntimeTest {
             PodmanRuntime.execArgs(cfg, "agern-run-x", "/workspace", listOf("true"), dk.egernet.factory.sandbox.ExecUser(1000, 1000, "builder", "/home/builder")),
         )
         assertEquals(listOf("podman", "logs", "--tail", "30", "agern-run-x-db"), PodmanRuntime.logsArgs(cfg, "agern-run-x-db", 30))
+    }
+
+    @Test
+    fun `prepared image commands`() {
+        assertEquals(listOf("podman", "image", "exists", "docker.io/library/x:1"), PodmanRuntime.imageExistsArgs(cfg, "docker.io/library/x:1"))
+        assertEquals(listOf("podman", "image", "inspect", "a", "b"), PodmanRuntime.imageInspectArgs(cfg, listOf("a", "b")))
+        assertEquals(listOf("/usr/bin/podman", "--url", "unix:///run/agern-podman/podman.sock", "pull", "--quiet", "docker.io/library/x:1"),
+            PodmanRuntime.pullArgs(remote, "docker.io/library/x:1"))
+        val labels = SandboxManager.preparedLabels("0123456789abcdef", "demo-app", "default", "d".repeat(64), "docker.io/library/eclipse-temurin:21-jdk@sha256:" + "e".repeat(64))
+        assertEquals(
+            listOf("podman", "commit", "--quiet",
+                "--change", "LABEL agern.prepared=0123456789abcdef", "--change", "LABEL agern.prepared.repo=demo-app",
+                "--change", "LABEL agern.prepared.platform=default", "--change", "LABEL agern.prepared.definition=${"d".repeat(64)}",
+                "--change", "LABEL agern.prepared.base=docker.io/library/eclipse-temurin:21-jdk@sha256:${"e".repeat(64)}",
+                "agern-run-x", "localhost/agern-prepared/demo-app:0123456789abcdef"),
+            PodmanRuntime.commitArgs(cfg, "agern-run-x", "localhost/agern-prepared/demo-app:0123456789abcdef", labels),
+        )
+        for (bad in listOf("a b", "x\ny", "\"q\"", "\$(id)", "a=b")) {
+            assertFailsWith<IllegalArgumentException> { PodmanRuntime.commitArgs(cfg, "c", "i", mapOf("agern.prepared" to bad)) }
+        }
+        assertEquals(listOf("podman", "images", "--filter", "label=agern.prepared", "--format", "{{.ID}}"), PodmanRuntime.listPreparedArgs(cfg))
+        assertEquals(listOf("podman", "rmi", "abc"), PodmanRuntime.removeImageArgs(cfg, "abc"))
+        val spec = manager.mainSpec(runId, "demo-app", Paths.get("/w"), def)
+        assertTrue(PodmanRuntime.runArgs(cfg, spec).contains("--pull=missing"))
+        val prepared = PodmanRuntime.runArgs(cfg, spec.copy(image = "localhost/agern-prepared/demo-app:0123456789abcdef", pull = ContainerSpec.PULL_NEVER))
+        assertTrue(prepared.contains("--pull=never") && !prepared.contains("--pull=missing"))
+        assertEquals("localhost/agern-prepared/demo-app:0123456789abcdef", prepared[prepared.size - 3], "the image, before the keep-alive command")
+        assertFailsWith<IllegalArgumentException> { spec.copy(pull = "always") }
+    }
+
+    @Test
+    fun `image inspect output is read tolerantly`() {
+        val out = """
+            [{"Id": "sha256:aaa", "Created": "2026-11-20T10:15:30.123456789+01:00", "Size": 123456, "Labels": {"agern.prepared": "k1", "agern.prepared.repo": "demo-app"},
+              "RepoTags": ["localhost/agern-prepared/demo-app:k1"]},
+             {"Id": "bbb", "Created": "2026-11-21T00:00:00Z", "Size": 7, "Labels": null, "Config": {"Labels": {"agern.prepared": "k2"}}},
+             {"Created": "2026-11-21T00:00:00Z"},
+             {"Id": "ccc", "Created": "not a time"}]
+        """.trimIndent()
+        val images = PodmanRuntime.parseImagesJson(out)
+        assertEquals(listOf("aaa", "bbb"), images.map { it.id })
+        assertEquals(java.time.Instant.parse("2026-11-20T09:15:30.123456789Z"), images[0].createdAt)
+        assertEquals(123456L, images[0].sizeBytes)
+        assertEquals("demo-app", images[0].labels["agern.prepared.repo"])
+        assertEquals(listOf("localhost/agern-prepared/demo-app:k1"), images[0].tags)
+        assertEquals(mapOf("agern.prepared" to "k2"), images[1].labels)
+        assertEquals(emptyList(), PodmanRuntime.parseImagesJson("[]"))
+        assertEquals(emptyList(), PodmanRuntime.parseImagesJson(""))
+        assertFailsWith<SandboxRuntimeException> { PodmanRuntime.parseImagesJson("Error: nope") }
+    }
+
+    @Test
+    fun `image lookups, pulls and removals through the runner`() {
+        val inspect = """[{"Id":"sha256:abc","Created":"2026-11-20T10:00:00Z","Size":5,"Labels":{}}]"""
+        val missing = Recorder { a -> if (a[1] == "image" && a[2] == "exists") CommandResult(1, "", false, false) else CommandResult(0, inspect, false, false) }
+        assertEquals(null, PodmanRuntime(cfg, missing).imageInfo("docker.io/library/x:1"))
+        assertEquals(1, missing.calls.size)
+        val present = Recorder { a -> CommandResult(0, if (a[1] == "image" && a[2] == "inspect") inspect else "", false, false) }
+        assertEquals("abc", PodmanRuntime(cfg, present).imageInfo("docker.io/library/x:1")!!.id)
+        assertEquals(listOf(listOf("podman", "image", "exists", "docker.io/library/x:1"), listOf("podman", "image", "inspect", "docker.io/library/x:1")), present.calls)
+
+        val list = Recorder { a -> CommandResult(0, if (a[1] == "images") "abc\nabc\ndef\n" else inspect, false, false) }
+        PodmanRuntime(cfg, list).listPreparedImages()
+        assertEquals(listOf("podman", "image", "inspect", "abc", "def"), list.calls[1])
+        assertEquals(emptyList(), PodmanRuntime(cfg, Recorder { CommandResult(0, "", false, false) }).listPreparedImages())
+
+        assertTrue(PodmanRuntime(cfg, Recorder { CommandResult(0, "", false, false) }).removeImage("abc"))
+        assertFalse(PodmanRuntime(cfg, Recorder { CommandResult(2, "Error: image used by 123: image is in use by a container", false, false) }).removeImage("abc"))
+        assertFailsWith<SandboxRuntimeException> { PodmanRuntime(cfg, Recorder { CommandResult(125, "Error: storage broken", false, false) }).removeImage("abc") }
+        val pull = Recorder()
+        PodmanRuntime(cfg, pull).pullImage("docker.io/library/x:1")
+        assertEquals(20 * 60_000L, pull.timeouts.single())
     }
 }

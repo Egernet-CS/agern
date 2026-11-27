@@ -675,4 +675,54 @@ class FakeSandboxRuntime : dk.egernet.factory.sandbox.SandboxRuntime {
     override fun listContainers() = containers.map { (n, r) -> dk.egernet.factory.sandbox.LabelledResource(n, r) }
     override fun listNetworks() = networks.map { (n, r) -> dk.egernet.factory.sandbox.LabelledResource(n, r) }
     override fun exposedPorts(image: String) = if (image.contains("postgres")) listOf("5432/tcp") else emptyList()
+
+    // Prepared images.
+
+    /** An image in the fake store: [spec] is the container it was committed from (null for a base image). */
+    data class Image(
+        val id: String, @Volatile var createdAt: java.time.Instant, val labels: Map<String, String>, val sizeBytes: Long,
+        val spec: dk.egernet.factory.sandbox.ContainerSpec? = null,
+    )
+    /** The local store by name; base images are added on pull (or present when in [baseIds]). */
+    val images = java.util.concurrent.ConcurrentHashMap<String, Image>()
+    /** Local ids of base images by reference: present without a pull; unknown references are pulled (id derived from the name). */
+    val baseIds = java.util.concurrent.ConcurrentHashMap<String, String>()
+    /** commitContainer fails with this message. */
+    @Volatile var failCommit: String? = null
+    /** Image ids a container uses (removeImage answers false). */
+    val inUse: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+    /** Called before a commit (e.g. to block it). */
+    @Volatile var onCommit: (container: String, image: String) -> Unit = { _, _ -> }
+    private val commits = java.util.concurrent.atomic.AtomicInteger()
+
+    override fun imageInfo(image: String): dk.egernet.factory.sandbox.LocalImage? {
+        val img = images[image] ?: images.values.firstOrNull { it.id == image }
+        if (img != null) return dk.egernet.factory.sandbox.LocalImage(img.id, img.createdAt, img.sizeBytes, img.labels,
+            images.filterValues { it === img }.keys.toList())
+        val base = baseIds[image] ?: return null
+        return dk.egernet.factory.sandbox.LocalImage(base, java.time.Instant.EPOCH, 100L shl 20, emptyMap(), listOf(image))
+    }
+    override fun pullImage(image: String) {
+        calls += "pull $image"
+        baseIds.putIfAbsent(image, "base-" + dk.egernet.factory.sandbox.SandboxDefinitions.sha256(image).take(12))
+    }
+    override fun commitContainer(container: String, image: String, labels: Map<String, String>) {
+        calls += "commit $container $image"
+        onCommit(container, image)
+        failCommit?.let { throw dk.egernet.factory.sandbox.SandboxRuntimeException(it) }
+        if (!containers.containsKey(container)) throw dk.egernet.factory.sandbox.SandboxRuntimeException("no such container $container")
+        // Validates the labels like podman's argument list does.
+        dk.egernet.factory.sandbox.PodmanRuntime.commitArgs(dk.egernet.factory.SandboxConfig(), container, image, labels)
+        images[image] = Image("img-${commits.incrementAndGet()}", java.time.Instant.now(), labels, 500L shl 20, started.lastOrNull { it.name == container })
+    }
+    override fun listPreparedImages() = images.values.distinct().filter { "agern.prepared" in it.labels }
+        .map { dk.egernet.factory.sandbox.LocalImage(it.id, it.createdAt, it.sizeBytes, it.labels) }
+    override fun removeImage(id: String): Boolean {
+        calls += "rmi $id"
+        if (id in inUse) return false
+        val names = images.filterValues { it.id == id }.keys
+        if (names.isEmpty()) return false
+        names.forEach { images.remove(it) }
+        return true
+    }
 }

@@ -268,6 +268,18 @@ class SandboxDefinitionTest {
     }
 
     @Test
+    fun `the prepared image age from the environment`() {
+        assertEquals(7, SandboxConfig.fromEnv(mapOf<String, String>()::get).preparedMaxAgeDays)
+        assertEquals(0, SandboxConfig.fromEnv(mapOf("FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS" to "0")::get).preparedMaxAgeDays)
+        assertEquals(365, SandboxConfig.fromEnv(mapOf("FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS" to "365")::get).preparedMaxAgeDays)
+        for (bad in listOf("-1", "366", "a week", "1.5")) {
+            val e = assertFailsWith<IllegalArgumentException> { SandboxConfig.fromEnv(mapOf("FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS" to bad)::get) }
+            assertTrue(e.message!!.startsWith("FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS must be"), e.message)
+        }
+        assertTrue("preparedMaxAgeDays=7" in SandboxConfig(mode = "podman").toString())
+    }
+
+    @Test
     fun `Agern's own definition is valid`() {
         // Gradle runs the tests in server/; the file is at the repository root.
         val file = listOf(java.nio.file.Paths.get("../.agern/sandbox.yml"), java.nio.file.Paths.get(".agern/sandbox.yml")).first { java.nio.file.Files.exists(it) }

@@ -39,7 +39,7 @@ sealed class FeedItem(val repo: String, val alsoRepos: List<String> = emptyList(
 
     /**
      * A container of a run's sandbox was created or removed, or an admin stopped the sandbox ([change]: `created`,
-     * `removed`, `stopped`). Sent to admins only (whatever they can see, like the overview), so the admin page updates live.
+     * `removed`, `stopped`), or prepared images changed (`prepared`: one was stored or an admin removed them). Sent to admins only (whatever they can see, like the overview), so the admin page updates live.
      */
     class Sandboxes(repo: String, val runId: String, val change: String) : FeedItem(repo)
 
