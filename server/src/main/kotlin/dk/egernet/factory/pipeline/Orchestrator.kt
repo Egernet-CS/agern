@@ -552,10 +552,12 @@ class Orchestrator(
         val withCommits = "$n commit${if (n == 1) "" else "s"}"
         val updateAvailable = run.updateAvailable
         val (recommended, reason) = when {
+            // The spec reported the issue blocked on another open issue: built again from scratch once that is merged.
+            run.failureKind == FailureKind.BLOCKED && run.error?.startsWith("Blocked on #") == true ->
+                RetryMode.START_OVER to run.error.lineSequence().first().trim()
             updateAvailable -> RetryMode.UPDATE to "The work is finished; only the merge into `$base` was refused" + (error?.let { ": $it" } ?: ".")
             stepAvailable -> RetryMode.STEP to "The builder finished; only the $stepName failed" + (error?.let { ": $it" } ?: ".")
             !continueAvailable -> RetryMode.START_OVER to when {
-                run.failureKind == FailureKind.BLOCKED && run.error?.startsWith("Blocked on #") == true -> error!!
                 run.failureKind == FailureKind.BLOCKED -> "The builder made no commits" + (run.error?.substringAfter("The builder said: ", "")
                     ?.takeIf { it.isNotBlank() }?.let { ": ${it.take(140)}" } ?: ".")
                 run.branch == null -> "The run stopped before it had a branch."
@@ -1323,7 +1325,7 @@ class Orchestrator(
             when {
                 // An automatic round leaves the run updatable ("Update and merge") while rounds remain.
                 !pushed && u.trigger == dk.egernet.factory.db.UpdateTrigger.BASE_MOVED ->
-                    if (u.migrations) runs.setFailure(runId, FailureKind.MIGRATION_CONFLICT, null)
+                    if (u.migrations || problems.isNotEmpty()) runs.setFailure(runId, FailureKind.MIGRATION_CONFLICT, null)
                     else runs.setFailure(runId, FailureKind.MERGE_CONFLICT, FailedStep.MERGE)
                 !pushed -> runs.setFailure(runId, u.before.failureKind, u.before.failedStep)
                 remaining.isNotEmpty() -> runs.setFailure(runId, FailureKind.MIGRATION_CONFLICT, null)
