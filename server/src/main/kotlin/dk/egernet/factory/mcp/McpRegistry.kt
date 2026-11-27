@@ -52,13 +52,14 @@ class McpRegistry {
             "factory_list_issues", "factory_get_issue", "factory_create_issue", "factory_start_run", "factory_list_runs",
             "factory_get_run", "factory_approve_run", "factory_cancel_run", "factory_send_to_agent", "factory_request_software",
             "factory_list_releases", "factory_create_release", "factory_assign_issues", "factory_unassign_issues",
-            "factory_approve_release", "factory_generate_image",
+            "factory_approve_release", "factory_generate_image", "factory_list_project_files",
         )
         /**
          * What a personal token offers (docs/ARCHITECTURE.md §7 "Personal tokens"): the chat tools without the image tool,
-         * which depends on a chat session (files on the server, selection in the chat, a budget per chat message).
+         * which depends on a chat session (files on the server, selection in the chat, a budget per chat message), and
+         * without the project files tool, whose paths are on the Agern server (docs/ARCHITECTURE.md §5 "Project files").
          */
-        val PERSONAL_TOOLS = CHAT_TOOLS - "factory_generate_image"
-        val STAGE_TOOLS = setOf("factory_get_issue", "factory_request_software")
+        val PERSONAL_TOOLS = CHAT_TOOLS - "factory_generate_image" - "factory_list_project_files"
+        val STAGE_TOOLS = setOf("factory_get_issue", "factory_request_software", "factory_list_project_files")
     }
 }

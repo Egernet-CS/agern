@@ -73,6 +73,17 @@ request is merged into the default branch, so for a merge into another base bran
 issue. The chat's checkout follows the base branch too. Releases are still created from and merged
 into the default branch.
 
+\section{Project files}\label{sec:project-files}
+
+Some projects need files that must not be committed, such as a vendor SDK, a licensed library or a
+large set of test data. The \ui{Files} row in the agents and runs pane opens the project's
+\ui{Files} page, which lists them with their size, version and SHA-256. Admins, and the people an
+admin names under \ui{Who can manage files}, upload them there (an interrupted upload continues
+where it stopped), replace and delete them. Every chat and run of the project then gets the files
+read-only in \envvar{AGERN_PROJECT_FILES}, and a sandbox at \file{/project-files}; Agern never sends
+them to GitHub and refuses to push a branch that contains one. Downloading a file through the
+browser is off until a manager allows it for that file.
+
 \whatyouhave
 You know where a project's issues, chat and agents are, on a desktop and on a phone. Next, talk to
 the project's agent in chapter~\ref{ch:chat}.

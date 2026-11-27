@@ -773,3 +773,180 @@
 .svm-dialog-cmds pre {
   margin: 2px 0 0;
 }
+
+/* project files: the Files page (pages/Files.tsx), the run line, the sandbox definition's files */
+.pf-usage {
+  grid-column: 1;
+  margin: 4px 0 0;
+}
+.pf-live {
+  min-height: 1.2em;
+  margin: 0 0 10px;
+}
+.pf-drop {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 84px;
+  padding: 16px;
+  margin-bottom: 12px;
+  border: 1px dashed var(--line-3);
+  border-radius: 10px;
+  color: var(--text-2);
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.pf-drop:hover,
+.pf-drop.is-dragging {
+  border-color: var(--amber);
+  background: var(--amber-wash);
+}
+.pf-drop:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+}
+.pf-uploads {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+.pf-upload {
+  padding: 10px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+}
+.pf-upload--interrupted,
+.pf-upload--error {
+  border-color: rgba(255, 120, 174, 0.4);
+}
+.pf-upload--done {
+  border-color: rgba(90, 214, 160, 0.3);
+}
+.pf-upload-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 12px;
+}
+.pf-upload-name {
+  overflow-wrap: anywhere;
+}
+.pf-upload p {
+  margin: 6px 0 0;
+}
+.pf-bar {
+  display: block;
+  height: 6px;
+  margin-top: 8px;
+  border-radius: 3px;
+  background: var(--line);
+  overflow: hidden;
+}
+.pf-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--amber);
+  transition: width 0.15s;
+}
+.pf-upload--done .pf-bar > span {
+  background: var(--pass);
+}
+.pf-upload-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.pf-empty p {
+  margin: 0 0 4px;
+}
+.sbx-page.pf-page {
+  max-width: 1200px;
+}
+.pf-table td {
+  vertical-align: top;
+}
+.pf-name {
+  display: inline-block;
+  min-width: 14ch;
+  max-width: 36ch;
+  overflow-wrap: anywhere;
+}
+.pf-sha {
+  white-space: nowrap;
+}
+.pf-note {
+  min-width: 16ch;
+  max-width: 32ch;
+  overflow-wrap: break-word;
+}
+.pf-dl-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.pf-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+  min-width: 12ch;
+}
+.pf-mgr-list {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+}
+.pf-mgr-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+}
+.pf-mgr-add input {
+  max-width: 220px;
+}
+.pf-row:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+  border-radius: 4px;
+}
+.run-pf {
+  grid-column: 1;
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 10px 0 0;
+  font-size: 0.86rem;
+  color: var(--text-2);
+}
+.run-pf-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.run-pf-name {
+  overflow-wrap: anywhere;
+}
+.pf-tag--changed,
+.pf-tag--missing {
+  color: var(--amber-hi);
+  border-color: rgba(255, 177, 74, 0.45);
+}
+.pf-sbx-files {
+  list-style: none;
+  margin: 0 0 4px;
+  padding: 0;
+}

@@ -138,7 +138,7 @@ export function SandboxPage() {
 
       {changed && st.content !== null && <DiffCard before={st.approval!.content} after={st.content} approvedSha={st.approval!.sha256} sha={st.sha256} />}
 
-      {st.definition && <DefinitionCard def={st.definition} />}
+      {st.definition && <DefinitionCard def={st.definition} repo={repo} missing={st.missingFiles ?? []} />}
 
       {st.content !== null ? (
         <details className="card sbx-card sbx-file" open={st.state === 'invalid'}>
@@ -315,7 +315,7 @@ function EnvList({ env }: { env: Record<string, string> }) {
   );
 }
 
-function DefinitionCard({ def }: { def: SandboxDefinition }) {
+function DefinitionCard({ def, repo, missing }: { def: SandboxDefinition; repo: string; missing: string[] }) {
   const l = def.limits;
   return (
     <section className="card sbx-card" aria-labelledby="sbx-def">
@@ -379,6 +379,32 @@ function DefinitionCard({ def }: { def: SandboxDefinition }) {
                 </li>
               ))}
             </ul>
+          )}
+        </dd>
+        <dt>project files</dt>
+        <dd>
+          {(def.files ?? []).length === 0 ? (
+            <span className="muted">none</span>
+          ) : (
+            <>
+              <ul className="pf-sbx-files">
+                {(def.files ?? []).map((f) => (
+                  <li key={f}>
+                    <code>{f}</code>
+                    {missing.includes(f) && (
+                      <>
+                        {' '}
+                        <span className="tag pf-tag--missing">not uploaded</span>
+                      </>
+                    )}
+                  </li>
+                ))}
+              </ul>
+              <span className="muted small">
+                {missing.length > 0 ? `${missing.length} not uploaded yet. Upload ${missing.length === 1 ? 'it' : 'them'} on the ` : 'Managed on the '}
+                <Link to={`/p/${repo}/files`}>Files page</Link>
+              </span>
+            </>
           )}
         </dd>
         <dt>caches</dt>

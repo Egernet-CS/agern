@@ -106,6 +106,8 @@ class SandboxManager(
     private val emitRun: (UUID) -> Unit = {},
     /** Pause between two runs of a service's readiness check. */
     private val readyPollMs: Long = 1000,
+    /** The names of a repository's uploaded project files, lower-case (docs/ARCHITECTURE.md §5 "Project files"). */
+    private val projectFileNames: (String) -> Set<String> = { emptySet() },
 ) {
     private val log = LoggerFactory.getLogger(SandboxManager::class.java)
     private val sc: SandboxConfig get() = cfg.sandbox
@@ -155,6 +157,8 @@ class SandboxManager(
     private class RunSandbox(
         val runId: UUID, val repo: String, val worktree: Path, val plan: Plan, @Volatile var info: RunSandboxDto,
         val runDir: Path? = null, val review: Boolean = false, val parent: RunSandbox? = null,
+        /** The run's project files snapshot, mounted read-only at [PROJECT_FILES] in every command container. */
+        val projectFiles: Path? = null,
     ) {
         /**
          * Serialises creation and commands: one command at a time per run. Taken by the tool call (waiting for a
@@ -224,8 +228,10 @@ class SandboxManager(
      */
     suspend fun prepare(
         runId: UUID, repo: String, worktree: Path, baseRef: String, home: Path, definitionRepo: String = repo, runDir: Path = worktree,
+        projectFiles: Path? = null,
     ): RunSandboxDto {
-        suspend fun record(info: RunSandboxDto, available: Plan.Available?, repo: String, worktree: Path) = recordDecision(runId, info, available, repo, worktree, runDir)
+        suspend fun record(info: RunSandboxDto, available: Plan.Available?, repo: String, worktree: Path) =
+            recordDecision(runId, info, available, repo, worktree, runDir, projectFiles)
         if (!enabled) {
             return record(RunSandboxDto("disabled", "Sandboxes are switched off on this server (FACTORY_SANDBOX=off).", null, null), null, repo, worktree)
         }
@@ -255,7 +261,7 @@ class SandboxManager(
                             "approved",
                             "Sandbox definition ${parsed.sha256.take(12)} approved by ${approval.approvedByUsername}; image ${def.image}$platforms. " +
                                 "It is created on the builder's first sandbox command.",
-                            parsed.sha256, def.image, platforms = def.platforms.map { it.name },
+                            parsed.sha256, def.image, platforms = def.platforms.map { it.name }, files = def.files,
                         ),
                         Plan.Available(def, parsed.sha256), repo, worktree,
                     )
@@ -272,10 +278,12 @@ class SandboxManager(
     }
 
     private suspend fun recordDecision(
-        runId: UUID, info: RunSandboxDto, available: Plan.Available?, repo: String, worktree: Path, runDir: Path,
+        runId: UUID, info: RunSandboxDto, available: Plan.Available?, repo: String, worktree: Path, runDir: Path, projectFiles: Path?,
     ): RunSandboxDto {
         withContext(Dispatchers.IO) { runs.setSandbox(runId, info) }
-        if (enabled) sandboxes[runId] = RunSandbox(runId, repo, worktree, available ?: Plan.Unavailable(info.reason), info, runDir)
+        if (enabled) {
+            sandboxes[runId] = RunSandbox(runId, repo, worktree, available ?: Plan.Unavailable(info.reason), info, runDir, projectFiles = projectFiles)
+        }
         return info
     }
 
@@ -380,6 +388,17 @@ class SandboxManager(
                 }
                 putJsonArray("caches") { def.caches.forEach { add(it) } }
                 putJsonArray("env") { def.env.keys.forEach { add(it) } }
+                val runFiles = withContext(Dispatchers.IO) { runs.get(runId)?.projectFiles }?.files.orEmpty()
+                putJsonObject("projectFiles") {
+                    put("path", PROJECT_FILES)
+                    put("readOnly", true)
+                    put("env", dk.egernet.factory.files.ProjectFiles.ENV)
+                    putJsonArray("files") {
+                        for (f in runFiles) addJsonObject { put("name", f.name); put("size", f.size); put("sha256", f.sha256) }
+                    }
+                    put("note", "The run's project files, mounted read-only at $PROJECT_FILES in every command container " +
+                        "(\$${dk.egernet.factory.files.ProjectFiles.ENV}). Never copy them into $WORKDIR; unpack them elsewhere (e.g. /opt or /tmp).")
+                }
                 put("setup", def.setup != null)
                 putJsonObject("limits") {
                     put("cpus", def.cpus); put("memory", SandboxConfig.formatMemory(def.memoryBytes))
@@ -404,7 +423,7 @@ class SandboxManager(
     private fun reviewSandbox(build: RunSandbox, plan: Plan.Available): RunSandbox? {
         if (build.released) return null
         val rs = reviews.computeIfAbsent(build.runId) {
-            RunSandbox(build.runId, build.repo, build.worktree, plan, build.info, build.runDir, review = true, parent = build)
+            RunSandbox(build.runId, build.repo, build.worktree, plan, build.info, build.runDir, review = true, parent = build, projectFiles = build.projectFiles)
         }
         if (build.released || rs.parent !== build) {
             if (reviews.remove(build.runId, rs)) dropReview(rs)
@@ -744,9 +763,9 @@ class SandboxManager(
                 }
                 if (rs.review) {
                     prepareOutputDir(rs)
-                    rt.startContainer(reviewSpec(rs.runId, rs.repo, rs.worktree, def, rs.outputDir))
+                    rt.startContainer(reviewSpec(rs.runId, rs.repo, rs.worktree, def, rs.outputDir, rs.projectFiles))
                 } else {
-                    rt.startContainer(commandSpec(rs.runId, rs.repo, rs.worktree, def, platform))
+                    rt.startContainer(commandSpec(rs.runId, rs.repo, rs.worktree, def, platform, rs.projectFiles))
                 }
                 box = Box(key, image).also { rs.boxes[key] = it }
             }
@@ -1078,10 +1097,14 @@ class SandboxManager(
         when (val p = SandboxDefinitions.parse(content, sc)) {
             is ParsedDefinition.Invalid ->
                 SandboxStatusDto(repo, enabled, SANDBOX_FILE, r.defaultBranch, "invalid", p.sha256, content, p.errors, null, approval, who)
-            is ParsedDefinition.Valid -> SandboxStatusDto(
-                repo, enabled, SANDBOX_FILE, r.defaultBranch, if (approval?.sha256 == p.sha256) "approved" else "pending",
-                p.sha256, content, emptyList(), dto(p.definition), approval, who,
-            )
+            is ParsedDefinition.Valid -> {
+                val uploaded = if (p.definition.files.isEmpty()) emptySet() else projectFileNames(repo)
+                SandboxStatusDto(
+                    repo, enabled, SANDBOX_FILE, r.defaultBranch, if (approval?.sha256 == p.sha256) "approved" else "pending",
+                    p.sha256, content, emptyList(), dto(p.definition), approval, who,
+                    missingFiles = p.definition.files.filter { it.lowercase() !in uploaded },
+                )
+            }
         }
     }
 
@@ -1117,6 +1140,7 @@ class SandboxManager(
         caches = d.caches,
         platforms = d.platforms.map { SandboxPlatformDto(it.name, it.image, it.setup, it.setupInherited) },
         user = d.user?.let { SandboxUserDto(it.name, it.uid) },
+        files = d.files,
         limits = SandboxLimitsDto(
             cpus = d.cpus, memory = SandboxConfig.formatMemory(d.memoryBytes), requestedCpus = d.requestedCpus,
             requestedMemory = d.requestedMemoryBytes?.let { SandboxConfig.formatMemory(it) }, capped = d.capped,
@@ -1151,13 +1175,16 @@ class SandboxManager(
          * limits and network; caches in the platform's own volumes. With `user:` the service user is that uid inside
          * (`keep-id`), container root a subordinate id, and the keep-alive process runs as root (`--user 0:0`).
          */
-        fun commandSpec(runId: UUID, repo: String, worktree: Path, def: SandboxDefinition, platform: SandboxPlatform?) = ContainerSpec(
+        fun commandSpec(
+            runId: UUID, repo: String, worktree: Path, def: SandboxDefinition, platform: SandboxPlatform?, projectFiles: Path? = null,
+        ) = ContainerSpec(
             name = if (platform == null) containerName(runId) else platformContainerName(runId, platform.name),
             image = platform?.image ?: def.image,
             labels = if (platform == null) labels(runId, repo, "sandbox") else labels(runId, repo, "platform").also { it["agern.platform"] = platform.name },
             network = networkName(runId),
-            env = def.env,
+            env = projectFilesEnv(def.env, projectFiles),
             mounts = listOf(SandboxMount(worktree.toAbsolutePath().normalize().toString(), WORKDIR, volume = false)) +
+                projectFilesMount(projectFiles) +
                 def.caches.map { SandboxMount(cacheVolumeName(repo, it, platform?.name), it, volume = true) },
             workdir = WORKDIR, cpus = def.cpus, memoryBytes = def.memoryBytes, entrypoint = "sh", command = keepAlive,
             keepIdUid = def.user?.uid, user = if (def.user != null) "0:0" else null,
@@ -1168,18 +1195,29 @@ class SandboxManager(
          * of [commandSpec], on the review network, the worktree bind-mounted **read-only** at [WORKDIR] and [outputDir]
          * (when there is one) read-write at [REVIEW_OUTPUT], the only host directory it can write to.
          */
-        fun reviewSpec(runId: UUID, repo: String, worktree: Path, def: SandboxDefinition, outputDir: Path?) = ContainerSpec(
+        fun reviewSpec(
+            runId: UUID, repo: String, worktree: Path, def: SandboxDefinition, outputDir: Path?, projectFiles: Path? = null,
+        ) = ContainerSpec(
             name = reviewContainerName(runId),
             image = def.image,
             labels = labels(runId, repo, "review"),
             network = reviewNetworkName(runId),
-            env = def.env,
+            env = projectFilesEnv(def.env, projectFiles),
             mounts = listOf(SandboxMount(worktree.toAbsolutePath().normalize().toString(), WORKDIR, volume = false, readOnly = true)) +
+                projectFilesMount(projectFiles) +
                 listOfNotNull(outputDir?.let { SandboxMount(it.toAbsolutePath().normalize().toString(), REVIEW_OUTPUT, volume = false) }) +
                 def.caches.map { SandboxMount(cacheVolumeName(repo, it), it, volume = true) },
             workdir = WORKDIR, cpus = def.cpus, memoryBytes = def.memoryBytes, entrypoint = "sh", command = keepAlive,
             keepIdUid = def.user?.uid, user = if (def.user != null) "0:0" else null,
         )
+
+        /** The run's project files snapshot, read-only at [PROJECT_FILES] (none when the run has no snapshot). */
+        fun projectFilesMount(projectFiles: Path?): List<SandboxMount> =
+            listOfNotNull(projectFiles?.let { SandboxMount(it.toAbsolutePath().normalize().toString(), PROJECT_FILES, volume = false, readOnly = true) })
+
+        /** The definition's env with `AGERN_PROJECT_FILES=/project-files` when the files are mounted; the server's value wins. */
+        fun projectFilesEnv(env: Map<String, String>, projectFiles: Path?): Map<String, String> =
+            if (projectFiles == null) env else env + (dk.egernet.factory.files.ProjectFiles.ENV to PROJECT_FILES)
 
         fun reviewServiceSpec(runId: UUID, repo: String, svc: SandboxService, def: SandboxDefinition) = ContainerSpec(
             name = reviewServiceContainerName(runId, svc.name), image = svc.image,
@@ -1203,6 +1241,8 @@ class SandboxManager(
             listOf("sh", "-c", "{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; exec sh -lc \"\$1\"", "sh", command)
 
         const val WORKDIR = "/workspace"
+        /** Where the run's project files are mounted read-only in every command container. */
+        const val PROJECT_FILES = dk.egernet.factory.files.ProjectFiles.SANDBOX_PATH
         /** Name prefix of every review sandbox container and network. */
         const val REVIEW_PREFIX = "agern-review-"
         /** Where the review sandbox's output directory is mounted inside it (`/run` cannot hold a cache path). */

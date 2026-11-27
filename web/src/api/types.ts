@@ -586,6 +586,8 @@ export type Run = {
   updateOnDemand?: boolean;
   /** Other active runs of the project when this run started (a warning). Issue titles and paths are untrusted text. */
   overlaps?: RunOverlap[];
+  /** The project files the run got, fixed when it starts; null for older runs. */
+  projectFiles?: RunProjectFiles | null;
 };
 
 /** Another run that was active in the same project when a run started. */
@@ -669,7 +671,9 @@ export const BLOCKING_CHECK_STATES: RunChecks['state'][] = ['failed', 'pending',
 
 export type FailureKind =
   | 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other'
-  | 'submodule_commit_missing' | 'checks' | 'migration_conflict' | 'merge_conflict';
+  | 'submodule_commit_missing' | 'checks' | 'migration_conflict' | 'merge_conflict'
+  /** The builder committed a project file (they are never committed or sent to GitHub). */
+  | 'project_file_committed';
 export type FailedStep = 'push' | 'pull_request' | 'merge';
 
 /**
@@ -715,6 +719,8 @@ export type RunSandbox = {
   platformsUsed: string[];
   /** The ux and ui-design reviewers ran the app in a read-only review sandbox at least once (absent for older runs). */
   reviewUsed?: boolean;
+  /** Project files the definition requires (`files:`); absent for older runs. */
+  files?: string[];
 };
 
 /** A sidecar's readiness check: run inside the service until it exits 0, for at most `timeoutSeconds`. */
@@ -739,6 +745,8 @@ export type SandboxDefinition = {
   platforms: SandboxPlatform[];
   /** Null: commands run as root inside the container. */
   user: SandboxUser | null;
+  /** Project files the sandbox needs (`files:`), by name. */
+  files?: string[];
 };
 
 export type SandboxApproval = { sha256: string; content: string; approvedBy: Owner; approvedAt: string };
@@ -761,7 +769,67 @@ export type SandboxStatus = {
   approval: SandboxApproval | null;
   /** Who can approve (the admins), so a non-admin knows whom to ask. */
   approvers: Owner[];
+  /** Names in the definition's `files` that are not uploaded to the project's files. */
+  missingFiles?: string[];
 };
+
+// ---------------------------------------------------------------- project files
+
+/**
+ * A file of the project's file store: uploaded once per project, handed read-only to every chat and run of the project,
+ * never committed or sent to GitHub. `sha256` is computed by the server; a replacement keeps the id and bumps `version`.
+ */
+export type ProjectFile = {
+  id: string;
+  name: string;
+  size: number;
+  sha256: string;
+  version: number;
+  note: string | null;
+  /** Whether people who can see the project may download it through the browser (default off). */
+  downloadable: boolean;
+  uploadedBy: Owner | null;
+  uploadedAt: string;
+};
+
+/** An open (resumable) upload. `received`: bytes the server has, the offset of the next chunk. */
+export type ProjectFileUpload = {
+  id: string;
+  name: string;
+  size: number;
+  received: number;
+  /** The expected SHA-256 given when it was created. */
+  sha256: string | null;
+  note: string | null;
+  createdBy: Owner | null;
+  createdAt: string;
+  touchedAt: string;
+  expiresAt: string;
+  /** The id of the file it replaces (same name). */
+  replaces: string | null;
+};
+
+export type ProjectFilesUsage = { files: number; projectBytes: number; totalBytes: number };
+export type ProjectFilesLimits = { maxFileBytes: number; maxProjectBytes: number; maxTotalBytes: number; maxFiles: number };
+
+/** `GET /api/projects/{repo}/files`. `canManage`: an admin or one of `managers`. */
+export type ProjectFiles = {
+  repo: string;
+  canManage: boolean;
+  files: ProjectFile[];
+  managers: Owner[];
+  usage: ProjectFilesUsage;
+  limits: ProjectFilesLimits;
+  /** Open uploads (managers only). */
+  uploads: ProjectFileUpload[];
+};
+
+/** A project file as a run got it. `required`: named by the sandbox definition; `previousSha256`: it changed since the previous run. */
+export type RunProjectFile = { name: string; size: number; sha256: string; version: number; required: boolean; previousSha256: string | null };
+export type RunProjectFiles = { repo: string; files: RunProjectFile[] };
+
+export type AdminProjectFilesRepo = { repo: string; files: number; bytes: number };
+export type AdminProjectFiles = { totalBytes: number; limits: ProjectFilesLimits; repos: AdminProjectFilesRepo[] };
 
 /** A target of a valid `.agern/deploy.yml` (docs/DEPLOY.md). */
 export type DeployTarget = {

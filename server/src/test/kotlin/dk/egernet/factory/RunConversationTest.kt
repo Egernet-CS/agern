@@ -396,6 +396,25 @@ class RunConversationTest {
     }
 
     @Test
+    fun `a follow-up that would push a project file is not pushed and fails like a push failure`() {
+        committingAdvisor()
+        val bytes = "licensed sdk".toByteArray()
+        world.uploadProjectFile("demo-app", "vendor/sdk.zip", bytes)
+        val runId = needsHuman()
+        val pushesBefore = world.git.pushes.size
+        world.git.newBlobsAnswer = listOf(dk.egernet.factory.git.NewBlob(gitBlobId(bytes), bytes.size.toLong(), "sdk.zip"))
+        val sid = UUID.fromString(talk(alice, runId, "please change it").sessionId)
+        awaitReview(runId, ReviewState.REQUIRED)
+        assertEquals(pushesBefore, world.git.pushes.size)
+        assertEquals(RunStatus.NEEDS_HUMAN, s.runs.get(runId)!!.status)
+        assertTrue(events(sid).any {
+            it.type == "system" && payload(it)["level"]!!.jsonPrimitive.content == "error" &&
+                payload(it)["text"]!!.jsonPrimitive.content.contains("Not pushed: the branch contains project file `vendor/sdk.zip`")
+        })
+        assertTrue(followUpPrompts.isEmpty())
+    }
+
+    @Test
     fun `review again needs a conversation, and approve catches a HEAD the review has not seen`() {
         val runId = needsHuman()
         assertEquals(409 to "nothing_to_review", code { runBlocking { s.orchestrator.review(alice, runId) } })

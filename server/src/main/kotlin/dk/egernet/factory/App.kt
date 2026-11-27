@@ -93,6 +93,8 @@ class Services(
     onBackgroundFailure: ((Throwable) -> Unit)? = null,
     /** What Agern sees of GitHub: the same instance [github] and [git] record into (docs/ARCHITECTURE.md §6 "GitHub status"). */
     val githubHealth: dk.egernet.factory.github.GitHubHealth = dk.egernet.factory.github.GitHubHealth(cfg.githubOrg, clock),
+    /** The usable bytes of the project file store's file system; null = the real one. Tests inject their own. */
+    projectFilesFreeSpace: ((java.nio.file.Path) -> Long)? = null,
 ) {
     /**
      * Background work of the server. A failure that escapes one of its coroutines is logged (instead of going to the
@@ -118,6 +120,11 @@ class Services(
         githubHealth, dk.egernet.factory.github.OfficialGitHubStatus(cfg.githubStatusUrl, clock), access, clock,
     )
     val workspaceDefs = dk.egernet.factory.workspace.WorkspaceService(access, gitHost = cfg.gitHost)
+    /** Project files (docs/ARCHITECTURE.md §5 "Project files"): metadata in PostgreSQL, bytes under the data directory. */
+    val projectFiles = dk.egernet.factory.files.ProjectFiles(
+        cfg, dk.egernet.factory.db.ProjectFileStore(db), users, access, twoFactorStore, clock,
+        projectFilesFreeSpace ?: { dir -> java.nio.file.Files.getFileStore(dir).usableSpace },
+    )
     val bus = EventBus()
     val mcpRegistry = McpRegistry()
     val prompts = Prompts(cfg.githubOrg)
@@ -134,7 +141,8 @@ class Services(
     val agents = AgentManager(cfg, sessions, events, access, launcher, bus, mcpRegistry, settings, prompts, workspaces, scope, attachments, preferences, usage,
         workspaceDefs, projectBranches,
         // Deploy tools only for chats, and only when switched on (never in McpRegistry.CHAT_TOOLS, so personal tokens cannot inherit them).
-        chatExtraTools = if (cfg.deploy.enabled && deployTransport != null) dk.egernet.factory.deploy.DeployManager.TOOLS else emptySet())
+        chatExtraTools = if (cfg.deploy.enabled && deployTransport != null) dk.egernet.factory.deploy.DeployManager.TOOLS else emptySet(),
+        chatProjectFiles = { repo -> projectFiles.currentDir(repo) })
     val sandboxes = SandboxManager(
         cfg, sandboxRuntime, SandboxApprovalStore(db), runs, access, git, scope,
         publishSystem = { sessionId, payload -> agents.publish(sessionId, "system", payload) },
@@ -145,6 +153,7 @@ class Services(
         devDefinitionSource = (github as? FakeGitHub)?.takeIf { cfg.fakeGithub }?.let { fake ->
             { repo -> fake.fileOf(repo, dk.egernet.factory.sandbox.SANDBOX_FILE) }
         },
+        projectFileNames = { repo -> projectFiles.files(repo).map { it.name.lowercase() }.toSet() },
     )
     val deploys = dk.egernet.factory.deploy.DeployManager(
         cfg, deployTransport, dk.egernet.factory.db.DeployKeyStore(db), dk.egernet.factory.db.DeployApprovalStore(db), access, box, scope,
@@ -189,7 +198,7 @@ class Services(
     val modePolicy: dk.egernet.factory.pipeline.ReleaseModePolicy = releaseModePolicy
         ?: dk.egernet.factory.pipeline.ReleaseModePolicy { repo -> projectSettings.get(repo).mergePolicy == MergePolicy.AUTOMATIC }
     val orchestrator = Orchestrator(cfg, runs, users, access, agents, workspaces, settings, prompts, bus, scope, preferences, sandboxes, screenshotStore,
-        sessions, events, images, workspaceDefs, releaseStore, projectSettings, clock, sandboxVms, projectBranches)
+        sessions, events, images, workspaceDefs, releaseStore, projectSettings, clock, sandboxVms, projectFiles, projectBranches)
     val screenshots = dk.egernet.factory.agent.Screenshots(cfg, screenshotStore, runs, workspaces, publishRun = { orchestrator.publish(it) })
     val releaseLocks = dk.egernet.factory.pipeline.ReleaseLocks()
     val releaseMerger = dk.egernet.factory.pipeline.ReleaseMerger(
@@ -217,7 +226,10 @@ class Services(
     val mcpTokens = dk.egernet.factory.db.McpTokenStore(db)
     /** Checks the bearer of `POST /mcp`; its `limiter` throttles unknown bearers per client address. */
     val mcpAuth = dk.egernet.factory.mcp.McpAuthenticator(mcpRegistry, mcpTokens, users, access, twoFactorStore, cfg.githubOrg, clock)
-    val mcp = McpServer(mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes, screenshots, images, mcpAuth, cfg, deploys, sandboxVms)
+    val mcp = McpServer(
+        mcpRegistry, users, sessions, factory, releases, BuildInfo.version, sandboxes, screenshots, images, mcpAuth, cfg, deploys, sandboxVms,
+        projectFiles = { grant -> kotlinx.coroutines.withContext(Dispatchers.IO) { orchestrator.projectFilesTool(grant.runId, grant.repo) } },
+    )
 
     /** The admins, who approve sandbox and deploy definitions: known admins plus FACTORY_ADMINS who never logged in. */
     private fun adminApprovers(): List<OwnerDto> {
@@ -261,6 +273,11 @@ class Services(
             .onFailure { LoggerFactory.getLogger("dk.egernet.factory").warn("Reaping run worktrees failed: {}", it.message) }
             .getOrDefault(emptyList())
         if (reaped.isNotEmpty()) LoggerFactory.getLogger("dk.egernet.factory").info("Removed {} worktree(s) of ended runs", reaped.size)
+        // Project files: snapshots of runs that are not live, and uploads that expired (docs/ARCHITECTURE.md §5 "Project files").
+        runCatching { orchestrator.reapProjectFileSnapshots() }
+            .onFailure { LoggerFactory.getLogger("dk.egernet.factory").warn("Removing project file snapshots failed: {}", it.message) }
+        runCatching { projectFiles.expireUploads() }
+            .onFailure { LoggerFactory.getLogger("dk.egernet.factory").warn("Removing expired project file uploads failed: {}", it.message) }
         // Sandbox VM leases: previews of runs still waiting for a human are kept, the others end (their resets run in the
         // background, so the start never waits for a VM).
         runCatching { sandboxVms.recover() }
