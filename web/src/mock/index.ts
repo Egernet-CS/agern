@@ -5,6 +5,7 @@
 // ?mock=github-down (only network errors, githubstatus.com unreachable); any other scenario: GitHub is working.
 import { ApiError, type Api, type Channel } from '../api/api';
 import * as deploy from './deploy';
+import * as projectFiles from './files';
 import { githubStatus } from './githubStatus';
 import * as images from './images';
 import * as sandboxVm from './sandboxVm';
@@ -86,6 +87,7 @@ import {
 
 images.seedRunImage();
 sandboxVm.seedSandboxVmPreview();
+projectFiles.seedRunProjectFiles();
 
 /** Mock rule: any 6 digits except 000000, or a recovery code like abcd-1234 (login only). */
 function secondFactor(u: User, code: string, allowRecovery: boolean) {
@@ -465,9 +467,9 @@ export const mockApi: Api = {
   releaseSandboxVmLease: (repo) => ok(() => (project(repo), sandboxVm.releaseSandboxVmLease(repo, me()))),
   startSandboxVmPreview: (runId) => ok(() => (needGithub(), sandboxVm.startSandboxVmPreview(run(runId), me()))),
   releaseSandboxVmPreview: (runId) => ok(() => (needGithub(), sandboxVm.releaseSandboxVmPreview(run(runId), me()))),
-  sandboxStatus: (repo) => ok(() => sandboxStatus(repo, project(repo).defaultBranch)),
-  approveSandbox: (repo, sha256) => ok(() => (project(repo), approveSandbox(repo, sha256, me()))),
-  revokeSandboxApproval: (repo) => ok(() => (project(repo), revokeSandboxApproval(repo, me()))),
+  sandboxStatus: (repo) => ok(() => projectFiles.withSandboxFiles(sandboxStatus(repo, project(repo).defaultBranch))),
+  approveSandbox: (repo, sha256) => ok(() => (project(repo), projectFiles.withSandboxFiles(approveSandbox(repo, sha256, me())))),
+  revokeSandboxApproval: (repo) => ok(() => (project(repo), projectFiles.withSandboxFiles(revokeSandboxApproval(repo, me())))),
   sandboxes: () => ok(() => (needAdmin(), sandboxOverview())),
   pendingSandboxes: () => ok(() => (needAdmin(), pendingSandboxes())),
   stopSandbox: (runId) => ok(() => (needAdmin(), stopSandbox(runId, me()))),
@@ -537,6 +539,25 @@ export const mockApi: Api = {
   checkRelease: (id) => ok(() => withRelease(id, (r) => checkRelease(r, me()))),
   syncRelease: (id) => ok(() => withRelease(id, (r) => syncRelease(r, me()))),
   setReleaseMode: (id, mode) => ok(() => withRelease(id, (r) => setReleaseMode(r, mode, me()))),
+
+  projectFiles: (repo) => ok(() => (project(repo), projectFiles.projectFiles(repo, me()))),
+  createProjectFileUpload: (repo, body) => ok(() => (project(repo), projectFiles.createUpload(repo, body, me()))),
+  projectFileUpload: (repo, id) => ok(() => (project(repo), projectFiles.getUpload(repo, id, me()))),
+  async putProjectFileChunk(repo, id, offset, chunk, opts) {
+    await ok(() => project(repo));
+    return projectFiles.putChunk(repo, id, offset, chunk, me(), opts);
+  },
+  async completeProjectFileUpload(repo, id) {
+    await ok(() => project(repo));
+    return projectFiles.completeUpload(repo, id, me());
+  },
+  cancelProjectFileUpload: (repo, id) => ok(() => (project(repo), projectFiles.cancelUpload(repo, id, me()))),
+  updateProjectFile: (repo, id, body) => ok(() => (project(repo), projectFiles.updateFile(repo, id, body, me()))),
+  deleteProjectFile: (repo, id) => ok(() => (project(repo), projectFiles.deleteFile(repo, id, me()))),
+  projectFileUrl: (repo, id) => projectFiles.fileUrl(repo, id),
+  setProjectFileManagers: (repo, usernames) => ok(() => (project(repo), projectFiles.setManagers(repo, usernames, me()))),
+  adminProjectFiles: () => ok(() => projectFiles.adminOverview(me())),
+  adminDeleteProjectFiles: (repo) => ok(() => projectFiles.adminDelete(repo, me())),
 
   projectRuns: (repo) => ok(() => (project(repo), [...db.runs.values()].filter((r) => r.repo === repo).sort(byNewest))),
   createMemberLabels: (repo) => ok(() => (project(repo), { created: [], missing: [] })),

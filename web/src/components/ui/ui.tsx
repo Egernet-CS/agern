@@ -204,13 +204,15 @@ export function Dialog({ open, onClose, title, children, wide }: { open: boolean
   );
 }
 
-export function CopyButton({ text, label = 'Copy', disabled }: { text: string; label?: string; disabled?: boolean }) {
+/** [ariaLabel]: a fuller name when several copy buttons share one visible label. */
+export function CopyButton({ text, label = 'Copy', disabled, ariaLabel }: { text: string; label?: string; disabled?: boolean; ariaLabel?: string }) {
   const [done, setDone] = useState(false);
   return (
     <button
       type="button"
       className="btn btn--ghost btn--sm"
       disabled={disabled}
+      aria-label={ariaLabel && !done ? ariaLabel : undefined}
       onClick={async () => {
         if (await copyText(text)) {
           setDone(true);
