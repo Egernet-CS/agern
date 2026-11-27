@@ -118,7 +118,7 @@ KNOWN_KEYS="$KNOWN_KEYS FACTORY_GITHUB_ORG FACTORY_AUTH FACTORY_2FA FACTORY_ADMI
 KNOWN_KEYS="$KNOWN_KEYS FACTORY_DATA_DIR FACTORY_CLAUDE_BIN FACTORY_AGENT_PATH FACTORY_PUBLIC_URL"
 KNOWN_KEYS="$KNOWN_KEYS AGERN_JAVA AGERN_JAVA_OPTS JAVA_HOME AGERN_UPGRADE_CHANNEL AGERN_UPGRADE_MAX_WAIT_HOURS"
 KNOWN_KEYS="$KNOWN_KEYS FACTORY_SANDBOX FACTORY_SANDBOX_PODMAN_URL FACTORY_SANDBOX_CGROUP_PARENT FACTORY_SANDBOX_REGISTRIES"
-KNOWN_KEYS="$KNOWN_KEYS AGERN_SANDBOX_PRUNE_HOURS AGERN_SANDBOX_TEST_IMAGE "
+KNOWN_KEYS="$KNOWN_KEYS AGERN_SANDBOX_PRUNE_HOURS AGERN_SANDBOX_TEST_IMAGE FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS "
 
 # Is FILE safe for root to parse: owned by root and not writable by group or others?
 root_owned_file() {
@@ -1583,15 +1583,19 @@ sandbox_status() {
 
 # Removes what nobody uses any more (agern-sandbox-prune.timer runs this daily as the agern user):
 # images no container uses that were built more than AGERN_SANDBOX_PRUNE_HOURS (default 168) ago,
+# prepared images (label agern.prepared) no container uses that were made more than
+# FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS (default 7) days ago (the shorter of the two ages wins),
 # volumes no container uses that are older than that and are not per-project caches, and leftovers
-# of self-tests. --caches also removes unused cache volumes; --all ignores the age as well.
+# of self-tests. --prepared removes every unused prepared image; --caches also removes unused cache
+# volumes (and prepared images: their setup may have filled a cache); --all ignores the age as well.
 sandbox_prune() {
-    local all=0 caches=0 hours v name cache
+    local all=0 caches=0 prepared=0 hours days v name cache
     while [ $# -gt 0 ]; do
         case $1 in
-            --all) all=1; caches=1 ;;
-            --caches) caches=1 ;;
-            *) die "usage: agern sandbox prune [--caches] [--all]" ;;
+            --all) all=1; caches=1; prepared=1 ;;
+            --caches) caches=1; prepared=1 ;;
+            --prepared) prepared=1 ;;
+            *) die "usage: agern sandbox prune [--caches] [--prepared] [--all]" ;;
         esac
         shift
     done
@@ -1600,6 +1604,8 @@ sandbox_prune() {
     ensure_env
     hours=${AGERN_SANDBOX_PRUNE_HOURS:-168}
     [[ $hours =~ ^[0-9]+$ ]] || die "AGERN_SANDBOX_PRUNE_HOURS must be a whole number of hours"
+    days=${FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS:-7}
+    [[ $days =~ ^[0-9]+$ ]] || die "FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS must be a whole number of days"
     if ! spodman version >/dev/null 2>&1; then
         info "the sandbox service does not answer at $SANDBOX_URL (sandboxes off?); nothing to prune"
         return 0
@@ -1610,6 +1616,12 @@ sandbox_prune() {
     for name in $(spodman network ls --filter label=agern.selftest --format '{{.Name}}' 2>/dev/null || true); do
         spodman network rm --force "$name" >/dev/null 2>&1 || true
     done
+    # Prepared images first, by their label only (no negated filters: Podman 4.3). Images a container uses stay.
+    if [ "$prepared" = 1 ]; then
+        spodman image prune --all --force --filter label=agern.prepared >/dev/null || warn "image prune (prepared) failed"
+    else
+        spodman image prune --all --force --filter label=agern.prepared --filter "until=$((days * 24))h" >/dev/null || warn "image prune (prepared) failed"
+    fi
     if [ "$all" = 1 ]; then
         spodman image prune --all --force >/dev/null || warn "image prune failed"
     else
@@ -1624,7 +1636,7 @@ sandbox_prune() {
         case $cache in '' | '<no value>') ;; *) [ "$caches" = 1 ] || continue ;; esac
         spodman volume rm "$name" >/dev/null 2>&1 && removed=$((removed + 1))
     done < <(spodman volume ls "${filters[@]}" --format '{{.Name}}	{{index .Labels "agern.cache"}}' 2>/dev/null || true)
-    info "pruned unused images$([ "$all" = 1 ] || echo " built more than ${hours}h ago") and $removed unused volume(s)$([ "$caches" = 1 ] && echo " (cache volumes included)" || echo " (cache volumes kept)")"
+    info "pruned unused images$([ "$all" = 1 ] || echo " built more than ${hours}h ago"), $([ "$prepared" = 1 ] && echo "all unused prepared images" || echo "unused prepared images older than ${days} day(s)") and $removed unused volume(s)$([ "$caches" = 1 ] && echo " (cache volumes included)" || echo " (cache volumes kept)")"
     spodman system df 2>/dev/null | sed 's/^/  /' || true
 }
 
@@ -1651,7 +1663,7 @@ cmd_sandbox() {
         status) sandbox_status ;;
         prune) sandbox_prune "$@" ;;
         selftest) sandbox_selftest_cmd ;;
-        *) die "usage: agern sandbox enable | disable [--force] | status | prune [--caches] [--all] | selftest" ;;
+        *) die "usage: agern sandbox enable | disable [--force] | status | prune [--caches] [--prepared] [--all] | selftest" ;;
     esac
 }
 
