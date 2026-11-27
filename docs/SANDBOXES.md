@@ -16,7 +16,8 @@ clean environment, without anyone installing that toolchain on the factory host:
 - one sandbox per run, created on the builder's first sandbox command and removed when the run's
   build/review part is over (also after a cancel, a time-out or a server restart);
 - the run's worktree mounted read-write at `/workspace` (the builder edits on the host and builds in
-  the container: the same files); nothing else from the host is mounted;
+  the container: the same files), and the project's uploaded files read-only at `/project-files` (see
+  "Using an uploaded SDK"); nothing else from the host is mounted;
 - rootless Podman: the containers belong to the factory's unprivileged service user, never to root, are
   never privileged, and Agern — not your file — decides mounts, network, capabilities and limits;
 - sidecars on a private network of the run, reachable by service name from that run only;
@@ -94,12 +95,16 @@ services:
       command: pg_isready -h 127.0.0.1 -U postgres
       timeoutSeconds: 60                          # 1–600, default 60
 
-# Directories kept between runs of this project (at most 10): absolute, not /workspace, not system
-# directories, not overlapping. One volume per path (per platform).
+# Directories kept between runs of this project (at most 10): absolute, not /workspace or /project-files,
+# not system directories, not overlapping. One volume per path (per platform).
 caches: [ /home/ubuntu/.gradle ]
 
 # Per container; capped by the server (FACTORY_SANDBOX_MAX_CPUS, _MAX_MEMORY: default 2 and 4g).
 resources: { cpus: 2, memory: 4g }
+
+# Project files the run needs (at most 50), by their name on the project's Files page. A run fails
+# early when one is not uploaded. Optional. See "Using an uploaded SDK".
+files: [ vendor/sdk.zip ]
 
 # Other images to test on (at most FACTORY_SANDBOX_MAX_PLATFORMS, default 4). See "Platforms".
 platforms:
@@ -243,6 +248,55 @@ build output that belongs to a run (that stays in `/workspace`) or for anything 
 project can use a cache at the same time; tools whose caches are not safe for concurrent use (few are)
 need their own locking.
 
+## Using an uploaded SDK
+
+Some builds need a file that must not be in git: a vendor SDK, a licensed library, a large test data set.
+Upload it to the project instead, and the sandbox gets it read-only. Say the build needs a vendor's SDK
+as `sdk.zip`:
+
+1. Open the project's **Files** page (the *Files* row in the project's activity panel) and upload the
+   archive under the name `vendor/sdk.zip`. Admins and the project's file managers can upload; the page
+   shows who that is.
+2. Name it under `files:` and unpack it in `setup`:
+
+   ```yaml
+   image: docker.io/library/eclipse-temurin:21-jdk
+   files: [ vendor/sdk.zip ]
+   setup: |
+     apt-get update && apt-get install -y --no-install-recommends unzip
+     unzip -q "$AGERN_PROJECT_FILES/vendor/sdk.zip" -d /opt/sdk
+   env:
+     SDK_HOME: /opt/sdk
+   ```
+
+3. An admin approves the changed file as usual.
+
+What to know:
+
+- **Where the files are.** Every command container of a run — the default one, each platform's and the
+  review sandbox — has the run's project files mounted **read-only** at `/project-files`, and
+  `AGERN_PROJECT_FILES=/project-files` in its environment (if `env:` sets the same name, Agern's value
+  wins). Services do not get them. Setup and commands see the same files, so unpack or copy them anywhere
+  outside `/workspace` (`/opt`, `/tmp`, the user's home); `/project-files` itself cannot be written and
+  cannot be a cache. A non-root `user:` can read them.
+- **Never in `/workspace`.** Nothing copies the files into the worktree, and nothing should: whatever is
+  in `/workspace` can be committed. Before every push Agern checks the branch and refuses to push a
+  commit that contains a project file, byte for byte (the run then needs a human). It cannot recognise
+  an unpacked or modified copy, so do not unpack into the worktree either.
+- **A snapshot per run.** A run gets the files as they are when it starts; replacing or deleting a file
+  later does not change a run that already started.
+- **`files:` makes a missing file fail early.** With an approved file, a run whose `files:` names a file
+  that is not uploaded fails at its start, before the spec writer: "`.agern/sandbox.yml` needs project
+  file(s) `vendor/sdk.zip` that are not uploaded. Upload them on the project's Files page and start the
+  run again." The project's Sandbox page marks such names "not uploaded". Without `files:` the files are
+  mounted all the same; the list only adds the check (names are compared ignoring case).
+- **A new version needs no new approval.** The approval is of `.agern/sandbox.yml`'s content, not of the
+  files' bytes: replacing `vendor/sdk.zip` with a new version takes effect with the next run. The run
+  page lists the files a run got, with their hashes, and marks one "changed since the previous run".
+
+Chats and agents that run on the host find the same files in `$AGERN_PROJECT_FILES` (a run's snapshot,
+or for a chat the project's current files), also read-only by convention.
+
 ## Limits
 
 | | |
@@ -290,6 +344,11 @@ A command that uses more memory than the limit is killed by the kernel; the sand
 - **The app stops between reviewer commands:** start it detached with every stream redirected
   (`nohup <start> > /tmp/app.log 2>&1 < /dev/null &`); a command that hits its time limit restarts the
   container and kills the app.
+- **"… needs project file(s) … that are not uploaded":** upload them on the project's Files page under
+  exactly the names in `files:` (or remove them from the list), then start the run again.
+- **"Not pushed: the branch contains project file …":** a commit of the run's branch contains a copy of
+  a project file. Remove it from every commit of the branch (deleting it in a later commit is not
+  enough); see "Using an uploaded SDK".
 - **Permission denied in a cache:** the cache was filled by an earlier version of the file that ran as
   root; ask an admin to remove the project's cache volumes (`agern sandbox prune --caches` removes the
   unused ones).
