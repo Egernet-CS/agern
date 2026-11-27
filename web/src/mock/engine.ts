@@ -1351,6 +1351,7 @@ function makeRun(repo: string, issue: Issue, owner: User, createdMs: number, sta
     stages: [],
     sandbox: runSandboxFor(repo),
     sandboxVm: runSandboxVmFor(repo),
+    projectFiles: null,
     releaseId: release?.id ?? null,
     baseBranch: release ? `release/${release.name}` : null,
     conversation: { sessionId: null, review: 'none', followUpFrom: null },

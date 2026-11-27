@@ -37,9 +37,13 @@ throwaway database.
 
 All persistent state lives in PostgreSQL, including the bytes of chat attachments, of the screenshots
 reviewers attach to their stage (§6 "Screenshots") and of project icons (§8 "Project icons"). The only things on disk are git workspaces, the
-per-user Claude home directories and the agents' copies of chat attachments (a cache of the database,
-§5), all under `FACTORY_DATA_DIR` — plus, with sandboxes on, the service user's Podman storage (images,
-per-run containers, per-project cache volumes; §5 "Sandboxes").
+per-user Claude home directories, the agents' copies of chat attachments (a cache of the database,
+§5) and the bytes of project files (§5 "Project files"), all under `FACTORY_DATA_DIR` — plus, with sandboxes on, the
+service user's Podman storage (images, per-run containers, per-project cache volumes; §5 "Sandboxes"). Project files are
+the one exception to "the database is the state": their metadata is in PostgreSQL, their bytes only in
+`$FACTORY_DATA_DIR/project-files/<repo>/` (`blobs/<sha256>` one file per distinct content, `current/<name>` the live
+view, `runs/<runId>/<name>` a run's snapshot, `uploads/<id>.part` uploads in flight), so the two are backed up
+together.
 
 ## 3. Configuration (environment variables)
 
@@ -83,6 +87,9 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_IMAGE_MAX_PER_TURN` | `8` | Images per chat message of the owner (1–100) |
 | `FACTORY_IMAGE_MAX_PER_STAGE` | `12` | Images per pipeline stage agent (1–200; each fix round is a new stage) |
 | `FACTORY_IMAGE_MAX_EDGE` | `2048` | Longest edge an agent may ask for, in pixels (256–4096) |
+| `FACTORY_PROJECT_FILES_MAX_FILE_MB` | `1024` | Largest single project file (1–102400; §5 "Project files") |
+| `FACTORY_PROJECT_FILES_MAX_PROJECT_MB` | `5120` | All files of one project together, open uploads included (1–1048576, at least the per-file limit) |
+| `FACTORY_PROJECT_FILES_MAX_TOTAL_MB` | `20480` | All projects' files on the server together, open uploads included (1–1048576, at least the per-project limit) |
 | `FACTORY_SANDBOX` | `off` | `off` or `podman`: per-run build/test sandboxes in rootless Podman (§5 "Sandboxes"). `off`: runs behave as before and the builder gets no sandbox tools; definitions can still be approved. `fake` (development and end-to-end tests only, accepted only with `FACTORY_DEV_FAKE_GITHUB`): an in-memory runtime that only pretends to run commands |
 | `FACTORY_SANDBOX_PODMAN` | `podman` | The podman binary |
 | `FACTORY_SANDBOX_PODMAN_URL` | unset | When set, every call is `podman --url <url> …` (podman-remote against a `podman system service`, e.g. `unix:///run/…/podman.sock`) |
@@ -229,7 +236,10 @@ user's own ChatGPT login instead of an API key.
 **Visibility.** A user may see a project, its issues, runs, sessions and transcripts if and only if
 their own GitHub token can read that repository (`GET /repos/{org}/{repo}` → 200; cached 60 s per
 user+repo). All GitHub calls made for a user use that user's token, so GitHub itself enforces
-access. A user without a GitHub token sees no projects.
+access. A user without a GitHub token sees no projects. A project's files (§5 "Project files") follow the
+repository's visibility: every project-file route under `/api/projects/{repo}/` answers 404 for a repository the caller
+cannot see, exactly like an unknown project, before any rights or the request body are checked (only the admin
+clean-up, §8, works without it).
 
 A workspace project (§5 "Workspace projects") adds one rule: every run and agent session records the member
 repositories that were checked out for it (`context_repos`: at a run's creation the target and every member the owner
@@ -569,6 +579,7 @@ services:                                            # optional sidecars (at mos
 caches: [ /root/.gradle, /root/.npm ]                # optional (at most 10): per-project named volumes
 resources: { cpus: 2, memory: 4g }                   # optional, capped by FACTORY_SANDBOX_MAX_CPUS / _MAX_MEMORY
 user: builder                                        # optional: commands run as this user (name or uid), not root
+files: [ vendor/sdk.zip ]                            # optional (at most 50): project files the run needs (§5 "Project files")
 platforms:                                           # optional (at most FACTORY_SANDBOX_MAX_PLATFORMS): other images
   jdk17:
     image: docker.io/library/eclipse-temurin:17-jdk  # validated like `image`
@@ -581,7 +592,8 @@ unknown keys at any level, an image without a registry (`debian:12`) or from a r
 `FACTORY_SANDBOX_REGISTRIES`, malformed image references, service names that are not DNS labels
 (lower-case, start with a letter, ≤ 31 characters; not `localhost`, `sandbox`, `workspace`, `host`,
 `gateway`), invalid environment names, cache paths that are not absolute, contain `..`, overlap, or lie
-in `/workspace` or a system directory, non-positive CPUs, memory below `64m`, platform names that are not
+in `/workspace`, `/project-files` or a system directory, a `files` value that is not a list, has more than 50 entries,
+an entry that is not a valid project file name or one listed twice (case-insensitively), non-positive CPUs, memory below `64m`, platform names that are not
 DNS labels or are `default` (the top-level image's name), more platforms than allowed, a readiness check
 without a command or with a timeout outside 1–600 s, and a `user` that is root (`0`, `root`), a uid
 outside 1–60000 or not a POSIX-style name (`[a-z_][a-z0-9_-]{0,31}`). Definitions written before these
@@ -734,8 +746,9 @@ mapping can take longer to start: rootless storage may copy the image's layers o
 services and their readiness commands, cache paths, setup, the user and limits within the caps. Never
 `--privileged`, never host network/pid/ipc/userns, no added capabilities (Podman's default rootless set), no devices,
 `no-new-privileges`, a PID limit of 4096, `--memory-swap` equal to `--memory`. The run's worktree is
-bind-mounted read-write at `/workspace` (the working directory); nothing else from the host is mounted (the review
-sandbox: the worktree read-only, plus its output directory, above).
+bind-mounted read-write at `/workspace` (the working directory) and the run's project files snapshot read-only at
+`/project-files` (below); nothing else from the host is mounted (the review sandbox: the worktree read-only, plus its
+output directory, above).
 Inside the rootless user namespace the container's root is the service user — with `user`, the user's uid
 is — so files the build writes in `/workspace` belong to that user on the host. Limits apply per container
 (sidecars and platform containers get the same limits as the sandbox). The exact command lines (`podman` or
@@ -751,8 +764,10 @@ run --detach --name agern-run-<id>-<svc> --label agern.run=<id> --label agern.re
 run --detach --name agern-run-<id> --label agern.run=<id> --label agern.repo=<repo> --label agern.role=sandbox
     --network agern-run-<id> --security-opt no-new-privileges --pids-limit 4096 --cpus <cpus> --memory <mem>
     --memory-swap <mem> --stop-timeout 5 --pull=missing [--cgroup-parent <FACTORY_SANDBOX_CGROUP_PARENT>]
-    --workdir /workspace --entrypoint sh [--env K=V …]
-    --mount type=bind,source=<worktree>,target=/workspace [--mount type=volume,source=<volume>,target=<path> …]
+    --workdir /workspace --entrypoint sh [--env K=V …] [--env AGERN_PROJECT_FILES=/project-files]
+    --mount type=bind,source=<worktree>,target=/workspace
+    [--mount type=bind,source=<run's project files snapshot>,target=/project-files,readonly=true]
+    [--mount type=volume,source=<volume>,target=<path> …]
     <image> -c "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"
 run … --name agern-run-<id>--<platform> … --label agern.role=platform --label agern.platform=<platform>
     …(as the sandbox container, with the platform's cache volumes)… <platform image> -c "<keep-alive>"   # platform, on first use
@@ -763,6 +778,7 @@ run … --name agern-review-<id>-<svc> … --label agern.role=review-service --l
 run --detach --name agern-review-<id> --label agern.run=<id> --label agern.repo=<repo> --label agern.role=review
     --network agern-review-<id> …(limits, user mapping as the sandbox container)… --workdir /workspace --entrypoint sh [--env K=V …]
     --mount type=bind,source=<worktree>,target=/workspace,readonly=true
+    [--mount type=bind,source=<run's project files snapshot>,target=/project-files,readonly=true]
     [--mount type=bind,source=<run dir>/.agern-run/review,target=/run/agern-review]
     [--mount type=volume,source=<volume>,target=<path> …] <image> -c "<keep-alive>"      # review sandbox
 exec --workdir / agern-run-<id>-<svc> sh -c <ready.command>                                      # readiness check, until exit 0
@@ -850,6 +866,21 @@ step. Nothing of the owner's credentials is passed into a container — no GitHu
 credential, no git configuration — and git does not work inside the sandbox (the worktree's `.git` points
 outside the mount): agents commit on the host as before. Builds that need private package registries are
 out of scope for this step.
+
+**Project files** (§5 "Project files"). Every command container of a run — the sandbox, each platform container and
+the review sandbox, not the services — bind-mounts the run's project files snapshot **read-only** at `/project-files`
+and gets `AGERN_PROJECT_FILES=/project-files` in its environment; when the definition's `env` names the same variable,
+the server's value wins. The setup script sees the files too, so it can unpack an SDK outside `/workspace` (e.g. under
+`/opt`); nothing copies them into `/workspace`. `/project-files` cannot be a cache path. `files:` names the project
+files a run needs (at most 50, validated like project file names, compared case-insensitively). It is part of the
+approved content like every other key, but the files' bytes are not: replacing a named file needs no new approval (the
+run page marks a file whose hash differs from the previous run's, §10). When `FACTORY_SANDBOX` is not `off` and the
+run's decision is `approved`, a named file that is not uploaded fails the run at its set-up, before the spec-writer (a
+release sync run: before its builder), with `failureKind` `other`: "`.agern/sandbox.yml` needs project file(s)
+`<name>`, … that are not uploaded. Upload them on the project's Files page and start the run again." An update round
+does not check again. `SandboxStatus.missingFiles` lists the named files that are not uploaded now, for the sandbox
+page. When the run has a sandbox, `factory_sandbox_info` carries `projectFiles: { path: "/project-files", readOnly:
+true, env: "AGERN_PROJECT_FILES", files: [{ name, size, sha256 }], note }` (the run's snapshot; §7).
 
 ### Deploy targets
 
@@ -1023,6 +1054,99 @@ log gets one line per operation, never the command or its output. Output is visi
 project.
 
 **Migration** `V30__sandbox_vm.sql`: tables `sandbox_vm_approvals` and `sandbox_vm_leases`, column `runs.sandbox_vm`.
+
+### Project files
+
+Some projects need files to build or test that must not be committed: a vendor SDK, a licensed library, large
+binaries, test data. A project keeps them in its **project files**: uploaded once in the web app (the project's Files
+page, §10) and handed read-only to every chat and run of the project. Package `dk.egernet.factory.files`
+(`ProjectFiles`), metadata in `db/ProjectFileStore`, the push check in `pipeline/ProjectFileGuard` (§6 "Project file
+guard").
+
+**Storage.** One store per repository, keyed by the bare repository name (a workspace's chats use the workspace
+repository's, a workspace run its target member's, below); a renamed repository does not take its files along. The
+metadata is in PostgreSQL (migration `V33__project_files.sql`: `project_files`, unique on `(repo, lower(name))`;
+`project_file_uploads`; `project_file_managers`; the column `runs.project_files`), the bytes only on disk under
+`$FACTORY_DATA_DIR/project-files/<repo>/`:
+
+- `blobs/<sha256>` — one regular file per distinct content, mode 0444;
+- `current/<name>` — hard links to the blobs, the live view chats get;
+- `runs/<runId>/<name>` — hard links, a run's snapshot (below);
+- `uploads/<uploadId>.part` — uploads in flight.
+
+`project-files/` itself is mode 0700; the view directories carry no write bits except while the server changes them.
+Disk paths are built only from validated repository and file names, UUIDs and hex hashes, and every resolved path is
+checked to stay inside its repository's directory without following symlinks. The server never executes, unpacks or
+sniffs a file and never holds one in memory: every copy, hash and download goes through a 1 MiB buffer. Nothing is
+encrypted at rest beyond the 0700 directory, which keeps other OS users out, not the agents (below).
+
+**Names.** 1–200 characters in 1–8 segments separated by `/`; each segment matches `^[A-Za-z0-9_][A-Za-z0-9._+@-]{0,99}$`
+(so no empty, `.` or `..` segment, no leading `-`, no spaces); anything else is 400 `invalid_file_name`. Names are unique
+per repository regardless of case: uploading `SDK.zip` when `sdk.zip` exists replaces that file, which keeps its name. A
+name may not be a directory of another (`vendor` and `vendor/sdk.zip`), counting open uploads: 409 `name_conflict`.
+
+**Versions.** A file keeps its id across replacements; `version` is 1 and grows by one per replacement. Only the current
+version's bytes are kept: a replacement or a deletion unlinks the old blob as soon as no file of the repository has that
+content (a run's snapshot keeps its own hard link, so the run keeps its bytes). The history is the audit log (below). A
+replacement without a note keeps the old note.
+
+**Limits.** `FACTORY_PROJECT_FILES_MAX_FILE_MB` per file (413 `file_too_large`), `FACTORY_PROJECT_FILES_MAX_PROJECT_MB`
+per project (413 `project_quota_exceeded`) and `FACTORY_PROJECT_FILES_MAX_TOTAL_MB` for the whole server (413
+`total_quota_exceeded`), the last two counting the current versions plus open uploads, without the file being
+replaced; at most 200 files per project (409 `too_many_files`; a replacement does not count). Empty files are refused
+(422 `empty_file`). Opening an upload needs its size plus a reserve of 256 MiB free on the file system (507
+`insufficient_storage`). Limits are checked when an upload is opened and again when it completes. Notes have at most
+2,000 characters.
+
+**Permissions.** Everyone who can see the repository (§4 "Visibility") sees the list: names, sizes, hashes, versions,
+notes, who uploaded each and when. Uploading, replacing, deleting, the note and the download switch are for admins and
+the repository's **file managers**, a list of usernames (at most 100) that only admins set (403 otherwise). The bytes
+leave the server through the browser only when a manager switched **download** on for that file (off by default; 403
+`download_disabled` otherwise), and then for everyone who can see the repository. Every change and download is written
+to `auth_audit`: `project_file_uploaded`, `project_file_replaced`, `project_file_deleted`, `project_file_downloaded`,
+`project_file_updated` (note, download switch), `project_file_managers_changed` and `project_files_purged`, with the
+repository, name, version, SHA-256 and size.
+
+**Uploads.** Resumable and streamed. `POST …/file-uploads` validates the name, the limits and the free space and opens
+an upload (201); an open upload of the same name, size, declared hash and user is returned as it is (200), so the
+client goes on at its `received`, and any other open upload of that name is discarded. `PUT …/file-uploads/{id}?offset=
+<received>` appends the body (409 `upload_offset_mismatch` for another offset, 409 `upload_busy` while another chunk of
+it is written; bytes beyond the declared size are not kept, 413 `file_too_large`); a body that breaks off keeps what
+arrived. `POST …/complete` needs every byte (409 `upload_incomplete`), computes the SHA-256 in one pass and, when the
+uploader declared one that differs, discards the upload (422 `checksum_mismatch`); then, under the repository's lock,
+it checks the limits again, moves the bytes into `blobs/`, writes the row and only then points `current/<name>` at the
+blob (an atomic rename, so a reader sees the old or the new bytes) and writes the audit entry. A failed database write
+leaves `current/` as it was. Uploads are deleted 24 hours after their last write (checked at server start and whenever
+an upload is opened), part files without a row too.
+
+**Runs.** Every run — issue, release and sync runs — snapshots the files of the repository it changes (`targetRepo ??
+repo`) at its set-up, before the sandbox decision: `runs/<runId>/` with hard links to the current blobs (empty when the
+project has none), recorded as `Run.projectFiles` (§8) with each file's name, size, SHA-256, version, `required` (the
+run's approved sandbox definition names it under `files:`) and `previousSha256` (only when the latest earlier run of
+the same repository recorded another hash for that name). Replacing or deleting a file later does not change the
+snapshot. A step retry keeps its snapshot while the directory exists; update rounds, the advisor and follow-up reviews
+use the run's snapshot, made again from the current files when it is gone. A snapshot is removed with the run's
+worktree, and at server start for every run that is not live.
+
+**Environment.** Every agent gets `AGERN_PROJECT_FILES` (it never overrides a variable the launcher sets itself): stage
+agents and the advisor the run's snapshot directory, a chat the repository's `current/` directory, which follows
+replacements at once. Inside a sandbox the same files are at `/project-files` (§5 "Sandboxes"). Every role prompt has a
+"Project files" paragraph (read-only; never copy, move, unpack or commit them into the repository or attach them to
+issues, pull requests or comments; unpack them outside the working directory, e.g. under `/tmp`;
+`factory_list_project_files` lists them, §7). The task prompts of the spec-writer, the builder (build, continue, fix and
+update rounds, sync runs), the reviewers and the advisor's run context add one line when the run has files: "Project
+files: read-only at `<dir>` (`/project-files` in the sandbox), also in `$AGERN_PROJECT_FILES`; never copy them into the
+repository: <name> (<size>, sha256 <first 12 hex>), …", at most 50 files named.
+
+**Read-only is advisory on the host.** Agents run as the server's OS user (§5 "Known limitation (v1)"), which owns the
+files; the 0444 and 0555 modes keep honest tools from writing, not an agent that wants to. Only the sandbox's read-only
+bind mount is enforced. The push guard (§6) is what keeps a project file out of GitHub.
+
+**Clean-up.** Nothing deletes project files implicitly: not a deleted or renamed repository, not losing access to it.
+Managers delete single files; admins delete all files of a repository (`DELETE /api/admin/project-files/{repo}`, the
+admin page's "Delete all files"): its rows and open uploads and its `current/`, `blobs/` and `uploads/` directories,
+also for a repository the admin cannot see or that no longer exists. The managers list stays, and run snapshots keep
+their hard links until their runs are cleaned up.
 
 ## 6. The pipeline
 
@@ -1485,7 +1609,8 @@ commits and nothing uncommitted), `step` (with `failedStep`), `other`; and, on a
 `submodule_commit_missing` (with `failedStep` `merge`, §6 "Submodule pointers"), `checks` (with `failedStep`
 `merge`: the checks failed, did not finish in time or could not be read, §6 "Checks before a merge"),
 `migration_conflict` (no `failedStep`) and `merge_conflict` (with `failedStep` `merge`), the two that make "Update and
-merge" available (`FailureKind.UPDATABLE`). `FailureKind.INTERRUPTED` holds the four kinds of the recommendation rule.
+merge" available (`FailureKind.UPDATABLE`); and `project_file_committed` (no `failedStep`) on a `needs_human` run whose
+push was stopped because the branch contains a project file (§6 "Project file guard"). `FailureKind.INTERRUPTED` holds the four kinds of the recommendation rule.
 A run fails with `api_unreachable` only after it waited for the network and gave up, reached the limit, or when
 waiting is switched off (§6 "Transient failures").
 
@@ -1493,7 +1618,8 @@ waiting is switched off (§6 "Transient failures").
 refusal (403), as for every action that makes agents run on the owner's credentials (§4) — and the owner needs a
 Claude credential (422 `claude_credential_required`). A single run must be `failed` or `cancelled` (409
 `run_not_retryable`), except that a `needs_human` run accepts `update` (or `recommended` when that is `update`) and
-nothing else; a release run is retried through its release (409 `release_run`). The automatic update of a release
+nothing else — and one stopped for a committed project file accepts `continue` and `start_over` instead (§6 "Project
+file guard"); a release run is retried through its release (409 `release_run`). The automatic update of a release
 runs as the release's owner, who owns its runs. A mode that is not available
 is 409 `retry_mode_unavailable`; an unknown one is 400.
 
@@ -2015,6 +2141,54 @@ administrative directory (`.git/worktrees/<name>/modules/…`), which goes when 
   of the root is bundled with the root.
 
 The run page makes an approver's escalation harder to override with one click (§10 "Conversation at needs human").
+
+### Project file guard
+
+A project file (§5 "Project files") must never reach GitHub, whatever an agent did with it. Before each of the four
+pushes of a run's branch — the run's push after its builder, the push of an update round, the push before a follow-up
+review at `needs_human`, and every push of a sync run — the server checks the branch (`ProjectFileGuard`; the git calls
+in `GitOps.newBlobs` and `GitOps.blobId`):
+
+- *New blobs.* `git rev-list --objects HEAD --not <base ref> --remotes=origin`, then `git cat-file --batch-check`: every
+  blob the push would publish for the first time, i.e. reachable from `HEAD` but neither from the run's base ref nor
+  from any `origin` remote-tracking ref, with its size and the first path it was seen under. Every commit counts, also
+  one whose file a later commit deleted.
+- *Candidates.* The repository's current files and the run's snapshot (whose bytes may differ from the current ones),
+  each read from its file on the server; files whose bytes are gone are skipped.
+- *Comparison by git object id.* A git object id is not the SHA-256 of the content, so a candidate is hashed as git
+  would store it (`git hash-object --no-filters` in the worktree, i.e. in the repository's object format) — only
+  candidates whose size equals some new blob's size, one per content — and a new blob whose id equals a candidate's is
+  a match. Only byte-identical copies are found: unpacked, re-compressed or modified copies are not detected.
+
+**A match stops the push.** Nothing is pushed, and the reason is "Not pushed: the branch contains project file `<name>`
+(sha256 `<first 12 hex>`) committed as `<path>`, … . Project files must not be committed. Remove it from every commit of
+the branch (a later commit that deletes it is not enough), then use Retry → Continue, or talk to the agent on the run
+page." (at most 10 matches named, then ", and N more"). What follows depends on the push:
+
+- *The run's push*: the sandbox (and the sandbox VM's build lease) is released, the reviewers and the approver are
+  skipped, the reason goes to the builder's transcript as an `error` event, and the run goes to `needs_human` through
+  the usual path (label, issue comment, `error`) with `failureKind` `project_file_committed` and no `failedStep`.
+  Such a run has no pull request, so it cannot be approved; the run page offers "Retry…" instead of "Approve". A retry
+  with `continue` (recommended when the branch has commits) or `start_over` ends it as `failed` — its local branch is
+  kept ("Worktrees and branches") — and starts a new run as for a failed run; the continuing builder's prompt carries the
+  reason. Talking to the advisor works too, and its follow-up review checks again.
+- *An update round* fails through its failure path ("Update round n of m with `<target>` did not finish: Not pushed:
+  …"): nothing of it is on GitHub, so branch and worktree go back to where they were and the run keeps its previous
+  failure; the builder's transcript gets the `error` event.
+- *A follow-up review* does not happen: the review stays `required` and the advisor's transcript gets "The follow-up
+  review of the changes did not complete: Not pushed: …".
+- *A sync run* fails ("Could not bring `release/<name>` up to date with `<target>`: Not pushed: … . Nothing was pushed.")
+  after an `error` event in its builder's transcript.
+
+**Fails closed.** When the check itself cannot be made (git fails, a file cannot be read), the push does not happen
+either and fails as a push failure: "Not pushed: the project-file check could not be made (<why, at most 500
+characters>). Nothing was pushed; retry the push." (a run: `failureKind` `step`, `failedStep` `push`, so a step retry is
+offered).
+
+**Large files.** New blobs of 10 MiB or more that are no project file do not stop the push; the builder's transcript (the
+advisor's for a follow-up review) gets one `warn` event, "Large new file(s) in this branch: `<path>` (<size>), … . If one
+is a vendor or licensed file, it belongs in the project's Files, not in git." (largest first, at most 10 named). Each
+blob is reported once per run (remembered in memory, so a restart may repeat it).
 
 ### Conversation at needs human
 
@@ -2903,17 +3077,18 @@ server in Claude Code on their own computer (`claude mcp add --transport http <n
   to its creation (`Cache-Control: no-store`); it is never logged, never written to `auth_audit` and never returned
   again. Creating one needs a full (2FA) web session; `/mcp` ignores cookies.
 - *Scope.* One user, one project (the token's `repo`), and the tools `McpRegistry.PERSONAL_TOOLS`: the chat tools
-  without `factory_generate_image`. Calls behave as for the chat agent of that user in that project, with the same
+  without `factory_generate_image` and `factory_list_project_files`. Calls behave as for the chat agent of that user in that project, with the same
   permission rules (the same service methods are called): `factory_approve_run` and `factory_send_to_agent` only for
   the user's own runs, `factory_approve_release` only for their own releases, `factory_start_run` without a Claude
   credential answers `Register a Claude credential in Settings first`. There is no session: runs started with a
   personal token have no `startedBySessionId`, messages to agents are recorded with `origin: "direct"`, software
   requests have no session. `factory_approve_run` and `factory_cancel_run` refuse a run of another project (`Run
-  belongs to another project`), like `factory_get_run`. Any other tool (sandbox, screenshot, image) is refused as
+  belongs to another project`), like `factory_get_run`. Any other tool (sandbox, screenshot, image, project files) is refused as
   `Tool <name> is not available to this agent`.
 - *Why no image tool.* `factory_generate_image` belongs to an agent session: files are written on the server for
   that agent, the result is offered for selection in the chat, and the budget is per chat message. A local Claude
-  could not read the returned server path.
+  could not read the returned server path. `factory_list_project_files` is left out for the same reason: its paths are
+  on the Agern server (refused like the other tools outside the scope).
 - *Validity, checked on every request.* The row exists and is not revoked; `expires_at` is null or after now; the user
   row still exists (it cascades on delete); and `Access.canSee(user, repo)` holds. Visibility comes from the user's own
   GitHub token and is cached for 60 s, so losing GitHub access takes effect within a minute; removing the GitHub
@@ -2984,12 +3159,12 @@ first (update round k of max). It merges by itself when the reviewers and the ap
 `factory_start_run` (and `/factory run`) appends the sentence about other active runs in the project when there are
 any (§6, "Other active runs"). No tool and no argument merges despite the checks (§6 "Checks before a merge"); "Update
 from base branch" has no tool or chat command (web and HTTP API only). `factory_approve_run` and `factory_approve_release` are both refused (tool error with the
-`merge_on_github` message) for a project that merges on GitHub (§6 "Merge policy"). Pipeline-stage agents get only `factory_get_issue`
-and `factory_request_software`; with sandboxes switched on (`FACTORY_SANDBOX` not `off`) the builder also
+`merge_on_github` message) for a project that merges on GitHub (§6 "Merge policy"). Pipeline-stage agents get only `factory_get_issue`,
+`factory_request_software` and `factory_list_project_files`; with sandboxes switched on (`FACTORY_SANDBOX` not `off`) the builder also
 gets `factory_sandbox_info`, `factory_sandbox_exec` and `factory_sandbox_wait`, the spec-writer `factory_sandbox_info`
 only, and the `ux` and `ui-design` reviewers of pipeline review rounds of an approved run the three sandbox tools for
 the review sandbox; the builder of a run with an approved sandbox VM also gets the four `factory_sandbox_vm_*` tools
-(below); the `ux` and `ui-design` reviewers also get `factory_attach_screenshot`. The chat agent, the spec-writer and the builder also get `factory_generate_image`. The advisor (§6 "Conversation at needs human") gets the same two stage tools, bound to its
+(below); the `ux` and `ui-design` reviewers also get `factory_attach_screenshot`. The chat agent, the spec-writer and the builder also get `factory_generate_image`. The advisor (§6 "Conversation at needs human") gets the same three stage tools, bound to its
 run, and nothing else: no approve, cancel, start, release, sandbox, sandbox VM, screenshot, image or deploy tool.
 
 Deploy tools (§5 "Deploy targets"), chat agents only and only when `FACTORY_DEPLOY` is not `off`. They are not in
@@ -3033,6 +3208,16 @@ errors with one sentence each.
 - `factory_sandbox_vm_wait { handle?, waitSeconds? }` → the operation's answer, or `running: true`; as
   `factory_sandbox_wait`, over the last 20 results of the lease.
 
+Project files tool (§5 "Project files"), chat agents and every pipeline-stage agent (the advisor included), not personal
+tokens:
+- `factory_list_project_files {}` → JSON `{ path, sandboxPath?, readOnly: true, files: [{ name, size, sha256, version,
+  note, uploadedBy, uploadedAt }], note }`. For a grant bound to a run (stage agents, the advisor) the run's snapshot:
+  `path` is its directory on the host (the agent's `$AGERN_PROJECT_FILES`), `sandboxPath` `/project-files` when the
+  run's sandbox decision is `approved` and sandboxes are on, and the files the run recorded; `note`, `uploadedBy` and
+  `uploadedAt` only while that content is still the current version (null otherwise). For a chat the repository's
+  current files and its `current/` directory. Names, sizes and hashes only, never content; `note` repeats that the files
+  are read-only and must never be copied, unpacked or committed into the repository or attached anywhere.
+
 Image tool (§6 "Generated images"), chat, spec-writer and builder only:
 - `factory_generate_image { prompt, purpose, size?, format?, count?, transparentBackground?, issueNumber? }` —
   `prompt` 1–4000 characters; `purpose` one line, 1–200 characters (e.g. "app icon"); `size` `WIDTHxHEIGHT` (default
@@ -3065,7 +3250,9 @@ spec-writer (`exec` and `wait` with a plan scope are refused: `The spec-writer c
   known once created; `readiness`: `unchecked`, `checked on creation` or `ready`) and, when a service has
   no check, `servicesNote` (it may still be starting); `caches`, `env` (names only), `setup` (boolean),
   `limits: { cpus, memory, execTimeoutSeconds, outputTailChars, toolCallTimeoutSeconds }`,
-  `capacity: { inUse, max, heldByThisRun }` and, while a command runs, `command: { handle, running: true, elapsedMs }`.
+  `capacity: { inUse, max, heldByThisRun }`, `projectFiles: { path: "/project-files", readOnly: true, env:
+  "AGERN_PROJECT_FILES", files: [{ name, size, sha256 }], note }` (the run's snapshot, mounted read-only in every
+  command container; §5 "Sandboxes") and, while a command runs, `command: { handle, running: true, elapsedMs }`.
   For the spec-writer it adds `access: "plan"` and a `note` (it cannot run commands; the builder does; the UI reviewers
   get a separate read-only review sandbox) and never creates anything. For a reviewer it describes the review
   sandbox: no `platforms`/`platformNote`, plus `access: "review"`, `readOnly: true`, `outputDir: { container:
@@ -3312,6 +3499,7 @@ type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; 
   stages: Stage[];
   sandbox: RunSandbox | null;  // the run's sandbox decision (§5 "Sandboxes"); null until the workspace is ready / older runs
   sandboxVm: RunSandboxVm | null;  // the run's sandbox VM decision and preview (§5 "Sandbox VMs"); null without a decision
+  projectFiles: RunProjectFiles | null;  // the project files the run got (§5 "Project files"); null for runs from before
   releaseId: string | null;  // the release this run builds an issue for (null: a single run, or the release was deleted)
   baseBranch: string | null;  // the branch it starts from and merges into; null = the default branch; a workspace run: the member's base
   targetRepo: string | null;       // a workspace run: the member repository it changes (§6 "Workspace runs"); null otherwise
@@ -3319,7 +3507,8 @@ type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; 
   conversation: RunConversation;  // always present; default { sessionId: null, review: 'none', followUpFrom: null }
   continuesRunId: string | null;   // the failed run this one continues from its commits (§6 "Retrying a run")
   continuedByRunId: string | null; // the newest run that continues this one
-  failureKind: 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | 'submodule_commit_missing' | 'checks' | null;
+  failureKind: 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | 'submodule_commit_missing' | 'checks'
+    | 'migration_conflict' | 'merge_conflict' | 'project_file_committed' | null;
   failedStep: 'push' | 'pull_request' | 'merge' | null;  // the step after the builder that failed
   mergePolicy: MergePolicy;        // the project's policy when the run started; never changes
   mergedOnGitHub: boolean;         // merged on GitHub outside Agern (followed `github` runs)
@@ -3375,7 +3564,8 @@ type RunSandbox = { state: 'disabled' | 'none' | 'invalid' | 'unapproved' | 'app
   platforms: string[];       // the definition's platforms ('approved' only; [] for older runs)
   platformsUsed: string[];   // where the builder ran commands, 'default' and platform names in first-use order
                              // (filled only when there are platforms)
-  reviewUsed: boolean };     // a review sandbox of the run was created (the ux and ui-design reviewers used it)
+  reviewUsed: boolean;       // a review sandbox of the run was created (the ux and ui-design reviewers used it)
+  files: string[] };         // project files the definition names under `files:` ('approved' only; [] for older runs)
 
 type SandboxDefinition = { image: string; setup: string | null; env: Record<string, string>;
   services: { name: string; image: string; env: Record<string, string>;
@@ -3386,7 +3576,8 @@ type SandboxDefinition = { image: string; setup: string | null; env: Record<stri
   platforms: { name: string; image: string;
     setup: string | null;    // effective: the platform's own, or the top-level one when setupInherited
     setupInherited: boolean }[];
-  user: { name: string | null; uid: number } | null };    // null: commands run as root; name null: given as a uid
+  user: { name: string | null; uid: number } | null;     // null: commands run as root; name null: given as a uid
+  files: string[] };         // project files the definition needs (`files:`), by name
 type SandboxApproval = { sha256: string; content: string; approvedBy: { username: string; displayName: string }; approvedAt: string };
 type SandboxStatus = { repo: string;
   enabled: boolean;          // FACTORY_SANDBOX is not off
@@ -3396,7 +3587,38 @@ type SandboxStatus = { repo: string;
   errors: string[];          // state 'invalid'
   definition: SandboxDefinition | null;                    // when valid
   approval: SandboxApproval | null;                        // the project's approval, possibly of other content (diff)
-  approvers: { username: string; displayName: string }[] };  // who can approve: the admins (configured or known)
+  approvers: { username: string; displayName: string }[];   // who can approve: the admins (configured or known)
+  missingFiles: string[] };  // names under the definition's `files:` that are not uploaded to the project now
+
+type ProjectFile = { id: string;    // stable across replacements (§5 "Project files")
+  name: string; size: number;
+  sha256: string;            // lower-case hex of the current version, computed by the server
+  version: number;           // 1, plus one per replacement
+  note: string | null;
+  downloadable: boolean;     // the bytes may be downloaded through the browser (default false)
+  uploadedBy: { username: string; displayName: string } | null;   // of the current version; null: user gone
+  uploadedAt: string };
+type ProjectFileUpload = { id: string; name: string; size: number;
+  received: number;          // bytes on the server: the offset of the next chunk
+  sha256: string | null;     // declared by the uploader, checked at completion
+  note: string | null; createdBy: { username: string; displayName: string } | null;
+  createdAt: string; touchedAt: string;
+  expiresAt: string;         // touchedAt + 24 h: discarded unless more bytes arrive
+  replaces: string | null }; // the id of the file it replaces when completed; null: a new name
+type ProjectFilesLimits = { maxFileBytes: number; maxProjectBytes: number; maxTotalBytes: number; maxFiles: number };
+type ProjectFiles = { repo: string;
+  canManage: boolean;        // the caller is an admin or on `managers`
+  files: ProjectFile[];      // by name, case-insensitively
+  managers: { username: string; displayName: string }[];   // the file managers list (admins manage without being on it)
+  usage: { files: number; projectBytes: number; totalBytes: number };   // current versions' sizes
+  limits: ProjectFilesLimits;
+  uploads: ProjectFileUpload[] };   // open uploads; only for callers who can manage, [] otherwise
+type RunProjectFiles = { repo: string;    // the repository whose files the run got (targetRepo ?? repo)
+  files: { name: string; size: number; sha256: string; version: number;
+    required: boolean;                     // the run's approved sandbox definition names it under `files:`
+    previousSha256: string | null }[] };   // the previous run's hash for this name, only when it differs
+type AdminProjectFiles = { totalBytes: number; limits: ProjectFilesLimits;
+  repos: { repo: string; files: number; bytes: number }[] };   // counts only, never file names
 
 type RunningSandbox = { runId: string; repo: string;
   visible: boolean;          // false when the admin cannot see the repository: issueTitle is null then
@@ -3666,6 +3888,16 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `DELETE /api/projects/{repo}/sandbox-vm/approval` | → `SandboxVmStatus` | admin; removes the approval and deletes the repository's leases without `reset` |
 | `POST /api/projects/{repo}/sandbox-vm/check` | → `SandboxVmCheck` | admin. Connects, verifies the host key, authenticates, then runs `ready.command` once (60 s) if defined. 409 `sandbox_vm_disabled`, `sandbox_vm_not_approved`, `sandbox_vm_key_missing`. Connection problems are `200` with `ok: false` |
 | `DELETE /api/projects/{repo}/sandbox-vm/lease` | → `SandboxVmStatus` | admin; ends the VM's lease (`reset` runs). 404 when there is none |
+| `GET /api/projects/{repo}/files` | → `ProjectFiles` | anyone who can see the project (§5 "Project files"); `uploads` only for admins and file managers |
+| `POST /api/projects/{repo}/file-uploads` | `{ name, size, sha256?, note? }` → 201 `ProjectFileUpload` | admin or file manager (404 first when the project is invisible, then 403; both before the body is read). Opens a resumable upload; the caller's open upload with the same name, size and declared hash is answered as it is (200) to resume at `received`. 400 `invalid_file_name`, 400 malformed `sha256` or note over 2,000 characters; 422 `empty_file`; 413 `file_too_large`, `project_quota_exceeded`, `total_quota_exceeded`; 409 `name_conflict`, `too_many_files`; 507 `insufficient_storage` |
+| `GET /api/projects/{repo}/file-uploads/{id}` | → `ProjectFileUpload` | admin or file manager; `received` is what the server has. 404 unknown or expired |
+| `PUT /api/projects/{repo}/file-uploads/{id}?offset=<n>` | raw bytes → `ProjectFileUpload` | admin or file manager; appends the body, streamed, at `offset`, which must equal `received` (400 when missing, 409 `upload_offset_mismatch` otherwise); 409 `upload_busy` while another chunk of it is written; 413 `file_too_large` for bytes beyond the declared size (they are not kept). A body that breaks off keeps what arrived |
+| `POST /api/projects/{repo}/file-uploads/{id}/complete` | → `ProjectFile` | admin or file manager; 409 `upload_incomplete` until every byte arrived; 422 `checksum_mismatch` when the declared SHA-256 differs (the upload is discarded); the limits and name checks again. Publishes the file, or replaces the one with the same name (case-insensitive; `version` + 1). Audit `project_file_uploaded` / `project_file_replaced` |
+| `DELETE /api/projects/{repo}/file-uploads/{id}` | → 204 | admin or file manager; discards the upload and its bytes |
+| `PUT /api/projects/{repo}/files/{id}` | `{ note?, downloadable? }` → `ProjectFile` | admin or file manager; an empty `note` removes it, an absent field stays. Audit `project_file_updated` when something changed |
+| `DELETE /api/projects/{repo}/files/{id}` | → 204 | admin or file manager; the row, its `current` link and, when no other file has that content, its bytes. Runs already started keep their snapshot. Audit `project_file_deleted` |
+| `GET /api/projects/{repo}/files/{id}/content` | → bytes | anyone who can see the project, only when the file is `downloadable` (403 `download_disabled`). The only route that returns a project file's bytes: `application/octet-stream`, `Content-Disposition: attachment` with the last segment of the name, `nosniff`, `Cache-Control: private, no-store` and the attachments' sandboxing CSP; streamed from disk. Audit `project_file_downloaded` |
+| `PUT /api/projects/{repo}/file-managers` | `{ usernames: string[] }` → `ProjectFiles` | admin (404 when the admin cannot see the project, then 403). Replaces the repository's file managers list (at most 100; 400 naming unknown usernames). Audit `project_file_managers_changed` |
 | `POST /api/projects/{repo}/deploy/targets/{name}/check` | → `DeployCheck` | admin. Connects, verifies the host key, authenticates and disconnects; runs no command. 409 `deploy_disabled` (`FACTORY_DEPLOY=off`), `deploy_not_approved`, `deploy_key_missing`, `deploy_busy` (an operation runs on the target); 404 unknown target. Connection problems are `200` with `ok: false` |
 | `GET /api/projects/{repo}/runs` | → `Run[]` | newest first |
 | `POST /api/projects/{repo}/workspace/labels` | → `{ created: string[]; missing: string[] }` | creates the missing member labels with the caller's token (§5 "Member labels"); 403 `labels_forbidden`, 409 `not_a_workspace` / `workspace_invalid`, 404 when the caller cannot see the project |
@@ -3684,7 +3916,7 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `POST /api/runs/{id}/network/retry` | → `Run` | owner or admin; a run waiting for the network tries again now (§6 "Transient failures"); 409 `run_not_waiting_for_network` |
 | `POST /api/runs/{id}/network/give-up` | → `Run` | owner or admin; the waiting run fails now and is returned once failed; 409 `run_not_waiting_for_network` |
 | `GET /api/runs/{id}/retry` | → `RetryOptions` | anyone who can see the run; how it can be retried and what is recommended (§6 "Retrying a run"); for a sync run every option is unavailable with the reason "A run that brings a release up to date is not retried; …" |
-| `POST /api/runs/{id}/retry` | `{ mode?: 'update' \| 'step' \| 'continue' \| 'start_over' \| 'recommended' }` (body optional) → `Run` | owner only (admins included: 403), single runs that are `failed` or `cancelled` (409 `run_not_retryable`; a release run: 409 `release_run`; a sync run: 409 `sync_run`), or `needs_human` with `update` (the same run, now `building`; 409 `run_not_retryable` for another mode); no mode = `start_over`; 409 `retry_mode_unavailable`, `active_run_exists`; 400 unknown mode; 422 `claude_credential_required`. Answers the run now at work: the same run for `step` and `update`, a new one otherwise |
+| `POST /api/runs/{id}/retry` | `{ mode?: 'update' \| 'step' \| 'continue' \| 'start_over' \| 'recommended' }` (body optional) → `Run` | owner only (admins included: 403), single runs that are `failed` or `cancelled` (409 `run_not_retryable`; a release run: 409 `release_run`; a sync run: 409 `sync_run`), or `needs_human` with `update` (the same run, now `building`; 409 `run_not_retryable` for another mode) — except a `needs_human` run with `failureKind` `project_file_committed`, which accepts `continue`, `start_over` or `recommended` (it ends as `failed` and a new run starts; 409 `retry_mode_unavailable` for `update` or `step`); no mode = `start_over`; 409 `retry_mode_unavailable`, `active_run_exists`; 400 unknown mode; 422 `claude_credential_required`. Answers the run now at work: the same run for `step` and `update`, a new one otherwise |
 | `GET /api/projects/{repo}/sessions?kind=chat` | → `AgentSession[]` | |
 | `POST /api/projects/{repo}/sessions` | `{ model? }` → `AgentSession` | new chat; needs Claude credential; without `model` the owner's effective `chatModel` |
 | `GET /api/agents?active=true` | → `AgentSession[]` | all kinds, across visible repos. `active=true`: `live` (a process exists, e.g. a chat idling between turns) or `starting`/`running` |
@@ -3703,6 +3935,8 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `GET /api/admin/sandboxes` | → `SandboxOverview` | admin. Every sandbox that exists on this server (also of repositories the admin cannot see, without their issue titles) |
 | `GET /api/admin/sandboxes/pending` | → `PendingSandbox[]` | admin. The projects the admin can see whose valid `.agern/sandbox.yml` on the default branch is not approved in this version (one GitHub read per project; unreadable ones are left out), by name |
 | `DELETE /api/admin/sandboxes/{runId}` | → `SandboxOverview` | admin. Removes that run's sandbox now (platform containers and services included); the run continues (§5 "Stopped by an admin"). 404 when the run has no sandbox right now |
+| `GET /api/admin/project-files` | → `AdminProjectFiles` | admin. Files and bytes per repository and in all, against the limits; never file names (§5 "Project files") |
+| `DELETE /api/admin/project-files/{repo}` | → 204 | admin. Deletes every file and open upload of the repository, also one the admin cannot see or that no longer exists; the managers list and the snapshots of runs already started stay. Audit `project_files_purged` |
 | `GET /api/admin/software-requests` | → `SoftwareRequest[]` | admin |
 | `POST /api/admin/software-requests/{id}` | `{ status, note? }` → `SoftwareRequest` | admin |
 
@@ -3739,6 +3973,10 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
   releasing: `release_not_ready`, `release_incomplete`, `release_empty`, `release_conflict`,
   `release_migration_conflict`, `release_submodule_commit_missing`, `release_submodule_check_failed`, `release_merge_failed`,
   `release_merge_method_unavailable`, `release_partially_merged`, `release_not_editable` (409).
+- Project files (§5 "Project files"): 400 `invalid_file_name`; 422 `empty_file`, `checksum_mismatch`; 413
+  `file_too_large`, `project_quota_exceeded`, `total_quota_exceeded`; 409 `name_conflict`, `too_many_files`,
+  `upload_offset_mismatch`, `upload_busy`, `upload_incomplete`; 507 `insufficient_storage`; 403 `download_disabled`,
+  and `forbidden` for a caller who is neither an admin nor a file manager.
 - Sandbox approval: stale hash → 409 `sandbox_definition_changed`; invalid definition → 422
   `sandbox_definition_invalid`.
 - Deploy targets: stale hash → 409 `deploy_definition_changed`; invalid definition → 422
@@ -4156,7 +4394,7 @@ Routes: `/login`, `/` (projects), `/p/:repo` (issues · CLI chat · agents), `/p
 `/p/:repo/releases/:releaseId` (a release's plan and build, below),
 `/p/:repo/sandbox` (the project's sandbox definition and its approval, below), `/p/:repo/deploy` (the project's
 deploy targets, key and approval, below), `/p/:repo/sandbox-vm` (the project's sandbox VM, its approval, key
-and lease, below), `/agents` (everything running), `/settings` (own credentials, and "Models & cost": the user's own model per
+and lease, below), `/p/:repo/files` (the project's files, below), `/agents` (everything running), `/settings` (own credentials, and "Models & cost": the user's own model per
 role and fix rounds, with presets — *Default* clears every choice, *Economy* picks Sonnet for chat and spec,
 Haiku for the four reviewers and one fix round), `/admin` ("Factory settings": the default models and the
 default and maximum fix rounds; installing software stays admin-only).
@@ -4560,7 +4798,8 @@ an example; the validation errors; waiting for approval; changed since the appro
 the definition (image, the user commands run as — "setup runs as root" —, setup script, platforms with their image and
 whether their setup is their own or the top-level one, environment, services with their readiness check or "no
 readiness check", caches, resources with the server's caps and that each platform in use is another container with
-these limits), a line diff
+these limits, and the project files it needs — "none", or each name under `files:` with a "not uploaded" tag for
+those in `missingFiles` and a line linking to the Files page), a line diff
 between the approved and the current content when they differ, and the raw file. Admins get "Approve…" — the
 confirmation names every image with its role (default, platform, service) and shows every setup script that will run
 and says plainly that they will run on the factory host for
@@ -4632,5 +4871,37 @@ VM"), failed (`role="alert"` with the step and error, the output in a collapsed 
 `system` event with `payload.sandboxVm` (`sandboxVmLogOf` in `components/chat/model.ts`) renders like a deploy block
 with a "sandbox VM" chip; the four tool calls are summarised next to the deploy ones. The mock (`web/src/mock/sandboxVm.ts`)
 implements every sandbox VM call.
+
+**Project files** (§5 "Project files"). Components in `web/src/components/files/FilesBits.tsx` (the project row's
+summary, the run line, the resumable upload hook and its row), the page `web/src/pages/Files.tsx`, the pure rules
+(names, chunks, limits; they must match the server's) in `web/src/lib/projectFiles.ts`, styles in
+`web/src/styles/sandbox.css`, the mock in `web/src/mock/files.ts`. The project page has a "Files" section after the
+Sandbox VM row, for every project: one row "Project files" linking to `/p/:repo/files` with "No files" or "<n> file(s)
+· <used> of <project limit>"; loading and error (Retry) as the other sections; it reloads on feed reconnect. The Files
+page (`Files · <repo> · Agern`; an invisible or unknown project shows "No project called …") follows the sandbox page's
+structure: crumbs, the heading, a usage line ("<used> of <limit> in this project · <used> of <limit> on this server ·
+largest file <limit>") and "Files here are available read-only to every chat and run of <repo> and are never committed
+or sent to GitHub."; people who cannot manage see who can ("Files are managed by admins and: …"). For admins and file
+managers an "Upload" card: a drop zone (a button for the keyboard: Enter or Space opens the file picker) and "Upload
+file" (several files at once). Each chosen file opens a dialog with its name (the file's name; it may contain `/`),
+an optional note and an optional expected SHA-256 ("The server refuses the file if its hash differs."), checked in the
+browser first (name rules, hash format, limits; "Replaces the existing <name> (v<n>)" when the name is taken). Uploads
+go in 8 MiB chunks; a failed chunk is tried again up to 5 times (after 1, 2, 4, 8 and 16 s), each time after reading
+`received` from the server, before the row says "Upload interrupted" with "Resume". A row shows the name, the state,
+percent and bytes and a progress bar (`role="progressbar"`), with Cancel (which deletes the upload on the server),
+Resume or Dismiss. Leaving the page stops sending; the server keeps the upload, and open uploads this tab is not
+sending (another tab, a reload) are listed with "Choose the same file again to resume. Kept until <time>." (the file
+picker; a file of another size is refused) and Cancel. The files table: name, size, version, the SHA-256's first 12
+hex digits with "Copy" (the full hash as a tooltip), note, who uploaded it and when, and "Download" when downloadable
+(else "download off"); managers also get an "Allow download" checkbox and "Replace", "Edit note" and "Delete…" per
+file (the confirmation says that runs already started keep their copy and new runs and chats no longer get it; `Cancel`
+focused). Admins get a "Who can manage files" card: the managers with "Remove" and a username field with "Add".
+Outcomes are announced in a `polite` live region, errors with `role="alert"`. The run page shows, below the sandbox
+lines and only when the run got files, "Project files (n)" with each file's name, version, hash prefix and size, a
+"required by sandbox" tag for `required` and a "changed since the previous run" tag (with the previous hash prefix as
+a tooltip) for `previousSha256`, and a "Files" link to `/p/<projectFiles.repo>/files`. The admin page has a "Project
+files" card: the server's usage of its limit and the per-file and per-project limits, then one row per repository with
+files (repository linking to its Files page, files, size) with "Delete all files" (confirmation: every file and open
+upload goes, runs already started keep their copy, new runs and chats get none).
 
 Artwork is served from `web/public/art/` (see `art/README.md`).

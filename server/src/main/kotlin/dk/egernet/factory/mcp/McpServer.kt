@@ -49,6 +49,8 @@ class McpServer(
     cfg: dk.egernet.factory.Config,
     private val deploys: dk.egernet.factory.deploy.DeployManager? = null,
     private val sandboxVms: dk.egernet.factory.sandboxvm.SandboxVmManager? = null,
+    /** `factory_list_project_files`: the run's snapshot or, for a chat, the project's current files. */
+    private val projectFiles: (suspend (grant: McpGrant) -> String)? = null,
 ) {
     private val publicUrl = cfg.publicUrl.trimEnd('/')
     private val org = cfg.githubOrg
@@ -229,6 +231,12 @@ class McpServer(
             "it is still running: call it again.",
             schema(Triple("handle", "string", "Optional: the handle factory_sandbox_vm_deploy or factory_sandbox_vm_exec returned; default: the latest"),
                 Triple("waitSeconds", "integer", "Optional: wait at most this long (0: answer at once); default: until it ends"))),
+        Tool("factory_list_project_files", "List the project files this agent has: files the project needs but must not keep " +
+            "in git (vendor SDKs, licensed libraries, test data), uploaded to the project in Agern. Returns { path (on this host, " +
+            "also in \$AGERN_PROJECT_FILES), sandboxPath (inside the run's sandbox, when it has one), readOnly, files: [{ name, size, " +
+            "sha256, version, note, uploadedBy, uploadedAt }], note }. Names, sizes and hashes only, never content. The files are " +
+            "read-only and must never be copied, unpacked or committed into the repository.",
+            schema()),
         Tool("factory_request_software", "Ask an administrator to install software on the factory host. " +
             "Use this instead of installing system-wide software yourself.",
             schema(Triple("name", "string", "Software name, e.g. 'ffmpeg' or 'JDK 21'"),
@@ -528,6 +536,10 @@ class McpServer(
                 "factory_attach_screenshot" ->
                     screenshots.attach(grant.sessionId ?: return toolError("Only reviewers of a run can attach screenshots"), grant.runId, repo, owner, str("path"), str("caption"))
                 "factory_generate_image" -> images.generate(grant, owner, args)
+                "factory_list_project_files" -> {
+                    if (grant.personal != null) return toolError("Not available with a personal token")
+                    (projectFiles ?: return toolError("Project files are not available")).invoke(grant)
+                }
                 "factory_request_software" -> {
                     val sr = factory.requestSoftware(owner, repo, grant.sessionId, str("name") ?: "", str("reason") ?: "")
                     "Request ${sr.id} filed for '${sr.name}'. An administrator will handle it; continue without it for now."

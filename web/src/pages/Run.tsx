@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { api, ApiError, BLOCKING_CHECK_STATES, isRunActive, isRunWorking, isSyncRun, runRef, type AgentSession, type GeneratedImage, type Run, type RunCheckItem, type RunUpdate, type Screenshot, type StageRole } from '../api';
 import { ChatView } from '../components/chat/ChatView';
+import { RunProjectFilesLine } from '../components/files/FilesBits';
 import { RunSandboxLine } from '../components/sandbox/SandboxBits';
 import { RunSandboxVmLine } from '../components/sandboxvm/SandboxVmBits';
 import { SandboxVmPreviewPanel } from '../components/sandboxvm/SandboxVmPreview';
@@ -239,6 +240,7 @@ export function RunPage() {
         </dl>
         <RunSandboxLine run={run} />
         <RunSandboxVmLine run={run} />
+        <RunProjectFilesLine run={run} />
         {run.status === 'merged' && checks?.overriddenBy && (
           <p className="muted small run-override">Merged by {checks.overriddenBy} despite checks: {checks.detail}</p>
         )}
@@ -257,7 +259,8 @@ export function RunPage() {
                   </button>
                 </>
               )}
-              {!onGitHub && (
+              {/* Nothing was pushed when a project file was committed: there is no pull request to approve. */}
+              {!onGitHub && run.failureKind !== 'project_file_committed' && (
                 <button
                   className="btn btn--approve"
                   onClick={() => (escalation !== null ? setConfirmApprove(true) : void act('approve'))}
@@ -285,7 +288,8 @@ export function RunPage() {
           {run.status === 'needs_human' && !isOwner && !onGitHub && <span className="muted small">Waiting for {run.owner.username} to approve.</span>}
           {run.status === 'ready' && updateFromBaseButton}
           {run.status === 'waiting_for_checks' && (isOwner ? mergeAnywayButton : <span className="muted small">Waiting for checks; it merges by itself.</span>)}
-          {(run.status === 'failed' || run.status === 'cancelled') && isOwner && !isSyncRun(run) && (
+          {(run.status === 'failed' || run.status === 'cancelled' || (run.status === 'needs_human' && run.failureKind === 'project_file_committed')) &&
+            isOwner && !isSyncRun(run) && (
             <button className="btn btn--primary" onClick={() => setRetrying(true)} disabled={busy !== null}>Retry…</button>
           )}
           {active && (isOwner || me.isAdmin) && (

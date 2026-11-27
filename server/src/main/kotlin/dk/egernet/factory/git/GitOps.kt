@@ -80,6 +80,9 @@ data class BaseMerge(
  */
 data class MergeState(val merging: Boolean, val unmerged: List<String>, val dirty: Boolean, val containsTarget: Boolean, val head: String)
 
+/** A blob a branch adds ([GitOps.newBlobs]): its git object id, size in bytes and the first path it was seen under. */
+data class NewBlob(val sha: String, val size: Long, val path: String)
+
 /** Git operations the server performs itself (the agents run git on their own). */
 interface GitOps {
     /**
@@ -250,6 +253,16 @@ interface GitOps {
      * failure is logged and answered false. A no-op outside that mode.
      */
     fun landSquash(mainDir: Path, target: String, branch: String, title: String, home: Path): Boolean = false
+
+    /**
+     * The blobs reachable from HEAD of [worktree] that are reachable neither from [baseRef] nor from any `origin`
+     * remote-tracking ref: what a push of the branch would publish for the first time (docs/ARCHITECTURE.md §6 "Project
+     * file guard"). Every commit counts, also one whose blob a later commit deleted.
+     */
+    fun newBlobs(worktree: Path, baseRef: String, home: Path): List<NewBlob> = emptyList()
+
+    /** The git object id [file] would have as a blob in [worktree]'s repository (its object format), without writing it. */
+    fun blobId(worktree: Path, file: Path, home: Path): String = throw GitException("Not supported")
 }
 
 /**
@@ -808,6 +821,54 @@ class CliGitOps(
         } catch (e: Exception) {
             log.warn("Restoring {} to {} failed: {}", worktree, sha, e.message)
         }
+    }
+
+    override fun newBlobs(worktree: Path, baseRef: String, home: Path): List<NewBlob> {
+        require(baseRef.isNotBlank() && !baseRef.startsWith("-")) { "Invalid ref" }
+        val listed = git(worktree, home, null, "rev-list", "--objects", "HEAD", "--not", baseRef, "--remotes=origin", timeoutSec = 600)
+        val paths = LinkedHashMap<String, String>()
+        for (line in listed.lineSequence()) {
+            val sha = line.substringBefore(' ').trim()
+            if (!SHA_RE.matches(sha)) continue
+            paths.putIfAbsent(sha, if (' ' in line) line.substringAfter(' ') else "")
+        }
+        if (paths.isEmpty()) return emptyList()
+        val out = gitWithInput(worktree, home, paths.keys.joinToString("\n", postfix = "\n"),
+            "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)")
+        return out.lineSequence().mapNotNull { line ->
+            val parts = line.trim().split(' ')
+            if (parts.size != 3 || parts[1] != "blob") return@mapNotNull null
+            val size = parts[2].toLongOrNull() ?: return@mapNotNull null
+            NewBlob(parts[0], size, paths[parts[0]].orEmpty())
+        }.toList()
+    }
+
+    override fun blobId(worktree: Path, file: Path, home: Path): String {
+        val out = git(worktree, home, null, "hash-object", "--no-filters", "--", file.toAbsolutePath().toString(), timeoutSec = 600).trim()
+        require(SHA_RE.matches(out)) { "Unexpected output of git hash-object" }
+        return out
+    }
+
+    /** Runs a local git command with [input] on its standard input (written while the output is read); throws on failure. */
+    private fun gitWithInput(cwd: Path, home: Path, input: String, vararg args: String, timeoutSec: Long = 600): String {
+        val pb = ProcessBuilder(listOf("git") + args).redirectErrorStream(true).directory(cwd.toFile())
+        pb.environment().clear()
+        pb.environment()["PATH"] = path
+        pb.environment()["HOME"] = home.toString()
+        pb.environment()["LANG"] = "en_US.UTF-8"
+        pb.environment()["GIT_TERMINAL_PROMPT"] = "0"
+        val p = pb.start()
+        val writer = Thread {
+            runCatching { p.outputStream.bufferedWriter().use { it.write(input) } }
+        }.apply { isDaemon = true; start() }
+        val out = p.inputStream.bufferedReader().readText()
+        if (!p.waitFor(timeoutSec, TimeUnit.SECONDS)) {
+            p.destroyForcibly()
+            throw GitException("git ${args.firstOrNull()} timed out")
+        }
+        writer.join(5000)
+        if (p.exitValue() != 0) throw GitException("git ${args.take(2).joinToString(" ")} failed: ${out.takeLast(1000).trim()}")
+        return out
     }
 
     override fun commitSubjects(worktree: Path, from: String, home: Path, max: Int): List<String> {

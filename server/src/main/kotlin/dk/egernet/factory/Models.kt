@@ -419,6 +419,8 @@ data class RunDto(
     val updateOnDemand: Boolean = false,
     /** Other active runs of the project when this run started (a warning, docs/ARCHITECTURE.md §6 "Other active runs"). */
     val overlaps: List<RunOverlapDto> = emptyList(),
+    /** The project files the run had (docs/ARCHITECTURE.md §5 "Project files"); null for runs from before project files. */
+    val projectFiles: RunProjectFilesDto? = null,
 )
 
 /**
@@ -535,6 +537,8 @@ object FailureKind {
      * time limit or could not be read (docs/ARCHITECTURE.md §6 "Checks before a merge").
      */
     const val CHECKS = "checks"
+    /** Not pushed: the branch contains a project file (docs/ARCHITECTURE.md §6 "Project file guard"); the run needs a human. */
+    const val PROJECT_FILE_COMMITTED = "project_file_committed"
     const val OTHER = "other"
 
     /**
@@ -614,6 +618,8 @@ data class RunSandboxDto(
     val platformsUsed: List<String> = emptyList(),
     /** A review sandbox of the run was created at least once (the ux and ui-design reviewers ran the app in it). */
     val reviewUsed: Boolean = false,
+    /** The project files the definition names under `files:` (`approved` only; empty for older runs). */
+    val files: List<String> = emptyList(),
 )
 
 /** A sidecar's readiness check (`ready:`). */
@@ -643,6 +649,8 @@ data class SandboxDefinitionDto(
     val platforms: List<SandboxPlatformDto> = emptyList(),
     /** Null: commands run as root inside the container. */
     val user: SandboxUserDto? = null,
+    /** Project files the definition needs (`files:`), by name. */
+    val files: List<String> = emptyList(),
 )
 
 @Serializable data class SandboxApprovalDto(val sha256: String, val content: String, val approvedBy: OwnerDto, val approvedAt: String)
@@ -666,6 +674,8 @@ data class SandboxStatusDto(
     val approval: SandboxApprovalDto?,
     /** Who can approve: the admins (so a non-admin knows whom to ask). */
     val approvers: List<OwnerDto> = emptyList(),
+    /** Names under the definition's `files:` that are not uploaded to the project now. */
+    val missingFiles: List<String> = emptyList(),
 )
 
 /** A target of a valid `.agern/deploy.yml` (docs/DEPLOY.md). */
@@ -1175,3 +1185,92 @@ fun issueKindFromLabels(labels: List<String>): String {
         else -> "task"
     }
 }
+
+// ------------------------------------------------------------------ project files (docs/ARCHITECTURE.md §5 "Project files")
+
+/** One file of a project's file store: metadata only, never content. */
+@Serializable
+data class ProjectFileDto(
+    /** Stable across replacements. */
+    val id: String,
+    val name: String,
+    val size: Long,
+    /** Lower-case hex of the current version's SHA-256, computed by the server. */
+    val sha256: String,
+    /** 1, plus one per replacement. */
+    val version: Int,
+    val note: String?,
+    /** Whether the bytes may be downloaded through the browser (default false). */
+    val downloadable: Boolean,
+    /** Who uploaded the current version and when; null when that user no longer exists. */
+    val uploadedBy: OwnerDto?,
+    val uploadedAt: String,
+)
+
+/** An upload in flight (resumable): [received] of [size] bytes are on the server. */
+@Serializable
+data class ProjectFileUploadDto(
+    val id: String,
+    val name: String,
+    val size: Long,
+    val received: Long,
+    /** The SHA-256 the uploader declared (checked at completion); null when none was given. */
+    val sha256: String?,
+    val note: String?,
+    val createdBy: OwnerDto?,
+    val createdAt: String,
+    val touchedAt: String,
+    /** When the upload is discarded unless more bytes arrive (24 hours after the last write). */
+    val expiresAt: String,
+    /** The id of the file this upload replaces when completed; null for a new name. */
+    val replaces: String? = null,
+)
+
+/** Bytes used, counted from the current versions' sizes. */
+@Serializable data class ProjectFilesUsageDto(val files: Int, val projectBytes: Long, val totalBytes: Long)
+
+/** The server's limits (FACTORY_PROJECT_FILES_MAX_*_MB, and the fixed file count). */
+@Serializable data class ProjectFilesLimitsDto(val maxFileBytes: Long, val maxProjectBytes: Long, val maxTotalBytes: Long, val maxFiles: Int)
+
+/** `GET /api/projects/{repo}/files`. */
+@Serializable
+data class ProjectFilesDto(
+    val repo: String,
+    /** The caller may upload, replace, delete and change files (an admin, or on [managers]). */
+    val canManage: Boolean,
+    val files: List<ProjectFileDto>,
+    /** The users on the repository's file managers list (admins manage without being listed). */
+    val managers: List<OwnerDto>,
+    val usage: ProjectFilesUsageDto,
+    val limits: ProjectFilesLimitsDto,
+    /** Uploads in flight; only for callers who can manage files (empty otherwise). */
+    val uploads: List<ProjectFileUploadDto> = emptyList(),
+)
+
+/** A project file a run had (its snapshot): no content, no paths on the host. */
+@Serializable
+data class RunProjectFileDto(
+    val name: String, val size: Long, val sha256: String, val version: Int,
+    /** The run's approved sandbox definition names the file under `files:`. */
+    val required: Boolean = false,
+    /** The hash the previous run of the same repository recorded for this name, only when it differs. */
+    val previousSha256: String? = null,
+)
+
+/** `RunDto.projectFiles`: the files of [repo] (the repository the run changes) the run got. */
+@Serializable data class RunProjectFilesDto(val repo: String, val files: List<RunProjectFileDto>)
+
+/** One repository in the admin overview: counts only, never file names. */
+@Serializable data class AdminProjectFilesRepoDto(val repo: String, val files: Int, val bytes: Long)
+
+/** `GET /api/admin/project-files`. */
+@Serializable
+data class AdminProjectFilesDto(
+    val totalBytes: Long,
+    val limits: ProjectFilesLimitsDto,
+    val repos: List<AdminProjectFilesRepoDto>,
+)
+
+@Serializable data class CreateProjectFileUploadReq(val name: String, val size: Long, val sha256: String? = null, val note: String? = null)
+@Serializable data class UpdateProjectFileReq(val note: String? = null, val downloadable: Boolean? = null)
+@Serializable data class ProjectFileManagersReq(val usernames: List<String> = emptyList())

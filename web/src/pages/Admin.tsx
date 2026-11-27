@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, Navigate } from 'react-router-dom';
-import { api, ApiError, runRef, type McpToken, type RunningSandbox, type Settings, type SoftwareRequest, type StageRole, type User } from '../api';
+import { api, ApiError, runRef, type AdminProjectFilesRepo, type McpToken, type RunningSandbox, type Settings, type SoftwareRequest, type StageRole, type User } from '../api';
 import { shortHash, shortImage } from '../components/sandbox/SandboxBits';
 import { McpTokenTable, RevokeMcpTokenDialog } from '../components/ui/McpTokens';
 import { Dialog, ErrorBox, Loading, Notice } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
-import { between, timeAgo } from '../lib/format';
+import { between, bytes, timeAgo } from '../lib/format';
+import { filesCount } from '../lib/projectFiles';
 import { useFeedReconnects, useSandboxesFeed } from '../lib/realtime';
 import { useNow } from '../lib/useNow';
 
@@ -27,6 +28,7 @@ export function AdminPage() {
         <RequestsCard />
       </div>
       <SandboxesCard />
+      <ProjectFilesCard />
       <UsersCard />
       <McpTokensCard />
     </div>
@@ -361,6 +363,80 @@ function SandboxesCard() {
               {busy ? 'Stopping…' : 'Stop sandbox'}
             </button>
           </div>
+        </div>
+      </Dialog>
+    </section>
+  );
+}
+
+/** The project files store: usage against the server's limit, per repository, with "Delete all files". */
+function ProjectFilesCard() {
+  const q = useAsync(() => api.adminProjectFiles(), []);
+  const [target, setTarget] = useState<AdminProjectFilesRepo | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [done, setDone] = useState<string | null>(null);
+  const remove = async () => {
+    if (!target) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await api.adminDeleteProjectFiles(target.repo);
+      setDone(`Deleted all files of ${target.repo}.`);
+      setTarget(null);
+      q.reload();
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const o = q.data;
+  return (
+    <section className="card settings-card" aria-labelledby="pf-h">
+      <header className="sc-head">
+        <h2 id="pf-h">Project files</h2>
+        {o && <span className="muted small">{bytes(o.totalBytes)} of {bytes(o.limits.maxTotalBytes)} used</span>}
+      </header>
+      <p className="muted small">
+        Files projects need to build but must not commit (vendor SDKs, licences). Up to {o ? bytes(o.limits.maxFileBytes) : '…'} per file and {o ? bytes(o.limits.maxProjectBytes) : '…'} per project.
+      </p>
+      {q.loading && !o && <Loading />}
+      {q.error && !o && <ErrorBox error={q.error} retry={q.reload} />}
+      {done && <p className="form-ok" role="status">{done}</p>}
+      {o && o.repos.length === 0 && <p className="muted">No project has files.</p>}
+      {o && o.repos.length > 0 && (
+        <div className="table-wrap">
+          <table className="table pf-admin-table">
+            <thead>
+              <tr><th scope="col">repository</th><th scope="col" className="num">files</th><th scope="col" className="num">size</th><th scope="col"><span className="sr-only">actions</span></th></tr>
+            </thead>
+            <tbody>
+              {o.repos.map((r) => (
+                <tr key={r.repo}>
+                  <td data-label="repository"><Link to={`/p/${r.repo}/files`} className="mono">{r.repo}</Link></td>
+                  <td data-label="files" className="num">{r.files}</td>
+                  <td data-label="size" className="num">{bytes(r.bytes)}</td>
+                  <td>
+                    <button type="button" className="btn btn--sm btn--ghost btn--danger" onClick={() => (setErr(null), setDone(null), setTarget(r))} aria-label={`Delete all files of ${r.repo}`}>
+                      Delete all files
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <Dialog open={!!target} onClose={() => setTarget(null)} title={`Delete all files of ${target?.repo ?? ''}?`}>
+        <p>
+          All {filesCount(target?.files ?? 0)} of <strong>{target?.repo}</strong> ({bytes(target?.bytes ?? 0)}) and its open uploads are deleted. Runs that already started keep their copy;
+          new runs and chats get none.
+        </p>
+        {err && <p className="form-error" role="alert">{err}</p>}
+        <div className="dialog-actions">
+          <button className="btn btn--ghost" onClick={() => setTarget(null)} data-autofocus>Cancel</button>
+          <button className="btn btn--danger" onClick={() => void remove()} disabled={busy}>{busy ? 'Deleting…' : 'Delete all files'}</button>
         </div>
       </Dialog>
     </section>

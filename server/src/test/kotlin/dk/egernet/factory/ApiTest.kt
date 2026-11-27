@@ -502,10 +502,11 @@ class ApiTest {
         assertEquals("agern", init["result"]!!.jsonObject["serverInfo"]!!.jsonObject["name"]!!.jsonPrimitive.content)
         assertEquals(202, rpc(chatToken, """{"jsonrpc":"2.0","method":"notifications/initialized"}""").status.value)
         val tools = json(rpc(chatToken, """{"jsonrpc":"2.0","id":2,"method":"tools/list"}""").bodyAsText()).jsonObject["result"]!!.jsonObject["tools"]!!.jsonArray
-        assertEquals(16, tools.size)
+        assertEquals(17, tools.size)
+        assertTrue(tools.any { it.jsonObject["name"]!!.jsonPrimitive.content == "factory_list_project_files" })
         assertTrue(tools.any { it.jsonObject["name"]!!.jsonPrimitive.content == "factory_send_to_agent" })
         val stageTools = json(rpc(stageToken, """{"jsonrpc":"2.0","id":2,"method":"tools/list"}""").bodyAsText()).jsonObject["result"]!!.jsonObject["tools"]!!.jsonArray
-        assertEquals(setOf("factory_get_issue", "factory_request_software"), stageTools.map { it.jsonObject["name"]!!.jsonPrimitive.content }.toSet())
+        assertEquals(setOf("factory_get_issue", "factory_request_software", "factory_list_project_files"), stageTools.map { it.jsonObject["name"]!!.jsonPrimitive.content }.toSet())
         val call = json(rpc(chatToken, """{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"factory_list_issues","arguments":{}}}""").bodyAsText()).jsonObject
         assertTrue(call["result"]!!.toString().contains("Add a dark mode toggle"))
         val denied = json(rpc(stageToken, """{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"factory_start_run","arguments":{"issueNumber":1}}}""").bodyAsText()).jsonObject

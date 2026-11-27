@@ -57,6 +57,8 @@ data class LaunchSpec(
      * long sandbox command is not abandoned by the client (docs/ARCHITECTURE.md §6 "Agent environment").
      */
     val mcpToolTimeoutMs: Long = DEFAULT_MCP_TOOL_TIMEOUT_MS,
+    /** More environment variables for the agent, e.g. `AGERN_PROJECT_FILES` (docs/ARCHITECTURE.md §5 "Project files"). */
+    val extraEnv: Map<String, String> = emptyMap(),
 ) {
     companion object {
         /** What `Config()` with its defaults gives: the 60-minute stage limit plus one minute. */
@@ -122,6 +124,8 @@ object AgentCommand {
             else -> env["CLAUDE_CODE_OAUTH_TOKEN"] = spec.identity.claude.value
         }
         env += gitEnvironment(spec.identity, spec.gitHost)
+        // Never overrides what the launcher itself sets (credentials, PATH, HOME).
+        for ((k, v) in spec.extraEnv) env.putIfAbsent(k, v)
         return env
     }
 

@@ -167,13 +167,15 @@ data class StageAgentRequest(
     val notes: List<Pair<String, String>> = emptyList(),
     /** The member repositories of a workspace run, recorded on the session (docs/ARCHITECTURE.md §4 "Visibility"). */
     val contextRepos: List<String> = emptyList(),
+    /** The run's project files snapshot, the agent's `AGERN_PROJECT_FILES` (docs/ARCHITECTURE.md §5 "Project files"). */
+    val projectFilesDir: Path? = null,
 )
 
 /**
  * What an advisor process is launched with (docs/ARCHITECTURE.md §6 "Conversation at needs human"): the run's worktree,
  * the run its MCP grant is bound to, and the `<run_context>` block its first message carries.
  */
-data class AdvisorLaunch(val workDir: Path, val runId: UUID, val context: String)
+data class AdvisorLaunch(val workDir: Path, val runId: UUID, val context: String, val projectFilesDir: Path? = null)
 
 data class StageAgentResult(
     val session: SessionRecord,
@@ -231,6 +233,8 @@ class AgentManager(
     private val workspaceDefs: dk.egernet.factory.workspace.WorkspaceService? = null,
     /** MCP tools a (non-advisor) chat gets on top of [McpRegistry.CHAT_TOOLS]: the deploy tools when they are switched on. */
     private val chatExtraTools: Set<String> = emptySet(),
+    /** A chat's `AGERN_PROJECT_FILES`: the live view of its project's files (docs/ARCHITECTURE.md §5 "Project files"). */
+    private val chatProjectFiles: ((repo: String) -> Path?)? = null,
 ) {
     private val log = LoggerFactory.getLogger(AgentManager::class.java)
 
@@ -653,12 +657,16 @@ class AgentManager(
             val granted = if (advisor) McpRegistry.STAGE_TOOLS else McpRegistry.CHAT_TOOLS + chatExtraTools
             val tools = if (mayInstall) granted - "factory_request_software" else granted
             token = mcp.issue(McpGrant(sessionId, owner.id, s.repo, launch?.runId, tools))
+            val filesDir = if (advisor) launch?.projectFilesDir else withContext(Dispatchers.IO) {
+                runCatching { chatProjectFiles?.invoke(s.repo) }.onFailure { log.warn("Preparing the project files of chat {} failed: {}", sessionId, it.message) }.getOrNull()
+            }
             val spec = LaunchSpec(
                 sessionId = sessionId, kind = s.kind, model = s.model, workDir = workDir, home = workspaces.home(owner.username),
                 identity = identity, interactive = true, resumeClaudeSessionId = s.claudeSessionId,
                 appendSystemPrompt = prompts.system(if (advisor) ADVISOR_KIND else "chat", s.repo, mayInstall, workspace = chatWs?.note ?: advisorWs),
                 mcpConfigJson = mcpConfig(token),
                 mcpToolTimeoutMs = cfg.mcpToolTimeoutMs,
+                extraEnv = filesDir?.let { mapOf(dk.egernet.factory.files.ProjectFiles.ENV to it.toString()) }.orEmpty(),
             )
             val proc = withContext(Dispatchers.IO) { launcher.launch(spec) }
             if (s.claudeSessionId != null) systemEvent(sessionId, "info", "Resuming conversation ${s.claudeSessionId}")
@@ -1076,6 +1084,7 @@ class AgentManager(
                 appendSystemPrompt = req.systemPrompt, prompt = req.prompt, jsonSchema = req.jsonSchema,
                 disallowedTools = req.disallowedTools, mcpConfigJson = mcpConfig(token),
                 mcpToolTimeoutMs = cfg.mcpToolTimeoutMs,
+                extraEnv = req.projectFilesDir?.let { mapOf(dk.egernet.factory.files.ProjectFiles.ENV to it.toString()) }.orEmpty(),
             )
             for ((level, text) in req.notes) systemEvent(s.id, level, text)
             publish(s.id, "user", buildJsonObject { put("text", req.prompt); put("username", req.owner.username) })
