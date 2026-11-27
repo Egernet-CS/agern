@@ -2508,6 +2508,9 @@ function seed() {
     issue('web-shop', 67, 'feature', 'Product reviews with photos', 'alice', 30, { state: 'closed' }),
     issue('web-shop', 68, 'bug', 'Sitemap misses category pages', 'carl', 28, { state: 'closed' }),
     issue('web-shop', 69, 'task', 'Drop the old promo banner', 'bob', 21),
+    // Seeded with partial-delivery runs only (no release plans them).
+    issue('web-shop', 70, 'feature', 'Newsletter with double opt-in', 'alice', 2),
+    issue('web-shop', 71, 'bug', 'Cart badge misses updates outside the product pages', 'carl', 3),
   ];
   db.issues['billing-service'] = [
     issue('billing-service', 17, 'feature', 'Switch card payments to the new provider', 'alice', 5),
@@ -2593,19 +2596,19 @@ function seed() {
   startRun('billing-service', 17, alice, null, { changes: {}, approver: 'ESCALATE', liveFrom: never }, Date.now() - 40 * 60_000);
   // Partial deliveries (docs/ARCHITECTURE.md §6 "Partial delivery"): the spec-writer split the issue into steps. One waits
   // for alice (the approver escalated), one was merged and left its issue open.
-  const plan61 = {
+  const plan70 = {
     delivers: 'The sign-up form in the footer and the subscribers table; confirmation e-mails are not sent yet.',
     remaining: ['Send the double opt-in confirmation e-mail', 'An unsubscribe link in every newsletter'],
   };
-  const partial61 = startRun('web-shop', 61, alice, null, { changes: {}, approver: 'ESCALATE', liveFrom: never }, Date.now() - 25 * 60_000);
-  Object.assign(partial61, { partial: true, partialSetBy: null, delivery: plan61 });
-  const partial64 = startRun('web-shop', 64, alice, null, { changes: {}, liveFrom: never }, Date.now() - 26 * 3_600_000);
-  Object.assign(partial64, {
+  const partial70 = startRun('web-shop', 70, alice, null, { changes: {}, approver: 'ESCALATE', liveFrom: never }, Date.now() - 25 * 60_000);
+  Object.assign(partial70, { partial: true, partialSetBy: null, delivery: plan70 });
+  const partial71 = startRun('web-shop', 71, alice, null, { changes: {}, liveFrom: never }, Date.now() - 50 * 60_000);
+  Object.assign(partial71, {
     partial: true,
     partialSetBy: null,
     delivery: { delivers: 'Recount the badge after every cart change on the product pages.', remaining: ['The same fix in the mini-cart drawer'] },
   });
-  db.issues['web-shop'].find((i) => i.number === 64)!.state = 'open';
+  db.issues['web-shop'].find((i) => i.number === 71)!.state = 'open';
   // Finished, but its migration clashes with one that landed on main meanwhile: "Update and merge" is offered.
   startRun('data-pipeline', 3, alice, null, { changes: {}, liveFrom: never, refuseMerge: 'migration' }, Date.now() - 30 * 60_000);
   // Updated once after a merge conflict, then merged (history).

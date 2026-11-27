@@ -4613,8 +4613,8 @@ gets the secondary button "Merge & keep issue open" (`closeIssue: false`), or "M
 true`) for a partial run, with the same disabling and `aria-describedby`; release runs have no second choice. With an
 escalation both open the confirmation dialog, which adds the sentence "Issue #N will be closed." / "Issue #N stays
 open (partial delivery)." (release runs: "… stays open until the release is merged.") and whose "Merge anyway"
-performs the chosen action. Mock mode seeds `/p/web-shop` with a `needs_human` partial run (#61, escalated) and a
-merged one (#64). The `ready` pill reuses the pass tone. In the diagram a `github` run's merge node is
+performs the chosen action. Mock mode seeds `/p/web-shop` with a `needs_human` partial run (#70, escalated) and a
+merged one (#71). The `ready` pill reuses the pass tone. In the diagram a `github` run's merge node is
 "merge on GitHub": at `ready` pending with "PR #n · waiting on GitHub" (the human node skipped), merged on GitHub done
 with "merged on GitHub"; an `owner_approves` run that merged shows the human node "approved by owner" whatever the
 approver said. On the release page a `github` project replaces "Approve and release" with "This project merges on
