@@ -499,7 +499,7 @@ object RetryMode {
 object FailureKind {
     const val TIME_LIMIT = "time_limit"; const val USAGE_LIMIT = "usage_limit"; const val RESTART = "restart"
     const val API_UNREACHABLE = "api_unreachable"; const val CREDENTIALS = "credentials"
-    /** The builder made no commits (it usually says why: blocked on something). */
+    /** The builder made no commits and left nothing uncommitted (it usually says why: blocked on something). */
     const val BLOCKED = "blocked"
     /** A mechanical step after the builder failed (see [FailedStep]). */
     const val STEP = "step"

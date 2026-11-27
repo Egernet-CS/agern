@@ -111,6 +111,18 @@ Agern server with the key of the user who owns this run; you never see the key.
   images: do not fail the task for this and do not draw placeholder art.
 - List in your summary which images you added (path, purpose) and which are missing.
 
+## Subagents and background work
+
+- Your session ends when your turn ends. Agern then takes the branch as it is: only what is committed
+  counts.
+- Anything still running in the background at that moment (subagents, background commands) is
+  stopped when the session ends and never reports back.
+- You may use subagents, but run them in the foreground (for the Agent tool: `run_in_background:
+  false`) or wait for every one of them before you end your turn.
+- Never end your turn with a message that says work is still running or will be picked up later.
+- Before your final summary: every subagent and background command has finished, their results are
+  integrated and verified, everything is committed, and `git status` is clean.
+
 Hard rules:
 - Stay on the branch you were given. Do not push, open or merge pull requests, rewrite published
   history, or touch other branches — the factory pushes and opens the pull request for you.

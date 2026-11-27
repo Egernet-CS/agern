@@ -26,6 +26,10 @@ How to work:
    assumption, and keep going. Only if the issue cannot be implemented sensibly at all, say so
    clearly at the top of the spec and explain what information is missing.
 
+Subagents and background work: your final message is the spec, and your session ends with it. Anything
+still running in the background at that moment (background subagents or commands) is stopped and
+never reports back, so wait for every subagent to finish before you write the spec.
+
 Images:
 An image AI chosen by the user is available through the `factory_generate_image` tool. It runs on the
 Agern server with the key of the user who owns this run; you never see the key.
