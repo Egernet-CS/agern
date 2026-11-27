@@ -65,6 +65,9 @@ private val AUTH_FAILURE = Regex(
     "(?i)invalid api key|please run /login|authentication[_ ](error|failed)|unauthori[sz]ed|oauth token (has )?(expired|revoked)|invalid (x-api-key|bearer token)",
 )
 
+/** A chat message that is the CLI's own `/compact [what to keep]` command (docs/ARCHITECTURE.md §5). */
+private val COMPACT_COMMAND = Regex("^/compact(\\s|$)")
+
 /** The owner's Claude usage limit was reached; [resetsAt] when the CLI said when it resets, [type] e.g. `five_hour`. */
 data class UsageLimit(val resetsAt: Instant?, val type: String?)
 
@@ -513,6 +516,18 @@ class AgentManager(
         if (isCommand && attachmentIds.isNotEmpty()) {
             throw unprocessable("/factory commands do not take attachments. Remove them, or send them in a normal message.", "attachments_not_allowed")
         }
+        // `/compact [what to keep]` goes to the CLI verbatim; it is refused rather than queued when it cannot run now.
+        val isCompact = COMPACT_COMMAND.containsMatchIn(trimmed)
+        if (isCompact) {
+            if (attachmentIds.isNotEmpty()) {
+                throw unprocessable("/compact does not take attachments. Remove them, or send them in a normal message.", "attachments_not_allowed")
+            }
+            val current = sessions.get(s.id) ?: s
+            if (live[s.id]?.turnActive == true || current.status == SessionStatus.STARTING || current.status == SessionStatus.RUNNING) {
+                throw conflict("The agent is working. Compact when it has finished, or interrupt it first.", "agent_busy")
+            }
+            if (current.claudeSessionId == null) throw conflict("There is nothing to compact yet.", "nothing_to_compact")
+        }
         if (!isCommand && !isLive(s.id)) {
             if (user.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
             if (slot(user.id).availablePermits == 0) throw conflict("You already have ${cfg.maxAgentsPerUser} agents running", "too_many_agents")
@@ -525,7 +540,9 @@ class AgentManager(
             put("text", text); put("username", user.username)
             if (attached.isNotEmpty()) put("attachments", AppJson.encodeToJsonElement(ListSerializer(AttachmentDto.serializer()), attached.map { it.toDto() }))
         })
-        sessions.setTitle(s.id, (trimmed.lineSequence().firstOrNull()?.takeIf { it.isNotEmpty() } ?: "Attachment: ${attached.first().name}").take(80))
+        if (!isCompact) {
+            sessions.setTitle(s.id, (trimmed.lineSequence().firstOrNull()?.takeIf { it.isNotEmpty() } ?: "Attachment: ${attached.first().name}").take(80))
+        }
 
         if (isCommand) {
             scope.launch {
@@ -542,7 +559,8 @@ class AgentManager(
             }
             return
         }
-        onChatInput?.invoke(s.id)
+        // A compaction is no message of the owner's: it does not count for image budgets.
+        if (!isCompact) onChatInput?.invoke(s.id)
 
         scope.launch {
             val mutex = chatLocks.computeIfAbsent(s.id) { Mutex() }
@@ -550,9 +568,12 @@ class AgentManager(
                 mutex.withLock {
                     // Closed while this input waited for the lock: drop it (no process, no files).
                     if (s.id in closed) return@withLock
-                    val content = withContext(Dispatchers.IO) { attachments.content(text, attached) }
                     val l = live[s.id] ?: startChat(s.id, user)
-                    val note = mergeNotes(checkoutNoteFor(l, syncCheckout(s.id, user, s.repo)), memberCheckoutNote(l, user, s.repo))
+                    // The CLI runs `/compact` only as the whole message, a plain string: no checkout sync and no note
+                    // (a pending note goes with the next normal message).
+                    val content = if (isCompact) JsonPrimitive(trimmed) else withContext(Dispatchers.IO) { attachments.content(text, attached) }
+                    val note = if (isCompact) null
+                    else mergeNotes(checkoutNoteFor(l, syncCheckout(s.id, user, s.repo)), memberCheckoutNote(l, user, s.repo))
                     try {
                         deliver(l, if (note == null) content else withNote(content, note))
                     } catch (e: Exception) {
