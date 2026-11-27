@@ -574,9 +574,30 @@ export type Run = {
   updateAvailable?: boolean;
   /** The run's update rounds, oldest first. */
   updates?: RunUpdate[];
+  /** True when the owner can bring the branch up to date with its target now ("Update from base branch"). */
+  updateOnDemand?: boolean;
+  /** Other active runs of the project when this run started (a warning). Issue titles and paths are untrusted text. */
+  overlaps?: RunOverlap[];
   /** The project files the run got, fixed when it starts; null for older runs. */
   projectFiles?: RunProjectFiles | null;
 };
+
+/** Another run that was active in the same project when a run started. */
+export type RunOverlap = {
+  runId: string;
+  issueNumber: number;
+  issueTitle: string;
+  owner: string;
+  /** Its status when this run started. */
+  status: RunStatus;
+  /** This issue names that run's issue, or that run's spec names this issue. */
+  references: boolean;
+  /** Paths both specs name (filled in after this run's spec). */
+  files: string[];
+};
+
+/** A pull request merged into the target that came in with an update round. Title untrusted; `url` only https. */
+export type RunUpdatePull = { number: number; title: string; url?: string | null };
 
 /**
  * One update round: Agern merged `target` into the run's branch, the builder resolved what conflicted, and the reviewers
@@ -586,8 +607,8 @@ export type RunUpdate = {
   number: number;
   round: number;
   maxRounds: number;
-  /** `release`: started automatically by a building release. */
-  trigger: 'owner' | 'release';
+  /** `release`: started automatically by a building release; `base_moved`: started by Agern because the target moved. */
+  trigger: 'owner' | 'release' | 'base_moved';
   target: string;
   reason: string | null;
   status: 'running' | 'resolved' | 'failed' | 'cancelled';
@@ -605,6 +626,8 @@ export type RunUpdate = {
   endedAt: string | null;
   /** One line, composed by the server. */
   summary: string;
+  /** The pull requests merged into the target that came in with the merge (at most 10). */
+  pulls?: RunUpdatePull[];
 };
 
 

@@ -39,7 +39,7 @@ export function RunPage() {
   const run = useLiveRun(runQ.data);
   const sessions = useLiveSessions(sessQ.data, (s) => s.runId === runId);
   const sessionMap = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions]);
-  const [busy, setBusy] = useState<'approve' | 'update' | 'cancel' | 'retry-now' | 'give-up' | 'merge-anyway' | null>(null);
+  const [busy, setBusy] = useState<'approve' | 'update' | 'update-base' | 'cancel' | 'retry-now' | 'give-up' | 'merge-anyway' | null>(null);
   const [confirmGiveUp, setConfirmGiveUp] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [confirmApprove, setConfirmApprove] = useState(false);
@@ -132,6 +132,33 @@ export function RunPage() {
     }
   };
   const currentUpdate = updateOf(run.round, run);
+
+  // "Update from base branch": the owner brings the branch up to date on demand (also a `ready` run under policy github).
+  const canUpdateFromBase =
+    isOwner && !!run.updateOnDemand && !run.updateAvailable && (run.status === 'needs_human' || (run.status === 'ready' && onGitHub));
+  const updateFromBase = async () => {
+    setBusy('update-base');
+    setErr(null);
+    try {
+      const r = await api.updateRun(run.id);
+      runQ.setData(() => r);
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  };
+  const updateFromBaseButton = canUpdateFromBase && (
+    <button
+      className="btn"
+      onClick={() => void updateFromBase()}
+      disabled={busy !== null || updateBlocked !== null}
+      aria-describedby={updateBlocked ? 'update-base-hint update-base-blocked' : 'update-base-hint'}
+    >
+      {busy === 'update-base' ? 'Updating…' : 'Update from base branch'}
+    </button>
+  );
+  const targetName = run.baseBranch ? <code>{run.baseBranch}</code> : 'the default branch';
 
   // Checks before the merge (docs/ARCHITECTURE.md §6 "Checks before a merge"): the owner may merge anyway while they block it.
   const checks = run.checks ?? null;
@@ -244,6 +271,7 @@ export function RunPage() {
                   {busy === 'approve' ? 'Approving…' : '✓ Approve & merge'}
                 </button>
               )}
+              {updateFromBaseButton}
               <button
                 className="btn btn--ghost"
                 onClick={() => {
@@ -258,6 +286,7 @@ export function RunPage() {
             </>
           )}
           {run.status === 'needs_human' && !isOwner && !onGitHub && <span className="muted small">Waiting for {run.owner.username} to approve.</span>}
+          {run.status === 'ready' && updateFromBaseButton}
           {run.status === 'waiting_for_checks' && (isOwner ? mergeAnywayButton : <span className="muted small">Waiting for checks; it merges by itself.</span>)}
           {(run.status === 'failed' || run.status === 'cancelled' || (run.status === 'needs_human' && run.failureKind === 'project_file_committed')) &&
             isOwner && !isSyncRun(run) && (
@@ -276,6 +305,20 @@ export function RunPage() {
             {updateBlocked && <span id="update-blocked"> {updateBlocked}</span>}
           </p>
         )}
+        {canUpdateFromBase && (
+          <p className="rh-update-hint muted small">
+            <span id="update-base-hint">
+              Update from base branch: Agern merges {targetName} into the branch, the builder resolves conflicts and re-runs the
+              tests, and the reviewers and the approver run again (update round {(run.updateRounds ?? 0) + 1} of {run.maxUpdateRounds}).{' '}
+              {onGitHub
+                ? 'The pull request stays open for GitHub.'
+                : policy === 'owner_approves'
+                  ? 'Then it waits for your approval.'
+                  : 'If they approve, the pull request is merged.'}
+            </span>
+            {updateBlocked && <span id="update-base-blocked"> {updateBlocked}</span>}
+          </p>
+        )}
       </header>
       {waiting && (
         <NetworkWaitBanner
@@ -292,6 +335,7 @@ export function RunPage() {
           <Markdown text={`**${run.status === 'needs_human' ? 'Needs a human:' : 'Error:'}** ${run.error}`} />
         </div>
       )}
+      {active && (run.overlaps ?? []).length > 0 && <OverlapsNotice run={run} repo={repo} />}
       {run.status === 'needs_human' && policy === 'owner_approves' && (
         <div className="notice run-policy" role="note">
           <div className="notice-text">This project requires the run owner’s approval before every merge.</div>
@@ -458,9 +502,10 @@ function UpdatesSection({ run, onShowBuilder }: { run: Run; onShowBuilder: (roun
         <article key={u.number} className={`run-update run-update--${u.status}`} aria-labelledby={`update-${u.number}`}>
           <h2 id={`update-${u.number}`} className="run-update-h">
             Update round {u.number} of {u.maxRounds}
-            {u.trigger === 'release' && <span className="muted"> · automatic</span>}
+            {(u.trigger === 'release' || u.trigger === 'base_moved') && <span className="muted"> · automatic</span>}
             <span className={`run-update-status run-update-status--${u.status}`}> · {UPDATE_STATUS[u.status]}</span>
           </h2>
+          {u.reason && <p className="small run-update-reason">{u.reason}</p>}
           <p className="small">
             {u.mergeStatus === 'up_to_date' ? (
               <>Already up to date with <code>{u.target}</code></>
@@ -478,12 +523,34 @@ function UpdatesSection({ run, onShowBuilder }: { run: Run; onShowBuilder: (roun
               <ul className="run-update-list">{u.incoming.map((c, i) => <li key={i}>{c}</li>)}</ul>
             </details>
           )}
+          {(u.pulls ?? []).length > 0 && (
+            <div className="small">
+              Pull requests merged into <code>{u.target}</code>:
+              <ul className="run-update-list">
+                {(u.pulls ?? []).map((p) => (
+                  <li key={p.number}>
+                    {p.url?.startsWith('https://') ? (
+                      <a href={p.url} target="_blank" rel="noopener noreferrer">#{p.number} {p.title}</a>
+                    ) : (
+                      <>#{p.number} {p.title}</>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           {u.conflicts.length > 0 && (
             <div className="small">
               Conflicted files:
               <ul className="run-update-list mono">{u.conflicts.map((c, i) => <li key={i}>{c}</li>)}</ul>
             </div>
           )}
+          {u.conflicts.length > 0 && u.status === 'resolved' && (
+            <p className="small run-update-resolved">
+              The builder resolved the conflicts in {u.conflicts.length} file{u.conflicts.length === 1 ? '' : 's'}.
+            </p>
+          )}
+          {u.conflicts.length > 0 && u.status === 'failed' && <p className="small">The conflicts were not resolved.</p>}
           {u.migrations.length > 0 && (
             <div className="small">
               Migration problems:
@@ -505,6 +572,44 @@ function UpdatesSection({ run, onShowBuilder }: { run: Run; onShowBuilder: (roun
         </article>
       ))}
     </section>
+  );
+}
+
+/**
+ * Other runs that were active in the project when this run started (a warning, never a block). Issue titles and paths
+ * are untrusted and rendered as text.
+ */
+function OverlapsNotice({ run, repo }: { run: Run; repo: string }) {
+  const overlaps = run.overlaps ?? [];
+  return (
+    <div className="notice run-overlaps" role="note" aria-label="Other active runs">
+      <div className="notice-text">
+        <p>Other runs were active in this project when this run started:</p>
+        <ul className="run-overlaps-list">
+          {overlaps.map((o) => (
+            <li key={o.runId}>
+              <Link to={`/p/${repo}/runs/${o.runId}`}>#{o.issueNumber} {o.issueTitle}</Link>
+              <span className="muted">
+                {' '}· {o.status.replace(/_/g, ' ')} at start · {o.owner}
+                {o.references && ' · referenced by this issue'}
+              </span>
+              {o.files.length > 0 && (
+                <div className="small">
+                  same files:{' '}
+                  {o.files.map((f, i) => (
+                    <span key={f}>
+                      {i > 0 && ', '}
+                      <code>{f}</code>
+                    </span>
+                  ))}
+                </div>
+              )}
+            </li>
+          ))}
+        </ul>
+        <p className="muted small">A warning only — Agern brings the branch up to date before merging.</p>
+      </div>
+    </div>
   );
 }
 

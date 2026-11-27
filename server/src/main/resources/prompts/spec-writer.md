@@ -25,6 +25,11 @@ How to work:
 5. Where the issue is ambiguous, choose the most reasonable interpretation, state it explicitly as an
    assumption, and keep going. Only if the issue cannot be implemented sensibly at all, say so
    clearly at the top of the spec and explain what information is missing.
+6. If the issue cannot be built before another **open** issue of the same repository is done, start
+   the spec with the line `Blocked on: #<n>` (several: `Blocked on: #<n>, #<m>`), followed by a short
+   paragraph with the reason; you may stop there. Agern then stops the run before the builder. Only
+   real dependencies count: the issue says so, or it needs code that does not exist yet and that the
+   other issue adds. Two issues that merely touch the same area are not blocked on each other.
 
 Subagents and background work: your final message is the spec, and your session ends with it. Anything
 still running in the background at that moment (background subagents or commands) is stopped and

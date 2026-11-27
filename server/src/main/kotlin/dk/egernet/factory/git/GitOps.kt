@@ -245,6 +245,14 @@ interface GitOps {
     fun restore(worktree: Path, sha: String, home: Path) {}
     /** `<short sha> <subject>` of the first-parent commits from [from] (exclusive) to HEAD of [worktree], oldest first, at most [max]. */
     fun commitSubjects(worktree: Path, from: String, home: Path, max: Int): List<String> = emptyList()
+    /**
+     * Fake-GitHub development mode only (docs/ARCHITECTURE.md §6 "Update and merge", `.agern-fake/land-merges`): applies
+     * the merged [branch] to the local [target] branch of the clone at [mainDir] as one squash commit titled [title], so
+     * that later runs see their base move. When [target] is checked out in [mainDir], its working tree follows the new
+     * commit if it was clean, and nothing happens when it was dirty. True when the target moved; a conflict or any git
+     * failure is logged and answered false. A no-op outside that mode.
+     */
+    fun landSquash(mainDir: Path, target: String, branch: String, title: String, home: Path): Boolean = false
 
     /**
      * The blobs reachable from HEAD of [worktree] that are reachable neither from [baseRef] nor from any `origin`
@@ -867,6 +875,51 @@ class CliGitOps(
         require(!from.startsWith("-")) { "Invalid commit" }
         return git(worktree, home, null, "log", "--first-parent", "-n", max.toString(), "--format=%h %s", "$from..HEAD", timeoutSec = 120)
             .lines().filter { it.isNotBlank() }.reversed()
+    }
+
+    override fun landSquash(mainDir: Path, target: String, branch: String, title: String, home: Path): Boolean {
+        if (!localOnly) return false
+        require(target.isNotBlank() && !target.startsWith("-") && branch.isNotBlank() && !branch.startsWith("-")) { "Invalid branch name" }
+        if (!Files.exists(mainDir.resolve(".git"))) return false
+        val targetRef = "refs/heads/$target"
+        fun sha(ref: String) = gitStatus(mainDir, home, null, "rev-parse", "--verify", "--quiet", "$ref^{commit}", timeoutSec = 60)
+            .let { (code, out) -> if (code == 0) out.trim() else null }
+        val old = sha(targetRef) ?: return false.also { log.info("Landing {}: branch {} not found", branch, target) }
+        sha("refs/heads/$branch") ?: return false.also { log.info("Landing {}: the branch is gone", branch) }
+        val checkedOut = gitStatus(mainDir, home, null, "symbolic-ref", "--quiet", "HEAD", timeoutSec = 60)
+            .let { (code, out) -> code == 0 && out.trim() == targetRef }
+        if (checkedOut && git(mainDir, home, null, "status", "--porcelain", "--untracked-files=no", timeoutSec = 120).isNotBlank()) {
+            log.info("Not landing {} on {}: its checkout in {} has uncommitted changes", branch, target, mainDir)
+            return false
+        }
+        val tmp = Files.createTempDirectory("agern-land-")
+        val wt = tmp.resolve("wt")
+        try {
+            git(mainDir, home, null, "worktree", "add", "-q", "--detach", wt.toString(), old)
+            val (code, out) = gitStatus(wt, home, null, "-c", "core.hooksPath=/dev/null", "merge", "--squash", "--quiet", "refs/heads/$branch", timeoutSec = 120)
+            if (code != 0) {
+                log.info("Not landing {} on {}: the squash merge failed: {}", branch, target, out.takeLast(300).trim())
+                return false
+            }
+            if (gitStatus(wt, home, null, "diff", "--cached", "--quiet", timeoutSec = 60).first == 0) return false
+            git(wt, home, null, "-c", "core.hooksPath=/dev/null", "commit", "-q", "--no-verify", "-m", title, timeoutSec = 120)
+            val new = git(wt, home, null, "rev-parse", "HEAD", timeoutSec = 60).trim()
+            if (checkedOut) {
+                // A fast-forward of the clean checkout: its working tree ends at the new commit.
+                git(mainDir, home, null, "-c", "core.hooksPath=/dev/null", "merge", "--ff-only", "--quiet", new, timeoutSec = 120)
+            } else {
+                // Compare-and-swap: refused when the branch moved meanwhile.
+                git(mainDir, home, null, "update-ref", targetRef, new, old, timeoutSec = 60)
+            }
+            return true
+        } catch (e: Exception) {
+            log.warn("Landing {} on {} failed: {}", branch, target, e.message)
+            return false
+        } finally {
+            gitStatus(mainDir, home, null, "worktree", "remove", "--force", "--force", wt.toString(), timeoutSec = 60)
+            tmp.toFile().deleteRecursively()
+            gitStatus(mainDir, home, null, "worktree", "prune", timeoutSec = 60)
+        }
     }
 
     override fun syncCheckout(id: AgentIdentity?, mainDir: Path, defaultBranch: String, home: Path, fetch: Boolean): CheckoutState? {

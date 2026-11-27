@@ -1901,6 +1901,27 @@ html.app-locked #root {
 .run-update .notice {
   align-self: stretch;
 }
+.run-update-reason {
+  color: var(--text-3);
+}
+.run-update-resolved {
+  color: var(--pass);
+}
+/* Other active runs when a run started (a warning only). */
+.run-overlaps {
+  margin: 12px 0 0;
+  overflow-wrap: anywhere;
+}
+.run-overlaps .notice-text p {
+  margin: 0;
+}
+.run-overlaps-list {
+  margin: 6px 0;
+  padding-left: 18px;
+}
+.run-overlaps-list li + li {
+  margin-top: 4px;
+}
 .rounds {
   display: flex;
   flex-direction: column;

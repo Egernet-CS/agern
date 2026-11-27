@@ -395,7 +395,8 @@ class McpServer(
                 }
                 "factory_start_run" -> {
                     val r = factory.startRun(owner, repo, int("issueNumber") ?: return toolError("issueNumber is required"), grant.sessionId)
-                    "Started run ${r.id} for #${r.issueNumber} (${r.status}). Follow it with factory_get_run."
+                    "Started run ${r.id} for #${r.issueNumber} (${r.status}). Follow it with factory_get_run." +
+                        dk.egernet.factory.FactoryService.overlapSentence(r)
                 }
                 "factory_list_runs" -> AppJson.encodeToString(runs,
                     factory.listRuns(owner, repo, args["activeOnly"]?.jsonPrimitive?.contentOrNull == "true").map { it.copy(stages = emptyList()) })

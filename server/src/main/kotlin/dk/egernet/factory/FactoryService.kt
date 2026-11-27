@@ -299,6 +299,12 @@ class FactoryService(
         return runs.toDto(orchestrator.approve(user, runId))
     }
 
+    /** "Update from base branch" (docs/ARCHITECTURE.md §6 "Retrying a run"): owner only; the run, now `building`. */
+    suspend fun updateRun(user: UserRecord, runId: UUID): RunDto {
+        visibleRun(user, runId)
+        return runs.toDto(orchestrator.updateFromBase(user, runId))
+    }
+
     /**
      * "Merge anyway" (docs/ARCHITECTURE.md §6 "Checks before a merge"): the owner merges although the checks on
      * [headSha] have not passed. Web only: there is deliberately no MCP tool, MCP argument or chat command for it.
@@ -411,7 +417,7 @@ class FactoryService(
             "run" -> {
                 val n = parts.getOrNull(1)?.removePrefix("#")?.toIntOrNull() ?: return "Usage: /factory run <issue number>"
                 val run = startRun(owner, repo, n, session.id)
-                "Started run ${run.id} for #$n \"${run.issueTitle}\" (status ${run.status})."
+                "Started run ${run.id} for #$n \"${run.issueTitle}\" (status ${run.status})." + overlapSentence(run)
             }
             "status" -> {
                 val list = runs.list(repo, activeOnly = false, limit = 10)
@@ -566,8 +572,28 @@ class FactoryService(
             return nums.ifEmpty { null }
         }
 
+        /**
+         * Appended to the answer of `factory_start_run` and `/factory run` when other runs were active in the project
+         * (docs/ARCHITECTURE.md §6 "Other active runs"); empty otherwise.
+         */
+        fun overlapSentence(r: RunDto): String {
+            if (r.overlaps.isEmpty()) return ""
+            return " Other active runs in this project: " + r.overlaps.joinToString("; ") { o ->
+                "#${o.issueNumber} ${o.issueTitle.take(120)} (run ${o.runId}, ${o.status}, @${o.owner})" +
+                    (if (o.references) " — referenced by this issue" else "")
+            } + ". Their changes may conflict with this one; Agern brings the branch up to date before merging."
+        }
+
         /** The reply to a run's approval (`/factory approve`, `factory_approve_run`). */
         fun approvedRunReply(r: RunDto): String {
+            val u = r.updates.lastOrNull()
+            if (r.status == RunStatus.BUILDING && u != null && u.status == dk.egernet.factory.db.UpdateStatus.RUNNING) {
+                val policy = when (r.mergePolicy) {
+                    MergePolicy.OWNER_APPROVES -> "It will wait for your approval again when the update is reviewed."
+                    else -> "It merges by itself when the reviewers and the approver pass it."
+                }
+                return "Run ${r.id}: `${u.target}` moved on, so Agern is updating the branch first (update round ${u.number} of ${u.maxRounds}). $policy"
+            }
             val c = r.checks
             if (r.status == RunStatus.WAITING_FOR_CHECKS && c != null) {
                 return "Run ${r.id} is waiting for checks on `${c.sha.take(7)}` (${c.detail}); it merges by itself when they pass."
