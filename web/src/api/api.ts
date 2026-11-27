@@ -190,6 +190,11 @@ export interface Api {
    * next sandbox command creates a fresh one. 404 when the run has no sandbox right now. Answers the new overview.
    */
   stopSandbox(runId: string): Promise<SandboxOverview>;
+  /**
+   * Admin: removes every prepared sandbox image no container uses; the next sandbox of each project runs its setup script
+   * again. Images in use stay listed. Answers the new overview; 403 for non-admins.
+   */
+  removePreparedImages(): Promise<SandboxOverview>;
 
   /** The project's `.agern/deploy.yml` on its default branch, its approval and the project's public deploy key. */
   deployStatus(repo: string): Promise<DeployStatus>;

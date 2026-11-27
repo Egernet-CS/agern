@@ -22,6 +22,7 @@ import type {
   Run,
   RunUpdate,
   PendingSandbox,
+  PreparedImage,
   RunSandbox,
   RunningSandbox,
   SandboxApproval,
@@ -40,7 +41,7 @@ import type {
   Workspace,
 } from '../api/types';
 import { runLeftNeedsHuman, runSandboxVmFor, sandboxVmBuilderSteps } from './sandboxVm';
-import { approverScript, builderScript, chatReplies, reviewSandboxSteps, reviewerScript, sandboxBuilderScript, seededChat, specScript, updateBuilderScript, type Step } from './scripts';
+import { approverScript, builderScript, chatReplies, reviewSandboxSteps, reviewerScript, sandboxBuilderScript, seededChat, specScript, updateBuilderScript, type PreparedUse, type Step } from './scripts';
 
 export const ORG = 'Egernet-CS';
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -157,6 +158,8 @@ export const db = {
   sandboxEnabled: scenario !== 'nosandbox',
   /** Sandboxes that exist right now, by run id (created when an approved run's builder starts, removed after review). */
   runningSandboxes: new Map<string, { createdAt: string; builderSessionId: string; containers: { platform: string; image: string; createdAt: string; kind: 'build' | 'review' }[] }>(),
+  /** Prepared sandbox images (like the backend's Podman store), newest first; `expired` is computed by the overview. */
+  preparedImages: [] as PreparedImage[],
   players: new Map<string, Player>(),
   settings: {
     agentsMayInstallSoftware: false,
@@ -853,9 +856,21 @@ function runStage(r: Run, role: StageRole, round: number, plan: Plan, startMs: n
     const sb = r.sandbox;
     const def = sb?.state === 'approved' ? db.sandboxFiles.get(r.repo)?.definition : null;
     const upd = r.updates?.find((u) => u.round === round);
+    // Like the backend: the first sandbox of a project (per definition) runs setup and stores a prepared image; later ones start from it.
+    const prep = def && round === 0 && !upd && def.setup && sb?.sha256 ? takePreparedImage(r.repo, sb.sha256, def.image, p.endMs) : null;
     steps = upd
       ? updateBuilderScript(upd.target, upd.migrations.length ? 'migration' : 'conflict')
-      : def ? sandboxBuilderScript(round, def.image, def.setup, def.services.map((x) => x.name), def.platforms) : builderScript(round, prev);
+      : def ? sandboxBuilderScript(round, def.image, def.setup, def.services.map((x) => x.name), def.platforms, prep) : builderScript(round, prev);
+    if (def && sb && round === 0 && !upd) {
+      // Like the backend: recorded at the builder's first sandbox command.
+      const startedFrom = prep ? prep.mode : def.setup ? 'setup' : 'plain';
+      Object.assign(sb, {
+        startedFrom,
+        preparedKey: prep?.key ?? null,
+        createMs: startedFrom === 'reused' ? 3_100 : startedFrom === 'plain' ? 2_400 : 54_100,
+        firstCommandMs: startedFrom === 'reused' ? 9_400 : startedFrom === 'plain' ? 8_700 : 61_200,
+      });
+    }
     if (upd) steps = [{ kind: 'system', level: 'info', text: `Update round ${upd.number}: merged \`${upd.target}\` (${upd.incomingCount} commits)${upd.conflicts.length ? `; conflicts in ${upd.conflicts.map((c) => `\`${c}\``).join(', ')}` : ''}`, ms: 50 }, ...steps];
     // Like the backend: after committing, a builder with an approved sandbox VM deploys there and checks it (first build only).
     if (round === 0) steps = [...steps, ...sandboxVmBuilderSteps(r)];
@@ -889,7 +904,8 @@ function runStage(r: Run, role: StageRole, round: number, plan: Plan, startMs: n
     // Like the backend: an approved run's ux reviewer starts the app in the read-only review sandbox.
     const reviewDef = r.sandbox?.state === 'approved' ? db.sandboxFiles.get(r.repo)?.definition : null;
     if (role === 'ux' && reviewDef && r.sandbox) {
-      steps = [...reviewSandboxSteps(reviewDef.image, reviewDef.setup), ...steps];
+      const reviewPrep = reviewDef.setup && r.sandbox.sha256 ? takePreparedImage(r.repo, r.sandbox.sha256, reviewDef.image, p.endMs) : null;
+      steps = [...reviewSandboxSteps(reviewDef.image, reviewDef.setup, reviewPrep), ...steps];
       r.sandbox.reviewUsed = true;
     }
     if (live) steps = [{ kind: 'pause', ms: reviewerMs[role] * 1500 }, ...steps];
@@ -1271,6 +1287,45 @@ function dropSandbox(runId: string, change: 'removed' | 'stopped' = 'removed') {
   if (db.runningSandboxes.delete(runId)) feed({ type: 'sandboxes', runId, change });
 }
 
+const PREPARED_MAX_AGE_DAYS = 7;
+const preparedExpired = (createdAt: string, atMs = Date.now()) => atMs - Date.parse(createdAt) > PREPARED_MAX_AGE_DAYS * 86400_000;
+
+/** Like the backend's key: 16 hex characters from the project, platform, definition and base image (here: a plain string hash). */
+function preparedKey(repo: string, platform: string, sha256: string, image: string): string {
+  let a = 0x811c9dc5;
+  let b = 0x01000193;
+  for (const ch of `agern-prepared-v1\n${repo}\n${platform}\n${sha256}\n${image}`) {
+    a = Math.imul(a ^ ch.charCodeAt(0), 0x01000193) >>> 0;
+    b = Math.imul(b + ch.charCodeAt(0), 0x5bd1e995) >>> 0;
+  }
+  return (a.toString(16).padStart(8, '0') + b.toString(16).padStart(8, '0')).slice(0, 16);
+}
+
+/**
+ * Like the backend at a sandbox's creation (default platform): reuses the project's prepared image when there is one
+ * younger than the max age, else "runs setup" and stores a new one (announced on the admins' feed).
+ */
+function takePreparedImage(repo: string, sha256: string, image: string, atMs: number): PreparedUse {
+  const key = preparedKey(repo, 'default', sha256, image);
+  const img = db.preparedImages.find((x) => x.key === key);
+  if (img && !preparedExpired(img.createdAt, atMs)) return { mode: 'reused', key, createdAt: img.createdAt };
+  const createdAt = iso(Math.min(Date.now(), atMs + 50_000));
+  db.preparedImages = [
+    { repo, platform: 'default', key, definition: sha256, baseImage: image, createdAt, sizeBytes: 1_288_490_189, expired: false },
+    ...db.preparedImages.filter((x) => x.key !== key),
+  ].sort((x, y) => y.createdAt.localeCompare(x.createdAt));
+  feed({ type: 'sandboxes', runId: '', change: 'prepared' });
+  return { mode: 'prepared', key, createdAt, stale: img?.createdAt };
+}
+
+/** Like the backend: removes every prepared image no running sandbox uses (here: of projects with a running sandbox). */
+export function removePreparedImages(): SandboxOverview {
+  const inUse = new Set([...db.runningSandboxes.keys()].map((id) => db.runs.get(id)?.repo));
+  db.preparedImages = db.preparedImages.filter((x) => inUse.has(x.repo));
+  feed({ type: 'sandboxes', runId: '', change: 'prepared' });
+  return sandboxOverview();
+}
+
 export function sandboxOverview(): SandboxOverview {
   const sandboxes: RunningSandbox[] = [];
   for (const [runId, sb] of db.runningSandboxes) {
@@ -1290,8 +1345,10 @@ export function sandboxOverview(): SandboxOverview {
     enabled: db.sandboxEnabled,
     runtime: db.sandboxEnabled ? 'podman' : 'off',
     inUse: sandboxes.reduce((n, x) => n + x.slots, 0),
-    limits: { maxCpus: 2, maxMemory: '4g', maxConcurrent: 4, execTimeoutMinutes: 30, registries: ['docker.io', 'ghcr.io', 'quay.io', 'mcr.microsoft.com'], maxPlatforms: 4 },
+    limits: { maxCpus: 2, maxMemory: '4g', maxConcurrent: 4, execTimeoutMinutes: 30, registries: ['docker.io', 'ghcr.io', 'quay.io', 'mcr.microsoft.com'], maxPlatforms: 4, preparedMaxAgeDays: PREPARED_MAX_AGE_DAYS },
     sandboxes,
+    prepared: db.sandboxEnabled ? db.preparedImages.map((x) => ({ ...x, expired: preparedExpired(x.createdAt) })) : [],
+    preparedBytes: db.sandboxEnabled ? db.preparedImages.reduce((n, x) => n + x.sizeBytes, 0) : 0,
   };
 }
 
@@ -1311,7 +1368,7 @@ export function stopSandbox(runId: string, by: User): SandboxOverview {
   dropSandbox(runId, 'stopped');
   emit(sb.builderSessionId, 'system', {
     level: 'warn',
-    text: `An admin (${by.username}) stopped this run's sandbox: its containers and network were removed (cache volumes are kept). The run continues; the next sandbox command creates a new sandbox and runs the setup script again.`,
+    text: `An admin (${by.username}) stopped this run's sandbox: its containers and network were removed (cache volumes are kept). The run continues; the next sandbox command creates a new sandbox.`,
   }, iso(Date.now()));
   return sandboxOverview();
 }

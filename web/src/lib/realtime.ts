@@ -169,7 +169,7 @@ export function useSessionStream(sessionId: string | null): SessionStream {
 
 type IssueListener = (repo: string, issue: Issue) => void;
 type SandboxApprovalListener = (repo: string, approval: SandboxApproval | null) => void;
-type SandboxesListener = (runId: string, change: 'created' | 'removed' | 'stopped') => void;
+type SandboxesListener = (runId: string, change: 'created' | 'removed' | 'stopped' | 'prepared') => void;
 type UsageListener = () => void;
 
 type FeedState = {
@@ -409,7 +409,7 @@ export function useSandboxApprovalFeed(repo: string, onChange: (approval: Sandbo
 }
 
 /** Calls `onChange` whenever a sandbox container is created or removed on the server (admins only receive these). */
-export function useSandboxesFeed(onChange: (runId: string, change: 'created' | 'removed' | 'stopped') => void) {
+export function useSandboxesFeed(onChange: (runId: string, change: 'created' | 'removed' | 'stopped' | 'prepared') => void) {
   const { subscribeSandboxes } = useFeed();
   const cb = useRef(onChange);
   cb.current = onChange;

@@ -715,7 +715,20 @@ export type RunSandbox = {
   platformsUsed: string[];
   /** The ux and ui-design reviewers ran the app in a read-only review sandbox at least once (absent for older runs). */
   reviewUsed?: boolean;
+  /**
+   * Startup of the build sandbox, recorded at its first command (absent or null for older runs and before): milliseconds
+   * from the first builder stage's start to that command (null when the start is unknown).
+   */
+  firstCommandMs?: number | null;
+  /** How long creating the container that first command ran in took, in milliseconds. */
+  createMs?: number | null;
+  /** How that container was made: from a prepared image, setup ran and an image was stored, setup ran, or no setup script. */
+  startedFrom?: SandboxStartedFrom | null;
+  /** The prepared image's key (`reused` and `prepared`). */
+  preparedKey?: string | null;
 };
+
+export type SandboxStartedFrom = 'reused' | 'prepared' | 'setup' | 'plain';
 
 /** A sidecar's readiness check: run inside the service until it exits 0, for at most `timeoutSeconds`. */
 export type SandboxReady = { command: string; timeoutSeconds: number };
@@ -962,8 +975,37 @@ export type SandboxOverview = {
   runtime: 'off' | 'podman' | 'fake';
   /** Command containers that exist (slots in use), over all runs. */
   inUse: number;
-  limits: { maxCpus: number; maxMemory: string; maxConcurrent: number; execTimeoutMinutes: number; registries: string[]; maxPlatforms: number };
+  limits: {
+    maxCpus: number;
+    maxMemory: string;
+    maxConcurrent: number;
+    execTimeoutMinutes: number;
+    registries: string[];
+    maxPlatforms: number;
+    /** Days a prepared image is reused (0: prepared images off). */
+    preparedMaxAgeDays: number;
+  };
   sandboxes: RunningSandbox[];
+  /** Prepared images, newest first. */
+  prepared: PreparedImage[];
+  /** Their total size in bytes. */
+  preparedBytes: number;
+};
+
+/**
+ * A prepared image: a sandbox container committed after its setup script ran; later sandboxes of the project (same
+ * definition, platform and base image) start from it. `sizeBytes` includes layers shared with the base image;
+ * `expired`: older than the max age, so it is never used again.
+ */
+export type PreparedImage = {
+  repo: string;
+  platform: string;
+  key: string;
+  definition: string;
+  baseImage: string;
+  createdAt: string;
+  sizeBytes: number;
+  expired: boolean;
 };
 
 /** A project whose valid `.agern/sandbox.yml` is not approved in this exact version. */
@@ -1162,8 +1204,8 @@ export type FeedFrame =
   | { type: 'release_deleted'; repo: string; releaseId: string }
   /** An admin approved (approval set) or revoked (null) the project's sandbox definition. */
   | { type: 'sandbox_approval'; repo: string; approval: SandboxApproval | null }
-  /** Admins only: a container of a run's sandbox was created or removed, or an admin stopped the sandbox. */
-  | { type: 'sandboxes'; runId: string; change: 'created' | 'removed' | 'stopped' }
+  /** Admins only: a container of a run's sandbox was created or removed, an admin stopped the sandbox, or prepared images changed. */
+  | { type: 'sandboxes'; runId: string; change: 'created' | 'removed' | 'stopped' | 'prepared' }
   /** Private to the receiving user: their own Claude usage changed; reload `GET /api/me/usage`. */
   | { type: 'usage' };
 

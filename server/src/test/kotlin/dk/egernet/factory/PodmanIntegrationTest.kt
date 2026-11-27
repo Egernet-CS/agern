@@ -62,6 +62,12 @@ class PodmanIntegrationTest {
     private val runB = UUID.randomUUID()
     private val runC = UUID.randomUUID()
     private val runD = UUID.randomUUID()
+    /** Prepared images: the first sandbox, the second one from its image, a review sandbox from it. */
+    private val runE = UUID.randomUUID()
+    private val runF = UUID.randomUUID()
+    private val runG = UUID.randomUUID()
+    private val runH = UUID.randomUUID()
+    private val preparedImages = mutableListOf<String>()
     private lateinit var base: Path
 
     private val memory = 128L shl 20
@@ -85,10 +91,12 @@ class PodmanIntegrationTest {
         if (!enabled) return
         val names = listOf(runA, runB, runC).flatMap { listOf(SandboxManager.containerName(it), SandboxManager.serviceContainerName(it, "web")) } +
             "agern-it-anon-$runA" + SandboxManager.platformContainerName(runC, "alt") +
-            listOf(runD).flatMap { listOf(SandboxManager.reviewContainerName(it), SandboxManager.reviewServiceContainerName(it, "web")) }
+            listOf(runD).flatMap { listOf(SandboxManager.reviewContainerName(it), SandboxManager.reviewServiceContainerName(it, "web")) } +
+            listOf(runE, runF, runH).map { SandboxManager.containerName(it) } + SandboxManager.reviewContainerName(runG)
         runCatching { rt.removeContainers(names) }
-        for (r in listOf(runA, runB, runC)) runCatching { rt.removeNetwork(SandboxManager.networkName(r)) }
-        runCatching { rt.removeNetwork(SandboxManager.reviewNetworkName(runD)) }
+        for (r in listOf(runA, runB, runC, runE, runF, runH)) runCatching { rt.removeNetwork(SandboxManager.networkName(r)) }
+        for (r in listOf(runD, runG)) runCatching { rt.removeNetwork(SandboxManager.reviewNetworkName(r)) }
+        for (i in preparedImages.reversed()) runCatching { podman("rmi", "--force", i) }
         for (v in listOf(SandboxManager.cacheVolumeName(repo, "/cache"), SandboxManager.cacheVolumeName(repo, "/cache", "alt"))) {
             runCatching { podman("volume", "rm", "--force", v) }
         }
@@ -374,5 +382,107 @@ class PodmanIntegrationTest {
             rt.removeNetwork(SandboxManager.reviewNetworkName(runD))
         }
         assertTrue(rt.listContainers().none { it.runId == runD.toString() })
+    }
+
+    /**
+     * Prepared images (docs/ARCHITECTURE.md §5 "Prepared images"), with `user:` (keep-id) as the server does it: setup
+     * runs in a fresh container, which is committed; a second sandbox on another worktree starts from the image with
+     * `--pull=never`. Only the container's own file system is in the image: not what setup wrote to the worktree, a cache
+     * volume or the review output directory.
+     */
+    @Test
+    fun `a prepared image keeps what setup installed and nothing from mounts`() {
+        val wt1 = Files.createDirectories(base.resolve("prep/one"))
+        val wt2 = Files.createDirectories(base.resolve("prep/two"))
+        val out = Files.createDirectories(base.resolve("prep/review-out"))
+        val d = def.copy(services = emptyList(), user = SandboxUser("builder", 1000), setup = "unused")
+        val builder = ExecUser(1000, 1000, "builder", "/home/builder")
+        val cache = SandboxManager.cacheVolumeName(repo, "/cache")
+        fun prepareUser(c: String) {
+            val r = rt.exec(c, listOf("sh", "-c", SandboxManager.PREPARE_USER_SCRIPT, "agern-user", "1000", "builder") + d.caches, SandboxManager.WORKDIR, 60_000)
+            assertEquals(0, r.exitCode, "prepare-user in $c: ${r.output}")
+        }
+        fun handOver(c: String, vararg paths: String) =
+            rt.exec(c, listOf("sh", "-c", SandboxManager.HAND_OVER_SCRIPT, "agern-hand-over", "1000") + paths, SandboxManager.WORKDIR, 120_000)
+        fun startFrom(run: UUID, spec: ContainerSpec): Long {
+            rt.createNetwork(SandboxManager.networkName(run), SandboxManager.labels(run, repo, "network"))
+            rt.ensureVolume(cache, linkedMapOf("agern.repo" to repo, "agern.cache" to "/cache"))
+            val t0 = System.nanoTime()
+            rt.startContainer(spec)
+            return (System.nanoTime() - t0) / 1_000_000
+        }
+
+        // 1. The first sandbox: from the base image, setup (as root) writes into the image, the worktree and the cache.
+        if (rt.imageInfo(image) == null) rt.pullImage(image)
+        val baseId = rt.imageInfo(image)!!.id
+        val first = SandboxManager.containerName(runE)
+        println("first container with keep-id started in ${startFrom(runE, SandboxManager.commandSpec(runE, repo, wt1, d, null))} ms")
+        prepareUser(first)
+        ok(first, "mkdir -p /opt/agern-it && echo baked > /opt/agern-it/marker && echo tool > /home/builder/tool.txt && " +
+            "echo ws > /workspace/setup-ws.txt && echo cached > /cache/setup-cache.txt")
+        handOver(first, "/home/builder", SandboxManager.WORKDIR)
+        val key = SandboxManager.preparedKey(repo, "default", "0".repeat(64), baseId)
+        val name = SandboxManager.preparedImageName(repo, key)
+        preparedImages += name
+        val t0 = System.nanoTime()
+        rt.commitContainer(first, name, SandboxManager.preparedLabels(key, repo, "default", "0".repeat(64), image))
+        println("committed $name in ${(System.nanoTime() - t0) / 1_000_000} ms")
+        val info = rt.imageInfo(name) ?: fail("the prepared image is not in the store")
+        assertEquals(key, info.labels["agern.prepared"])
+        assertEquals(repo, info.labels["agern.prepared.repo"])
+        assertEquals(image, info.labels["agern.prepared.base"])
+        println("prepared image labels (does commit copy the container's labels?): ${info.labels}")
+        assertTrue(info.sizeBytes > 0, "size: ${info.sizeBytes}")
+        assertTrue(java.time.Duration.between(info.createdAt, java.time.Instant.now()).abs() < java.time.Duration.ofMinutes(10), "created ${info.createdAt}")
+        assertTrue(rt.listPreparedImages().any { it.id == info.id && it.labels["agern.prepared"] == key }, "listed among the prepared images")
+        assertFalse(rt.removeImage(info.id), "in use by the first container, so not removed")
+        assertTrue(Files.exists(wt1.resolve("setup-ws.txt")), "setup's worktree file is in the first worktree")
+        // A fresh cache volume for the next sandbox, so a file in it could only come from the image.
+        rt.removeContainers(listOf(first))
+        rt.removeNetwork(SandboxManager.networkName(runE))
+        podman("volume", "rm", "--force", cache)
+
+        // 2. A second sandbox on another worktree from the prepared image, never pulled.
+        val second = SandboxManager.containerName(runF)
+        val spec = SandboxManager.commandSpec(runF, repo, wt2, d, null).copy(image = name, pull = ContainerSpec.PULL_NEVER)
+        assertTrue(PodmanRuntime.runArgs(cfg, spec).contains("--pull=never"))
+        println("second container from the prepared image with keep-id started in ${startFrom(runF, spec)} ms")
+        prepareUser(second)
+        assertEquals("baked", ok(second, "cat /opt/agern-it/marker"))
+        assertEquals("tool", rt.exec(second, SandboxManager.shellCommand("cat /home/builder/tool.txt"), SandboxManager.WORKDIR, 30_000, builder).output.trim())
+        assertEquals("absent", ok(second, "test -e /workspace/setup-ws.txt && echo present || echo absent"), "worktree files are not in the image")
+        assertEquals("absent", ok(second, "test -e /cache/setup-cache.txt && echo present || echo absent"), "cache files are not in the image")
+        assertFalse(Files.exists(wt2.resolve("setup-ws.txt")))
+        assertTrue(ok(second, "env").lines().none { it.startsWith("FACTORY_") || it.startsWith("GITHUB") }, "no environment from Agern")
+        rt.removeContainers(listOf(second))
+        rt.removeNetwork(SandboxManager.networkName(runF))
+
+        // 3. The review sandbox from the prepared image: what it writes to its output directory stays out of a commit.
+        val review = SandboxManager.reviewContainerName(runG)
+        rt.createNetwork(SandboxManager.reviewNetworkName(runG), SandboxManager.labels(runG, repo, "review-network"))
+        rt.startContainer(SandboxManager.reviewSpec(runG, repo, wt2, d, out).copy(image = name, pull = ContainerSpec.PULL_NEVER))
+        prepareUser(review)
+        ok(review, "echo review > /opt/agern-it/review")
+        // As the user, who is the service user on the host: the file in the output directory stays removable there.
+        val shot = rt.exec(review, SandboxManager.shellCommand("echo shot > /run/agern-review/review.txt"), SandboxManager.WORKDIR, 30_000, builder)
+        assertEquals(0, shot.exitCode, shot.output)
+        handOver(review, "/home/builder")
+        val name2 = SandboxManager.preparedImageName(repo, key.reversed())
+        preparedImages += name2
+        rt.commitContainer(review, name2, SandboxManager.preparedLabels(key.reversed(), repo, "default", "0".repeat(64), image))
+        assertTrue(Files.exists(out.resolve("review.txt")), "the output directory got the file")
+        rt.removeContainers(listOf(review))
+        rt.removeNetwork(SandboxManager.reviewNetworkName(runG))
+        val third = SandboxManager.containerName(runH)
+        startFrom(runH, SandboxManager.commandSpec(runH, repo, wt2, d, null).copy(image = name2, pull = ContainerSpec.PULL_NEVER))
+        assertEquals("review", ok(third, "cat /opt/agern-it/review"))
+        assertEquals("absent", ok(third, "test -e /run/agern-review/review.txt && echo present || echo absent"), "the review output is not in the image")
+        rt.removeContainers(listOf(third))
+        rt.removeNetwork(SandboxManager.networkName(runH))
+
+        // Unused now: removed without force.
+        assertTrue(rt.removeImage(rt.imageInfo(name2)!!.id))
+        assertTrue(rt.removeImage(info.id))
+        assertEquals(null, rt.imageInfo(name))
     }
 }

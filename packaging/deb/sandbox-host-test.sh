@@ -302,6 +302,23 @@ out=$(runuser -u nobody -- agern sandbox status 2>&1) || true
 printf '%s' "$out" | grep -q '^containers: *unknown (only root and agern' && pass "status without root: says what it cannot read" || fail "status as nobody: $out"
 spodman volume create --label agern.repo=it --label agern.cache=/root/.cache agern-cache-it-test >/dev/null
 spodman volume create agern-dangling-test >/dev/null
+# Prepared images (docs/SANDBOXES.md "Prepared images"): a fresh one survives the plain prune, --prepared removes it.
+# Before AGERN_SANDBOX_PRUNE_HOURS=0 below, which removes every unused image anyway.
+PREPARED=localhost/agern-prepared/it:0123456789abcdef
+spodman run --detach --name agern-prepared-src "$TEST_IMAGE" sleep 600 >/dev/null
+spodman exec agern-prepared-src sh -c 'echo baked > /prepared-marker'
+spodman commit --quiet --change "LABEL agern.prepared=0123456789abcdef" --change "LABEL agern.prepared.repo=it" agern-prepared-src "$PREPARED" >/dev/null &&
+    pass "committed a prepared image" || fail "podman commit"
+spodman rm --force agern-prepared-src >/dev/null
+if agern sandbox prune >"$WORK/prune.log" 2>&1; then pass "agern sandbox prune"; else fail "agern sandbox prune"; fi
+cat "$WORK/prune.log"
+check "plain prune kept the fresh prepared image" spodman image exists "$PREPARED"
+grep -q 'unused prepared images older than 7 day(s)' "$WORK/prune.log" && pass "prune names prepared images" || fail "prune output: prepared images"
+if agern sandbox prune --prepared >"$WORK/prune.log" 2>&1; then pass "agern sandbox prune --prepared"; else fail "agern sandbox prune --prepared"; fi
+cat "$WORK/prune.log"
+check "prune --prepared removed the unused prepared image" bash -c "! runuser -u agern -- env -i HOME=/var/lib/agern PATH=/usr/bin:/bin podman --url unix:///run/agern-podman/podman.sock image exists $PREPARED"
+grep -q 'all unused prepared images' "$WORK/prune.log" && pass "prune --prepared says so" || fail "prune --prepared output"
+spodman pull --quiet "$TEST_IMAGE" >/dev/null
 setenv AGERN_SANDBOX_PRUNE_HOURS 0
 T0=$(date +%s)
 systemctl start agern-sandbox-prune.service && pass "agern-sandbox-prune.service (as agern)" || fail "prune service"

@@ -168,6 +168,7 @@ export const httpApi: Api = {
   sandboxes: () => get('/api/admin/sandboxes'),
   pendingSandboxes: () => get('/api/admin/sandboxes/pending'),
   stopSandbox: (runId) => del(`/api/admin/sandboxes/${enc(runId)}`),
+  removePreparedImages: () => del('/api/admin/sandboxes/prepared'),
 
   deployStatus: (repo) => get(`/api/projects/${enc(repo)}/deploy`),
   approveDeploy: (repo, sha256) => post(`/api/projects/${enc(repo)}/deploy/approval`, { sha256 }),

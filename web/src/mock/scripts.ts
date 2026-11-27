@@ -155,8 +155,32 @@ const npmOutput = () =>
     .concat(['✓ 2403 modules transformed.', 'dist/index.html                 0.48 kB', 'dist/assets/index-4f1c2b.js   312.77 kB │ gzip: 98.31 kB', '✓ built in 9.81s'])
     .join('\n') + '\n';
 
+/**
+ * How a sandbox with a setup script starts (like the backend, docs/SANDBOXES.md "Prepared images"): from the project's
+ * prepared image, or by running setup and storing one (`stale`: the expired image it replaces).
+ */
+export type PreparedUse = { mode: 'reused' | 'prepared'; key: string; createdAt: string; stale?: string };
+
+/** The transcript lines around setup: reuse instead of the setup log, or the setup log between "Preparing" and "stored". */
+function preparedSteps(label: string, setupLogs: SystemStep[], prep: PreparedUse | null | undefined): SystemStep[] {
+  if (!prep) return setupLogs;
+  if (prep.mode === 'reused') return [{ kind: 'system', level: 'info', text: `${label} from prepared image ${prep.key} (prepared ${prep.createdAt})` }];
+  return [
+    { kind: 'system', level: 'info', text: `Preparing sandbox image (setup) …${prep.stale ? ` The prepared image ${prep.key} from ${prep.stale} is older than 7 days.` : ''}` },
+    ...setupLogs,
+    { kind: 'system', level: 'info', text: `Prepared image ${prep.key} stored in 6.2 s; later sandboxes of this project start from it.` },
+  ];
+}
+
 /** The builder of a run with an approved sandbox: builds and tests inside it through the factory's MCP tools. */
-export function sandboxBuilderScript(round: number, image: string, setup: string | null, services: string[], platforms: SandboxPlatform[] = []): Step[] {
+export function sandboxBuilderScript(
+  round: number,
+  image: string,
+  setup: string | null,
+  services: string[],
+  platforms: SandboxPlatform[] = [],
+  prep: PreparedUse | null = null,
+): Step[] {
   // With platforms, every log names where it ran (null without, like the backend).
   const at = platforms.length ? 'default' : null;
   if (round > 0) {
@@ -174,13 +198,13 @@ export function sandboxBuilderScript(round: number, image: string, setup: string
   const setupLogs: SystemStep[] = setup
     ? [{ kind: 'system', level: 'info', text: `Sandbox${at ? ` [${at}]` : ''} setup script: exit 0 in 41.3 s`, sandbox: { kind: 'setup', command: setup, exitCode: 0, timedOut: false, durationMs: 41_300, output: aptOutput, outputTruncated: false, platform: at } }]
     : [];
-  const ready: SystemStep = { kind: 'system', level: 'info', text: `Sandbox ready in 47.9 s: ${image}, 2 CPUs, 4g memory.` };
+  const ready: SystemStep = { kind: 'system', level: 'info', text: `Sandbox ready in ${prep?.mode === 'reused' ? '3.1' : '47.9'} s: ${image}, 2 CPUs, 4g memory.` };
   return [
     { kind: 'think', text: 'The run has a sandbox with the project toolchain and a PostgreSQL sidecar. Build and test there, not on the host.' },
     tool('mcp__factory__factory_sandbox_info', {}, JSON.stringify({ available: true, state: 'approved', image, created: false, workdir: '/workspace', services: services.map((n) => ({ name: n, host: n, image: 'docker.io/library/postgres:17', ports: [] })), caches: ['/root/.gradle', '/root/.npm'], limits: { cpus: 2, memory: '4g', execTimeoutSeconds: 1800, outputTailChars: 20000 }, capacity: { inUse: 1, max: 2 } }, null, 2), 500),
     tool('Write', { file_path: 'src/main/resources/db/migration/V7__saved_carts.sql', content: '…' }, 'File created successfully at: src/main/resources/db/migration/V7__saved_carts.sql', 700),
     tool('Edit', { file_path: 'src/main/kotlin/shop/cart/CartService.kt', old_string: '…', new_string: '…' }, 'The file src/main/kotlin/shop/cart/CartService.kt has been updated.', 700),
-    sandboxExec('./gradlew test', 1, gradleTest(true), 38_400, [...created, ...setupLogs, ready], 'exec', at),
+    sandboxExec('./gradlew test', 1, gradleTest(true), 38_400, [...created, ...preparedSteps('Sandbox', setupLogs, prep), ready], 'exec', at),
     { kind: 'text', text: 'One failure — the expiry check compares `Instant` against a `LocalDate`. Fixing.' },
     tool('Edit', { file_path: 'src/main/kotlin/shop/cart/CartService.kt', old_string: 'updatedAt < cutoff.toLocalDate()', new_string: 'updatedAt < cutoff' }, 'The file src/main/kotlin/shop/cart/CartService.kt has been updated.', 600),
     sandboxExec('npm ci && npm run build', 0, npmOutput(), 52_700, [], 'exec', at),
@@ -221,13 +245,14 @@ export function reviewerScript(role: string, verdict: 'PASS' | 'CHANGES', summar
  * What a ux reviewer of a run with an approved sandbox does first (like the backend): starts the app detached in the
  * shared, read-only review sandbox and waits until it answers.
  */
-export function reviewSandboxSteps(image: string, setup: string | null): Step[] {
+export function reviewSandboxSteps(image: string, setup: string | null, prep: PreparedUse | null = null): Step[] {
+  const setupLogs: SystemStep[] = setup
+    ? [{ kind: 'system' as const, level: 'info' as const, text: 'Review sandbox setup script: exit 0 in 39.8 s', sandbox: { kind: 'setup' as const, command: setup, exitCode: 0, timedOut: false, durationMs: 39_800, output: aptOutput, outputTruncated: false, platform: null, review: true } }]
+    : [];
   const created: SystemStep[] = [
     { kind: 'system', level: 'info', text: `Creating the review sandbox: image ${image}, services postgres …` },
-    ...(setup
-      ? [{ kind: 'system' as const, level: 'info' as const, text: 'Review sandbox setup script: exit 0 in 39.8 s', sandbox: { kind: 'setup' as const, command: setup, exitCode: 0, timedOut: false, durationMs: 39_800, output: aptOutput, outputTruncated: false, platform: null, review: true } }]
-      : []),
-    { kind: 'system', level: 'info', text: `Review sandbox ready in 44.1 s: ${image}, 2 CPUs, 4g memory, /workspace read-only, output in .agern-run/review.` },
+    ...preparedSteps('Review sandbox', setupLogs, prep),
+    { kind: 'system', level: 'info', text: `Review sandbox ready in ${prep?.mode === 'reused' ? '2.8' : '44.1'} s: ${image}, 2 CPUs, 4g memory, /workspace read-only, output in .agern-run/review.` },
   ];
   const start = 'cp -a /workspace /tmp/app && cd /tmp/app && (nohup ./gradlew run > /tmp/app.log 2>&1 < /dev/null &) && for i in $(seq 90); do curl -fsS http://127.0.0.1:8081/ >/dev/null && break; sleep 1; done; tail -3 /tmp/app.log';
   return [

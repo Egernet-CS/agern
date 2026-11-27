@@ -103,6 +103,36 @@ test('a run with an approved sandbox shows its image and the commands it ran', a
   await expect(setup.locator('.t-sbx-out')).toContainText(`installing the toolchain ${tag}`);
 });
 
+test('the next run starts from the prepared image; an admin lists and removes prepared images', async ({ page }) => {
+  await login(page, 'alice');
+  const runId = await startRun(page, `Prepared build ${tag}`, 'Build it again in the sandbox. fake:sandbox');
+  await page.goto(`${BASE()}/p/demo-app/runs/${runId}`);
+  await expect(page.locator('.rh-title .pill')).toHaveText('merged', { timeout: 45_000 });
+  const startup = page.locator('.run-sbx .run-sbx-startup');
+  await expect(startup).toHaveText(/^first command after \d/);
+  await expect(startup).toHaveAttribute('title', /creating the sandbox took .* \(from prepared image [0-9a-f]{16}\)$/);
+
+  await node(page, 'builder').click();
+  const log = page.locator('.stage-detail .chat-log');
+  await expect(log).toContainText(/Sandbox from prepared image [0-9a-f]{16} \(prepared /);
+  await expect(log.locator('.t-sbx', { hasText: 'echo built in the sandbox && ls' })).toContainText('exit 0');
+  await expect(log.locator('.t-sbx', { hasText: 'setup script' })).toHaveCount(0);
+
+  await page.goto(`${BASE()}/admin`);
+  const card = page.locator('section', { has: page.locator('#sb-h') });
+  await expect(card.locator('.sbx-limits')).toContainText('kept up to 7 days');
+  const list = card.getByRole('list', { name: 'Prepared images' });
+  await expect(list.locator('li', { hasText: 'demo-app' })).toHaveCount(1);
+  await expect(list).toContainText('eclipse-temurin:21-jdk');
+  await card.getByRole('button', { name: 'Remove prepared images' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Remove the prepared images?' });
+  await expect(dialog).toContainText('Images a running sandbox uses are kept.');
+  await dialog.getByRole('button', { name: 'Remove images' }).click();
+  await expect(dialog).toBeHidden();
+  await expect(list).toHaveCount(0);
+  await expect(card).toContainText('No prepared image yet.');
+});
+
 test('the ux and ui-design reviewers run the app in a read-only review sandbox, shown on the run page', async ({ page }) => {
   await login(page, 'alice');
   const runId = await startRun(page, `Review sandbox ${tag}`, 'Look at it in the review sandbox. fake:review-sandbox');

@@ -1,5 +1,6 @@
 import { Link } from 'react-router-dom';
 import type { Run, SandboxStatus } from '../../api/types';
+import { startupNote } from './prepared';
 
 export type SandboxTone = 'pass' | 'escalate' | 'fail' | 'idle';
 
@@ -57,6 +58,10 @@ export function RunSandboxLine({ run }: { run: Run }) {
             definition <code>{shortHash(sb.sha256)}</code>
           </span>
           {(sb.platforms?.length ?? 0) > 0 && <RunPlatforms declared={sb.platforms} used={sb.platformsUsed ?? []} />}
+          {(() => {
+            const st = startupNote(sb);
+            return st && <span className="run-sbx-why run-sbx-startup" title={st.title}>{st.text}</span>;
+          })()}
           {sb.reviewUsed && (
             <span className="run-sbx-why run-sbx-review" title="The ux and ui-design reviewers ran the app in a read-only review sandbox">
               review sandbox ✓

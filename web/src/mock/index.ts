@@ -69,6 +69,7 @@ import {
   sandboxOverview,
   sandboxStatus,
   stopSandbox,
+  removePreparedImages,
   chatInput,
   clearUsageWindows,
   closeChat,
@@ -472,6 +473,7 @@ export const mockApi: Api = {
   sandboxes: () => ok(() => (needAdmin(), sandboxOverview())),
   pendingSandboxes: () => ok(() => (needAdmin(), pendingSandboxes())),
   stopSandbox: (runId) => ok(() => (needAdmin(), stopSandbox(runId, me()))),
+  removePreparedImages: () => ok(() => (needAdmin(), removePreparedImages())),
 
   releases: (repo) => ok(() => (project(repo), releasesOf(repo))),
   release: (id) =>

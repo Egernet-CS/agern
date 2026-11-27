@@ -2,11 +2,12 @@ import { useEffect, useRef, useState } from 'react';
 import { Link, Navigate } from 'react-router-dom';
 import { api, ApiError, runRef, type McpToken, type RunningSandbox, type Settings, type SoftwareRequest, type StageRole, type User } from '../api';
 import { shortHash, shortImage } from '../components/sandbox/SandboxBits';
+import { diskSize } from '../components/sandbox/prepared';
 import { McpTokenTable, RevokeMcpTokenDialog } from '../components/ui/McpTokens';
 import { Dialog, ErrorBox, Loading, Notice } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
-import { between, timeAgo } from '../lib/format';
+import { between, dateTime, timeAgo } from '../lib/format';
 import { useFeedReconnects, useSandboxesFeed } from '../lib/realtime';
 import { useNow } from '../lib/useNow';
 
@@ -200,6 +201,25 @@ function SandboxesCard() {
       setBusy(false);
     }
   };
+  const [removeOpen, setRemoveOpen] = useState(false);
+  const [removing, setRemoving] = useState(false);
+  const [removeErr, setRemoveErr] = useState<string | null>(null);
+  /** Images still listed after a removal: in use by a running sandbox. */
+  const [kept, setKept] = useState<number | null>(null);
+  const removePrepared = async () => {
+    setRemoving(true);
+    setRemoveErr(null);
+    try {
+      const next = await api.removePreparedImages();
+      q.setData(() => next);
+      setKept(next.prepared.length);
+      setRemoveOpen(false);
+    } catch (e) {
+      setRemoveErr((e as Error).message);
+    } finally {
+      setRemoving(false);
+    }
+  };
   const o = q.data;
   const used = o ? `${o.inUse} of ${o.limits.maxConcurrent} container${o.limits.maxConcurrent === 1 ? '' : 's'}` : '';
   return (
@@ -250,6 +270,12 @@ function SandboxesCard() {
               <dt>command limit</dt>
               <dd>{o.limits.execTimeoutMinutes} min</dd>
             </div>
+            {o.enabled && (
+              <div>
+                <dt>prepared images</dt>
+                <dd>{o.limits.preparedMaxAgeDays > 0 ? `kept up to ${o.limits.preparedMaxAgeDays} day${o.limits.preparedMaxAgeDays === 1 ? '' : 's'}` : 'off'}</dd>
+              </div>
+            )}
             <div>
               <dt>registries</dt>
               <dd className="mono small">{o.limits.registries.join(', ')}</dd>
@@ -311,6 +337,51 @@ function SandboxesCard() {
               ))}
             </ul>
           )}
+          {o.enabled && (
+            <>
+              <div className="sbx-prep-head">
+                <h3 className="sd-h">
+                  Prepared images <span className="muted">{o.prepared.length}</span>
+                  {o.prepared.length > 0 && <span className="muted small sbx-prep-total"> · {diskSize(o.preparedBytes)}</span>}
+                </h3>
+                {o.prepared.length > 0 && (
+                  <button type="button" className="btn btn--sm btn--ghost btn--danger" onClick={() => (setRemoveErr(null), setKept(null), setRemoveOpen(true))}>
+                    Remove prepared images
+                  </button>
+                )}
+              </div>
+              {kept !== null && kept > 0 && (
+                <p className="muted small" role="status">
+                  {kept} prepared image{kept === 1 ? ' is' : 's are'} in use and {kept === 1 ? 'was' : 'were'} kept.
+                </p>
+              )}
+              {o.prepared.length === 0 ? (
+                <p className="muted">No prepared image yet. The first sandbox of a project runs its setup script and stores the result; later sandboxes start from it.</p>
+              ) : (
+                <ul className="sbx-prep-list" aria-label="Prepared images">
+                  {o.prepared.map((p) => (
+                    <li key={`${p.repo}-${p.platform}-${p.key}`} className={`sbx-prep${p.expired ? ' sbx-prep--expired' : ''}`}>
+                      <div className="sbx-prep-top">
+                        <span className="sbx-prep-repo">{p.repo}</span>
+                        {p.platform !== 'default' && <span className="sbx-plat">{p.platform}</span>}
+                        <code className="sbx-prep-key">{p.key}</code>
+                        {p.expired && <span className="pill pill--idle sbx-prep-expired">expired</span>}
+                      </div>
+                      <div className="sbx-prep-meta muted small">
+                        <span>
+                          from <code title={p.baseImage}>{shortImage(p.baseImage)}</code>
+                        </span>
+                        <span>
+                          · prepared <time dateTime={p.createdAt} title={dateTime(p.createdAt)}>{timeAgo(p.createdAt)}</time>
+                        </span>
+                        <span>· {diskSize(p.sizeBytes)}</span>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </>
+          )}
         </>
       )}
       <h3 className="sd-h">
@@ -345,7 +416,7 @@ function SandboxesCard() {
         <div className="form">
           <p>
             Its containers and network are removed now, and so is the run’s review sandbox if it has one (cache volumes are kept); a command running in either is killed. The run
-            itself continues: the next sandbox command of the builder or a UI reviewer creates a fresh sandbox and runs the setup script again.
+            itself continues: the next sandbox command of the builder or a UI reviewer creates a new sandbox.
           </p>
           {target && (
             <p className="muted small">
@@ -359,6 +430,22 @@ function SandboxesCard() {
             </button>
             <button type="button" className="btn btn--danger" onClick={() => void stop()} disabled={busy}>
               {busy ? 'Stopping…' : 'Stop sandbox'}
+            </button>
+          </div>
+        </div>
+      </Dialog>
+      <Dialog open={removeOpen} onClose={() => !removing && setRemoveOpen(false)} title="Remove the prepared images?">
+        <div className="form">
+          <p>
+            Unused prepared images are removed now; the next sandbox of each project runs its setup script again and stores a new one. Images a running sandbox uses are kept.
+          </p>
+          {removeErr && <p className="form-error" role="alert">{removeErr}</p>}
+          <div className="dialog-actions">
+            <button type="button" className="btn btn--ghost" onClick={() => setRemoveOpen(false)} disabled={removing} autoFocus>
+              Cancel
+            </button>
+            <button type="button" className="btn btn--danger" onClick={() => void removePrepared()} disabled={removing}>
+              {removing ? 'Removing…' : 'Remove images'}
             </button>
           </div>
         </div>
