@@ -445,6 +445,7 @@ All in `/etc/agern/agern.env` (restart Agern after a change):
 | `FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES` | `30` | longest single command |
 | `FACTORY_SANDBOX_REGISTRIES` | `docker.io,ghcr.io,quay.io,mcr.microsoft.com` | registries images may come from |
 | `AGERN_SANDBOX_PRUNE_HOURS` | `168` | age after which unused images and volumes are removed |
+| `FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS` | `7` | days a prepared image (a project's sandbox after its setup script ran) is reused before setup runs again; `0` runs setup in every new sandbox |
 
 Every container also gets a limit of 4096 processes. Sidecars and platform containers have the same
 limits as the sandbox, so a run with one database uses up to twice the memory, and three times when
@@ -465,20 +466,25 @@ server gets the CPU first.
 
 ### Disk use
 
-Images and per-project cache volumes (e.g. Gradle or npm caches) live in
-`/var/lib/agern/containers`; plan several GB per project image. `agern sandbox status` shows the
+Images, per-project cache volumes (e.g. Gradle or npm caches) and prepared images (each project's
+sandbox image after its setup script ran, reused by later runs so setup does not run every time) live
+in `/var/lib/agern/containers`; plan several GB per project image, and about as much again per prepared
+image (one per project, platform and approved definition). The admin page lists the prepared images
+with their sizes. `agern sandbox status` shows the
 sandboxes that exist, the cache volumes and Podman's disk use; `agern doctor` warns below 10 GB free
 and fails below 2 GB.
 
 `agern-sandbox-prune.timer` runs daily (as `agern`) and removes images no container uses that were
 *built* more than `AGERN_SANDBOX_PRUNE_HOURS` ago — Podman does not record when an image was last
 used, so an idle old base image is removed and simply pulled again on the next run — plus unused
-volumes of that age that are not caches. Cache volumes are kept until you remove them:
+prepared images older than `FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS` (the shorter of the two ages wins)
+and unused volumes of that age that are not caches. Cache volumes are kept until you remove them:
 
 ```sh
-sudo agern sandbox prune             # what the timer does
-sudo agern sandbox prune --caches    # also unused cache volumes
-sudo agern sandbox prune --all       # every unused image and volume, regardless of age
+sudo agern sandbox prune              # what the timer does
+sudo agern sandbox prune --prepared   # also every unused prepared image (setup runs again next time)
+sudo agern sandbox prune --caches     # also unused cache volumes and prepared images
+sudo agern sandbox prune --all        # every unused image and volume, regardless of age
 ```
 
 ### Troubleshooting

@@ -35,6 +35,8 @@ and sandbox limits in \repodoc{INSTALL-LINUX.md\#limits-and-settings}{\texttt{IN
   \envvar{FACTORY_CHAT_IDLE_MINUTES} & \texttt{30} & When an idle chat's process is stopped.\\
   \envvar{FACTORY_SANDBOX} & \texttt{off} & Set by \cmd{agern sandbox enable} (chapter~\ref{ch:sandboxes}).\\
   \envvar{FACTORY_SANDBOX_MAX_MEMORY}, \envvar{FACTORY_SANDBOX_MAX_CPUS} & \texttt{4g}, \texttt{2} & Per sandbox container.\\
+  \envvar{FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS} & \texttt{7} & Days a project's prepared sandbox image is reused
+  before its setup script runs again; \texttt{0} runs setup in every new sandbox.\\
   \envvar{FACTORY_DEPLOY} & \texttt{ssh} & \texttt{off} to take the deploy tools away from chats
   (\repodoc{DEPLOY.md}{\texttt{DEPLOY.md}}).\\
   \envvar{FACTORY_DEPLOY_EXEC_TIMEOUT_MINUTES} & \texttt{30} & The longest one deploy command or copy may take.\\

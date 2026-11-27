@@ -93,6 +93,7 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_SANDBOX_MAX_CONCURRENT` | `2` | Containers that run commands that may exist at the same time, over all runs (1–100): a run's sandbox takes one slot and each platform container it creates one more (sidecars take none). A builder that would exceed it first gives up its run's own idle containers, else gets a "busy" answer |
 | `FACTORY_SANDBOX_MAX_PLATFORMS` | `4` | Platforms a definition may name besides its default image (0–20; `0` forbids them) |
 | `FACTORY_SANDBOX_EXEC_TIMEOUT_MINUTES` | `30` | Default and maximum time for one sandbox command (1–1440), also capped by `FACTORY_STAGE_TIMEOUT_MINUTES` |
+| `FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS` | `7` | Days a prepared image (a sandbox container committed after its setup script ran, §5 "Prepared images") is reused before setup runs again (0–365). `0` switches prepared images off: setup runs in every new container. `agern sandbox prune` removes unused ones older than this |
 | `FACTORY_DEPLOY` | `ssh` | `ssh` or `off`: per-project SSH deploy targets for chat agents (§5 "Deploy targets"). `off`: chats get no deploy tools, the status says `enabled: false` and a target check answers 409 `deploy_disabled`; keys and approvals can still be managed. `fake` (development and end-to-end tests only, accepted only with `FACTORY_DEV_FAKE_GITHUB`): a transport that only pretends to connect and run commands |
 | `FACTORY_DEPLOY_EXEC_TIMEOUT_MINUTES` | `30` | Default and maximum time for one deploy command or copy (1–1440) |
 | `FACTORY_DEPLOY_MAX_COPY_MB` | `512` | Largest file `factory_deploy_copy` uploads (1–10240); also the largest archive a sandbox VM deploy uploads |
@@ -573,7 +574,7 @@ sub-command and option below exists in Podman 4.3 (Debian 12), the oldest suppor
 
 ```yaml
 image: docker.io/library/eclipse-temurin:21-jdk     # required; fully qualified, from an allowed registry
-setup: |                                             # optional shell script, run once when the sandbox is created
+setup: |                                             # optional shell script, run once per prepared image (below)
   apt-get update && apt-get install -y nodejs npm
 env: { CI: "true" }                                  # optional environment of the sandbox
 services:                                            # optional sidecars (at most 5), reachable by name
@@ -656,9 +657,10 @@ shared by all builder rounds of the run. Creation, in order: a private network `
 container per service, `agern-run-<runId>-<service>`, with the service name as its network alias; one
 named volume per cache, `agern-cache-<repo>-<first 12 hex of SHA-256(path)>` (kept across runs, per
 project); the sandbox container `agern-run-<runId>`; the services' readiness checks (below); with `user`,
-the account is prepared (below); then the `setup` script (`sh -lc`, as root, time limit as for commands).
-A failed creation, readiness check or setup removes what was created and frees the slot; the tool answers
-with the error (and the setup output's tail), and a later call tries again. Everything carries the labels
+the account is prepared (below); then the `setup` script (`sh -lc`, as root, time limit as for commands) —
+unless the container starts from a *prepared image* (below), which skips setup, and right after a setup
+that stores one. A failed creation, readiness check or setup removes what was created and frees the slot;
+the tool answers with the error (and the setup output's tail), and a later call tries again. Everything carries the labels
 `agern.run=<runId>`, `agern.repo=<repo>` and `agern.role=sandbox|platform|service|network` (platform
 containers also `agern.platform=<name>`). The sandbox is
 removed (all containers and network, never the cache volumes) as soon as no builder round can follow: before
@@ -677,14 +679,56 @@ Podman cannot keep the server from starting); then the worktree reaper removes t
 live; only then do releases resume and the scheduler start, which may start new runs. A best-effort removal of
 every sandbox also runs at shutdown.
 
+**Prepared images.** Setup gives the same result as long as the image and the approved definition are the same, so
+it runs once and the result is reused. For a command container whose effective setup is non-null (and
+`FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS` > 0), right after the "Creating …" message and before its network and
+services, the server computes a *key*: the first 16 hex of SHA-256 over `agern-prepared-v1`, the repo, the platform key
+(`default` or the platform's name), the approved definition's hash, the base image's local id (`image inspect`; the
+image is pulled first when the store lacks it, 20-minute limit) and the SHA-256 of `prepare-user.sh` and of the
+hand-over script, joined by newlines. The image name is `localhost/agern-prepared/<slug>:<key>`, the slug being the
+repo lower-cased with runs of other characters as `-` (at most 100 characters).
+
+- *Reuse.* When that image exists and was created at most the max age ago, the container starts from it with
+  `--pull=never`; everything else (mounts, env, labels, user mapping, limits, network) is as above. `prepare-user.sh`
+  still runs (idempotent: it yields the user and gives fresh cache volumes to it); setup and the hand-over do not, and
+  no setup log is written. Info event: `Sandbox from prepared image <key> (prepared <instant>)` (`Review sandbox from …`,
+  ``Platform `<name>` from …``).
+- *Prepare.* Otherwise (`Preparing sandbox image (setup) …`, plus `The prepared image <key> from <instant> is older
+  than <n> days.` for an expired one) the container is created from the base image as before; after a successful setup
+  and hand-over, unless the sandbox was released or stopped meanwhile, it is committed (`podman commit`, never
+  `--include-volumes`, never `--pause`) with labels `agern.prepared=<key>`, `agern.prepared.repo`, `.platform`,
+  `.definition` and `.base` (all server values; the commit refuses others than `[A-Za-z0-9._:/@-]`). Info event:
+  `Prepared image <key> stored in <s> s; …`, feed change `prepared`; the expired image it replaced is removed
+  best-effort, without force. A failed commit only warns (`Could not store the prepared image …`); a failed or
+  timed-out setup never commits.
+- *One at a time.* Preparing one image name is serialised in the server by a per-name mutex, held from "missing or
+  stale" until after the commit or failure. A second sandbox needing it says `Waiting for another sandbox to finish
+  preparing image <key> …`, waits at most the command limit (holding only its slot) and checks again: it reuses the
+  image, or prepares it itself when the first failed. After the time-out it undoes its attempt and answers `Another run
+  is still preparing this project's sandbox image (more than <n> minutes). Nothing was run. …`.
+- *Isolation.* Each run still has its own containers, network, services and worktree mount. A commit captures only the
+  container's root file system — not the worktree, cache volumes or `/run/agern-review` (mounts), not service data
+  (other containers), not processes — and the container never had Agern's environment. A prepared image is shared only
+  between sandboxes of the same repo, platform and approved definition. What setup wrote outside the image (worktree,
+  caches, services) happens only in the preparing sandbox; what it read from `/workspace` is frozen until the image is
+  prepared again: the contract for authors is in [SANDBOXES.md](SANDBOXES.md) "Prepared images".
+- *Lifetime.* Podman's store (labels, creation time) is the only record; nothing is in the database. The server never
+  reuses an image older than the max age; the daily prune removes unused ones (§9), an admin can remove all unused ones
+  (`DELETE /api/admin/sandboxes/prepared`, `agern sandbox prune --prepared`). The base image is pulled only when
+  missing (`--pull=missing` and `pull`, never `always`), so a moved upstream tag is noticed when the image is pulled
+  again, as before.
+- *Startup time.* At the build sandbox's first command the run records `Run.sandbox.firstCommandMs` (from the first
+  builder stage's start), `createMs`, `startedFrom` (`reused`, `prepared`, `setup`, `plain`) and `preparedKey`, and
+  the server logs them.
+
 **Platforms.** `platforms:` names other images the builder can run commands in, e.g. another runtime
 version or distribution (issue #25's "test on different platforms"). `factory_sandbox_exec` with
 `platform: <name>` runs in that platform's container, `agern-run-<runId>--<name>` (the `--` cannot clash
 with a service's container, whose name starts with a letter), created on its first command exactly like
 the sandbox container: the same worktree mount at `/workspace`, environment, `user`, limits and network
 (so the same services, reached by the same names; a platform container is not given a network alias).
-Its setup is the platform's own `setup`, or the top-level one when the platform has no `setup` key.
-Caches are **per platform**: the same paths, in volumes `agern-cache-<repo>-<first 12 hex of
+Its setup is the platform's own `setup`, or the top-level one when the platform has no `setup` key; it has its own
+prepared image (the platform is part of the key). Caches are **per platform**: the same paths, in volumes `agern-cache-<repo>-<first 12 hex of
 SHA-256(<platform> NUL <path>)>`, because another image's tools (another JDK, another libc, other native
 npm modules) cannot be assumed to share a cache safely. `platform` omitted or `default` is the top-level
 image. Commands stay one at a time per run, whichever container they run in.
@@ -705,7 +749,9 @@ so an app that needs the project's toolchain or its database can be looked at an
   `factory_sandbox_info` says so.
 - *Creation and sharing.* Lazily, by the first review-scoped `factory_sandbox_exec` of a round, in the same order as
   the build sandbox (network, services, cache volumes, container, readiness checks, `prepare-user.sh`, setup as root).
-  After setup only the user's home is handed over (`/workspace` is read-only). Both UI reviewers of the round use the
+  It uses the `default` key, so it starts from the image the builder's sandbox prepared (and the builder's sandbox from
+  one the review sandbox prepared); only without one does setup run here. After setup only the user's home is handed
+  over (`/workspace` is read-only). Both UI reviewers of the round use the
   same container — two first calls create it once — and commands stay one at a time: foreground calls queue, a
   background command refuses the others. Reviewers start a long-running app detached inside a foreground command with
   all streams redirected (`nohup … > /tmp/app.log 2>&1 < /dev/null &`), which `podman exec` returns from. A failed
@@ -769,7 +815,7 @@ run --detach --name agern-run-<id>-<svc> --label agern.run=<id> --label agern.re
     [--cgroup-parent <FACTORY_SANDBOX_CGROUP_PARENT>] [--env K=V …] <service image>
 run --detach --name agern-run-<id> --label agern.run=<id> --label agern.repo=<repo> --label agern.role=sandbox
     --network agern-run-<id> --security-opt no-new-privileges --pids-limit 4096 --cpus <cpus> --memory <mem>
-    --memory-swap <mem> --stop-timeout 5 --pull=missing [--cgroup-parent <FACTORY_SANDBOX_CGROUP_PARENT>]
+    --memory-swap <mem> --stop-timeout 5 --pull=missing|never [--cgroup-parent <FACTORY_SANDBOX_CGROUP_PARENT>]
     --workdir /workspace --entrypoint sh [--env K=V …]
     --mount type=bind,source=<worktree>,target=/workspace [--mount type=volume,source=<volume>,target=<path> …]
     <image> -c "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"
@@ -784,6 +830,13 @@ run --detach --name agern-review-<id> --label agern.run=<id> --label agern.repo=
     --mount type=bind,source=<worktree>,target=/workspace,readonly=true
     [--mount type=bind,source=<run dir>/.agern-run/review,target=/run/agern-review]
     [--mount type=volume,source=<volume>,target=<path> …] <image> -c "<keep-alive>"      # review sandbox
+    # from a prepared image: <image> is localhost/agern-prepared/<slug>:<key> and --pull=never
+image exists <image>  ;  image inspect <image>                     # base image id and prepared image (JSON: Id, Created, Size, Labels)
+pull --quiet <image>                                               # base image missing from the store, before the key
+commit --quiet --change "LABEL agern.prepared=<key>" --change "LABEL agern.prepared.repo=<repo>" --change "LABEL agern.prepared.platform=<p>"
+    --change "LABEL agern.prepared.definition=<sha256>" --change "LABEL agern.prepared.base=<image>" <container> localhost/agern-prepared/<slug>:<key>
+images --filter label=agern.prepared --format '{{.ID}}'  ;  image inspect <id> …   # admin overview
+rmi <id>                                                           # replaced or admin-removed prepared image; never --force
 exec --workdir / agern-run-<id>-<svc> sh -c <ready.command>                                      # readiness check, until exit 0
 logs --tail 30 agern-run-<id>-<svc>                                                              # when it never passes
 exec --workdir /workspace <container> sh -c <prepare-user.sh> agern-user <n> <name or ''> [<cache path> …]   # with `user`, as root
@@ -841,8 +894,8 @@ stop ends a running command's waits at once with the same errors a foreground ca
 services included — and network, and the review sandbox if it exists, are removed at once (cache volumes are kept)
 and their slots are freed; 404 only when the run has neither. The run itself is not touched: a command running at that moment ends with
 a tool error saying the sandbox was stopped, a `system` warn event in the transcript of each sandbox's last user (the
-builder, a reviewer) says who stopped it, and the next `factory_sandbox_exec` creates a fresh sandbox (setup runs
-again) like the first one did.
+builder, a reviewer) says who stopped it, and the next `factory_sandbox_exec` creates a new sandbox like the first
+one did (from the prepared image, when there is one).
 
 **Concurrency and memory.** `FACTORY_SANDBOX_MAX_CONCURRENT` counts *containers that run commands*, over all
 runs: a run's sandbox container takes a slot when created and each platform container one more; sidecars
@@ -850,8 +903,8 @@ take none (they belong to the run's network, whatever container uses them). A sl
 container is removed. A review sandbox's container takes one slot too (its services none). This keeps the cap truthful about load — a run that tests on three images really
 runs three containers, each with the full per-container memory limit — without starving single-image runs.
 When a run needs a slot and none is free, it first removes its *own* other command containers, least
-recently used first (they are idle: one command at a time per run; files in `/workspace` stay, the setup
-runs again when that container is used next); a run that holds none is not queued: the tool answers at once
+recently used first (they are idle: one command at a time per run; files in `/workspace` stay, and the
+container is created again, from its prepared image, when used next); a run that holds none is not queued: the tool answers at once
 that the sandboxes are busy and nothing ran; the agent may try again later (its prompt tells it not to fall
 back to installing a toolchain on the host). So even with a cap of 1 a run can test on every platform, one
 container at a time. A review sandbox that finds no free slot first removes the same run's idle build command
@@ -3447,7 +3500,13 @@ type RunSandbox = { state: 'disabled' | 'none' | 'invalid' | 'unapproved' | 'app
   platforms: string[];       // the definition's platforms ('approved' only; [] for older runs)
   platformsUsed: string[];   // where the builder ran commands, 'default' and platform names in first-use order
                              // (filled only when there are platforms)
-  reviewUsed: boolean };     // a review sandbox of the run was created (the ux and ui-design reviewers used it)
+  reviewUsed: boolean;       // a review sandbox of the run was created (the ux and ui-design reviewers used it)
+  // Recorded at the build sandbox's first command (§5 "Prepared images"); absent or null for older runs:
+  firstCommandMs?: number | null;  // from the first builder stage's start to that command (null: start unknown)
+  createMs?: number | null;        // how long creating the container it ran in took
+  startedFrom?: 'reused' | 'prepared' | 'setup' | 'plain' | null;  // prepared image / setup ran and stored one /
+                                   // setup ran, nothing stored / no setup script
+  preparedKey?: string | null };   // the prepared image's key (reused, prepared)
 
 type SandboxDefinition = { image: string; setup: string | null; env: Record<string, string>;
   services: { name: string; image: string; env: Record<string, string>;
@@ -3484,8 +3543,15 @@ type RunningSandbox = { runId: string; repo: string;
 type SandboxOverview = { enabled: boolean; runtime: 'off' | 'podman' | 'fake';
   inUse: number;             // slots in use: command containers over all runs
   limits: { maxCpus: number; maxMemory: string; maxConcurrent: number; execTimeoutMinutes: number; registries: string[];
-    maxPlatforms: number };
-  sandboxes: RunningSandbox[] };                          // the sandboxes that exist right now, oldest first
+    maxPlatforms: number; preparedMaxAgeDays: number };  // FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS (0: off)
+  sandboxes: RunningSandbox[];                            // the sandboxes that exist right now, oldest first
+  prepared: PreparedImage[];                              // prepared images in Podman's store, newest first
+  preparedBytes: number };                                // their sizes summed
+type PreparedImage = { repo: string; platform: string;    // 'default' or a platform name
+  key: string; definition: string;                        // the approved definition's hash
+  baseImage: string; createdAt: string;
+  sizeBytes: number;                                      // as Podman reports it, including shared base layers
+  expired: boolean };                                     // older than the max age: never started again
 type PendingSandbox = { repo: string; sha256: string; image: string;
   approvedSha256: string | null };                         // the approved older version, or null when none ever was
 
@@ -3776,6 +3842,7 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `GET /api/admin/users` | → `User[]` | admin |
 | `GET /api/admin/sandboxes` | → `SandboxOverview` | admin. Every sandbox that exists on this server (also of repositories the admin cannot see, without their issue titles) |
 | `GET /api/admin/sandboxes/pending` | → `PendingSandbox[]` | admin. The projects the admin can see whose valid `.agern/sandbox.yml` on the default branch is not approved in this version (one GitHub read per project; unreadable ones are left out), by name |
+| `DELETE /api/admin/sandboxes/prepared` | → `SandboxOverview` | admin (403 otherwise). Removes every prepared image no container uses, without force (§5 "Prepared images"); images in use stay listed. A runtime failure while listing answers 502 |
 | `DELETE /api/admin/sandboxes/{runId}` | → `SandboxOverview` | admin. Removes that run's sandbox now (platform containers and services included); the run continues (§5 "Stopped by an admin"). 404 when the run has no sandbox right now |
 | `GET /api/admin/software-requests` | → `SoftwareRequest[]` | admin |
 | `POST /api/admin/software-requests/{id}` | `{ status, note? }` → `SoftwareRequest` | admin |
@@ -3943,10 +4010,11 @@ card and in the project header (§10). Agern stores it, since GitHub has no per-
   (`approval` set) or revoked (`null`) a project's sandbox definition, with the same visibility filter. Clients apply it
   to a loaded `SandboxStatus` (`approved` when the approval's hash is the file's, else `pending`) and reload after a
   reconnect.
-  `{ type: 'sandboxes', runId: string, change: 'created' | 'removed' | 'stopped' }` is sent **to admins only** (of
-  every project, like the overview) when a container of a run's sandbox was created (the sandbox or a platform
-  container) or removed (one container to free a slot, or the whole sandbox when its run's build/review part ended),
-  or an admin stopped a sandbox. It carries no project data; the admin page reloads `GET /api/admin/sandboxes`
+  `{ type: 'sandboxes', runId: string, change: 'created' | 'removed' | 'stopped' | 'prepared' }` is sent **to admins
+  only** (of every project, like the overview) when a container of a run's sandbox was created (the sandbox or a
+  platform container) or removed (one container to free a slot, or the whole sandbox when its run's build/review part
+  ended), an admin stopped a sandbox, or prepared images changed (`prepared`: one was stored, or an admin removed them;
+  `runId` is the storing run's or empty). It carries no project data; the admin page reloads `GET /api/admin/sandboxes`
   (debounced) and keeps a slow fallback poll for missed frames.
   `{ type: 'usage' }` is **private**: it goes only to the feed connections of the user whose Claude usage changed (limit
   windows recorded, spend added, credential replaced or removed), is not subject to the visibility filter and carries
@@ -4042,7 +4110,12 @@ sandboxes off it prints one line.
 container uses whose build time is older than `AGERN_SANDBOX_PRUNE_HOURS` (default 168; Podman records no
 "last used", so an old base image is removed once idle and pulled again on the next run), dangling images,
 unused volumes of that age that are not per-project caches (label `agern.cache`), and self-test leftovers.
-Cache volumes are removed only by `prune --caches`/`--all`. Containers are removed with `--volumes`, so an
+Prepared images (label `agern.prepared`, §5 "Prepared images") no container uses are removed once they were created more
+than `FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS` × 24 hours ago (`image prune --all --filter label=agern.prepared --filter
+until=<h>h`, no negated filters, which Podman 4.3 may lack); the general age rule applies to them as to every image,
+so the shorter of the two ages wins. `prune --prepared` removes every unused prepared image; `--caches` and `--all`
+include it, since a setup script may have filled a cache that is then gone. `agern sandbox status` counts them in
+`podman system df`; the admin page lists them with their sizes. Cache volumes are removed only by `prune --caches`/`--all`. Containers are removed with `--volumes`, so an
 image's anonymous volumes (e.g. PostgreSQL's data) go with the run.
 
 *Packaging.* The Podman stack is in `Suggests:` (`podman (>= 4.3), uidmap, netavark, aardvark-dns, crun,
@@ -4657,7 +4730,9 @@ and says plainly that they will run on the factory host for
 every run of the project — and "Revoke…" (confirmation); others see who can approve. The page and the row follow
 `sandbox_approval` frames. The run page shows one line under the run's facts: "sandbox" with the image and the approved
 definition's hash prefix and, when the definition has platforms, each platform (marked ✓ once commands ran in it),
-then "review sandbox ✓" when the UI reviewers ran the app in a review sandbox (`reviewUsed`), or
+then "first command after <n> s" when `firstCommandMs` is known (its title: the time from the builder's start to its
+first sandbox command, how long creating the sandbox took and whether it came from a prepared image), then "review
+sandbox ✓" when the UI reviewers ran the app in a review sandbox (`reviewUsed`), or
 "none — <why>" (switched off, no definition, not approved, invalid), and a link to the
 sandbox page. In a builder's or UI reviewer's transcript every `system` event with `payload.sandbox` is a collapsible command block
 (a `review` chip when `review` is set — screen readers hear "Review sandbox command:" —, the platform as a chip when `platform` is set, `$ command` or "setup script", exit code or "timed out", duration,
@@ -4668,10 +4743,15 @@ themselves are summarised as "Exit N in X s · full log below" (or "Timed out �
 "Started in the background" (a background start) or "Still running after N s" (a wait that ran out), and the wait's
 arguments show the handle or "latest command". The admin page has a "Sandboxes" card: runtime, containers in use of the maximum (with a note that
 every container that runs commands takes a slot and services take none), the per-container caps, the platform cap, the
-command time limit and the registries; the running sandboxes (run, project, owner, run status, age, each existing
+command time limit, the registries and how long prepared images are kept ("kept up to <n> days" or "off"); the running sandboxes (run, project, owner, run status, age, each existing
 container as platform chip + image — the review sandbox's as a `review` chip —, services, platforms not created yet,
 slots held, per-container limits and the memory the run may use in all, definition hash) with "Stop" (confirmation:
-the containers go, the review sandbox's too, the run continues and its next sandbox command creates a new one); and the projects waiting for an approval, linking to their sandbox pages. The card reloads
+the containers go, the review sandbox's too, the run continues and its next sandbox command creates a new one); with
+sandboxes on, "Prepared images <count>" with their total size, a list (project, platform when not `default`, key, short
+base image, when prepared, size, an "expired" marker) or the empty state "No prepared image yet. …", and "Remove
+prepared images" (confirmation dialog "Remove the prepared images?", "Remove images"/"Removing…", errors in the dialog;
+afterwards "<n> prepared image(s) are in use and were kept." when some remain); and the projects waiting for an
+approval, linking to their sandbox pages. The card reloads
 (debounced) on every `sandboxes` frame and otherwise every 60 s. The software
 requests card notes that build and test tools can go in the project's `.agern/sandbox.yml` instead of on the host.
 

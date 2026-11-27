@@ -15,6 +15,10 @@ clean environment, without anyone installing that toolchain on the factory host:
 
 - one sandbox per run, created on the builder's first sandbox command and removed when the run's
   build/review part is over (also after a cancel, a time-out or a server restart);
+- the setup script runs once per project, image and approved definition: the container it prepared is
+  stored as a *prepared image*, and later sandboxes of the project (other runs, the next issue of a
+  release, the review sandbox) start from it in seconds, each still in its own fresh container (see
+  "Prepared images");
 - the run's worktree mounted read-write at `/workspace` (the builder edits on the host and builds in
   the container: the same files); nothing else from the host is mounted;
 - rootless Podman: the containers belong to the factory's unprivileged service user, never to root, are
@@ -73,8 +77,10 @@ Every key, with its default. Only `image` is required.
 # It needs a POSIX sh.
 image: docker.io/library/eclipse-temurin:21-jdk
 
-# Shell script, run once as root when the container is created (sh -lc, in /workspace, time limit as
-# for commands). Install system packages here. Optional; at most 32 KiB.
+# Shell script, run as root in a fresh container (sh -lc, in /workspace, time limit as for commands).
+# Install system packages here. The result is stored as a prepared image that later sandboxes start
+# from, so it runs once per project, image and definition, not per run (see "Prepared images").
+# Optional; at most 32 KiB.
 setup: |
   apt-get update && apt-get install -y --no-install-recommends git
 
@@ -149,7 +155,9 @@ toolchain or its database can be started for review. What to know when you write
   `resources` and the default `caches` (shared with the builder's container, read-write) — no platforms
   — and starts its own copy of every service, with your readiness checks. It does not share data with the
   builder's services.
-- **Setup.** The setup script runs again in the review sandbox, as root, with `/workspace` read-only: it
+- **Setup.** The review sandbox starts from the project's prepared image (the same one the builder's
+  sandbox uses, see "Prepared images"), so setup does not run again. Only when there is none yet does
+  setup run here, as root, with `/workspace` read-only, and its result is stored for later sandboxes: it
   must not write into `/workspace` (install into the image's system directories, the user's home or a
   cache instead). Afterwards only the user's home is handed over to `user:`.
 - **A browser.** To take screenshots inside the container the reviewers need a headless browser there:
@@ -181,10 +189,57 @@ lists the platforms used and labels every command with the platform it ran on.
 - Each container that runs commands — the default one and each platform's — takes one of the server's
   `FACTORY_SANDBOX_MAX_CONCURRENT` slots and has the full memory limit, so a run that tests on three
   images uses up to three times the memory (plus its services). When the server has no free slot, a run
-  first gives up its own idle containers (the least recently used; its setup runs again when used next),
-  so testing on several platforms also works on a small server, one container at a time.
+  first gives up its own idle containers (the least recently used; it is created again from its prepared
+  image when used next), so testing on several platforms also works on a small server, one container at
+  a time.
+- Each platform has its own prepared image, made by its own setup the first time it is used.
 - Platform names: lower-case letters, digits and `-`, starting with a letter, at most 31 characters;
   `default` means the top-level image.
+
+## Prepared images
+
+Setting up a container (pulling the image, `apt-get update`, installing packages, downloading a
+runtime) takes minutes and gives the same result every time, as long as the image and the file do not
+change. So Agern does it once:
+
+- The **first** sandbox of a project with a `setup` script runs it as described above. When setup has
+  succeeded, Agern stores that container's file system as a local image, a *prepared image*
+  (`localhost/agern-prepared/<project>:<key>`). The run page says `Preparing sandbox image (setup) …`
+  and then `Prepared image <key> stored in … s`.
+- **Later** sandboxes with the same key start from that image and skip setup: other runs, the next
+  issue of a release, the review sandbox, a container recreated after an admin's stop or after a run
+  made room for a platform. The run page says `Sandbox from prepared image <key> (prepared <date>)`.
+  Each sandbox is still its own fresh container with its own worktree mount, services and network:
+  runs share the prepared starting point, never each other's files, processes or databases.
+- The **key** is made of the project, the platform, the approved version of this file, the local id
+  of the base image and Agern's own preparation scripts. A newly approved file, a base image that was
+  pulled again (a moved tag), another platform or a new Agern version that prepares the user
+  differently therefore prepares a new image; old ones are never reused.
+- A prepared image is used for at most `FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS` (default 7) days.
+  After that setup runs again, so `apt-get update` and similar steps pick up security updates. Unused
+  expired images are removed by the daily prune. An admin can remove all unused prepared images at any
+  time (admin page, Sandboxes, or `agern sandbox prune --prepared`); `0` switches prepared images off
+  and runs setup in every new container, as before.
+- A failed setup never stores anything. When two runs need the same missing image at the same time,
+  the second waits for the first (at most the command limit) and starts from its image.
+
+What this means for your `setup` script — **setup must only install into the image**:
+
+- A prepared image keeps the container's own file system after setup: system directories, `/opt`, the
+  user's home.
+- It does **not** keep what setup wrote into `/workspace` (the worktree is mounted, not copied), into a
+  `caches:` path (a volume) or into `/run/agern-review`, nor anything it did to a service (a database
+  it created or migrated), nor processes it started. Such effects happen only in the sandbox that
+  prepares the image; later sandboxes do not see them. Do these things in the build (or in the
+  Verification commands) instead.
+- What setup *reads* from `/workspace` (for example a version number in a lock file) is frozen in the
+  image until it is prepared again: after a change that matters, ask an admin to remove the prepared
+  images.
+
+**Caches versus prepared images.** Both survive between runs. `caches:` volumes hold downloads that the
+build itself fills and updates (Gradle, npm, pip), are shared by all runs of the project and are mounted
+into every sandbox. A prepared image holds what setup installed into the system; it is read-only for the
+runs (each sandbox writes into its own container layer) and replaced, not updated.
 
 ## Services and readiness
 
@@ -237,8 +292,11 @@ Point cache paths at the user's home, e.g. `/home/ubuntu/.gradle`, not `/root/.g
 ## Caches
 
 Each path in `caches` is a named volume of the project (one per platform), kept between runs and
-removed only by an admin (`agern sandbox prune --caches`). Use them for downloads that are safe to
-reuse: `~/.gradle`, `~/.m2`, `~/.npm`, `~/.cache/pip`, `~/.cache/ms-playwright`. Do not use them for
+removed only by an admin (`agern sandbox prune --caches`, which also removes the unused prepared
+images, since a setup script may have filled a cache that is then gone). Use them for downloads that are
+safe to reuse: `~/.gradle`, `~/.m2`, `~/.npm`, `~/.cache/pip`, `~/.cache/ms-playwright`. What setup
+writes into a cache path is not part of the prepared image (see "Prepared images"): a browser that setup
+downloads into a cache is there as long as the volume is. Do not use them for
 build output that belongs to a run (that stays in `/workspace`) or for anything secret. Several runs of a
 project can use a cache at the same time; tools whose caches are not safe for concurrent use (few are)
 need their own locking.
@@ -254,6 +312,7 @@ need their own locking.
 | Handles | the running command and the results of the last 20 finished commands per run, until the sandbox is removed |
 | Containers at once | `FACTORY_SANDBOX_MAX_CONCURRENT` over the whole server (default 2), counting the default and each platform container and the review sandbox's; a builder over it is told to try again later |
 | Review sandbox | one per run, for one review round, default image only; one slot (after removing the run's idle build containers); without a free slot the UI reviewers review on the host |
+| Prepared images | reused for `FACTORY_SANDBOX_PREPARED_MAX_AGE_DAYS` (default 7; `0`: off), one per project, platform, definition and base image |
 | Platforms | `FACTORY_SANDBOX_MAX_PLATFORMS` (default 4) |
 | Services | 5, each with the same CPU and memory limits as the sandbox |
 
@@ -265,6 +324,13 @@ A command that uses more memory than the limit is killed by the kernel; the sand
   the run page and the project's Sandbox page), or not approved in this version.
 - **"Could not create the sandbox: … pull …":** the image name is wrong, the registry is not allowed, or
   Docker Hub's anonymous pull limit was hit; try again later or use another registry.
+- **A tool that setup installs is missing or outdated:** the sandbox started from a prepared image
+  made before. A new approval of the file prepares a new one by itself; otherwise ask an admin to remove
+  the prepared images (admin page, Sandboxes, "Remove prepared images"), and the next sandbox runs setup
+  again. Also check that setup did not put the tool into `/workspace` or a cache path, which are not
+  part of the prepared image (see "Prepared images").
+- **"Another run is still preparing this project's sandbox image":** a first sandbox is running setup
+  and took longer than the command limit; try again a few minutes later.
 - **"The sandbox's setup script failed":** its output is on the run page. Setup runs non-interactively
   as root: use `DEBIAN_FRONTEND=noninteractive`, `apt-get install -y`, and remember that `apt-get update`
   is needed in fresh images.
