@@ -83,12 +83,22 @@ class Workspaces(private val cfg: Config, val git: GitOps, private val github: G
     /** Where unpushed submodule commits of run [runId] are saved when its checkout is removed ([removeRunCheckout]). */
     fun bundleDir(username: String, repo: String, runId: UUID): Path = repoDir(username, repo).resolve("bundles").resolve(runId.toString())
 
-    /** The owner's clone used by chat (and as the base of run worktrees). Blocking. */
-    fun ensureMain(id: AgentIdentity, repo: String): Path {
+    /**
+     * The owner's clone used by chat (and as the base of run worktrees). A fresh clone is checked out on [branch] (the
+     * project's base branch; null = the default branch); when that fails, it is cloned once more without one. Blocking.
+     */
+    fun ensureMain(id: AgentIdentity, repo: String, branch: String? = null): Path {
         val dir = mainDir(id.username, repo)
         synchronized(locks.computeIfAbsent("${id.username}/$repo") { Any() }) {
             Files.createDirectories(home(id.username))
-            git.ensureClone(id, github.cloneUrl(cfg.githubOrg, repo), dir, home(id.username))
+            val url = github.cloneUrl(cfg.githubOrg, repo)
+            try {
+                git.ensureClone(id, url, dir, home(id.username), branch)
+            } catch (e: dk.egernet.factory.git.GitException) {
+                if (branch == null) throw e
+                log.warn("Cloning {} on branch {} failed, cloning its default branch instead: {}", repo, branch, e.message)
+                git.ensureClone(id, url, dir, home(id.username))
+            }
             lastFetch["${id.username}/$repo"] = System.currentTimeMillis()
         }
         return dir
@@ -96,14 +106,16 @@ class Workspaces(private val cfg: Config, val git: GitOps, private val github: G
 
     /**
      * [GitOps.syncCheckout] of the owner's main clone of [repo] under the clone's lock: fast-forwards it to
-     * `origin/<defaultBranch>` when safe. Fetches unless the clone was fetched within [mainFetchMinIntervalMs]. Blocking.
+     * `origin/<baseBranch>` (the project's base branch) when safe, switching it there first from the branch it followed
+     * before (else [defaultBranch]) when nothing of the user's can be lost (docs/ARCHITECTURE.md §5 "Workspaces").
+     * Fetches unless the clone was fetched within [mainFetchMinIntervalMs]. Blocking.
      */
-    fun syncMain(id: AgentIdentity, repo: String, defaultBranch: String): CheckoutState? = withRepoLock(id.username, repo) {
+    fun syncMain(id: AgentIdentity, repo: String, baseBranch: String, defaultBranch: String): CheckoutState? = withRepoLock(id.username, repo) {
         val key = "${id.username}/$repo"
         val now = System.currentTimeMillis()
         val fetch = now - (lastFetch[key] ?: 0L) >= mainFetchMinIntervalMs
         if (fetch) lastFetch[key] = now
-        git.syncCheckout(id, mainDir(id.username, repo), defaultBranch, home(id.username), fetch)
+        git.syncCheckout(id, mainDir(id.username, repo), baseBranch, home(id.username), fetch, switchFrom = defaultBranch)
     }
 
     // ------------------------------------------------------------ workspace members

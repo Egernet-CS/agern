@@ -229,6 +229,8 @@ class AgentManager(
     private val preferences: dk.egernet.factory.db.PreferenceStore,
     private val usageStore: dk.egernet.factory.db.ClaudeUsageStore,
     private val workspaceDefs: dk.egernet.factory.workspace.WorkspaceService? = null,
+    /** The projects' base branches, which the chat checkout follows (docs/ARCHITECTURE.md §6 "Base branch"); null = default branches. */
+    private val projectBranches: dk.egernet.factory.ProjectBranches? = null,
     /** MCP tools a (non-advisor) chat gets on top of [McpRegistry.CHAT_TOOLS]: the deploy tools when they are switched on. */
     private val chatExtraTools: Set<String> = emptySet(),
 ) {
@@ -362,7 +364,7 @@ class AgentManager(
         scope.launch(Dispatchers.IO) {
             try {
                 val identity = chatIdentity(owner) ?: return@launch
-                workspaces.ensureMain(identity, repo)
+                workspaces.ensureMain(identity, repo, projectBranches?.configured(repo))
                 ensureChatWorkspace(s.id, owner, identity, repo)
                 syncCheckout(s.id, owner, repo)
             } catch (e: CancellationException) {
@@ -450,15 +452,16 @@ class AgentManager(
     }
 
     /**
-     * Syncs [owner]'s main clone of [repo] with its default branch ([Workspaces.syncMain]) and publishes the result as a
+     * Syncs [owner]'s main clone of [repo] with the project's base branch ([Workspaces.syncMain]) and publishes the result as a
      * `checkout` event unless it equals the last one published for [sessionId]. Never throws (docs/ARCHITECTURE.md §5
      * "Workspaces"): any failure is logged and gives null.
      */
     private suspend fun syncCheckout(sessionId: UUID, owner: UserRecord, repo: String): CheckoutState? = try {
         withContext(Dispatchers.IO) {
-            val branch = access.visibleRepo(owner, repo)?.defaultBranch
+            val info = access.visibleRepo(owner, repo)
             val identity = chatIdentity(owner)
-            if (branch == null || identity == null) null else workspaces.syncMain(identity, repo, branch)
+            if (info == null || identity == null) null
+            else workspaces.syncMain(identity, repo, projectBranches?.baseOf(info) ?: info.defaultBranch, info.defaultBranch)
         }?.also { publishCheckout(sessionId, it) }
     } catch (e: CancellationException) {
         throw e
@@ -478,6 +481,7 @@ class AgentManager(
             put("status", state.status)
             put("reason", state.reason)
             put("updatedFrom", state.updatedFrom)
+            put("switchedFrom", state.switchedFrom)
         }
         if (checkoutPublished.put(sessionId, payload) != payload) publish(sessionId, "checkout", payload)
     }
@@ -638,7 +642,7 @@ class AgentManager(
             val advisor = s.kind == ADVISOR_KIND
             // An advisor works in its run's worktree with the run's context; a chat in the owner's main clone.
             val launch = if (advisor) (advisorLaunch ?: error("Advisors are not available")).invoke(s, owner) else null
-            val workDir = launch?.workDir ?: withContext(Dispatchers.IO) { workspaces.ensureMain(identity, s.repo) }
+            val workDir = launch?.workDir ?: withContext(Dispatchers.IO) { workspaces.ensureMain(identity, s.repo, projectBranches?.configured(s.repo)) }
             // A chat in a workspace gets the members its owner can read beside the workspace clone.
             val chatWs = if (advisor) null else withContext(Dispatchers.IO) {
                 // Never fails quietly: a chat whose member clones cannot be recorded does not start.

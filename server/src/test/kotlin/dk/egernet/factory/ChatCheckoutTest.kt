@@ -136,6 +136,33 @@ class ChatCheckoutTest {
     }
 
     @Test
+    fun `a chat follows the project's base branch and switches a clean checkout to it`() {
+        gitIn(upstream, "checkout", "-q", "-b", "dev")
+        Files.writeString(upstream.resolve("dev.txt"), "dev\n")
+        gitIn(upstream, "add", "dev.txt")
+        gitIn(upstream, "commit", "-q", "-m", "Add dev.txt")
+        gitIn(upstream, "push", "-q", "origin", "dev")
+        val dev = head(upstream)
+        val old = head(main)
+        val root = s.users.upsertOnLogin("root-${cases.get()}", "root", true)
+        s.projectSettings.put("demo-app", ProjectSettingsDto(baseBranch = "dev"), root.id)
+        try {
+            val chat = s.agents.createChat(alice, "demo-app", null)
+            send(alice, chat.id, "what is new")
+            assertEquals(dev, head(main))
+            assertEquals("dev", gitIn(main, "symbolic-ref", "--short", "HEAD").trim())
+            await("a checkout event on dev") { checkoutEvents(chat.id).any { str(it, "branch") == "dev" } }
+            val ev = checkoutEvents(chat.id).first { str(it, "branch") == "dev" }
+            assertEquals("dev", str(ev, "defaultBranch"))
+            assertEquals("main", str(ev, "switchedFrom"))
+            assertEquals("updated", str(ev, "status"))
+            assertEquals(old, str(ev, "updatedFrom"))
+        } finally {
+            s.projectSettings.put("demo-app", ProjectSettingsDto(), root.id)
+        }
+    }
+
+    @Test
     fun `a dirty checkout is never modified and the agent is told once per launch`() {
         val old = head(main)
         pushCommit()

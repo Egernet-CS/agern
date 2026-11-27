@@ -244,7 +244,7 @@ class ReleaseBuildTest {
         val merged = world.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
         assertEquals(RunStatus.MERGED, merged.status, merged.error)
         assertNull(merged.releaseId)
-        assertNull(merged.baseBranch)
+        assertEquals("main", merged.baseBranch)
         assertTrue(merged.branch!!.startsWith("factory/issue-$single-"))
         assertTrue(world.github.actions.any { it.startsWith("pr demo-app ${merged.branch} -> main") })
         assertTrue(world.github.pullBodies[merged.prNumber!!]!!.startsWith("Closes #$single"))

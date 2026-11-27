@@ -147,6 +147,8 @@ class Orchestrator(
     private val clock: java.time.Clock = java.time.Clock.systemUTC(),
     /** Sandbox VMs (docs/SANDBOX-VMS.md); null in setups without them. */
     private val vms: dk.egernet.factory.sandboxvm.SandboxVmManager? = null,
+    /** The projects' base branches (docs/ARCHITECTURE.md §6 "Base branch"); null = every project uses its default branch. */
+    private val projectBranches: dk.egernet.factory.ProjectBranches? = null,
 ) {
     private val log = LoggerFactory.getLogger(Orchestrator::class.java)
     private val jobs = ConcurrentHashMap<UUID, Job>()
@@ -448,7 +450,7 @@ class Orchestrator(
         continuesFrom: RunRecord? = null, expectedTarget: ExpectedTarget? = null,
     ): RunRecord {
         if (owner.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
-        access.requireVisible(owner, repo)
+        val repoInfo = access.requireVisible(owner, repo)
         val client = access.requireClient(owner)
         val issue = withContext(Dispatchers.IO) { client.getIssue(org, repo, issueNumber) } ?: throw notFound("Issue #$issueNumber not found")
         // A workspace project: the member the run changes (docs/ARCHITECTURE.md §6 "Workspace runs"), fixed for the run.
@@ -465,10 +467,13 @@ class Orchestrator(
         // The merge policy in force now, fixed for the run (docs/ARCHITECTURE.md §6 "Merge policy"). A release run merges
         // into its release branch; the policy applies to the release's own merge instead.
         val policy = if (releaseId != null) MergePolicy.AUTOMATIC else settingsOf(repo).mergePolicy
+        // A release run's base is always its release branch (in the member repository for a member issue); a member run's
+        // is the member's base; a single run's is the project's base branch, fixed for the run.
+        val base = (if (releaseId != null) baseBranch else null) ?: member?.first?.baseBranch ?: baseBranch
+            ?: withContext(Dispatchers.IO) { singleRunBase(client, repoInfo, continuesFrom) }
         val run = runs.createIfNoActive(
             repo, issueNumber, issue.title, issueKindFromLabels(issue.labels.map { it.name }), eff.maxFixRounds, owner.id, startedBySession,
-            // A release run's base is always its release branch (in the member repository for a member issue).
-            releaseId, (if (releaseId != null) baseBranch else null) ?: member?.first?.baseBranch ?: baseBranch, continuesFrom?.id, continuesFrom?.spec, member?.first?.repository,
+            releaseId, base, continuesFrom?.id, continuesFrom?.spec, member?.first?.repository,
             member?.first?.directory, member?.second.orEmpty(), policy, maxUpdateRounds = cfg.maxUpdateRounds,
         ) ?: throw conflict("Issue #$issueNumber already has an active run", "active_run_exists")
         for (role in listOf("spec-writer", "builder") + REVIEWER_ROLES + "approver") runs.createStage(run.id, role, 0, eff.model(role))
@@ -477,6 +482,26 @@ class Orchestrator(
         publish(run.id)
         launchJob(run.id) { execute(run.id) }
         return runs.get(run.id)!!
+    }
+
+    /**
+     * The base branch of a new single run of [repo] (docs/ARCHITECTURE.md §6 "Base branch"): a continuation keeps the base
+     * of the run it continues (its commits were branched from it); otherwise the project's base branch, else the
+     * repository's default branch. A base other than the default branch must exist on GitHub now (checked with the owner's
+     * [client]): 409 `base_branch_not_found` otherwise, never a fallback to the default branch. Blocking.
+     */
+    private fun singleRunBase(client: GitHubClient, repoInfo: dk.egernet.factory.github.GhRepo, continuesFrom: RunRecord?): String {
+        val base = continuesFrom?.baseBranch ?: projectBranches?.configured(repoInfo.name) ?: repoInfo.defaultBranch
+        if (base == repoInfo.defaultBranch) return base
+        // A GitHub failure propagates like the issue lookup before it.
+        if (client.branchSha(org, repoInfo.name, base) == null) {
+            throw conflict(
+                "The base branch `$base` does not exist in $org/${repoInfo.name}. Create it on GitHub, or ask an admin to change " +
+                    "the project's base branch.",
+                "base_branch_not_found",
+            )
+        }
+        return base
     }
 
     /**
@@ -2758,14 +2783,16 @@ class Orchestrator(
         val repoInfo = client.getRepo(org, run.repo) ?: throw StageFailed("Repository not accessible")
         val issue = client.getIssue(org, run.repo, run.issueNumber) ?: throw StageFailed("Issue not found")
         val comments = runCatching { client.listComments(org, run.repo, run.issueNumber) }.getOrDefault(emptyList())
-        // A release run starts from and merges into its release branch; a single run uses the default branch.
+        // A release run starts from and merges into its release branch; a single run uses its base branch (null on runs
+        // from before base branches: the default branch).
         val target = run.baseBranch ?: repoInfo.defaultBranch
         val branch = if (resuming) run.branch ?: throw StageFailed("The run has no branch to retry") else runBranch(run.issueNumber, issue.title, releaseName, run.id)
         // A step retry re-creates the worktree on its own branch; a continuation starts at the tip of the earlier run's branch.
         val startFrom = if (resuming) branch else previous?.branch
         val checkout = if (run.targetRepo != null) setUpWorkspace(run, owner, id, repoInfo.defaultBranch, target, branch, startFrom)
         else {
-            val main = workspaces.ensureMain(id, run.repo)
+            // A fresh clone is checked out on the project's base branch, which the chat checkout follows.
+            val main = workspaces.ensureMain(id, run.repo, projectBranches?.configured(run.repo))
             val base = workspaces.withRepoLock(owner.username, run.repo) {
                 // Leftovers of runs that have ended (e.g. after a crash) never block a new run; live runs keep theirs.
                 workspaces.reapRunWorktrees(owner.username, run.repo) { it != run.id && keepWorktree(it) }
@@ -3496,7 +3523,13 @@ class Orchestrator(
                         "The issue stays open until the release is merged into `$defaultBranch`.")
             }
         } else {
-            bestEffort { client.comment(org, run.repo, run.issueNumber, "**Agern: merged** pull request ${prRef(run, pr)}$approval.") }
+            // A single run on a base other than the default branch says where it merged (docs/ARCHITECTURE.md §6 "Base branch").
+            val into = run.baseBranch?.takeIf { run.targetRepo == null }?.let { base ->
+                val defaultBranch = runCatching { client.getRepo(org, run.repo)?.defaultBranch }.getOrNull()
+                base.takeIf { defaultBranch != null && it != defaultBranch }
+            }
+            val where = into?.let { " into `$it`" }.orEmpty()
+            bestEffort { client.comment(org, run.repo, run.issueNumber, "**Agern: merged** pull request ${prRef(run, pr)}$where$approval.") }
             bestEffort { client.closeIssue(org, run.repo, run.issueNumber) }
         }
         // Development only: the fake GitHub merges in memory; with the switch the merge also lands on the local target.
@@ -3607,8 +3640,28 @@ class Orchestrator(
             bestEffort { client.removeLabel(org, run.repo, run.issueNumber, "needs-human") }
             // Agern did not merge it: the pointer bump is opened for a human, never merged.
             if (merged && run.targetRepo != null && run.releaseId == null) bumpPointerSafely(run, client, pr, autoMerge = false)
+            if (merged) closeAfterGitHubMerge(run, client, pr, by)
         }
         publish(run.id)
+    }
+
+    /**
+     * A single run's pull request [pr] merged on GitHub into a base other than the default branch (docs/ARCHITECTURE.md
+     * §6 "Base branch"): GitHub closes issues itself only for merges into the default branch, so Agern comments and
+     * closes the issue. Nothing for runs on the default branch, release and member runs. Best effort. Blocking.
+     */
+    private fun closeAfterGitHubMerge(run: RunRecord, client: GitHubClient, pr: Int, by: String?) {
+        if (run.releaseId != null || run.targetRepo != null) return
+        val base = run.baseBranch ?: return
+        val defaultBranch = runCatching { client.getRepo(org, run.repo)?.defaultBranch }.getOrNull() ?: return
+        if (base == defaultBranch) return
+        val who = by?.let { " by @$it" }.orEmpty()
+        bestEffort {
+            client.comment(org, run.repo, run.issueNumber,
+                "**Agern:** pull request #$pr was merged into `$base` on GitHub$who. Closing this issue: GitHub closes issues " +
+                    "itself only for merges into the default branch (`$defaultBranch`).")
+        }
+        bestEffort { client.closeIssue(org, run.repo, run.issueNumber) }
     }
 
     /** Records the worktree HEAD Agern just pushed as the head first seen now (the checks' settle period counts from it). */
@@ -3998,7 +4051,7 @@ class Orchestrator(
         append("(e.g. Flyway `V<n>__name.sql`), take its version from `${c.baseRef}` as it is now (fetch it first): the next version ")
         append("above every migration there. Check it again before you finish and after any rebase or merge of `${c.targetBranch}`, ")
         append("and never change a migration that exists there.")
-        if (c.targetBranch != c.defaultBranch) {
+        if (c.releaseName != null && c.targetBranch != c.defaultBranch) {
             append(" The release is later merged into `${c.defaultBranch}`, so the version must also be above every migration on ")
             append("`${c.defaultBranch}`.")
         }
