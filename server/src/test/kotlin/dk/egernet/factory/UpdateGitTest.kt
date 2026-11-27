@@ -148,4 +148,43 @@ class UpdateGitTest {
         assertTrue(git.mergeState(wt, head(main), home).dirty)
         assertFailsWith<IllegalArgumentException> { git.mergeBase(id, wt, "-main", home) }
     }
+
+    @Test
+    fun `commitAll commits tracked and untracked changes as Agern, without ignored files`() {
+        setUp()
+        Files.writeString(wt.resolve(".gitignore"), ".env\n")
+        gitIn(wt, "add", ".gitignore")
+        gitIn(wt, "commit", "-q", "-m", "ignore .env")
+        val before = head(wt)
+        Files.writeString(wt.resolve("b.txt"), "changed\n")
+        Files.writeString(wt.resolve("new.txt"), "new\n")
+        Files.writeString(wt.resolve(".env"), "SECRET=1\n")
+        val message = "WIP: saved\n\nThe run failed with: \"quotes\" and `backticks`; \$(not a shell)"
+        val sha = git.commitAll(wt, message, home)
+        assertEquals(head(wt), sha)
+        assertEquals(before, gitIn(wt, "rev-parse", "HEAD~1").trim())
+        assertEquals("Agern|Agern", gitIn(wt, "log", "-1", "--format=%an|%cn").trim())
+        assertEquals(message, gitIn(wt, "log", "-1", "--format=%B").trim())
+        assertEquals(listOf("b.txt", "new.txt"), gitIn(wt, "show", "--name-only", "--format=", "HEAD").lines().filter { it.isNotBlank() }.sorted())
+        // Only the ignored file is left, still uncommitted.
+        assertEquals("", gitIn(wt, "status", "--porcelain").trim())
+        assertTrue(Files.exists(wt.resolve(".env")))
+    }
+
+    @Test
+    fun `commitAll commits nothing on a clean tree or during a conflicted merge`() {
+        setUp()
+        val before = head(wt)
+        assertEquals(null, git.commitAll(wt, "WIP", home))
+        assertEquals(before, head(wt))
+
+        commit(main, "a.txt", "theirs\n", "Change a on main")
+        commit(wt, "a.txt", "ours\n", "Change a on feature")
+        val mid = head(wt)
+        assertEquals(UPDATE_CONFLICT, git.mergeBase(id, wt, "main", home).status)
+        Files.writeString(wt.resolve("stray.txt"), "stray\n")
+        assertEquals(null, git.commitAll(wt, "WIP", home))
+        assertEquals(mid, head(wt))
+        assertTrue(git.mergeState(wt, head(main), home).merging)
+    }
 }

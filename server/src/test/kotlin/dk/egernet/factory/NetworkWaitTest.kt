@@ -400,7 +400,8 @@ class NetworkWaitTest {
         val crashed = w.awaitEnd(w.start().id)
         assertEquals(RunStatus.FAILED, crashed.status)
         listOf(blocked, noVerdict, noApproval, creds, crashed).forEach { assertNull(w.run(it.id).wait, it.error) }
-        assertEquals(5, w.builders().size, "no stage ran twice")
+        // The blocked builder is asked once to finish (a finish resume, not a network retry); nothing else ran twice.
+        assertEquals(6, w.builders().size, "no stage ran twice")
     }
 
     @Test

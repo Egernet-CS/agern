@@ -71,7 +71,9 @@ class RetryTest {
                     p.init()
                     builderPrompts += p.spec.prompt ?: ""
                     builderLogs += gitIn(p.spec.workDir, "log", "--format=%s").lines().filter { it.isNotBlank() }
-                    when (first.remove(title)) {
+                    // Asked to finish after ending without commits: only the blocked builder gets here, and stays blocked.
+                    val behaviour = if (p.spec.prompt.orEmpty().startsWith("Message from Agern: your session ended")) "blocked" else first.remove(title)
+                    when (behaviour) {
                         "timeout" -> {
                             commit(p.spec.workDir, "part-1.txt", "feature part 1")
                             while (!p.killed) p.pickUp(50)?.let { warnings += it }
@@ -143,6 +145,8 @@ class RetryTest {
         assertEquals(FailureKind.TIME_LIMIT, failed.failureKind)
         assertNull(failed.failedStep)
         assertTrue(failed.error!!.contains("Timed out"), failed.error)
+        // Its tree was clean: nothing to save.
+        assertFalse(failed.error!!.contains("saved as commit"), failed.error)
         // Warned at 80 % of the limit through the message mechanism.
         assertTrue(warnings.any { it.contains("time limit") && it.contains("hand-over note") }, warnings.toString())
         // The unpushed commit is kept on the local branch.
@@ -201,6 +205,11 @@ class RetryTest {
         val n = issue("Blocked one", "blocked")
         val failed = await(start(n).id)
         assertEquals(FailureKind.BLOCKED, failed.failureKind)
+        // Asked once to finish (it said it was blocked again); nothing was left to save.
+        assertEquals(2, launched("builder"))
+        assertTrue(failed.error!!.startsWith("The builder made no commits on ${failed.branch}. The builder said: Blocked on #19"), failed.error)
+        assertFalse(failed.error!!.contains("saved as commit"), failed.error)
+        assertFalse(failed.branch in localBranches(), localBranches().toString())
         val opts = options(failed.id)
         assertEquals(RetryMode.START_OVER, opts.recommended)
         assertTrue(opts.reason.contains("Blocked on #19"), opts.reason)
