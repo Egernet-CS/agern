@@ -13,11 +13,10 @@
   <img src="web/public/art/hero.webp" alt="The Agern factory line: specs arrive, are built, reviewed by four gates and shipped" width="100%">
 </p>
 
+https://github.com/user-attachments/assets/2c2fbd83-a048-4737-b094-f7589a5aa1fa
+
 <p align="center">
-  <a href="docs/media/agern-concept.mp4">
-    <img src="docs/media/agern-concept-poster.webp" alt="Watch the Agern concept video (67 seconds)" width="70%">
-  </a><br>
-  <sub><a href="docs/media/agern-concept.mp4">▶ Watch the concept video (67 s)</a></sub>
+  <sub>▶ The Agern concept video (67 s). If it doesn't play here, <a href="docs/media/agern-concept.mp4">download it</a>.</sub>
 </p>
 
 Agern is a web application you run on your own machine. A GitHub organization is the source of
