@@ -1512,7 +1512,8 @@ waiting is switched off (§6 "Transient failures").
 refusal (403), as for every action that makes agents run on the owner's credentials (§4) — and the owner needs a
 Claude credential (422 `claude_credential_required`). A single run must be `failed` or `cancelled` (409
 `run_not_retryable`), except that a `needs_human` run accepts `update` (or `recommended` when that is `update`) and
-nothing else; a release run is retried through its release (409 `release_run`). The automatic update of a release
+nothing else — and one stopped for a committed project file accepts `continue` and `start_over` instead (§6 "Project
+file guard"); a release run is retried through its release (409 `release_run`). The automatic update of a release
 runs as the release's owner, who owns its runs. A mode that is not available
 is 409 `retry_mode_unavailable`; an unknown one is 400.
 
@@ -2057,9 +2058,10 @@ page." (at most 10 matches named, then ", and N more"). What follows depends on 
 - *The run's push*: the sandbox (and the sandbox VM's build lease) is released, the reviewers and the approver are
   skipped, the reason goes to the builder's transcript as an `error` event, and the run goes to `needs_human` through
   the usual path (label, issue comment, `error`) with `failureKind` `project_file_committed` and no `failedStep`.
-  Because a `needs_human` run is only retried with `update` (§6 "Retrying a run"), "Continue" is reached after
-  cancelling it (the unpushed branch is kept, "Worktrees and branches"); talking to the advisor works without that, and
-  its follow-up review checks again.
+  Such a run has no pull request, so it cannot be approved; the run page offers "Retry…" instead of "Approve". A retry
+  with `continue` (recommended when the branch has commits) or `start_over` ends it as `failed` — its local branch is
+  kept ("Worktrees and branches") — and starts a new run as for a failed run; the continuing builder's prompt carries the
+  reason. Talking to the advisor works too, and its follow-up review checks again.
 - *An update round* fails through its failure path ("Update round n of m with `<target>` did not finish: Not pushed:
   …"): nothing of it is on GitHub, so branch and worktree go back to where they were and the run keeps its previous
   failure; the builder's transcript gets the `error` event.
@@ -3774,7 +3776,7 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `POST /api/runs/{id}/network/retry` | → `Run` | owner or admin; a run waiting for the network tries again now (§6 "Transient failures"); 409 `run_not_waiting_for_network` |
 | `POST /api/runs/{id}/network/give-up` | → `Run` | owner or admin; the waiting run fails now and is returned once failed; 409 `run_not_waiting_for_network` |
 | `GET /api/runs/{id}/retry` | → `RetryOptions` | anyone who can see the run; how it can be retried and what is recommended (§6 "Retrying a run"); for a sync run every option is unavailable with the reason "A run that brings a release up to date is not retried; …" |
-| `POST /api/runs/{id}/retry` | `{ mode?: 'update' \| 'step' \| 'continue' \| 'start_over' \| 'recommended' }` (body optional) → `Run` | owner only (admins included: 403), single runs that are `failed` or `cancelled` (409 `run_not_retryable`; a release run: 409 `release_run`; a sync run: 409 `sync_run`), or `needs_human` with `update` (the same run, now `building`; 409 `run_not_retryable` for another mode); no mode = `start_over`; 409 `retry_mode_unavailable`, `active_run_exists`; 400 unknown mode; 422 `claude_credential_required`. Answers the run now at work: the same run for `step` and `update`, a new one otherwise |
+| `POST /api/runs/{id}/retry` | `{ mode?: 'update' \| 'step' \| 'continue' \| 'start_over' \| 'recommended' }` (body optional) → `Run` | owner only (admins included: 403), single runs that are `failed` or `cancelled` (409 `run_not_retryable`; a release run: 409 `release_run`; a sync run: 409 `sync_run`), or `needs_human` with `update` (the same run, now `building`; 409 `run_not_retryable` for another mode) — except a `needs_human` run with `failureKind` `project_file_committed`, which accepts `continue`, `start_over` or `recommended` (it ends as `failed` and a new run starts; 409 `retry_mode_unavailable` for `update` or `step`); no mode = `start_over`; 409 `retry_mode_unavailable`, `active_run_exists`; 400 unknown mode; 422 `claude_credential_required`. Answers the run now at work: the same run for `step` and `update`, a new one otherwise |
 | `GET /api/projects/{repo}/sessions?kind=chat` | → `AgentSession[]` | |
 | `POST /api/projects/{repo}/sessions` | `{ model? }` → `AgentSession` | new chat; needs Claude credential; without `model` the owner's effective `chatModel` |
 | `GET /api/agents?active=true` | → `AgentSession[]` | all kinds, across visible repos. `active=true`: `live` (a process exists, e.g. a chat idling between turns) or `starting`/`running` |
