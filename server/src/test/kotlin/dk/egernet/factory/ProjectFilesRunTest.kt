@@ -299,6 +299,17 @@ class ProjectFilesRunTest {
         assertEquals(RetryMode.CONTINUE, opts.recommended)
         assertTrue(opts.options.single { it.mode == RetryMode.CONTINUE }.available)
         assertTrue(systemTexts(w, run.id, "builder").any { it.startsWith("Not pushed: the branch contains project file") })
+        // Approving cannot work (no pull request); Retry → Continue ends the run and continues from its commits.
+        assertEquals(409, runCatching { runBlocking { w.services.orchestrator.approve(w.user("alice"), run.id) } }.exceptionOrNull().let { (it as ApiException).status.value })
+        w.git.newBlobsAnswer = emptyList()
+        val next = runBlocking { w.services.orchestrator.retry(w.user("alice"), run.id, RetryMode.CONTINUE) }
+        assertEquals(run.id, next.continuesRunId)
+        val old = w.services.runs.get(run.id)!!
+        assertEquals(RunStatus.FAILED, old.status)
+        assertTrue(old.error!!.startsWith("Not pushed: the branch contains project file"))
+        val continued = w.awaitRun(next.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
+        assertEquals(RunStatus.MERGED, continued.status, continued.error)
+        assertTrue(w.launcher.byRole("builder").last().spec.prompt!!.contains("Not pushed: the branch contains project file"))
     }
 
     @Test

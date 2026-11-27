@@ -639,6 +639,26 @@ class Orchestrator(
         if (run.releaseId != null) {
             throw conflict("This run builds an issue of a release; retry the issue on the release's page", "release_run")
         }
+        if (run.status == RunStatus.NEEDS_HUMAN && run.failureKind == FailureKind.PROJECT_FILE_COMMITTED) {
+            // Nothing was pushed (docs/ARCHITECTURE.md §6 "Project file guard"): the run ends as failed, keeping its local
+            // branch, and a new run continues from its commits (or starts over), as for a failed run.
+            val opts = withContext(Dispatchers.IO) { retryOptions(run) }
+            val mode = resolveRetryMode(requested, opts)
+            if (mode != RetryMode.CONTINUE && mode != RetryMode.START_OVER) {
+                throw conflict("A run stopped for a committed project file can only be continued or started over", "retry_mode_unavailable")
+            }
+            if (user.claudeCredEnc == null) throw unprocessable("Register a Claude credential in Settings first", "claude_credential_required")
+            val ended = endRun(run.id, merged = false, proceed = { it.status == RunStatus.NEEDS_HUMAN }) {
+                runs.setStatus(run.id, RunStatus.FAILED)
+            }
+            if (!ended) throw conflict("Run is ${runs.get(run.id)?.status}", "run_not_retryable")
+            withContext(Dispatchers.IO) { bestEffort { gh(user).removeLabel(org, run.repo, run.issueNumber, "needs-human") } }
+            publish(run.id)
+            settled(run.id)
+            val stopped = runs.get(run.id)!!
+            return if (mode == RetryMode.CONTINUE) create(user, run.repo, run.issueNumber, null, null, null, continuesFrom = stopped)
+            else create(user, run.repo, run.issueNumber, null, null, null)
+        }
         if (run.status == RunStatus.NEEDS_HUMAN) {
             // A run that needs a human is only retried by an update round ("Update and merge"); it keeps its work.
             val opts = withContext(Dispatchers.IO) { retryOptions(run) }
