@@ -187,4 +187,53 @@ class UpdateGitTest {
         assertEquals(mid, head(wt))
         assertTrue(git.mergeState(wt, head(main), home).merging)
     }
+
+    // ------------------------------------------------------------ landing a merge locally (fake-GitHub mode)
+
+    @Test
+    fun `a merged branch lands on the checked-out target as one squash commit, and the clean checkout follows`() {
+        setUp()
+        commit(wt, "c.txt", "more\n", "feature work 2")
+        val before = head(main)
+        assertTrue(git.landSquash(main, "main", "feature", "Feature (#3)", home))
+        val after = head(main)
+        assertEquals(before, gitIn(main, "rev-parse", "HEAD~1").trim(), "one commit on top of the old tip")
+        assertEquals("Feature (#3)", gitIn(main, "log", "-1", "--format=%s").trim())
+        assertEquals("mine\n", Files.readString(main.resolve("b.txt")))
+        assertEquals("more\n", Files.readString(main.resolve("c.txt")))
+        assertEquals("", gitIn(main, "status", "--porcelain"))
+        assertEquals(after, gitIn(main, "rev-parse", "refs/heads/main").trim())
+        // The temporary worktree is gone.
+        assertEquals(2, gitIn(main, "worktree", "list").lines().count { it.isNotBlank() })
+    }
+
+    @Test
+    fun `a dirty checked-out target is not touched`() {
+        setUp()
+        Files.writeString(main.resolve("a.txt"), "local edit\n")
+        val before = head(main)
+        assertFalse(git.landSquash(main, "main", "feature", "Feature (#3)", home))
+        assertEquals(before, head(main))
+        assertEquals("local edit\n", Files.readString(main.resolve("a.txt")))
+        assertFalse(Files.exists(main.resolve("b.txt")))
+    }
+
+    @Test
+    fun `a target that is not checked out moves without a checkout, and a conflict is skipped`() {
+        setUp()
+        gitIn(main, "branch", "release", "main")
+        assertTrue(git.landSquash(main, "release", "feature", "Feature", home))
+        assertEquals("mine\n", gitIn(main, "show", "release:b.txt"))
+        assertFalse(Files.exists(main.resolve("b.txt")), "the checked-out main is not touched")
+
+        // main changes b.txt differently: the squash merge conflicts, nothing moves.
+        commit(main, "b.txt", "theirs\n", "theirs")
+        val before = head(main)
+        assertFalse(git.landSquash(main, "main", "feature", "Feature", home))
+        assertEquals(before, head(main))
+        assertEquals("", gitIn(main, "status", "--porcelain"))
+        // Outside fake-GitHub mode nothing happens at all.
+        val real = CliGitOps(System.getenv("PATH") ?: "/usr/bin:/bin", "https://github.invalid/", localOnly = false)
+        assertFalse(real.landSquash(main, "release", "feature", "Feature", home))
+    }
 }

@@ -813,6 +813,7 @@ function setRunStatus(r: Run, status: Run['status'], ts: string) {
       if (status === 'merged' && !r.releaseId) issue.state = 'closed';
     }
   }
+  r.updateOnDemand = updatableOnDemand(r);
   touchRun(r, ts);
   if (r.releaseId && ['merged', 'needs_human', 'failed', 'cancelled'].includes(status)) releaseRunEnded(r);
 }
@@ -990,6 +991,10 @@ function pipeline(r: Run, plan: Plan, owner: User, startMs: number) {
 // ---------------------------------------------------------------- update and merge (docs/ARCHITECTURE.md §6 "Retrying a run")
 
 const targetOf = (r: Run) => r.baseBranch ?? 'main';
+/** Like the server's rule for "Update from base branch". */
+const updatableOnDemand = (r: Run) =>
+  !r.releaseId && (r.kind ?? 'issue') === 'issue' && (r.status === 'needs_human' || (r.status === 'ready' && r.mergePolicy === 'github')) &&
+  !!r.branch && !!r.prNumber && (r.updateRounds ?? 0) < (r.maxUpdateRounds ?? 2);
 const updatable = (r: Run) =>
   r.status === 'needs_human' && (r.failureKind === 'migration_conflict' || r.failureKind === 'merge_conflict') && !!r.branch && !!r.prNumber &&
   (r.updateRounds ?? 0) < (r.maxUpdateRounds ?? 0);
@@ -1003,11 +1008,12 @@ function updateSummary(u: RunUpdate): string {
   if (u.conflicts.length) parts.push(n(u.conflicts.length, 'conflicted file'));
   if (u.migrations.length) parts.push(n(u.migrations.length, 'migration problem'));
   if (u.commits.length) parts.push(`builder added ${n(u.commits.length, 'commit')}`);
-  return `Update round ${u.number} of ${u.maxRounds}${u.trigger === 'release' ? ' (automatic)' : ''}${parts.length ? `: ${parts.join('; ')}` : ''} — ${u.status}`;
+  return `Update round ${u.number} of ${u.maxRounds}${u.trigger === 'release' || u.trigger === 'base_moved' ? ' (automatic)' : ''}${parts.length ? `: ${parts.join('; ')}` : ''} — ${u.status}`;
 }
 
 function syncUpdateFields(r: Run) {
   r.updateAvailable = updatable(r);
+  r.updateOnDemand = updatableOnDemand(r);
   for (const u of r.updates ?? []) u.summary = updateSummary(u);
 }
 
@@ -1034,19 +1040,29 @@ function refuseMerge(r: Run, kind: 'migration' | 'conflict', ts: string) {
 }
 
 /** Like the server's "Update and merge": same checks and codes; the round always resolves in the mock. */
-export function updateRun(r: Run, by: User, trigger: RunUpdate['trigger'] = 'owner', instantAt?: number): Run {
+/** Like the server's "Update from base branch": the same round as "Update and merge", or a clean one on demand. */
+export function updateRunFromBase(r: Run, by: User): Run {
+  if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner of this run can update it');
+  if (!by.claudeCredentialKind) throw new MockError(422, 'claude_credential_required', 'Register a Claude credential in Settings first');
+  if (!updatableOnDemand(r)) throw new MockError(409, 'update_unavailable', 'Cannot update this run from its base branch');
+  if (updatable(r)) return updateRun(r, by);
+  return updateRun(r, by, 'owner', undefined, true);
+}
+
+export function updateRun(r: Run, by: User, trigger: RunUpdate['trigger'] = 'owner', instantAt?: number, onDemand = false): Run {
   if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner of this run can update and merge it');
   if (!by.claudeCredentialKind) throw new MockError(422, 'claude_credential_required', 'Register a Claude credential in Settings first');
-  if (!updatable(r)) throw new MockError(409, 'retry_mode_unavailable', 'Cannot update and merge this run');
+  if (!onDemand && !updatable(r)) throw new MockError(409, 'retry_mode_unavailable', 'Cannot update and merge this run');
   if (r.conversation.review === 'running') throw new MockError(409, 'review_in_progress', 'The changes from the conversation are being reviewed; update when the reviews are in');
   const adv = r.conversation.sessionId ? db.sessions.get(r.conversation.sessionId) : undefined;
   if (adv && (adv.status === 'running' || adv.status === 'starting')) throw new MockError(409, 'agent_busy', 'The agent is still answering; wait for it or interrupt it');
-  const kind = r.failureKind === 'migration_conflict' ? 'migration' : 'conflict';
+  const kind = onDemand ? 'clean' : r.failureKind === 'migration_conflict' ? 'migration' : 'conflict';
   const round = Math.max(...r.stages.map((x) => x.round)) + 1;
   const t = targetOf(r);
   r.updateRounds = (r.updateRounds ?? 0) + 1;
   const u: RunUpdate = {
-    number: r.updateRounds, round, maxRounds: r.maxUpdateRounds ?? 2, trigger, target: t, reason: r.error, status: 'running',
+    number: r.updateRounds, round, maxRounds: r.maxUpdateRounds ?? 2, trigger, target: t,
+    reason: onDemand ? `The run owner asked to bring the branch up to date with \`${t}\`.` : r.error, status: 'running',
     mergeStatus: kind === 'conflict' ? 'conflict' : 'merged', targetSha: '7c1e0a94b2d3f5e6a7b8c9d0e1f2a3b4c5d6e7f8', incomingCount: 3,
     incoming: ['Gift cards at checkout (#71)', 'Fix VAT rounding on invoices (#70)', 'Bump Kotlin to 2.1 (#69)'],
     conflicts: kind === 'conflict' ? ['src/main/kotlin/shop/cart/CartService.kt'] : [],
@@ -1068,7 +1084,7 @@ export function updateRun(r: Run, by: User, trigger: RunUpdate['trigger'] = 'own
   setRunStatus(r, 'building', iso(t0));
   runStage(r, 'builder', round, plan, t0, by, (t1) => {
     if (r.status === 'cancelled') return;
-    u.commits = [kind === 'migration' ? 'c41d2e9 Renumber the saved-carts migration to V8' : '9b0e7a1 Merge ' + t + ' into the run branch'];
+    u.commits = kind === 'clean' ? [] : [kind === 'migration' ? 'c41d2e9 Renumber the saved-carts migration to V8' : '9b0e7a1 Merge ' + t + ' into the run branch'];
     u.status = 'resolved';
     u.endedAt = iso(t1);
     syncUpdateFields(r);
@@ -1080,9 +1096,12 @@ export function updateRun(r: Run, by: User, trigger: RunUpdate['trigger'] = 'own
         setRunStatus(r, 'approving', iso(t2));
         runStage(r, 'approver', round, plan, t2 + 400, by, (t3) => {
           if (r.status === 'cancelled') return;
-          r.status = 'merged';
+          // By the run's merge policy, as after the pipeline's approver.
+          const end = r.mergePolicy === 'github' ? 'ready' : r.mergePolicy === 'owner_approves' ? 'needs_human' : 'merged';
+          if (end === 'needs_human') r.error = 'The approver recommends merging. This project requires the run owner’s approval before every merge.';
+          r.status = end;
           syncUpdateFields(r);
-          setRunStatus(r, 'merged', iso(t3 + 1500));
+          setRunStatus(r, end, iso(t3 + 1500));
         });
       });
     }
@@ -1316,6 +1335,8 @@ function makeRun(repo: string, issue: Issue, owner: User, createdMs: number, sta
     status: 'queued',
     round: 0,
     maxRounds: effective(owner.username).maxFixRounds,
+    updateRounds: 0,
+    maxUpdateRounds: 2,
     branch: release
       ? `factory/release-${release.name}/issue-${issue.number}-${slug}-${suffix}`
       : `factory/issue-${issue.number}-${slug}-${suffix}`,
@@ -2496,7 +2517,26 @@ function seed() {
 
   // Historical runs (instant).
   const never = () => false;
-  startRun('web-shop', 47, alice, null, { changes: {}, liveFrom: never }, Date.now() - 3 * 86400_000);
+  const run47 = startRun('web-shop', 47, alice, null, { changes: {}, liveFrom: never }, Date.now() - 3 * 86400_000);
+  // Its target moved before the approver ran: Agern merged main in, the builder resolved a conflict (#35).
+  const round47 = Math.max(...run47.stages.map((x) => x.round));
+  run47.updateRounds = 1;
+  run47.maxUpdateRounds = 2;
+  run47.updates = [
+    {
+      number: 1, round: round47, maxRounds: 2, trigger: 'base_moved', target: 'main', reason: '`main` moved on (2 new commits) before the approver ran',
+      status: 'resolved', mergeStatus: 'conflict', targetSha: '5e2c9a10d4b7f3e6a8c1d2e3f4a5b6c7d8e9f0a1', incomingCount: 2,
+      incoming: ['Show prices with VAT on the receipt page (#81)', 'Round VAT per line, not per order (#79)'],
+      conflicts: ['src/main/kotlin/shop/checkout/VatCalculator.kt'], migrations: [],
+      commits: ['e41c0b7 Merge main; keep per-line VAT rounding from #79 and the receipt totals from #81'], error: null,
+      startedAt: ago(3 * 1440 - 30), endedAt: ago(3 * 1440 - 26), summary: '',
+      pulls: [
+        { number: 81, title: 'Show prices with VAT on the receipt page', url: `https://github.com/${ORG}/web-shop/pull/81` },
+        { number: 79, title: 'Round VAT per line, not per order', url: `https://github.com/${ORG}/web-shop/pull/79` },
+      ],
+    },
+  ];
+  syncUpdateFields(run47);
   startRun('design-system', 12, alice, null, { changes: {}, liveFrom: never, noScreenshots: true }, Date.now() - 5 * 86400_000);
   const failed = startRun('web-shop', 44, bob, null, { changes: {}, liveFrom: never }, Date.now() - 86400_000);
   for (const st of failed.stages.slice(2)) {
@@ -2558,8 +2598,15 @@ function seed() {
 
   // Live: alice's run on #42 is in its first review round; bob's run on #38 is building.
   const runStart = Date.now() - 12 * 60_000;
-  startRun('web-shop', 42, alice, chat.id, { liveFrom: (role, round) => !(round === 0 && (role === 'spec-writer' || role === 'builder')) }, runStart);
-  startRun('web-shop', 38, bob, null, { changes: {}, liveFrom: (role) => role !== 'spec-writer' }, Date.now() - 4 * 60_000);
+  const run42 = startRun('web-shop', 42, alice, chat.id, { liveFrom: (role, round) => !(round === 0 && (role === 'spec-writer' || role === 'builder')) }, runStart);
+  const run38 = startRun('web-shop', 38, bob, null, { changes: {}, liveFrom: (role) => role !== 'spec-writer' }, Date.now() - 4 * 60_000);
+  // Bob's run started while alice's was active, and both specs name the cart service (a warning, #35).
+  run38.overlaps = [
+    {
+      runId: run42.id, issueNumber: 42, issueTitle: run42.issueTitle, owner: 'alice', status: 'reviewing', references: false,
+      files: ['src/main/kotlin/shop/cart/CartService.kt'],
+    },
+  ];
 
   // A release building on release/1.3 (alice started it): one merged, one running, one held, one waiting.
   const building = createRelease('web-shop', { name: '1.3', description: 'Small fixes, shipped together.' }, alice, Date.now() - 3 * 86400_000);

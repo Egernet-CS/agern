@@ -97,7 +97,10 @@ class MigrationGitTest {
             world.launcher.stage = { p ->
                 when (p.spec.kind) {
                     "spec-writer" -> { p.init(); p.result("## Spec\nDo the thing."); p.exit(0) }
-                    "builder" -> {
+                    "builder" -> if (p.spec.prompt.orEmpty().contains("This is update round")) {
+                        // The automatic update round's builder does not renumber: the run is held.
+                        p.init(); p.result("Could not renumber."); p.exit(0)
+                    } else {
                         p.init()
                         // Meanwhile another change lands V1 on the target; the builder picks V1 as well.
                         write(main, "$dir/V1__theirs.sql", "select 1;\n")
@@ -115,15 +118,20 @@ class MigrationGitTest {
                 }
             }
             val run = runBlocking { s.orchestrator.start(alice, "demo-app", 1, null) }
-            val done = world.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
+            val done = world.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN, 20_000)
             assertEquals(RunStatus.NEEDS_HUMAN, done.status, done.error)
+            // The target moved before the approver: an automatic update round, whose builder did not renumber.
             assertTrue(
-                done.error!!.startsWith("Database migration conflict with `main`: `$dir/V1__mine.sql` has the same version (1) as `$dir/V1__theirs.sql`."),
+                done.error!!.contains("Migrations: `$dir/V1__mine.sql` has the same version (1) as `$dir/V1__theirs.sql`."),
                 done.error,
             )
+            assertEquals(FailureKind.MIGRATION_CONFLICT, done.failureKind)
+            val update = s.runs.updates(run.id).single()
+            assertEquals(listOf("`$dir/V1__mine.sql` has the same version (1) as `$dir/V1__theirs.sql`"), update.migrations)
             assertTrue(world.github.actions.none { it.startsWith("merge ") }, world.github.actions.toString())
-            // The builder's prompt named the target and the rule.
-            val prompt = world.launcher.byRole("builder").single().spec.prompt!!
+            // The builder's prompt named the target and the rule; the update round's prompt names the renumbering.
+            assertTrue(world.launcher.byRole("builder").last().spec.prompt!!.contains("`$dir/V1__mine.sql` → version 2"))
+            val prompt = world.launcher.byRole("builder").first().spec.prompt!!
             assertTrue(prompt.contains("Database migrations: the pull request merges into `main`."), prompt)
         } finally {
             world.close()

@@ -336,8 +336,15 @@ class ApiTest {
         world.awaitRun(UUID.fromString(runId), RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
         assertEquals(403, bob.postJson("/api/runs/$runId/approve").status.value)
         assertEquals(403, bob.postJson("/api/runs/$runId/cancel").status.value)
+        // "Update from base branch": owner only; unknown runs are 404.
+        assertEquals(true, json(alice.get("/api/runs/$runId").bodyAsText()).jsonObject["updateOnDemand"]!!.jsonPrimitive.content.toBoolean())
+        assertEquals(403, bob.postJson("/api/runs/$runId/update").status.value)
+        assertEquals(404, alice.postJson("/api/runs/${UUID.randomUUID()}/update").status.value)
         val approved = alice.postJson("/api/runs/$runId/approve")
         assertEquals("merged", json(approved.bodyAsText()).jsonObject["status"]!!.jsonPrimitive.content)
+        val late = alice.postJson("/api/runs/$runId/update")
+        assertEquals(409, late.status.value)
+        assertTrue(late.bodyAsText().contains("update_unavailable"), late.bodyAsText())
         val run = json(bob.get("/api/runs/$runId").bodyAsText()).jsonObject
         assertEquals(7, run["stages"]!!.jsonArray.size)
         assertEquals(JsonNull, run["targetRepo"])

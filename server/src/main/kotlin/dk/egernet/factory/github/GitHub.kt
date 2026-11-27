@@ -100,6 +100,9 @@ data class GhPullInfo(
     @SerialName("merge_commit_sha") val mergeCommitSha: String? = null,
     /** Who merged it; null while open or when GitHub does not report it. */
     @SerialName("merged_by") val mergedBy: GhLogin? = null,
+    /** Its title and description (untrusted text; GitHub sends a null body for an empty description). */
+    val title: String = "",
+    val body: String? = null,
 )
 
 /**

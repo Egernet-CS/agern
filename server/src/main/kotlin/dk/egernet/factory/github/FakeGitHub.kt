@@ -609,6 +609,7 @@ class FakeGitHub(private val org: String) : GitHub {
                 mergeableState = if (m.state != "open" || computing) "unknown" else if (clean) "clean" else "dirty",
                 head = GhRef(m.head, "sha-${m.head}-${commitList(repo, m.head).size}"), base = GhRef(m.base, "sha-${m.base}"),
                 mergeCommitSha = m.mergeCommit, mergedBy = m.mergedBy?.let { GhLogin(it) },
+                title = m.title, body = pullBodies[number],
             )
         }
 

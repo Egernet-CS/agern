@@ -74,6 +74,10 @@ Behaviour
   at that moment), and one that arrives after the last tool round starts a further turn with its own
   `result`. The process exits when stdin is closed.
     - spec-writer: prints a small spec
+    - builder in an update round (prompt contains "This is update round"): when a merge is in progress (MERGE_HEAD),
+      keeps both sides of every unmerged file (drops the conflict marker lines), adds them and concludes the merge with
+      `git commit --no-edit` ("Merged and resolved (fake): <files>"); without one it makes no commit ("Verified the
+      merge (fake).")
     - builder: appends a line to AGERN_FAKE.md and commits it (if the cwd is a git repository); in a workspace run (a
       prompt line "Target member directory: `<dir>`") it commits in <cwd>/<dir> instead, and the advisor runs its
       git diff --stat and "please change" commit there
@@ -885,6 +889,12 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
         image_report += prepared_report(prompt)
         # A workspace run commits in the target member's worktree (its prompt names it), else in the working directory.
         d = target_dir(prompt)
+        if "This is update round" in prompt and is_git(d):
+            # An update round: conclude a merge in progress keeping both sides of every conflict; nothing else changes.
+            text = update_round(d)
+            stream_text(text)
+            result(text)
+            return
         if is_git(d):
             with open(os.path.join(d, "AGERN_FAKE.md"), "a") as f:
                 f.write("fake build at %s\n" % time.strftime("%Y-%m-%dT%H:%M:%S"))
@@ -925,6 +935,27 @@ def run_stage(prompt, checkpoint=lambda: None, received=()):
     text = "Done (fake)."
     stream_text(text)
     result(text)
+
+
+def update_round(d):
+    """Resolves the merge Agern left in progress in d (both sides kept) and commits it; no merge: no commit."""
+    git_dir = subprocess.run(["git", "rev-parse", "--git-dir"], cwd=d, capture_output=True, text=True).stdout.strip()
+    if not git_dir or not os.path.exists(os.path.join(d, git_dir, "MERGE_HEAD")):
+        return "Verified the merge (fake)."
+    out = subprocess.run(["git", "diff", "--name-only", "--diff-filter=U", "-z"], cwd=d, capture_output=True, text=True).stdout
+    files = [f for f in out.split("\0") if f]
+    for f in files:
+        path = os.path.join(d, f)
+        try:
+            with open(path) as fh:
+                lines = fh.readlines()
+            with open(path, "w") as fh:
+                fh.writelines(l for l in lines if not re.match(r"^(<<<<<<<|=======|>>>>>>>)( |$)", l.rstrip("\n") + " "))
+        except OSError:
+            pass
+        subprocess.run(["git", "add", "--", f], check=False, cwd=d)
+    subprocess.run(["git", "commit", "-q", "--no-edit"], check=False, cwd=d)
+    return "Merged and resolved (fake): " + ", ".join(files)
 
 
 def one_shot():
