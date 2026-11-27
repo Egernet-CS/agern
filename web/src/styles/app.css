@@ -1447,8 +1447,9 @@ html.app-locked #root {
 .ph-live {
   color: var(--amber-hi);
 }
-/* The project's merge policy (ARCHITECTURE §6 "Merge policy"): one line under the meta row. */
-.ph-policy {
+/* The project's merge policy and base branch (ARCHITECTURE §6 "Merge policy", "Base branch"): lines under the meta row. */
+.ph-policy,
+.ph-base {
   display: flex;
   flex-wrap: wrap;
   gap: 6px 12px;
@@ -1457,11 +1458,16 @@ html.app-locked #root {
   font-size: 0.82rem;
   color: var(--text-2);
 }
-.ph-policy-label {
+.ph-policy-label,
+.ph-base-label {
   color: var(--text-3);
 }
-.ph-policy .btn {
+.ph-policy .btn,
+.ph-base .btn {
   padding-block: 0;
+}
+.ph-policy + .ph-base {
+  margin-top: 4px;
 }
 .project-tabs {
   display: none;

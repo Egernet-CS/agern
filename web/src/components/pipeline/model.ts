@@ -146,7 +146,15 @@ export function buildNodes(run: Run, sessions: Map<string, AgentSession>): Recor
   const prSub = run.prNumber ? `PR #${run.prNumber}` : null;
   nodes.merge = {
     ...base('merge'),
-    title: run.targetRepo && run.baseBranch ? `merge to ${run.baseBranch}` : run.baseBranch ? 'merge to release' : onGitHub ? 'merge on GitHub' : ROLE_TITLE.merge,
+    title: run.targetRepo && run.baseBranch
+      ? `merge to ${run.baseBranch}`
+      : run.releaseId
+        ? 'merge to release'
+        : onGitHub
+          ? 'merge on GitHub'
+          : run.baseBranch
+            ? `merge to ${run.baseBranch}`
+            : ROLE_TITLE.merge,
     state: run.status === 'merged' ? 'done' : TERMINAL_FAIL.includes(run.status) ? 'skipped' : 'pending',
     sub: mergedOnGitHub ? 'merged on GitHub' : run.status === 'ready' ? `${prSub ?? 'PR'} · waiting on GitHub` : prSub,
     tone: run.status === 'merged' ? 'pass' : null,

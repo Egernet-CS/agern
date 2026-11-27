@@ -65,6 +65,11 @@ export type ProjectSettings = {
   reviewers: string[];
   /** Team slugs of the organisation requested as reviewers (policy `github` only). */
   teamReviewers: string[];
+  /**
+   * The branch new runs start from, open their pull request against and merge into (ARCHITECTURE §6 "Base branch");
+   * null = the repository's default branch.
+   */
+  baseBranch: string | null;
 };
 
 /** A member repository of a workspace, as the caller sees it. */
@@ -534,7 +539,10 @@ export type Run = {
   sandbox: RunSandbox | null;
   /** The release this run builds an issue of; null for a single run. */
   releaseId: string | null;
-  /** The branch the run branches from and merges into (`release/<name>`); null for a single run (default branch). */
+  /**
+   * The branch the run branches from and merges into: the project's base branch, `release/<name>` for a release run, or
+   * the member's base. Always set on runs started since base branches exist; null on older single runs (default branch).
+   */
   baseBranch: string | null;
   /** The owner's conversation with the advisor while the run needs a human. Always present. */
   conversation: RunConversation;
@@ -1027,7 +1035,8 @@ export type EventType = 'user' | 'claude' | 'system' | 'status' | 'images' | 'ch
 
 /**
  * Payload of a `checkout` event: the state of the owner's main checkout after the server synced it with
- * `origin/<defaultBranch>` (docs/ARCHITECTURE.md §8). `branch` null = detached HEAD.
+ * `origin/<defaultBranch>` (docs/ARCHITECTURE.md §8), the branch it follows: the project's base branch. `branch` null =
+ * detached HEAD.
  */
 export type CheckoutInfo = {
   branch: string | null;
@@ -1038,6 +1047,8 @@ export type CheckoutInfo = {
   status: 'current' | 'updated' | 'behind';
   reason: 'other_branch' | 'local_changes' | 'local_commits' | 'update_failed' | null;
   updatedFrom: string | null;
+  /** The branch Agern switched the checkout from to the project's base branch (`defaultBranch`); absent or null otherwise. */
+  switchedFrom?: string | null;
 };
 
 export type FactoryEvent = {

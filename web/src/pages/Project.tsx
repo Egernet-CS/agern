@@ -9,6 +9,7 @@ import { sandboxSummary } from '../components/sandbox/SandboxBits';
 import { sandboxVmSummary } from '../components/sandboxvm/SandboxVmBits';
 import { ProjectIconControl } from '../components/ui/ProjectIconControl';
 import { MergePolicyControl } from '../components/ui/MergePolicyControl';
+import { BaseBranchControl } from '../components/ui/BaseBranchControl';
 import { Dialog, Empty, ErrorBox, KindBadge, Loading, Notice, ProjectIcon, ReleaseStatusPill, RoleBadge, RunStatusPill, SessionStatusPill } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
@@ -128,6 +129,15 @@ export function ProjectPage() {
           <MergePolicyControl
             repo={repo}
             settings={p.settings}
+            isAdmin={me.isAdmin}
+            onChanged={(np) => project.setData((old) => ({ ...np, workspace: old?.workspace ?? np.workspace }))}
+          />
+        )}
+        {p?.settings && (
+          <BaseBranchControl
+            repo={repo}
+            settings={p.settings}
+            defaultBranch={p.defaultBranch}
             isAdmin={me.isAdmin}
             onChanged={(np) => project.setData((old) => ({ ...np, workspace: old?.workspace ?? np.workspace }))}
           />

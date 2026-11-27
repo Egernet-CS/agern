@@ -141,3 +141,19 @@ test('a merge despite checks is noted on the merge node', () => {
   assert.equal(n.note, 'despite checks');
   assert.equal(mergeNode(full('merged', { checks: { ...checks()!, state: 'passed' } })).note, null);
 });
+
+// Base branch (ARCHITECTURE §6 "Base branch")
+test('the merge node names the base branch; "merge to release" only for release runs', () => {
+  assert.equal(buildNodes(policyRun('building', { mergePolicy: 'automatic', baseBranch: 'dev', releaseId: null, targetRepo: null }), new Map()).merge.title, 'merge to dev');
+  assert.equal(buildNodes(policyRun('building', { mergePolicy: 'automatic', baseBranch: 'main', releaseId: null, targetRepo: null }), new Map()).merge.title, 'merge to main');
+  assert.equal(buildNodes(policyRun('building', { mergePolicy: 'automatic', baseBranch: null, releaseId: null, targetRepo: null }), new Map()).merge.title, 'merge to main');
+  assert.equal(
+    buildNodes(policyRun('building', { mergePolicy: 'automatic', baseBranch: 'release/1.0', releaseId: 'rel-1', targetRepo: null }), new Map()).merge.title,
+    'merge to release',
+  );
+  assert.equal(
+    buildNodes(policyRun('building', { mergePolicy: 'automatic', baseBranch: 'develop', releaseId: null, targetRepo: 'demo-ws-app' }), new Map()).merge.title,
+    'merge to develop',
+  );
+  assert.equal(buildNodes(policyRun('ready', { mergePolicy: 'github', baseBranch: 'dev', releaseId: null, targetRepo: null }), new Map()).merge.title, 'merge on GitHub');
+});

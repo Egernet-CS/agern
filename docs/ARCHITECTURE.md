@@ -99,7 +99,7 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_SANDBOX_VM` | `ssh` | `ssh` or `off`: per-project sandbox VMs for run builders and human previews (§5 "Sandbox VMs"). `off`: runs decide `disabled`, builders get no sandbox VM tools, a preview and a check answer 409 `sandbox_vm_disabled`; definitions can still be approved. `fake` (development and end-to-end tests only, accepted only with `FACTORY_DEV_FAKE_GITHUB`): the deploy targets' fake transport |
 | `FACTORY_SANDBOX_VM_EXEC_TIMEOUT_MINUTES` | `30` | Default and maximum time for one sandbox VM command and for one whole deploy (1–1440), also capped by `FACTORY_STAGE_TIMEOUT_MINUTES`; included in the MCP tool timeouts (§5) |
 | `FACTORY_SANDBOX_VM_PREVIEW_MINUTES` | `120` | How long a human preview holds a sandbox VM (5–1440) |
-| `FACTORY_DEV_FAKE_GITHUB` | `false` | Development only, requires `FACTORY_AUTH=dev`: in-memory fake GitHub (org with `demo-app`, `private-lab` and the workspace `demo-workspace` with its members `demo-ws-app` (base branch `dev`), `demo-ws-tools` and `demo-ws-lab` (only alice can read it); issues #1–#5 of `demo-workspace` carry one, no, several and an inaccessible member's label; the submodule workspace `demo-shop` whose `.gitmodules` declares `services/api` (`demo-shop-api`, SSH URL), `web` (`demo-shop-web`, relative URL, `branch = main`), `tools/cli` (`demo-ws-tools`, whose label no issue of `demo-shop` carries, so it is missing until Agern creates it) and `vendor/icons` (another organization, context only), with issues #1–#2 labelled `demo-shop-api` and `demo-shop-web` and #3 without a member label (a run of `demo-shop` itself); tokens `fake-<login>` = classic with `repo`, `read:org`; `fake-<login>~<scope>,…` = only those scopes), local `git init` instead of clones, pushes skipped (a sync run's fast-forward push moves the local release branch instead); `<dataDir>/fake-github-checks/<repo>/<branch>.json` sets the checks of a branch's head and, with `"conflict": true`, makes its pull requests conflict (§6 "Releasing", "Fake-GitHub mode") |
+| `FACTORY_DEV_FAKE_GITHUB` | `false` | Development only, requires `FACTORY_AUTH=dev`: in-memory fake GitHub (org with `demo-app` (branches `main` and `dev`, to try a base branch, §6 "Base branch"), `private-lab` and the workspace `demo-workspace` with its members `demo-ws-app` (base branch `dev`), `demo-ws-tools` and `demo-ws-lab` (only alice can read it); issues #1–#5 of `demo-workspace` carry one, no, several and an inaccessible member's label; the submodule workspace `demo-shop` whose `.gitmodules` declares `services/api` (`demo-shop-api`, SSH URL), `web` (`demo-shop-web`, relative URL, `branch = main`), `tools/cli` (`demo-ws-tools`, whose label no issue of `demo-shop` carries, so it is missing until Agern creates it) and `vendor/icons` (another organization, context only), with issues #1–#2 labelled `demo-shop-api` and `demo-shop-web` and #3 without a member label (a run of `demo-shop` itself); tokens `fake-<login>` = classic with `repo`, `read:org`; `fake-<login>~<scope>,…` = only those scopes), local `git init` instead of clones, pushes skipped (a sync run's fast-forward push moves the local release branch instead); `<dataDir>/fake-github-checks/<repo>/<branch>.json` sets the checks of a branch's head and, with `"conflict": true`, makes its pull requests conflict (§6 "Releasing", "Fake-GitHub mode") |
 
 ## 4. Identity and secrets
 
@@ -339,8 +339,10 @@ chat. A pipeline run works in a git worktree `…/<repo>/runs/<runId>` on its ow
 `factory/release-<name>/issue-<number>-<slug>-<run>`, where `<run>` is the first 8 hex digits of the run id. How
 worktrees and branches are cleaned up is in §6 "Worktrees and branches".
 
-The main clone is kept in step with `origin/<default branch>` (GitHub's current default branch, cached 60 s) so a chat
-agent does not read and report old code (`Workspaces.syncMain`, `CliGitOps.syncCheckout`). A sync runs in the
+The main clone is kept in step with `origin/<b>`, where `<b>` is the project's base branch (§6 "Base branch"; without
+one GitHub's current default branch, cached 60 s), so a chat agent does not read and report old code
+(`Workspaces.syncMain`, `CliGitOps.syncCheckout`). A fresh main clone is checked out on the base branch (`ensureClone`
+with the branch; when that clone fails it is retried once without a branch and a warning is logged). A sync runs in the
 background when a chat is created (after `ensureMain`) and before every non-command chat message (inside the chat
 lock, after the process is obtained); `/factory` commands, advisors and pipeline stages never sync, and run worktrees
 are unaffected. Under the clone's lock it fetches only `+refs/heads/<b>:refs/remotes/origin/<b>` (`--no-tags`, 30 s
@@ -358,6 +360,21 @@ chat: errors are logged and the message goes out unchanged. After a sync with a 
 fast-forward (old and new short sha, number of new commits, "read files again"), and when behind once per process
 launch and again whenever reason, `HEAD` or the count changes (how far behind, why, how to read `origin/<b>`, and not
 to update the checkout without asking). `prompts/chat.md` explains the block to the agent.
+
+**Switching to the base branch.** When the project's base branch changes (or is set), an existing clone is switched to
+it only when nothing of the user's can be lost and the user did not choose the current branch themselves. After the
+fetch, when `origin/<b>` exists and the checked-out branch `cur` is not `<b>`, the checkout is switched when all of
+these hold: `cur` is the branch Agern followed last (git config `agern.followed-branch` in the clone, else the
+repository's default branch); `git status --porcelain` is empty; `refs/remotes/origin/<cur>` exists and
+`origin/<cur>..HEAD` has no commits. The switch is `git -c core.hooksPath=/dev/null checkout --quiet <b>` when the local
+branch exists, else `checkout --quiet -b <b> --track origin/<b>`; then submodules are updated, `agern.followed-branch`
+is set to `<b>`, and the usual comparison and fast-forward run. The result carries `switchedFrom = cur`, and a
+`current` result is reported as `updated` from the HEAD before the switch; the `<checkout_status>` note says "Agern
+switched this checkout from `<old>` to `<b>`, the project's base branch (HEAD `<sha7>`). Files you read earlier in this
+conversation may have changed: read them again before relying on them." A failed switch is logged and leaves the
+checkout as it was (`other_branch`). A detached HEAD, a user's own branch, a dirty tree or unpushed commits are never
+switched. `agern.followed-branch` is also set whenever the checkout is on `<b>` and the value differs. Workspace member
+clones are never switched.
 
 Submodules: whenever a checkout has a `.gitmodules` file at its root, `git submodule update --init --recursive` runs
 with the owner's git authentication — after a fresh clone (`ensureClone`), after a successful fast-forward in
@@ -597,7 +614,9 @@ and can revoke. Approvals can be given while `FACTORY_SANDBOX=off`.
 
 **The run's decision.** When a run has created its worktree, the server reads `.agern/sandbox.yml` with
 git from the run's base commit (`origin/<default branch>` as fetched), validates it and compares its hash
-with the approval. The decision is stored on the run (`Run.sandbox`, below) and never changes during the
+with the approval. A single run whose base branch is not the default branch (§6 "Base branch") reads it, like a release
+run, from the default branch, and so does the sandbox VM definition: approvals are always of the default branch's file,
+so a project with a `dev` flow gets a definition change only once it reached the default branch. The decision is stored on the run (`Run.sandbox`, below) and never changes during the
 run. Because the file comes from the base commit, a run cannot approve its own change to it: a run that
 edits `.agern/sandbox.yml` still uses the approved base version, and the changed file needs a new
 approval after it is merged. A **release run** (§6 "Releases"; whether the release was started by hand or by the
@@ -1041,8 +1060,9 @@ issue → spec-writer (opus) → builder (opus) ─┬→ security  (opus)   ┐
    spec "Blocked on: #n" (n open) → failed (blocked) before the builder
 ```
 
-"main" is the repository's default branch for a single run, and `release/<name>` for a release run (§6
-"Releases"): the run's worktree starts from that branch and its pull request merges into it. A release branch
+"main" is the run's base branch: for a single run the project's base branch (§6 "Base branch"; without one the
+repository's default branch), for a release run `release/<name>` (§6 "Releases"), for a workspace member run the
+member's base: the run's worktree starts from that branch and its pull request merges into it. A release branch
 reaches the default branch only through the owner's approval of the release (§6 "Releasing").
 
 - **spec-writer** reads the issue and the repo and writes a spec; it is posted as an issue comment.
@@ -1414,7 +1434,8 @@ builder's summary is the stage summary and `builderSummary`.
 #### Keeping runs up to date
 
 Issue #35: a run must not get stuck, or merge an untested result, because its target moved while it worked. Terms:
-*target* = the run's base branch, else the repository's default branch; *single run* = no release, not a sync run;
+*target* = the run's base branch (`runs.base_branch`: the project's base branch when the run was created, a release
+branch or a member's base; null on older single runs), else the repository's default branch; *single run* = no release, not a sync run;
 *behind* = the branch comparison reports target commits the pushed branch lacks.
 
 *Automatic updating is allowed* for a single run whose merge policy is not `github`, with `maxUpdateRounds > 0` and
@@ -1864,7 +1885,8 @@ from base branch" on the `ready` or `needs_human` run), and an approved round en
   - open: nothing; a failed read (no owner, no token, GitHub error, not found): logged, tried again next round;
   - merged: `merged`, `mergedOnGitHub: true`, `mergedBy` = GitHub's `merged_by.login` (null if not reported), the
     `needs-human` label removed; a submodule workspace run opens its pointer bump pull request and leaves it for a
-    human. Agern does not close the issue (`Closes #N` does that on GitHub) and posts nothing else;
+    human. For a run on the default branch Agern does not close the issue (`Closes #N` does that on GitHub) and posts
+    nothing else; for a single run on another base branch it comments and closes the issue (§6 "Base branch");
   - closed without merge: `cancelled` with ``Pull request <ref> was closed on GitHub without being merged.``.
   From `ready` the change is a conditional update that keeps `endedAt`; a `needs_human` run is ended like a cancel
   (follow-up review stopped, advisor ended, sandbox and worktree removed, open stages closed) unless an approval or a
@@ -1875,6 +1897,49 @@ from base branch" on the `ready` or `needs_human` run), and an approved round en
   `factory_approve_release`: 409 `merge_on_github`, "… Review and merge the release pull request on GitHub."), and the
   ready announcement on the release pull request ends "This project merges on GitHub: review and merge this pull
   request there; Agern follows it." The periodic reconcile already finishes a release merged on GitHub.
+
+### Base branch
+
+Teams with a `dev` → staging → production flow, or a long-lived integration branch, want Agern to branch from and
+open pull requests against that branch. An admin sets a **base branch** per project (`PUT /api/projects/{repo}/settings`,
+§8, `project_settings.base_branch`, V33); null (the default) means the repository's default branch, and follows a
+later change of the default branch on GitHub. `ProjectBranches` (`configured(repo)`, `baseOf(repo)`) is the one place
+that resolves it; workspace members (#18) can reuse it.
+
+- **Validation** (`FactoryService.validBaseBranch`, then `setProjectSettings`): the value is trimmed; blank, null or
+  omitted clears it (the endpoint is a full replacement). It must match `^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$`, contain
+  no `..` and no `//`, not end in `/`, `.` or `.lock`, have no path component starting with `.`, and not start with
+  `factory/` (Agern's own run branches); otherwise 400 `bad_request` with a message starting `baseBranch:`. The name
+  goes into git argv, GitHub API paths, Markdown comments and agent prompts, so whitespace, backticks, a leading `-`,
+  control and shell characters are excluded. The current default branch's name is stored as null. Any other name must
+  exist on GitHub (`branchSha` with the acting admin's own token): otherwise 422 `base_branch_not_found` "Branch
+  `<name>` does not exist in `<org>/<repo>`." and nothing is stored.
+- **Resolution at start.** `Orchestrator.create` stores a non-null `runs.base_branch` on every new single run (no
+  release, not a workspace member run; a run of a workspace repository itself included): a retry `continue` keeps the
+  continued run's base (its commits were branched from it); otherwise the project's setting, else the repository's
+  default branch. A base that is not the default branch must exist on GitHub at start (`branchSha`, the owner's
+  token), checked before the run row is created: otherwise 409 `base_branch_not_found` "The base branch `<name>` does
+  not exist in `<org>/<repo>`. Create it on GitHub, or ask an admin to change the project's base branch." No run,
+  stage or worktree is created and there is no fallback to the default branch. Every start goes through `create`:
+  the web UI, `POST /api/projects/{repo}/runs`, `factory_start_run`, `/factory run` and retries. There is no per-run
+  override.
+- **Snapshot.** The run's worktree is created from the stored base, its pull request is opened against it, and its
+  merge, update rounds, migration and submodule comparisons and "Update from base branch" use it. Changing or clearing
+  the setting never changes an existing run, including its step retries and update rounds; retry `start over` takes the
+  setting as it is then.
+- **Closing the issue.** GitHub closes issues by `Closes #N` only for merges into the default branch, so Agern closes
+  the issue itself; there is no setting to leave it open. When Agern merges: the comment ``**Agern: merged** pull
+  request #N into `<base>`<approval>.`` (unchanged text when the base is the default branch or the repository cannot
+  be read), then the issue is closed as before. When the pull request was merged on GitHub (the follower, from `ready`
+  or `needs_human`) and the run's base is not the default branch (single runs only): ``**Agern:** pull request #N was
+  merged into `<base>` on GitHub[ by @<login>]. Closing this issue: GitHub closes issues itself only for merges into
+  the default branch (`<default>`).``, then the issue is closed; both best effort. The pull request body keeps
+  `Closes #N`.
+- **Prompts.** The builder's migration line mentions "The release is later merged into …" only for release runs.
+- **What still uses the default branch.** Releases (`release/<name>` is created from and merged into the default
+  branch; sync runs merge the default branch), workspace members (their declared `branch` or their default branch) and
+  the workspace root worktree and pointer bump; `.agern/sandbox.yml`, `sandbox-vm.yml`, `deploy.yml`, `workspace.yml`
+  and project icons are read from the default branch. The chat checkout follows the base branch (§5 "Workspaces").
 
 ### Database migrations
 
@@ -2164,7 +2229,8 @@ which merges it so that each issue stays one commit, closes the issues and delet
 A release set to **automatic** is merged the same way without the approval, once it is complete, clean and its
 checks are green ("Release mode" below). Delivered in steps (issue #13): planning (#17), starting and building
 (#19), scheduled starts (#21, "Scheduled start" below), the release pull request, approval and merge (#20), and the
-release mode (#41). Single runs are unaffected and still merge into the default branch.
+release mode (#41). Single runs are unaffected and still merge into their base branch (§6 "Base branch"; by default the
+repository's default branch). Releases are always created from and merged into the default branch.
 
 Release runs keep the update behaviour of #120 unchanged (§6 "Keeping runs up to date"): they merge one at a time into
 their release branch, get no freshness check before the approver or at the gate, and the release starts at most one
@@ -2181,7 +2247,9 @@ automatic update round per run (trigger `release`).
   `auto_merge_failed_sha`, `checks_head_seen_at`) and `release_issues` (`release_id`, `repo`, `issue_number`, `position`, `issue_title`, `issue_kind`,
   `added_by`, `added_at`, `state`, `run_id` = the issue's latest release run, `note`, and since V16 `retry_mode`
   (`continue` | `step` | `update` (V31) | null, checked; §6 "Retrying a run")). `runs` carry `release_id`
-  (`ON DELETE SET NULL`) and `base_branch` (null = the default branch); for retries (V16) `continues_run_id` (→
+  (`ON DELETE SET NULL`) and `base_branch` (the branch the run starts from and merges into: `release/<name>`, a member's
+base, or for single runs the project's base branch, set on every single run created since V33; null on older single
+runs = the default branch); for retries (V16) `continues_run_id` (→
   `runs`, `ON DELETE SET NULL`), `spec`, `builder_summary`, `failure_kind` and `failed_step`; for update rounds (V31)
   `update_rounds` and `max_update_rounds`, with one `run_updates` row per round (`run_id` → `runs` `ON DELETE
   CASCADE`, `number` unique per run, `round`, `max_rounds`, `trigger` `owner` | `release`, `target`, `reason`,
@@ -2982,7 +3050,8 @@ target moved (§6 "Keeping runs up to date") the answer is "Run <id>: `<target>`
 first (update round k of max). It merges by itself when the reviewers and the approver pass it." (`owner_approves`:
 "It will wait for your approval again when the update is reviewed."); `/factory approve` answers the same.
 `factory_start_run` (and `/factory run`) appends the sentence about other active runs in the project when there are
-any (§6, "Other active runs"). No tool and no argument merges despite the checks (§6 "Checks before a merge"); "Update
+any (§6, "Other active runs"). Both start the run on the project's base branch (§6 "Base branch"; 409
+`base_branch_not_found`, shown as the tool error or reply, when it no longer exists); there is no per-run override. No tool and no argument merges despite the checks (§6 "Checks before a merge"); "Update
 from base branch" has no tool or chat command (web and HTTP API only). `factory_approve_run` and `factory_approve_release` are both refused (tool error with the
 `merge_on_github` message) for a project that merges on GitHub (§6 "Merge policy"). Pipeline-stage agents get only `factory_get_issue`
 and `factory_request_software`; with sandboxes switched on (`FACTORY_SANDBOX` not `off`) the builder also
@@ -3183,12 +3252,13 @@ type Project = { name: string; fullName: string; description: string | null; pri
   htmlUrl: string; activeAgents: number; activeRuns: number;
   iconUrl: string | null;      // `/api/projects/<repo>/icon?v=<version>`; null: no icon (§8 "Project icons")
   workspace: Workspace | null;  // §5 "Workspace projects"; filled by GET /api/projects/{repo} only (null in the list)
-  settings: ProjectSettings };  // §6 "Merge policy"; defaults without a stored row, in the list and the detail
+  settings: ProjectSettings };  // §6 "Merge policy", "Base branch"; defaults without a stored row, in the list and the detail
 
 type MergePolicy = 'automatic' | 'owner_approves' | 'github';
 type ProjectSettings = { mergePolicy: MergePolicy;   // default 'automatic'
   reviewers: string[];         // GitHub logins requested on a `github` run's pull request
-  teamReviewers: string[] };   // team slugs of the organisation, likewise
+  teamReviewers: string[];     // team slugs of the organisation, likewise
+  baseBranch: string | null }; // §6 "Base branch": where new single runs start and merge; null = the default branch
 
 type Workspace = { path: '.agern/workspace.yml' | '.gitmodules'; valid: boolean; // .gitmodules: members from the submodules
   errors: string[];            // every problem, with its path; [] when valid
@@ -3313,7 +3383,9 @@ type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; 
   sandbox: RunSandbox | null;  // the run's sandbox decision (§5 "Sandboxes"); null until the workspace is ready / older runs
   sandboxVm: RunSandboxVm | null;  // the run's sandbox VM decision and preview (§5 "Sandbox VMs"); null without a decision
   releaseId: string | null;  // the release this run builds an issue for (null: a single run, or the release was deleted)
-  baseBranch: string | null;  // the branch it starts from and merges into; null = the default branch; a workspace run: the member's base
+  baseBranch: string | null;  // the branch it starts from and merges into: a single run's project base branch (§6 "Base branch"),
+                              // `release/<name>`, or a workspace run's member base; set on every run since V33; null on
+                              // older single runs = the default branch
   targetRepo: string | null;       // a workspace run: the member repository it changes (§6 "Workspace runs"); null otherwise
   targetDirectory: string | null;  // … and that member's directory in the workspace
   conversation: RunConversation;  // always present; default { sessionId: null, review: 'none', followUpFrom: null }
@@ -3509,11 +3581,13 @@ type Event = { seq: number; sessionId: string; ts: string;
 //  images: { requestId, provider, providerLabel, model, prompt, purpose, issueNumber?,   // one factory_generate_image
 //            images: [{ id, mediaType, width, height, size }] }                          // call (§6 "Generated images")
 //  checkout: { branch: string | null,          // a chat's main checkout after a sync (§5 "Workspaces"); null = detached
-//              defaultBranch: string, commit: string,  // full HEAD sha after the sync
+//              defaultBranch: string, commit: string,  // the branch it follows (the project's base branch, §6
+//                                              // "Base branch"; the name is historical); full HEAD sha after the sync
 //              behind: number, ahead: number,  // relative to origin/<defaultBranch>
 //              status: 'current' | 'updated' | 'behind',
 //              reason: 'other_branch' | 'local_changes' | 'local_commits' | 'update_failed' | null,  // only for 'behind'
-//              updatedFrom: string | null }    // the previous HEAD, only for 'updated'
+//              updatedFrom: string | null,     // the previous HEAD, only for 'updated'
+//              switchedFrom: string | null }   // the branch Agern switched the checkout from to defaultBranch (§5)
 //          sandbox: the full log of a sandbox setup script or command (§5 "Sandboxes"):
 //            { kind: 'setup' | 'exec', command, exitCode, timedOut, durationMs, output, outputTruncated,
 //              platform: string | null,    // null when the definition has no platforms, else 'default' or the platform
@@ -3627,7 +3701,7 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `GET /api/projects/{repo}` | → `Project` | with `workspace` (read with the caller's token; members' `accessible` per caller) |
 | `PUT /api/projects/{repo}/icon` | raw image bytes (PNG, JPEG, WebP, GIF or SVG) → `Project` | admin (403 before the body is read; 404 when the admin cannot see the project). Sets or replaces the icon; 400 `empty_icon`, 413 `icon_too_large`, 415 `unsupported_icon_type`, 422 `invalid_icon` (also every refused SVG) / `icon_dimensions_too_large`; see "Project icons" below |
 | `POST /api/projects/{repo}/icon/from-repository` | `{path}` → `Project` | admin (403; 404 as above). Sets the icon from a file on the repository's default branch, read once with the admin's own GitHub token; 400 `bad_request` for an invalid path, 404 `icon_file_not_found`, then the upload's 400/413/415/422; see "Project icons" below |
-| `PUT /api/projects/{repo}/settings` | `{ mergePolicy, reviewers?, teamReviewers? }` → `Project` | admin (403; 404 when the admin cannot see the project). 400 unknown `mergePolicy`, an entry that is not a GitHub login (`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$`) or team slug (`^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$`, the message names it), or more than 15 per list. Entries are trimmed, one leading `@` stripped, empty ones dropped and duplicates removed case-insensitively; omitted lists are empty. Applies to runs started from now on (§6 "Merge policy") |
+| `PUT /api/projects/{repo}/settings` | `{ mergePolicy, reviewers?, teamReviewers?, baseBranch? }` → `Project` | admin (403; 404 when the admin cannot see the project). A full replacement: omitted lists are empty and an omitted, null or blank `baseBranch` clears it. 400 an invalid `baseBranch` (message starting `baseBranch:`, rules in §6 "Base branch"); 422 `base_branch_not_found` when it does not exist on GitHub (checked with the admin's token; the default branch's name is stored as null). 400 unknown `mergePolicy`, an entry that is not a GitHub login (`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$`) or team slug (`^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$`, the message names it), or more than 15 per list. Entries are trimmed, one leading `@` stripped, empty ones dropped and duplicates removed case-insensitively; omitted lists are empty. Applies to runs started from now on (§6 "Merge policy") |
 | `DELETE /api/projects/{repo}/icon` | → `Project` | admin (403; 404 as above); removes the icon (also when there is none), `iconUrl: null` |
 | `GET /api/projects/{repo}/icon?v=<version>` | → image bytes (`image/png`, `image/jpeg`, `image/webp`, `image/gif` or `image/svg+xml`) | anyone who can see the project; 404 when not visible or no icon is set |
 | `GET /api/projects/{repo}/issues?state=open\|closed\|all` | → `Issue[]` | pull requests excluded |
@@ -4465,6 +4539,20 @@ GitHub: review and merge the release pull request there.", and a non-automatic p
 (the release mode select and the "New release" dialog: "this project requires a human approval"). The mock implements
 the setting, the snapshot and the outcomes at approval (no follower).
 
+**Base branch** (§6 "Base branch"). Directly below the merge policy row everyone sees "Base branch: `dev`", or
+"Base branch: `main` (the repository's default branch)" when unset (`BaseBranchControl`, container `.ph-base`, styled
+like `.ph-policy`). Admins get a ghost button "Change" (`aria-label="Change base branch"`, `aria-haspopup="dialog"`)
+that opens the dialog "Base branch": a monospace text input labelled "Base branch" (focused, no spell check,
+placeholder = the default branch, prefilled with the setting or empty), the hint "Leave empty to use the repository's
+default branch (`<default>`). The branch must exist on GitHub.", the notes "Applies to runs started from now on;
+running runs keep their base branch." and "Releases are still created from and merged into the default branch.",
+Cancel and Save ("Saving…", disabled while saving). A server error (e.g. the branch does not exist) stays in the dialog
+(`role="alert"`) with the input; Escape closes it and focus returns to "Change". The endpoint replaces the whole
+settings object, so each dialog sends the other's values unchanged. The run header's `base` row appears for every run
+started since the setting exists (plain text; a link to the release page for release runs). The mock gives every
+project the branches `main`, `dev` and `staging` (anything else: 422 `base_branch_not_found`), applies the server's
+name rules and stores the default branch's name as null.
+
 **Checks before a merge** (§6 "Checks before a merge"). A `waiting_for_checks` run shows a status notice (`role="status"`):
 "Waiting for checks on `<sha7>`. <detail>. The pull request is merged automatically when they pass; Agern stops waiting at
 <local time>.", with the pending checks below it as links (new tab) when GitHub gave an `https://` URL. The owner sees
@@ -4519,7 +4607,9 @@ that run (the run page's confirmation). The texts come from `lib/networkWait.ts`
 `useNow`. The mock never waits: its endpoints answer 409 with the documented codes after the permission checks.
 
 On the run page of a release run the merge node is titled "merge to release" and the header shows the base branch
-linking to the release page (plain text when the release was deleted); single runs still say "merge to main".
+linking to the release page (plain text when the release was deleted). Only release runs (`releaseId` set) say "merge
+to release"; a workspace member run says "merge to <baseBranch>", a `github` run "merge on GitHub", and any other run
+"merge to <baseBranch>" (the project's base branch; "merge to main" for older runs without one).
 
 **Workspace projects** (§5 "Workspace projects", §6 "Workspace runs"). The project header shows the tag
 "workspace · N members" for a valid workspace. The activity pane gets a "Members" section above "Releases", one row per
