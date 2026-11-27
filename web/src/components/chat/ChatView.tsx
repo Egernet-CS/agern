@@ -46,10 +46,10 @@ function ContextItem({ context }: { context: ContextUsage }) {
   const value = !meter ? '—' : meter.percent == null ? meter.label : `${meter.label} · ${meter.percent}%${meter.warn ? ' · nearly full' : ''}`;
   const n = (v: number) => Math.round(v).toLocaleString('en-US');
   const title = !meter || context.used == null
-    ? 'How much of the agent’s context is used: not known yet'
+    ? "How much of the agent's context is used: not known yet"
     : context.window == null
-      ? `${n(context.used)} tokens in the agent’s context`
-      : `${n(context.used)} of ${n(context.window)} tokens in the agent’s context (${meter.percent}%)${meter.warn ? ' — Agern’s agent compacts automatically near the limit; you can compact now.' : ''}`;
+      ? `${n(context.used)} tokens in the agent's context`
+      : `${n(context.used)} of ${n(context.window)} tokens in the agent's context (${meter.percent}%)${meter.warn ? " — Agern's agent compacts automatically near the limit; you can compact now." : ''}`;
   return (
     <span className={`cf-item cf-context ${meter?.warn ? 'cf-context--warn' : ''}`} title={title}>
       <span className="cf-k">context</span> {value}
