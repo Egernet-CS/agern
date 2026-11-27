@@ -8,6 +8,12 @@ export const FACTORY_COMMANDS = [
   { cmd: '/factory help', usage: '/factory help', help: 'Show factory commands' },
 ];
 
+/** Chat commands suggested after `/`: the factory's, then the CLI's own `/compact` (docs/ARCHITECTURE.md §5). */
+export const CHAT_COMMANDS = [
+  ...FACTORY_COMMANDS,
+  { cmd: '/compact ', usage: '/compact [what to keep]', help: 'Summarise the conversation to free up context' },
+];
+
 type Props = {
   onSubmit: (text: string) => Promise<boolean>;
   /** Absent: no interrupt (messages to pipeline agents). */
@@ -15,7 +21,7 @@ type Props = {
   working: boolean;
   /** Sending is allowed while the agent works (messages to a pipeline agent are queued for its next step). */
   sendWhileWorking?: boolean;
-  /** `/factory …` command suggestions (chat only). */
+  /** `/factory …` and `/compact` command suggestions (chat only). */
   commands?: boolean;
   placeholder?: string;
   label?: string;
@@ -55,7 +61,7 @@ export function Prompt({
   const suggestions = useMemo(() => {
     if (!commands || dismissed || !value.startsWith('/') || value.includes('\n')) return [];
     const v = value.toLowerCase();
-    return FACTORY_COMMANDS.filter((c) => c.cmd.startsWith(v));
+    return CHAT_COMMANDS.filter((c) => c.cmd.startsWith(v));
   }, [value, dismissed, commands]);
   const open = suggestions.length > 0;
 
@@ -164,7 +170,7 @@ export function Prompt({
       {attachments}
       {blocked && <div className="prompt-blocked muted small" role="status">{blocked}</div>}
       {open && (
-        <ul className="prompt-suggest" id={listId} role="listbox" aria-label="Factory commands">
+        <ul className="prompt-suggest" id={listId} role="listbox" aria-label="Commands">
           {suggestions.map((s, i) => (
             <li
               key={s.cmd}

@@ -305,6 +305,25 @@ Launch rules:
   OAuth token, …) is reported as a `system` error telling the user to update it in Settings, for
   chats and pipeline stages alike. A process the server stops itself (stop, idle, shutdown) is
   reported as a neutral notice, never as an error exit code.
+- **Compaction.** The CLI compacts a long conversation itself near the end of its context window and reports it as
+  `{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto"|"manual","pre_tokens",
+  "post_tokens"?,"user_context"?,…}}`, preceded by `system/status` `{"status":"compacting"}` and followed by one with
+  `"status":null` and `compact_result` (`success`/`failed`, `compact_error`). They are stored like other events; the
+  web app turns them into a divider and the spinner's "Compacting…" (§10). A chat compacts on demand with
+  **`/compact [what to keep]`**: `sendInput` recognises `text.trim()` matching `^/compact(\s|$)` (case-sensitive)
+  and, before anything is published or marked sent, refuses it with 422 `attachments_not_allowed` when it has
+  attachments, 409 `agent_busy` while the agent is mid-turn (a live process with an open turn, or the session
+  `starting`/`running`; it is refused, not queued) and 409 `nothing_to_compact` when the session has no
+  `claudeSessionId` yet; then the usual credential and agent-slot checks apply when no process is alive. Accepted, the
+  `user` event shows the text as sent and the trimmed text goes to the CLI **verbatim as a plain string** through the
+  same chat lock, `startChat` (so `--resume` for a stopped chat) and `deliver`; the CLI runs it as its own local
+  command only when it is the whole message. It does not rename the chat, does not count for image budgets
+  (`onChatInput`), does not sync the checkout and carries no `<checkout_status>` note (a pending note goes with the next
+  normal message). The CLI answers with the events above, a `"model":"<synthetic>"` assistant message with zero usage
+  (e.g. "Not enough messages to compact.") and a `result` with `num_turns: 0` and `local_command: "compact"`, which
+  ends the turn as usual (verified with Claude Code 2.1.328 up to the refusal of a too-short conversation; the
+  successful path is modelled by the fake CLI). Other CLI slash commands typed in a chat reach the CLI unchanged too;
+  Agern gives them no special treatment. Advisors and pipeline agents have no `/compact`.
 - The **advisor** (§6 "Conversation at needs human") is launched exactly like a chat — the same flags, kept alive
   between turns, stopped by the idle reaper, resumed with `--resume` and the same failed-resume fallback — except:
   its working directory is the run's worktree, its role prompt is `advisor`, its MCP grant is the stage tools
@@ -3532,7 +3551,7 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `GET /api/sessions/{id}` | → `AgentSession` | |
 | `GET /api/sessions/{id}/events?after=<seq>&limit=<n>` | → `Event[]` | ascending |
 | `GET /api/config` | → `ClientConfig` | limits the frontend checks before uploading; `images.providers[]` with `id, label, models, defaultModel, supportsTransparency, keyPlaceholder, auth, available, unavailableReason` |
-| `POST /api/sessions/{id}/input` | `{ text, attachmentIds? }` → 202 | owner only. **Chat:** accepted mid-turn too (delivered after the current turn); a `stopped` or process-less chat resumes. `text` may be empty when `attachmentIds` is not. The attachments are bound to this message when it is accepted, so a message queued mid-turn keeps its own. Answer `{ status: 'accepted' }`. **Pipeline agent:** a text message for a running spec-writer or builder (§6 "Messages to running agents") → 202 `AgentMessage`; 403 for everyone but the run's owner (admins too), 409 `agent_does_not_accept_messages` (reviewers, approver), 409 `agent_not_running`, 422 `attachments_not_allowed`. **Advisor:** exactly as `POST /api/runs/{id}/conversation` (answer `{ status, sessionId }`); 422 `attachments_not_allowed` with attachments |
+| `POST /api/sessions/{id}/input` | `{ text, attachmentIds? }` → 202 | owner only. **Chat:** accepted mid-turn too (delivered after the current turn); a `stopped` or process-less chat resumes. `/compact [what to keep]` (§5 "Compaction") goes to the CLI verbatim and is refused instead: 422 `attachments_not_allowed` with attachments, 409 `agent_busy` while the agent works, 409 `nothing_to_compact` before the conversation exists; no `user` event is published then. `text` may be empty when `attachmentIds` is not. The attachments are bound to this message when it is accepted, so a message queued mid-turn keeps its own. Answer `{ status: 'accepted' }`. **Pipeline agent:** a text message for a running spec-writer or builder (§6 "Messages to running agents") → 202 `AgentMessage`; 403 for everyone but the run's owner (admins too), 409 `agent_does_not_accept_messages` (reviewers, approver), 409 `agent_not_running`, 422 `attachments_not_allowed`. **Advisor:** exactly as `POST /api/runs/{id}/conversation` (answer `{ status, sessionId }`); 422 `attachments_not_allowed` with attachments |
 | `POST /api/sessions/{id}/attachments?name=<file name>` | raw bytes → 201 `Attachment` | owner only, chat only; see "Attachments" below |
 | `GET /api/sessions/{id}/attachments/{aid}?preview=1` | → bytes | anyone who may see the session once it is sent; before that only its uploader. `preview=1`: the downscaled copy if there is one |
 | `DELETE /api/sessions/{id}/attachments/{aid}` | → 204 | owner only; unsent only (409 `attachment_sent`) |
@@ -4051,6 +4070,26 @@ branch (or `detached`) before the sha when it is not the default branch, and ` �
 is behind; `title` and an `sr-only` span carry the full sentence (up to date, or how far behind and why it was not
 updated). Without a `checkout` event only `~/<repo>` is shown; at the narrow breakpoint it is hidden with the path.
 `checkout` events are not transcript items (a malformed one is shown as `unknown`).
+
+**Compaction and context** (`model.ts`, all transcripts). A `compact_boundary` event is a `compact` item (never
+`unknown`): a centred divider with dashed rules, "Conversation compacted here (auto) — 640k → 48k tokens" (`compactLabel`:
+the trigger when known; `pre → post` when both are known, `was <pre>` with a trigger but no post; `formatTokens`:
+`950`, `48k`, `1M`, `1.5M`) and the line "The agent continues from a summary. Earlier messages stay visible but are no
+longer in its context word for word." Every item before the **last** divider is wrapped in one
+`div.t-compacted[role=group][aria-label="Earlier messages, compacted"]`, dimmed to 0.65 opacity and back to full on
+`:hover`/`:focus-within` (no transition under reduced motion); everything inside stays interactive.
+`TranscriptSummary.context` is derived from the stored events: `used` is `input + cache_read + cache_creation` tokens of
+the latest main-thread `assistant` message (`parent_tool_use_id` null, model not `<synthetic>`, a sum > 0) or a
+boundary's `post_tokens` (null without one); `window` is the `contextWindow` of the `result`'s `modelUsage` entry for
+that message's model (exact key, else `<model>[…]`, else the largest). `compacting` is true from a `system/status`
+`compacting` until another status, a boundary, a `result` or a factory `stopped`/`failed`; the spinner then reads
+"Compacting…" (thinking wins). **Chats only** (owner and observers): the footer shows `context 312k / 1M · 31%` after
+`turns` (`312k` without a window, `—` while unknown; `contextMeter`), from 80% in amber with `· nearly full` and a
+`title` with the exact numbers. The owner also gets a **Compact** button (`aria-label="Compact conversation"`) that
+sends `/compact` like a typed message; it is disabled with a `title` while the agent works or a send is in flight, and
+while nothing is known to compact. The prompt suggests `/compact [what to keep]` after the factory commands (listbox
+"Commands"). At the narrow breakpoint the footer wraps so the meter and button are never clipped. The mock seeds
+alice's `web-shop` chat with an automatic compaction and a context above 80%, and plays `/compact`.
 
 **Conversation at needs human** (§6). On the run page the `human` node is selectable when the run is `needs_human` or
 has a conversation (`?stage=human`; the default selection of a `needs_human` run with a conversation). Its sub-line

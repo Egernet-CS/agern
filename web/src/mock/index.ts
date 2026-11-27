@@ -620,6 +620,13 @@ export const mockApi: Api = {
       if (text.trim().startsWith('/factory') && attachmentIds.length) {
         throw new MockError(422, 'attachments_not_allowed', '/factory commands do not take attachments. Remove them, or send them in a normal message.');
       }
+      // Like the backend: /compact goes to the CLI as is, and only when it can run now.
+      const compact = /^\/compact(\s|$)/.test(text.trim());
+      if (compact) {
+        if (attachmentIds.length) throw new MockError(422, 'attachments_not_allowed', '/compact does not take attachments. Remove them, or send them in a normal message.');
+        if (s.status === 'running' || s.status === 'starting') throw new MockError(409, 'agent_busy', 'The agent is working. Compact when it has finished, or interrupt it first.');
+        if (!(db.events.get(s.id) ?? []).some((e) => e.type === 'claude')) throw new MockError(409, 'nothing_to_compact', 'There is nothing to compact yet.');
+      }
       if (!text.trim().startsWith('/factory')) needClaude();
       const list = attachmentIds.map((a) => attachments.get(a));
       if (new Set(attachmentIds).size !== attachmentIds.length || list.some((a) => !a || a.sent || a.sessionId !== id || a.owner !== me().username)) {
@@ -627,7 +634,7 @@ export const mockApi: Api = {
       }
       list.forEach((a) => (a!.sent = true));
       chatInput(s, text, me(), list.map((a) => a!.meta));
-      if (!text.trim().startsWith('/factory')) images.chatImages(s, text, me());
+      if (!text.trim().startsWith('/factory') && !compact) images.chatImages(s, text, me());
     }),
   sendToAgent: (id, text) => ok(() => messageAgent(session(id), text, me())),
   async uploadAttachment(sessionId, file, opts) {

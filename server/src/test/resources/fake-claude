@@ -31,6 +31,26 @@ Behaviour
       "[Attachments]" text block's paths are checked on disk ("FILE ok name 123 bytes" / "FILE missing ...").
       Trigger words are only looked for in the user's own text, not in that listing.
     - control_request {subtype: interrupt} stops the current turn
+    - context usage: a process-wide context size, unset at start. "fake:context=<n>" in a message sets it to n before
+      the reply. While it is set, every assistant message of a chat reply carries the usage of a main-thread call with
+      that context: cache_read_input_tokens = n // 3, cache_creation_input_tokens = n // 3,
+      input_tokens = n - 2 * (n // 3) (the three sum to n), plus output_tokens; unset, usage is input_tokens 10 as before.
+      Every result carries "modelUsage": {"<model>": {inputTokens, outputTokens, cacheReadInputTokens,
+      cacheCreationInputTokens, webSearchRequests 0, costUSD, contextWindow 1000000, maxOutputTokens 64000}}.
+    - text containing "fake:autocompact" -> before the reply, compacts like the CLI does near the limit: system/status
+                                 "compacting", system/compact_boundary {compact_metadata: {trigger "auto", pre_tokens
+                                 = the current context (10 when unset), post_tokens = pre // 10}}, system/status null with
+                                 compact_result "success"; the context is then post_tokens and the reply follows as usual
+    - a message whose text matches ^/compact(\\s|$) is the CLI's local /compact command (checked before every trigger
+      word above; no "You said" reply). The arguments are focus instructions (compact_metadata.user_context).
+        nothing to compact (no earlier user message in this process and not launched with --resume): status
+          "compacting"; status null with compact_result "failed", compact_error "Not enough messages to compact.";
+          a "<synthetic>" assistant message with zero usage and that text; a result with num_turns 0, cost 0 and
+          local_command "compact" (what CLI 2.1.328 does, see docs/ARCHITECTURE.md §5)
+        otherwise: status "compacting"; ~1.5 s; compact_boundary {trigger "manual", pre_tokens, post_tokens = pre // 10,
+          user_context when arguments were given}; status null with compact_result "success"; a "<synthetic>" zero-usage
+          assistant message "Compacted." (or "Compacted. Focus: <args>"); a result with num_turns 0, no added cost and
+          local_command "compact". The context is then post_tokens.
     - only with an OAuth token (CLAUDE_CODE_OAUTH_TOKEN), one rate_limit_event (the shape of the CLI 2.1.328 schema,
       utilization a fraction, resetsAt epoch seconds in the future) is emitted before the reply when the text contains:
         "usage-ok"    -> unifiedWindows five_hour 0.42 and seven_day 0.18, both "allowed"
@@ -139,6 +159,9 @@ for line in system_prompt.splitlines():
 
 out_lock = threading.Lock()
 total_cost = 0.0
+# The size of the conversation's context in tokens (chat): None until "fake:context=<n>" or a compaction sets it.
+context_tokens = None
+COMPACT_COMMAND = re.compile(r"^/compact(\s|$)")
 
 
 def emit(obj):
@@ -191,9 +214,63 @@ def stream_text(text, chunk_delay=0.0, chunks=None, interrupted=lambda: False):
           "parent_tool_use_id": None, "uuid": str(uuid.uuid4())})
     emit({"type": "assistant", "message": {"id": mid, "type": "message", "role": "assistant", "model": model,
                                            "content": [{"type": "text", "text": text}], "stop_reason": None,
-                                           "usage": {"input_tokens": 10, "output_tokens": len(text) // 4}},
+                                           "usage": usage(len(text) // 4)},
           "parent_tool_use_id": None, "session_id": session_id, "uuid": str(uuid.uuid4())})
     return True, sent
+
+
+def usage(output_tokens):
+    """The usage of a main-thread assistant message: the three input counters sum to the context size when one is set."""
+    n = context_tokens
+    if n is None:
+        return {"input_tokens": 10, "output_tokens": output_tokens}
+    return {"input_tokens": n - 2 * (n // 3), "cache_read_input_tokens": n // 3, "cache_creation_input_tokens": n // 3,
+            "output_tokens": output_tokens}
+
+
+def system_status(status, **extra):
+    emit(dict({"type": "system", "subtype": "status", "status": status, "session_id": session_id, "uuid": str(uuid.uuid4())}, **extra))
+
+
+def compact_boundary(trigger, user_context=None):
+    """Emits a compact_boundary for the current context and shrinks it to a tenth. Returns post_tokens."""
+    global context_tokens
+    pre = context_tokens if context_tokens is not None else 10
+    post = pre // 10
+    meta = {"trigger": trigger, "pre_tokens": pre, "post_tokens": post, "duration_ms": 1500}
+    if user_context:
+        meta["user_context"] = user_context
+    emit({"type": "system", "subtype": "compact_boundary", "session_id": session_id, "uuid": str(uuid.uuid4()),
+          "compact_metadata": meta})
+    context_tokens = post
+    return post
+
+
+def synthetic_message(text):
+    """The CLI's own assistant message for a local command: model "<synthetic>", all usage counters 0."""
+    emit({"type": "assistant", "message": {"id": msg_id(), "type": "message", "role": "assistant", "model": "<synthetic>",
+                                           "content": [{"type": "text", "text": text}], "stop_reason": "stop_sequence",
+                                           "usage": {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0,
+                                                     "cache_creation_input_tokens": 0}},
+          "parent_tool_use_id": None, "session_id": session_id, "uuid": str(uuid.uuid4())})
+
+
+def compact_command(text, had_messages):
+    """The CLI's local /compact command (see the docstring): fails with nothing to compact, else compacts."""
+    args = text.strip()[len("/compact"):].strip()
+    system_status("compacting")
+    if not had_messages:
+        error = "Not enough messages to compact."
+        system_status(None, compact_result="failed", compact_error=error)
+        synthetic_message(error)
+        result(error, turns=0, cost=0.0, local_command="compact")
+        return
+    time.sleep(1.5)
+    compact_boundary("manual", args or None)
+    system_status(None, compact_result="success")
+    reply = "Compacted. Focus: " + args if args else "Compacted."
+    synthetic_message(reply)
+    result(reply, turns=0, cost=0.0, local_command="compact")
 
 
 def think(events=15, delay=0.2):
@@ -234,15 +311,23 @@ def tool_roundtrip(command):
           "parent_tool_use_id": None, "session_id": session_id, "uuid": str(uuid.uuid4())})
 
 
-def result(text, subtype="success", is_error=False, structured=None, turns=1, cost=0.0123):
+def result(text, subtype="success", is_error=False, structured=None, turns=1, cost=0.0123, local_command=None):
     global total_cost
     total_cost += cost
+    u = usage(20)
     r = {"type": "result", "subtype": subtype, "is_error": is_error, "duration_ms": 50, "duration_api_ms": 40,
          "num_turns": turns, "result": text, "stop_reason": "end_turn" if not is_error else None,
          "session_id": session_id, "total_cost_usd": round(total_cost, 6),
-         "usage": {"input_tokens": 10, "output_tokens": 20}, "permission_denials": [], "uuid": str(uuid.uuid4())}
+         "usage": {"input_tokens": 10, "output_tokens": 20}, "permission_denials": [], "uuid": str(uuid.uuid4()),
+         "modelUsage": {model: {"inputTokens": u.get("input_tokens", 0), "outputTokens": u["output_tokens"],
+                                "cacheReadInputTokens": u.get("cache_read_input_tokens", 0),
+                                "cacheCreationInputTokens": u.get("cache_creation_input_tokens", 0),
+                                "webSearchRequests": 0, "costUSD": round(total_cost, 6),
+                                "contextWindow": 1000000, "maxOutputTokens": 64000}}}
     if structured is not None:
         r["structured_output"] = structured
+    if local_command is not None:
+        r["local_command"] = local_command
     emit(r)
 
 
@@ -526,6 +611,7 @@ def advisor_reply(text, context):
 
 
 def chat_mode():
+    global context_tokens
     inbox = queue.Queue()
 
     def reader():
@@ -541,6 +627,7 @@ def chat_mode():
     threading.Thread(target=reader, daemon=True).start()
     pending = []
     interrupt_flag = {"set": False}
+    had_messages = {"any": False}
 
     def drain_controls():
         while True:
@@ -580,6 +667,11 @@ def chat_mode():
                                if isinstance(c, dict) and c.get("type") == "text" and not c.get("text", "").startswith("[Attachments]"))
         interrupt_flag["set"] = False
         init_event()
+        if role == "chat" and COMPACT_COMMAND.match(content.strip()):
+            compact_command(content, had_messages["any"] or resume is not None)
+            had_messages["any"] = True
+            continue
+        had_messages["any"] = True
         forward = re.match(r"\s*forward (\S+) (\S+?):\s*(.+)$", content, re.S)
         if forward and mcp_config:
             try:
@@ -623,6 +715,13 @@ def chat_mode():
             result(reply)
             continue
         rate_limit_event(content)
+        set_context = re.search(r"fake:context=(\d+)", content)
+        if set_context:
+            context_tokens = int(set_context.group(1))
+        if "fake:autocompact" in content:
+            system_status("compacting")
+            compact_boundary("auto")
+            system_status(None, compact_result="success")
         if "fake:think" in content:
             think()
         if "fake:heartbeat" in content:
