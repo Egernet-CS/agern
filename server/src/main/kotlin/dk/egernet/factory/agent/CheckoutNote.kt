@@ -35,11 +35,16 @@ fun checkoutNoteBody(state: CheckoutState): String? {
     return when (state.status) {
         "updated" -> {
             val from = state.updatedFrom ?: return null
+            state.switchedFrom?.let { old ->
+                return "Agern switched this checkout from `${branchName(old)}` to `$b`, the project's base branch (HEAD ${short(state.head)}). " +
+                    "Files you read earlier in this conversation may have changed: read them again before relying on them."
+            }
             "Agern fast-forwarded this checkout of `$b` from ${short(from)} to ${short(state.head)} " +
                 "(${state.newCommits} new ${if (state.newCommits == 1) "commit" else "commits"} from origin/$b). Files you read earlier in this conversation may have changed: " +
                 "read them again before relying on them."
         }
         "behind" ->
+            state.switchedFrom?.let { "Agern switched this checkout from `${branchName(it)}` to `$b`, the project's base branch. " }.orEmpty() +
             "This checkout is ${commits(state.behind)} behind origin/$b (HEAD ${short(state.head)}) and Agern did not update it " +
                 "because ${checkoutWhy(state)}. The code you read here may be out of date: say so when you answer questions about " +
                 "the current state of the project, and use `git log HEAD..origin/$b` or `git show origin/$b:<path>` to look at " +

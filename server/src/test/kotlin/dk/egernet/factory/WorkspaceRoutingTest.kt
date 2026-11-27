@@ -90,7 +90,7 @@ class WorkspaceRoutingTest {
         val done = world.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
         assertEquals(RunStatus.MERGED, done.status, done.error)
         assertNull(done.targetRepo)
-        assertNull(done.baseBranch)
+        assertEquals("main", done.baseBranch)
         assertTrue(done.contextRepos.isEmpty())
         val pr = world.github.pullMeta[done.prNumber!!]!!
         assertEquals("demo-app" to "main", pr.repo to pr.base)

@@ -73,7 +73,15 @@ function SettingsForm({ repo, settings, onCancel, onSaved }: {
     setBusy(true);
     setErr(null);
     try {
-      onSaved(await api.setProjectSettings(repo, { mergePolicy: policy, reviewers: splitList(reviewers), teamReviewers: splitList(teams) }));
+      // The endpoint replaces the whole settings object: the base branch goes along unchanged.
+      onSaved(
+        await api.setProjectSettings(repo, {
+          mergePolicy: policy,
+          reviewers: splitList(reviewers),
+          teamReviewers: splitList(teams),
+          baseBranch: settings.baseBranch ?? null,
+        }),
+      );
     } catch (e2) {
       setErr(errorMessage(e2));
       setBusy(false);

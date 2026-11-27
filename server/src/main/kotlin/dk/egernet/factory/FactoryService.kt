@@ -163,14 +163,24 @@ class FactoryService(
     }
 
     /**
-     * `PUT /api/projects/{repo}/settings` (docs/ARCHITECTURE.md §6 "Merge policy"). The caller has checked that [user] is
-     * an admin; 404 when [repo] is not visible to them, 400 for an unknown policy or a bad reviewer entry. Applies to
-     * runs started from now on; a run keeps the policy it started with.
+     * `PUT /api/projects/{repo}/settings` (docs/ARCHITECTURE.md §6 "Merge policy", "Base branch"), a full replacement.
+     * The caller has checked that [user] is an admin; 404 when [repo] is not visible to them, 400 for an unknown policy,
+     * a bad reviewer entry or an invalid branch name, 422 `base_branch_not_found` when the base branch does not exist on
+     * GitHub (checked with [user]'s own token). The default branch's name is stored as null ("follow the default
+     * branch"). Applies to runs started from now on; a run keeps the policy and base branch it started with.
      */
     suspend fun setProjectSettings(user: UserRecord, repo: String, req: ProjectSettingsReq): ProjectDto {
         val r = withContext(Dispatchers.IO) { access.requireVisible(user, repo) }
         val store = projectSettings ?: throw dk.egernet.factory.conflict("Project settings are not available")
-        val valid = validSettings(req)
+        val checked = validSettings(req)
+        val base = checked.baseBranch?.takeIf { it != r.defaultBranch }
+        if (base != null) {
+            val client = access.requireClient(user)
+            gh { client.branchSha(org, r.name, base) } ?: throw unprocessable(
+                "Branch `$base` does not exist in $org/${r.name}.", "base_branch_not_found",
+            )
+        }
+        val valid = checked.copy(baseBranch = base)
         withContext(Dispatchers.IO) { store.put(r.name, valid, user.id) }
         return projectWithIcon(r)
     }
@@ -669,7 +679,28 @@ class FactoryService(
             }
             return ProjectSettingsDto(
                 policy!!, list(req.reviewers, LOGIN_RE, "GitHub login", "reviewers"), list(req.teamReviewers, TEAM_RE, "team slug", "teamReviewers"),
+                validBaseBranch(req.baseBranch),
             )
+        }
+
+        private val BRANCH_RE = Regex("^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
+
+        /**
+         * The base branch of a settings request, trimmed; null when omitted or blank (docs/ARCHITECTURE.md §6 "Base
+         * branch"). The name goes into git argv, GitHub API paths, Markdown comments and agent prompts, so only a safe
+         * subset of git's branch names passes: no whitespace, backticks, leading `-`, control or shell characters, no
+         * `..`, `//`, trailing `/`, `.` or `.lock`, no path component starting with `.`, and none of Agern's own
+         * `factory/` run branches.
+         */
+        fun validBaseBranch(raw: String?): String? {
+            val b = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+            fun bad(why: String): Nothing = throw badRequest("baseBranch: '${b.take(100)}' $why")
+            if (!BRANCH_RE.matches(b)) bad("is not a valid branch name (letters, digits, `.`, `_`, `-` and `/`, at most 200)")
+            if (".." in b || "//" in b) bad("must not contain `..` or `//`")
+            if (b.endsWith("/") || b.endsWith(".") || b.endsWith(".lock")) bad("must not end in `/`, `.` or `.lock`")
+            if (b.split('/').any { it.startsWith(".") }) bad("must not have a path component starting with `.`")
+            if (b.startsWith("factory/")) bad("must not be one of Agern's own `factory/` branches")
+            return b
         }
 
         val HELP = """
