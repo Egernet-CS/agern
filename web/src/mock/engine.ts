@@ -636,10 +636,20 @@ export function chatInput(s: AgentSession, text: string, by: User, attachments: 
           const r = startRun(s.repo, Number(arg?.replace('#', '')), by, s.id);
           systemReply(s, `Started run ${r.id.slice(0, 8)} for #${r.issueNumber} "${r.issueTitle}". Follow it at /p/${s.repo}/runs/${r.id}`);
         } else if (cmd === 'approve') {
-          const r = arg ? findRun(arg) : [...db.runs.values()].find((x) => x.repo === s.repo && x.status === 'needs_human');
+          const args = text.trim().split(/\s+/).slice(2);
+          const has = (w: string) => args.some((a) => a.toLowerCase() === w);
+          if (has('keep-open') && has('close')) throw new Error('Usage: /factory approve [runId] [update] [keep-open|close]');
+          const closeIssue = has('keep-open') ? false : has('close') ? true : undefined;
+          const id = args.find((a) => !['update', 'keep-open', 'close'].includes(a.toLowerCase()));
+          const r = id ? findRun(id) : [...db.runs.values()].find((x) => x.repo === s.repo && x.status === 'needs_human');
           if (!r) throw new Error('No run is waiting for approval.');
-          approveRun(r, by);
-          systemReply(s, `Approved run ${r.id.slice(0, 8)} — merging #${r.prNumber}.`);
+          approveRun(r, by, closeIssue);
+          systemReply(
+            s,
+            r.partial && !r.releaseId
+              ? `Run ${r.id.slice(0, 8)}: merged — issue #${r.issueNumber} stays open (partial delivery)`
+              : `Approved run ${r.id.slice(0, 8)} — merging #${r.prNumber}.`,
+          );
         } else if (cmd === 'cancel') {
           const r = arg ? findRun(arg) : undefined;
           if (!r) throw new Error('Usage: /factory cancel <runId>');
@@ -809,8 +819,9 @@ function setRunStatus(r: Run, status: Run['status'], ts: string) {
     const issue = db.issues[r.repo]?.find((i) => i.number === r.issueNumber);
     if (issue) {
       issue.activeRunId = null;
-      // A release run merges into the release branch; its issue stays open until the release is merged.
-      if (status === 'merged' && !r.releaseId) issue.state = 'closed';
+      // A release run merges into the release branch; its issue stays open until the release is merged. A partial
+      // delivery leaves it open too.
+      if (status === 'merged' && !r.releaseId && !r.partial) issue.state = 'closed';
     }
   }
   r.updateOnDemand = updatableOnDemand(r);
@@ -1463,12 +1474,35 @@ export function startRun(repo: string, issueNumber: number, owner: User, started
   return r;
 }
 
-export function approveRun(r: Run, by: User) {
+/**
+ * The owner marks a `needs_human` run as a partial delivery or a complete one (docs/ARCHITECTURE.md §6 "Partial delivery").
+ */
+export function setRunPartial(r: Run, by: User, partial: boolean) {
+  if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner of this run can change whether it is a partial delivery');
+  if (r.releaseId || r.kind === 'sync')
+    throw new MockError(409, 'partial_not_supported', "A release run's issue is closed by its release; partial delivery does not apply.");
+  if (r.status !== 'needs_human') throw new MockError(409, 'run_not_waiting', `Run is ${r.status}, not needs_human`);
+  if (!!r.partial === partial) return;
+  r.partial = partial;
+  r.partialSetBy = by.username;
+  touchRun(r, iso(Date.now()));
+}
+
+/** [closeIssue]: false keeps the issue open (partial delivery), true closes it, undefined merges as the run is marked. */
+export function approveRun(r: Run, by: User, closeIssue?: boolean) {
   if (r.owner.username !== by.username) throw new MockError(403, 'forbidden', 'Only the owner can approve this run.');
   if (r.mergePolicy === 'github') {
     throw new MockError(409, 'merge_on_github', `This project merges on GitHub: Agern does not merge. Review and merge pull request ${r.prUrl ?? '(none)'} on GitHub.`);
   }
+  if (r.status === 'merged' && r.mergedOnGitHub) {
+    throw new MockError(409, 'pull_request_merged', `Pull request #${r.prNumber} was already merged on GitHub${r.mergedBy ? ` by @${r.mergedBy}` : ''}; run ${r.id} is merged and nothing was merged again.`);
+  }
   if (r.status !== 'needs_human') throw new MockError(409, 'conflict', 'Run is not waiting for a human.');
+  if (closeIssue !== undefined) {
+    if (!closeIssue && (r.releaseId || r.kind === 'sync'))
+      throw new MockError(409, 'partial_not_supported', "A release run's issue is closed by its release; partial delivery does not apply.");
+    if (!r.releaseId && r.kind !== 'sync') setRunPartial(r, by, !closeIssue);
+  }
   const adv = r.conversation.sessionId ? db.sessions.get(r.conversation.sessionId) : undefined;
   if (r.conversation.review === 'running') throw new MockError(409, 'review_in_progress', 'Changes from the conversation are being reviewed; wait for the reviews.');
   if (adv && (adv.status === 'running' || adv.status === 'starting')) throw new MockError(409, 'agent_busy', 'The agent is still answering; wait for it or interrupt it');
@@ -2557,6 +2591,21 @@ function seed() {
 
   // Waiting for a human (alice owns it).
   startRun('billing-service', 17, alice, null, { changes: {}, approver: 'ESCALATE', liveFrom: never }, Date.now() - 40 * 60_000);
+  // Partial deliveries (docs/ARCHITECTURE.md §6 "Partial delivery"): the spec-writer split the issue into steps. One waits
+  // for alice (the approver escalated), one was merged and left its issue open.
+  const plan61 = {
+    delivers: 'The sign-up form in the footer and the subscribers table; confirmation e-mails are not sent yet.',
+    remaining: ['Send the double opt-in confirmation e-mail', 'An unsubscribe link in every newsletter'],
+  };
+  const partial61 = startRun('web-shop', 61, alice, null, { changes: {}, approver: 'ESCALATE', liveFrom: never }, Date.now() - 25 * 60_000);
+  Object.assign(partial61, { partial: true, partialSetBy: null, delivery: plan61 });
+  const partial64 = startRun('web-shop', 64, alice, null, { changes: {}, liveFrom: never }, Date.now() - 26 * 3_600_000);
+  Object.assign(partial64, {
+    partial: true,
+    partialSetBy: null,
+    delivery: { delivers: 'Recount the badge after every cart change on the product pages.', remaining: ['The same fix in the mini-cart drawer'] },
+  });
+  db.issues['web-shop'].find((i) => i.number === 64)!.state = 'open';
   // Finished, but its migration clashes with one that landed on main meanwhile: "Update and merge" is offered.
   startRun('data-pipeline', 3, alice, null, { changes: {}, liveFrom: never, refuseMerge: 'migration' }, Date.now() - 30 * 60_000);
   // Updated once after a merge conflict, then merged (history).

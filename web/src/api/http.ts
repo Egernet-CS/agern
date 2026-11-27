@@ -195,7 +195,8 @@ export const httpApi: Api = {
     return get(`/api/runs${qs ? `?${qs}` : ''}`);
   },
   run: (id) => get(`/api/runs/${enc(id)}`),
-  approveRun: (id) => post(`/api/runs/${enc(id)}/approve`),
+  approveRun: (id, closeIssue) => post(`/api/runs/${enc(id)}/approve`, closeIssue === undefined ? undefined : { closeIssue }),
+  setRunPartial: (id, partial) => put(`/api/runs/${enc(id)}/partial`, { partial }),
   updateRun: (id) => post(`/api/runs/${enc(id)}/update`),
   mergeAnywayRun: (id, headSha) => post(`/api/runs/${enc(id)}/merge-anyway`, { headSha }),
   cancelRun: (id) => post(`/api/runs/${enc(id)}/cancel`),

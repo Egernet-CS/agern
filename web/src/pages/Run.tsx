@@ -38,10 +38,12 @@ export function RunPage() {
   const run = useLiveRun(runQ.data);
   const sessions = useLiveSessions(sessQ.data, (s) => s.runId === runId);
   const sessionMap = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions]);
-  const [busy, setBusy] = useState<'approve' | 'update' | 'update-base' | 'cancel' | 'retry-now' | 'give-up' | 'merge-anyway' | null>(null);
+  const [busy, setBusy] = useState<'approve' | 'partial' | 'update' | 'update-base' | 'cancel' | 'retry-now' | 'give-up' | 'merge-anyway' | null>(null);
   const [confirmGiveUp, setConfirmGiveUp] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [confirmApprove, setConfirmApprove] = useState(false);
+  // The issue's fate chosen with the approval: undefined merges as the run is marked (docs/ARCHITECTURE.md §6 "Partial delivery").
+  const [approveChoice, setApproveChoice] = useState<boolean | undefined>(undefined);
   const [confirmMergeAnyway, setConfirmMergeAnyway] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const navigate = useNavigate();
@@ -165,14 +167,16 @@ export function RunPage() {
   const canMergeAnyway =
     isOwner && run.prNumber !== null && checksBlock && (run.status === 'waiting_for_checks' || run.status === 'needs_human');
 
-  const act = async (kind: 'approve' | 'cancel' | 'retry-now' | 'give-up' | 'merge-anyway') => {
+  const act = async (kind: 'approve' | 'cancel' | 'retry-now' | 'give-up' | 'merge-anyway', closeIssue?: boolean) => {
     setBusy(kind);
     setErr(null);
     try {
       const r =
         kind === 'merge-anyway'
           ? await api.mergeAnywayRun(run.id, checks?.sha ?? '')
-          : await { approve: api.approveRun, cancel: api.cancelRun, 'retry-now': api.retryRunNow, 'give-up': api.giveUpRun }[kind](run.id);
+          : kind === 'approve'
+            ? await api.approveRun(run.id, closeIssue)
+            : await { cancel: api.cancelRun, 'retry-now': api.retryRunNow, 'give-up': api.giveUpRun }[kind](run.id);
       runQ.setData(() => r);
     } catch (e) {
       setErr((e as Error).message);
@@ -183,6 +187,34 @@ export function RunPage() {
       setConfirmMergeAnyway(false);
       setConfirmGiveUp(false);
     }
+  };
+  // Partial delivery (docs/ARCHITECTURE.md §6 "Partial delivery"): merging leaves the issue open.
+  const partial = !!run.partial;
+  const singleRun = !run.releaseId && !isSyncRun(run);
+  const canSwitchPartial = isOwner && run.status === 'needs_human' && singleRun;
+  const setPartial = async (value: boolean) => {
+    setBusy('partial');
+    setErr(null);
+    try {
+      const r = await api.setRunPartial(run.id, value);
+      runQ.setData(() => r);
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  };
+  // An approval: with the approver's escalation the owner confirms first, seeing what happens to the issue.
+  const approve = (closeIssue?: boolean) => {
+    setApproveChoice(closeIssue);
+    if (escalation !== null) setConfirmApprove(true);
+    else void act('approve', closeIssue);
+  };
+  const issueClosed = (closeIssue?: boolean) => (closeIssue ?? !partial) && singleRun;
+  const approveButtonProps = {
+    disabled: busy !== null || approveHint !== null,
+    'aria-describedby': approveHint ? 'approve-hint' : undefined,
+    'aria-haspopup': escalation !== null ? ('dialog' as const) : undefined,
   };
   const mergeAnywayButton = canMergeAnyway && (
     <button className="btn btn--ghost" onClick={() => setConfirmMergeAnyway(true)} disabled={busy !== null} aria-haspopup="dialog">
@@ -233,6 +265,7 @@ export function RunPage() {
           {run.continuedByRunId && (
             <div><dt>continued by</dt><dd><Link to={`/p/${repo}/runs/${run.continuedByRunId}`}>run {shortId(run.continuedByRunId)}</Link></dd></div>
           )}
+          {partial && singleRun && <div><dt>delivery</dt><dd>partial — issue stays open</dd></div>}
           <div><dt>pull request</dt><dd>{run.prUrl ? <a href={run.prUrl} target="_blank" rel="noreferrer">{run.targetRepo ? `${run.targetRepo}#${run.prNumber}` : `#${run.prNumber}`} ↗</a> : <span className="muted">after first build</span>}</dd></div>
           <div><dt>{run.endedAt ? 'took' : 'running for'}</dt><dd>{between(run.createdAt, run.endedAt, now)}</dd></div>
           <div><dt>started</dt><dd>{timeAgo(run.createdAt, now)}</dd></div>
@@ -258,14 +291,13 @@ export function RunPage() {
                 </>
               )}
               {!onGitHub && (
-                <button
-                  className="btn btn--approve"
-                  onClick={() => (escalation !== null ? setConfirmApprove(true) : void act('approve'))}
-                  disabled={busy !== null || approveHint !== null}
-                  aria-describedby={approveHint ? 'approve-hint' : undefined}
-                  aria-haspopup={escalation !== null ? 'dialog' : undefined}
-                >
-                  {busy === 'approve' ? 'Approving…' : '✓ Approve & merge'}
+                <button className="btn btn--approve" onClick={() => approve()} {...approveButtonProps}>
+                  {busy === 'approve' && approveChoice === undefined ? 'Approving…' : '✓ Approve & merge'}
+                </button>
+              )}
+              {!onGitHub && singleRun && (
+                <button className="btn btn--ghost" onClick={() => approve(partial)} {...approveButtonProps}>
+                  {busy === 'approve' && approveChoice !== undefined ? 'Approving…' : partial ? 'Merge & close issue' : 'Merge & keep issue open'}
                 </button>
               )}
               {updateFromBaseButton}
@@ -357,6 +389,24 @@ export function RunPage() {
           <div className="notice-text">{run.mergedBy ? `Merged on GitHub by @${run.mergedBy}` : 'Merged on GitHub'}</div>
         </div>
       )}
+      {partial && singleRun && (active || run.status === 'ready' || run.status === 'merged') ? (
+        <DeliveryNotice run={run}>
+          {canSwitchPartial && (
+            <button type="button" className="btn btn--sm btn--ghost notice-action" onClick={() => void setPartial(false)} disabled={busy !== null}>
+              {busy === 'partial' ? 'Saving…' : 'Mark as complete'}
+            </button>
+          )}
+        </DeliveryNotice>
+      ) : (
+        canSwitchPartial && (
+          <div className="notice run-delivery run-delivery--complete" role="note">
+            <div className="notice-text">Merging closes issue #{run.issueNumber}.</div>
+            <button type="button" className="btn btn--sm btn--ghost notice-action" onClick={() => void setPartial(true)} disabled={busy !== null}>
+              {busy === 'partial' ? 'Saving…' : 'Mark as partial delivery'}
+            </button>
+          </div>
+        )
+      )}
       {err && <p className="form-error" role="alert">{err}</p>}
       <SandboxVmPreviewPanel run={run} canAct={isOwner || me.isAdmin} onRun={(r) => runQ.setData(() => r)} />
       {run.status === 'waiting_for_checks' && checks && <WaitingForChecks checks={checks} />}
@@ -430,9 +480,16 @@ export function RunPage() {
           Merging squash-merges {run.prNumber ? <>pull request #{run.prNumber}</> : 'the pull request'} into{' '}
           <code>{run.baseBranch ?? 'the default branch'}</code> now. Merge only if you have checked the approver’s concern.
         </p>
+        <p className="approve-outcome">
+          {!singleRun
+            ? `Issue #${run.issueNumber} stays open until the release is merged.`
+            : issueClosed(approveChoice)
+              ? `Issue #${run.issueNumber} will be closed.`
+              : `Issue #${run.issueNumber} stays open (partial delivery).`}
+        </p>
         <div className="dialog-actions">
           <button className="btn btn--ghost" onClick={() => setConfirmApprove(false)} data-autofocus>Don’t merge</button>
-          <button className="btn btn--approve" onClick={() => void act('approve')} disabled={busy !== null}>{busy === 'approve' ? 'Merging…' : 'Merge anyway'}</button>
+          <button className="btn btn--approve" onClick={() => void act('approve', approveChoice)} disabled={busy !== null}>{busy === 'approve' ? 'Merging…' : 'Merge anyway'}</button>
         </div>
       </Dialog>
 
@@ -575,6 +632,39 @@ function UpdatesSection({ run, onShowBuilder }: { run: Run; onShowBuilder: (roun
  * Other runs that were active in the project when this run started (a warning, never a block). Issue titles and paths
  * are untrusted and rendered as text.
  */
+/**
+ * A partial delivery (docs/ARCHITECTURE.md §6 "Partial delivery"): the issue stays open, with the spec's plan. The plan
+ * comes from the agent: plain text only. [children]: the owner's "Mark as complete".
+ */
+function DeliveryNotice({ run, children }: { run: Run; children?: React.ReactNode }) {
+  const plan = run.delivery ?? null;
+  const remaining = plan?.remaining ?? [];
+  return (
+    <div className="notice run-delivery" role="note" aria-label="Partial delivery">
+      <div className="notice-text">
+        <p>
+          <strong>Partial delivery.</strong>{' '}
+          {run.status === 'merged' ? `Issue #${run.issueNumber} was left open.` : `Issue #${run.issueNumber} stays open when this is merged.`}
+        </p>
+        {plan?.delivers && <p className="run-delivery-delivers">Delivered: {plan.delivers}</p>}
+        {remaining.length > 0 ? (
+          <>
+            <p className="run-delivery-label">Remaining</p>
+            <ul className="run-delivery-list">
+              {remaining.map((item, i) => (
+                <li key={i}>{item}</li>
+              ))}
+            </ul>
+          </>
+        ) : (
+          <p className="muted small">Marked by {run.partialSetBy ?? run.owner.username}; the spec names no remaining steps.</p>
+        )}
+      </div>
+      {children}
+    </div>
+  );
+}
+
 function OverlapsNotice({ run, repo }: { run: Run; repo: string }) {
   const overlaps = run.overlaps ?? [];
   return (

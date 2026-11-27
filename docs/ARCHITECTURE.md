@@ -99,7 +99,7 @@ per-run containers, per-project cache volumes; §5 "Sandboxes").
 | `FACTORY_SANDBOX_VM` | `ssh` | `ssh` or `off`: per-project sandbox VMs for run builders and human previews (§5 "Sandbox VMs"). `off`: runs decide `disabled`, builders get no sandbox VM tools, a preview and a check answer 409 `sandbox_vm_disabled`; definitions can still be approved. `fake` (development and end-to-end tests only, accepted only with `FACTORY_DEV_FAKE_GITHUB`): the deploy targets' fake transport |
 | `FACTORY_SANDBOX_VM_EXEC_TIMEOUT_MINUTES` | `30` | Default and maximum time for one sandbox VM command and for one whole deploy (1–1440), also capped by `FACTORY_STAGE_TIMEOUT_MINUTES`; included in the MCP tool timeouts (§5) |
 | `FACTORY_SANDBOX_VM_PREVIEW_MINUTES` | `120` | How long a human preview holds a sandbox VM (5–1440) |
-| `FACTORY_DEV_FAKE_GITHUB` | `false` | Development only, requires `FACTORY_AUTH=dev`: in-memory fake GitHub (org with `demo-app`, `private-lab` and the workspace `demo-workspace` with its members `demo-ws-app` (base branch `dev`), `demo-ws-tools` and `demo-ws-lab` (only alice can read it); issues #1–#5 of `demo-workspace` carry one, no, several and an inaccessible member's label; the submodule workspace `demo-shop` whose `.gitmodules` declares `services/api` (`demo-shop-api`, SSH URL), `web` (`demo-shop-web`, relative URL, `branch = main`), `tools/cli` (`demo-ws-tools`, whose label no issue of `demo-shop` carries, so it is missing until Agern creates it) and `vendor/icons` (another organization, context only), with issues #1–#2 labelled `demo-shop-api` and `demo-shop-web` and #3 without a member label (a run of `demo-shop` itself); tokens `fake-<login>` = classic with `repo`, `read:org`; `fake-<login>~<scope>,…` = only those scopes), local `git init` instead of clones, pushes skipped (a sync run's fast-forward push moves the local release branch instead); `<dataDir>/fake-github-checks/<repo>/<branch>.json` sets the checks of a branch's head and, with `"conflict": true`, makes its pull requests conflict (§6 "Releasing", "Fake-GitHub mode") |
+| `FACTORY_DEV_FAKE_GITHUB` | `false` | Development only, requires `FACTORY_AUTH=dev`: in-memory fake GitHub (org with `demo-app`, `private-lab` and the workspace `demo-workspace` with its members `demo-ws-app` (base branch `dev`), `demo-ws-tools` and `demo-ws-lab` (only alice can read it); issues #1–#5 of `demo-workspace` carry one, no, several and an inaccessible member's label; the submodule workspace `demo-shop` whose `.gitmodules` declares `services/api` (`demo-shop-api`, SSH URL), `web` (`demo-shop-web`, relative URL, `branch = main`), `tools/cli` (`demo-ws-tools`, whose label no issue of `demo-shop` carries, so it is missing until Agern creates it) and `vendor/icons` (another organization, context only), with issues #1–#2 labelled `demo-shop-api` and `demo-shop-web` and #3 without a member label (a run of `demo-shop` itself); tokens `fake-<login>` = classic with `repo`, `read:org`; `fake-<login>~<scope>,…` = only those scopes), local `git init` instead of clones, pushes skipped (a sync run's fast-forward push moves the local release branch instead); `<dataDir>/fake-github-checks/<repo>/<branch>.json` sets the checks of a branch's head and, with `"conflict": true`, makes its pull requests conflict, and with `"pull": "merged"` (optionally `"mergedBy": "<login>"`) or `"pull": "closed"` merges or closes an open pull request of that head on its next read, as a person on GitHub would (§6 "Releasing", "Fake-GitHub mode", "Pull requests merged or closed on GitHub") |
 
 ## 4. Identity and secrets
 
@@ -1039,6 +1039,8 @@ issue → spec-writer (opus) → builder (opus) ─┬→ security  (opus)   ┐
    merge policy owner_approves: APPROVE and ESCALATE → needs-human ← /factory approve
    merge policy github:         APPROVE and ESCALATE → ready (pull request left open; merged or closed on GitHub)
    spec "Blocked on: #n" (n open) → failed (blocked) before the builder
+   spec "## Delivery plan" with remaining steps → partial delivery: `Part of #N`, the merge leaves the issue open
+   pull request merged / closed on GitHub meanwhile → merged (on GitHub) / cancelled, at any status before the merge
 ```
 
 "main" is the repository's default branch for a single run, and `release/<name>` for a release run (§6
@@ -1054,6 +1056,9 @@ reaches the default branch only through the owner's approval of the release (§6
   `## Tests` and `## Out of scope`): the commands the builder runs in the sandbox and on which platforms, and for UI
   changes how the UI reviewers start the app in the review sandbox and what they look at. It reads the sandbox with
   `factory_sandbox_info` but cannot run anything in it, and never asks for a sandbox to be enabled or approved.
+- **Delivery plan.** When the issue is too large for one run, `spec-writer.md` (rule 7) has the spec cover a first
+  step that works on its own and add a `## Delivery plan` section after `## Summary` ("**This run:** …" and a
+  "**Remaining:**" list). The run is then a partial delivery (§6 "Partial delivery").
 - **Blocked on another issue.** When the issue cannot be built before another open issue of the same repository is
   done, `spec-writer.md` has the spec start with the line `Blocked on: #<n>` (several: `Blocked on: #<n>, #<m>`; bold
   allowed), then a short paragraph with the reason. After the spec-writer (not for a reused spec) the orchestrator
@@ -1127,7 +1132,8 @@ reaches the default branch only through the owner's approval of the release (§6
   branch up to date with the target on the same run. Before the approver runs, a single run whose target moved gets
   that update round first. `ESCALATE` labels the issue `needs-human`, comments, and waits
   for the owner's `/factory approve`. Under the other policies the verdict is only a recommendation: `owner_approves`
-  always waits in `needs_human`, `github` ends the run `ready` and never merges.
+  always waits in `needs_human`, `github` ends the run `ready` and never merges. For a partial delivery the approver
+  judges the change against the spec's stated scope, and the merge leaves the issue open (§6 "Partial delivery").
 - **Whose models.** Every agent runs on its owner's Claude account, so model choices are personal. The
   global settings (`chatModel`, `pipelineModels`, `maxFixRounds`) are the admin's *defaults* — the models
   shown above unless an admin changes them. Each user may override any of them for themselves
@@ -1186,7 +1192,9 @@ reaches the default branch only through the owner's approval of the release (§6
     approve) also deletes the local branch; `failed` (any stage, the time limit, no commits, set-up errors) and
     `cancelled` (also from `needs_human`, or through a release) delete the local branch unless it holds commits
     found on no other branch and no remote-tracking branch (never pushed), which are kept rather than lost. A
-    `needs_human` run is still alive and keeps its worktree until it is approved or cancelled. `ready` (merge policy
+    `needs_human` run is still alive and keeps its worktree until it is approved or cancelled. A run whose pull request
+    was merged on GitHub outside Agern is cleaned up as a merged run (worktree and local branch removed), one whose pull
+    request was closed there as a cancelled one (§6 "Pull requests merged or closed on GitHub"). `ready` (merge policy
     `github`) removes the worktree like an unmerged end; the pushed branch and the open pull request stay. Submodule commits
     found on no remote-tracking branch of their submodule are saved as git bundles first (§6 "Submodule pointers").
     A non-sync run that *fails* with uncommitted changes in its worktree (`git status --porcelain`, ignored files
@@ -1232,7 +1240,21 @@ Every run merge — the approver's `APPROVE`, the owner's approval (button, `/fa
 and the step retry of a failed merge — goes through one gate (issue #100). Single, release and workspace runs behave
 alike. Decided by these rules alone, never by an agent.
 
-1. The database migration and submodule guards run first (§6 "Database migrations", "Submodule pointers"). One
+1. The pull request is read first, before any guard, so that a pull request merged on GitHub meanwhile never starts an
+   update round (§6 "Pull requests merged or closed on GitHub"):
+   - **merged** on GitHub (and not by this run's own merge request whose answer was lost, which counts as Agern's
+     merge, §6 "Transient failures"): the run ends `merged` with `mergedOnGitHub` and `mergedBy`, directly in the gate
+     (never `endRun`, which would cancel the job the gate runs in): `needs-human` label removed, worktree and local
+     branch removed, a submodule workspace run's pointer bump opened for a human, failure cleared, open stages closed,
+     the partial-delivery comment for a partial run; Agern neither merges nor closes the issue;
+   - **closed** without merge: `cancelled` with ``Pull request <ref> was closed on GitHub without being merged.``,
+     worktree removed as for an unmerged end, label removed, open stages closed, no comment;
+   - **not found**: `needs_human`, `failedStep` `merge`, "Pull request <ref> is no longer open on GitHub (not found),
+     so Agern did not merge it.";
+   - a read that fails (5xx, network): as a failed read inside the loop below (wait and evaluate again; rethrown for
+     the pipeline's network wait).
+   The callers' `finishMerge` then ends the advisor for a `merged` or `cancelled` run and tells a release.
+   The database migration and submodule guards follow (§6 "Database migrations", "Submodule pointers"). One
    comparison of the run's branch with its target (`GitOps.compareBranches`) serves the migration guard and the
    freshness check; a comparison that cannot be made is logged and counts as "no problems, not behind".
    *Freshness* (single runs with `maxUpdateRounds > 0`, §6 "Keeping runs up to date"): migration problems, or a branch
@@ -1242,8 +1264,8 @@ alike. Decided by these rules alone, never by an agent.
    reached, so the merged result was not built and reviewed. Approve to merge pull request <ref> as it is, or build the
    issue again from the current `<target>`.", `merge_conflict`, `merge`); behind and approved by a person: merged as
    today (their decision). Release and sync runs skip the freshness check.
-2. The pull request is read. Not open on GitHub (merged or closed there) or not found: `needs_human`, `failedStep`
-   `merge`, "Pull request <ref> is no longer open on GitHub (<merged|closed>), so Agern did not merge it."
+2. The pull request's current head: the first attempt uses the read of step 1; after a head move (GitHub's 409 below)
+   it is read again, and one that is no longer open is handled as in step 1.
 3. The checks on its current **head commit** are evaluated with the rules of releases (§6 "Releasing", "Checks"):
    commit statuses, check runs and GitHub Actions workflow runs; `failed` > `pending` > `passed` > `none`, and "no
    checks" is `awaiting` until the head commit has been known for `FACTORY_RELEASE_CHECKS_SETTLE_SECONDS`. For a run
@@ -1868,13 +1890,118 @@ from base branch" on the `ready` or `needs_human` run), and an approved round en
   - closed without merge: `cancelled` with ``Pull request <ref> was closed on GitHub without being merged.``.
   From `ready` the change is a conditional update that keeps `endedAt`; a `needs_human` run is ended like a cancel
   (follow-up review stopped, advisor ended, sandbox and worktree removed, open stages closed) unless an approval or a
-  cancel won the race. The rest of #22 (outside merges of other policies) is not built.
+  cancel won the race. The follower uses the same check as every other path (§6 "Pull requests merged or closed on
+  GitHub"), which also covers the other policies when a run or a project is loaded and before an action.
 - **Releases.** Release runs are exempt (they merge into `release/<name>` as `automatic`); the policy applies to the
   release's merge into the default branch, read live. `owner_approves` and `github` refuse automatic release mode
   (§6 "Release mode"). `github` also refuses Agern's release approval (HTTP, `/factory release approve`,
   `factory_approve_release`: 409 `merge_on_github`, "… Review and merge the release pull request on GitHub."), and the
   ready announcement on the release pull request ends "This project merges on GitHub: review and merge this pull
   request there; Agern follows it." The periodic reconcile already finishes a release merged on GitHub.
+
+### Partial delivery
+
+A spec-writer may decide that an issue is too large for one run and specify only a first step (issue #22). Such a run
+is a **partial delivery**: its pull request says `Part of #N`, the approver judges it against the spec's stated scope,
+and merging it leaves the issue open.
+
+- **Delivery plan.** `spec-writer.md` (rule 7) has such a spec carry a section right after `## Summary`:
+  ```
+  ## Delivery plan
+  **This run:** <what this run delivers>
+  **Remaining:**
+  - <one line per remaining step>
+  ```
+  `DeliveryPlan.parse` reads it (next to `BlockedMarker`): the first line outside fenced code blocks matching
+  `^##\s+Delivery plan\s*$` (case-insensitive) up to the next `#`/`##` heading; `delivers` = the text after
+  `This run:` (bold or plain) up to a blank line or the Remaining label, whitespace collapsed, at most 1000 characters
+  (may be empty); `remaining` = the list items (`-`, `*`, `+`, `1.`, `1)`, indented continuation lines joined) after a
+  line `Remaining:`, each at most 300 characters, at most 20. The text is the agent's: capped, shown as plain text.
+- **When it counts.** After the spec is stored — written by the spec-writer (after the `Blocked on:` check) or reused by
+  a `continue` run; never on a step retry — a plan with remaining items makes a single or workspace run partial
+  (`runs.partial`, `runs.delivery` JSONB, `partial_set_by` null; V33), with the `info` event "Partial delivery: this
+  run covers part of #N (k step(s) remain); the issue stays open after the merge." on the spec-writer's session. A plan
+  without remaining items is not partial (`warn` "The spec has a Delivery plan without remaining steps; the run is
+  treated as a complete delivery."). A release run stores the plan but is never partial (`warn` "The spec plans a
+  partial delivery, which is not supported in a release: the issue is closed when the release is merged."); sync runs
+  have no spec.
+- **Pull request.** The lead is `Part of #N` (a workspace member run: `Part of <org>/<repo>#N`) instead of `Closes …`;
+  release leads are unchanged.
+- **Approver.** After the policy paragraph: "Partial delivery: this run delivers only the part of issue #N that the
+  spec's Delivery plan names under "This run". Judge the change against the spec's stated scope, not against the whole
+  issue; the remaining steps are not a reason to escalate. The pull request says `Part of #N` and the issue stays open
+  after the merge." (marked by the owner without a plan: "Partial delivery: the run owner marked this run as covering
+  only part of issue #N. …"). The `automatic` paragraph reads "… `APPROVE` squash-merges the pull request immediately,
+  without a human looking at it (the issue stays open: partial delivery); …". The advisor's `<run_context>` has the line
+  "Delivery: partial — the issue stays open after the merge.", and the `needs_human` issue comment (not under
+  `github`) ends " This run is a partial delivery: merging it keeps the issue open."
+- **The owner's switch.** `PUT /api/runs/{id}/partial` `{ partial }` (owner only, also under `github`): 404, 403
+  `forbidden` (admins included), 409 `partial_not_supported` for a release or sync run, 409 `run_not_waiting` unless
+  `needs_human`, in that order. The same value is a no-op. Otherwise the pull request is read and, when the first line of
+  its body is exactly the other lead (`Closes …#N` ↔ `Part of …#N`), that line is replaced (`updatePull`, title
+  unchanged) — GitHub itself closes an issue named by `Closes` when the pull request merges, so skipping `closeIssue`
+  alone would not keep it open. A body whose first line is neither is left as it is. A GitHub failure answers 502
+  `github_error` and changes nothing. Then `partial` and `partialSetBy` are stored; the plan never changes.
+- **The approval's choice** is the same flag: `POST /api/runs/{id}/approve` with `{ "closeIssue": false }` switches to
+  partial, `true` to complete, before the merge starts (after the 404, 403, `merge_on_github`, outside-merge, status and
+  "no pull request" checks); no body, an empty body or no field merges as the run is marked, which closes the issue for
+  a run nobody marked partial (unchanged default). `closeIssue: false` on a release run is 409 `partial_not_supported`.
+  `factory_approve_run` (`closeIssue`) and `/factory approve … keep-open|close` do the same. Merge anyway, Update and
+  merge, the step retry of a merge and the checks wait use the run's flag.
+- **The merge.** For a partial non-release run the `needs-human` label is removed and one comment is posted;
+  `closeIssue` is not called:
+  ```
+  **Agern: merged** pull request <ref><approval>. This is a partial delivery: the issue stays open.
+
+  **Delivered:** <delivers>
+
+  **Remaining:**
+  - <item>
+  ```
+  ("Delivered" is left out when empty; without a plan with remaining items: "The run owner (@<partialSetBy>) marked
+  this run as a partial delivery; the spec names no remaining steps."). A complete run is merged as before (comment and
+  `closeIssue`). `approvedRunReply` ends "Run <id>: merged — issue #N stays open (partial delivery)".
+- **Not built:** filing the remaining steps as issues, partial delivery inside a release, starting the next step's run.
+
+### Pull requests merged or closed on GitHub
+
+A run's pull request can be merged or closed by a person on GitHub while Agern still has the run open (issue #22).
+Agern notices it without a webhook, for every merge policy:
+
+- **One check.** `Orchestrator.checkOutside(runId, force)` reads the pull request with the **run owner's** token for a
+  run with a pull request, not a sync run, in `queued`, `spec`, `building`, `reviewing`, `needs_human` or `ready`
+  (`approving` and `waiting_for_checks` are left to their merge gate, §6 "Checks before a merge", step 1). Open,
+  unreadable, not found, no owner or no token: nothing changes (logged). One check per run at a time; without `force` a
+  run is read at most once per `outsideCheckMillis` (15 s; any viewer can trigger it). Failures never reach the caller.
+  - **Merged:** the run ends `merged` with `mergedOnGitHub` and `mergedBy` (`merged_by.login`, null when not reported),
+    error and failure cleared, as a cancel ends it (`endRun(merged = true)`: job, follow-up review and advisor stopped,
+    sandbox and VM released, worktree and local branch removed, open stages closed). The `needs-human` label is removed;
+    a single workspace member run opens its pointer bump for a human (`autoMerge = false`). Agern does not close the
+    issue (GitHub's `Closes #N` may) and posts no comment — except for a partial run: "**Agern:** pull request <ref> was
+    merged on GitHub[ by @<login>]. This is a partial delivery: the issue stays open." with the plan (§6 "Partial
+    delivery").
+  - **Closed without merge:** `cancelled` with ``Pull request <ref> was closed on GitHub without being merged.``
+    (`endRun(merged = false)`), label removed, no comment.
+  - From `ready` the follower's conditional updates apply (`endedAt` kept). The change is conditional on the run still
+    being eligible with the same pull request; a pipeline whose job the check cancelled after it had moved on to its
+    approver ends too (nothing drives it any more). Then the run is published, and a release run settles.
+- **When.** `GET /api/runs/{id}` checks (throttled) before it answers; `GET /api/projects/{repo}/runs`,
+  `GET /api/projects/{repo}/issues` and `factory_list_runs` check the project's eligible runs in the background
+  (changes arrive through the feed). Starting a run when the issue already has an active one checks that run once
+  (`force`) and tries again before 409 `active_run_exists`. The follower (§6 "Merge policy") checks `ready` runs and
+  `needs_human` runs under `github` every 60 s.
+- **Before an action.** Approve (`POST /runs/{id}/approve`, `/factory approve`, `factory_approve_run`), Merge anyway,
+  Update and merge and Update from base branch run a forced check first: a run merged on GitHub (now or earlier) is 409
+  `pull_request_merged` ("Pull request <ref> was already merged on GitHub[ by @<login>]; run <id> is merged and nothing
+  was merged again."); one the check just found closed is 409 `pull_request_closed` ("Pull request <ref> was closed on
+  GitHub without being merged; run <id> is cancelled."). No merge request is sent in either case. Cancel (owner or
+  admin) checks too and then answers the usual 409 "Run is already merged" / "Run is already cancelled".
+- **Writes.** The only GitHub writes an outside merge causes are removing Agern's own `needs-human` label, the
+  workspace pointer-bump pull request (left for a human) and the partial-delivery comment. Agern never closes or
+  reopens an issue for it.
+- **Fake-GitHub mode** (development and e2e only): `<dataDir>/fake-github-checks/<repo>/<branch>.json` with
+  `"pull": "merged"` (and `"mergedBy": "carol"`) or `"pull": "closed"` merges or closes the open pull request of that
+  head on its next read (`FakeGitHub.mergeOnGitHub` / `closePull`).
 
 ### Database migrations
 
@@ -2818,7 +2945,8 @@ automatic update round per run (trigger `release`).
   (`FACTORY_DEV_FAKE_GITHUB`) `<dataDir>/fake-github-checks/<repo>/<branch>.json` (`{"statuses": {"ci": "pending"},
   "checkRuns": [{"name", "status", "conclusion"}]}`) sets the checks of a branch while the server runs, and
   `"conflict": true` makes its pull requests conflict (reported and refused on merge like `conflicting`) while the
-  file says so; the e2e suite uses both.
+  file says so; `"pull": "merged"` (with `"mergedBy"`) or `"pull": "closed"` merges or closes an open pull request of
+  that head on its next read (§6 "Pull requests merged or closed on GitHub"); the e2e suite uses all of them.
 
 ### Generated images
 
@@ -2981,6 +3109,12 @@ a run"); without it the run goes through the merge gate, and the answer ends wit
 target moved (§6 "Keeping runs up to date") the answer is "Run <id>: `<target>` moved on, so Agern is updating the branch
 first (update round k of max). It merges by itself when the reviewers and the approver pass it." (`owner_approves`:
 "It will wait for your approval again when the update is reviewed."); `/factory approve` answers the same.
+The optional boolean `closeIssue` chooses the issue's fate (§6 "Partial delivery"): `false` merges and keeps the issue
+open (partial delivery), `true` merges and closes it, omitted merges as the run is marked (closes unless it is a partial
+delivery); it is read only when present and ignored with `update: true`. A merged partial run is answered "Run <id>:
+merged — issue #N stays open (partial delivery)". A run whose pull request was merged or closed on GitHub answers the
+tool error of 409 `pull_request_merged` / `pull_request_closed` (§6 "Pull requests merged or closed on GitHub").
+`factory_list_runs` also checks the project's runs for outside merges in the background.
 `factory_start_run` (and `/factory run`) appends the sentence about other active runs in the project when there are
 any (§6, "Other active runs"). No tool and no argument merges despite the checks (§6 "Checks before a merge"); "Update
 from base branch" has no tool or chat command (web and HTTP API only). `factory_approve_run` and `factory_approve_release` are both refused (tool error with the
@@ -3116,10 +3250,12 @@ message is queued for the agent's next step, never that it was already applied.
 
 Chat input starting with `/factory` is handled by the server and not sent to Claude (with attachments it
 is rejected with 422 `attachments_not_allowed`; they stay unsent so the owner can send them in a normal message):
-`/factory run <issue>`, `/factory status`, `/factory approve [runId] [update]` (refused with the `merge_on_github`
-message for a run of merge policy `github`, §6 "Merge policy"; a plain approval merges as it is and, when the run can
+`/factory run <issue>`, `/factory status`, `/factory approve [runId] [update] [keep-open|close]` (refused with the
+`merge_on_github` message for a run of merge policy `github`, §6 "Merge policy"; a plain approval merges as it is and, when the run can
 be updated, ends with the line "Update and merge is available: /factory approve <id> update"; with `update` it does
-what `/factory retry <runId> update` does), `/factory cancel <runId>`,
+what `/factory retry <runId> update` does; `keep-open` / `close` (case-insensitive, any position) are the
+`closeIssue` choice of `factory_approve_run`, both together is the usage error "Usage: /factory approve [runId] [update]
+[keep-open|close]"; an outside merge or close answers the `pull_request_merged` / `pull_request_closed` message), `/factory cancel <runId>`,
 `/factory retry <runId> [update|step|continue|over|recommended]` (owner only; without a mode it lists the options, the
 recommendation and its reason; a release run is retried through its release: "Release "<name>": #n is waiting to be
 updated and merged."; a single run answers "Run <id>: updating with <target> and merging (update round k of max)."),
@@ -3322,7 +3458,7 @@ type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; 
   failureKind: 'time_limit' | 'usage_limit' | 'restart' | 'api_unreachable' | 'credentials' | 'blocked' | 'step' | 'other' | 'submodule_commit_missing' | 'checks' | null;
   failedStep: 'push' | 'pull_request' | 'merge' | null;  // the step after the builder that failed
   mergePolicy: MergePolicy;        // the project's policy when the run started; never changes
-  mergedOnGitHub: boolean;         // merged on GitHub outside Agern (followed `github` runs)
+  mergedOnGitHub: boolean;         // merged on GitHub outside Agern (§6 "Pull requests merged or closed on GitHub")
   mergedBy: string | null;         // the GitHub login that merged it there, when GitHub reports it
   waiting: RunWait | null;  // while it sleeps before retrying an operation that lost the network; it keeps its status
   warnings: { round: number; roles: StageRole[]; text: string }[];  // the stages' warnings per round, oldest first
@@ -3333,7 +3469,11 @@ type Run = { id: string; repo: string; issueNumber: number; issueTitle: string; 
   updateAvailable: boolean;        // "Update and merge" can start now
   updateOnDemand: boolean;         // "Update from base branch" can start now (§6 "Keeping runs up to date")
   updates: RunUpdate[];            // the run's update rounds, oldest first
-  overlaps: RunOverlap[] };        // other active runs of the project when it started (a warning; §6 "Other active runs")
+  overlaps: RunOverlap[];          // other active runs of the project when it started (a warning; §6 "Other active runs")
+  partial: boolean;                // a partial delivery: merging it leaves the issue open (§6 "Partial delivery")
+  partialSetBy: string | null;     // who marked it partial or complete on the run page; null when the spec decided
+  delivery: RunDelivery | null };  // the spec's Delivery plan (agent text: plain text only)
+type RunDelivery = { delivers: string; remaining: string[] };
 
 type RunUpdate = { number: number; round: number; maxRounds: number;
   trigger: 'owner' | 'release' | 'base_moved';  // release, base_moved: automatic
@@ -3630,7 +3770,7 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `PUT /api/projects/{repo}/settings` | `{ mergePolicy, reviewers?, teamReviewers? }` → `Project` | admin (403; 404 when the admin cannot see the project). 400 unknown `mergePolicy`, an entry that is not a GitHub login (`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$`) or team slug (`^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$`, the message names it), or more than 15 per list. Entries are trimmed, one leading `@` stripped, empty ones dropped and duplicates removed case-insensitively; omitted lists are empty. Applies to runs started from now on (§6 "Merge policy") |
 | `DELETE /api/projects/{repo}/icon` | → `Project` | admin (403; 404 as above); removes the icon (also when there is none), `iconUrl: null` |
 | `GET /api/projects/{repo}/icon?v=<version>` | → image bytes (`image/png`, `image/jpeg`, `image/webp`, `image/gif` or `image/svg+xml`) | anyone who can see the project; 404 when not visible or no icon is set |
-| `GET /api/projects/{repo}/issues?state=open\|closed\|all` | → `Issue[]` | pull requests excluded |
+| `GET /api/projects/{repo}/issues?state=open\|closed\|all` | → `Issue[]` | pull requests excluded; checks the project's runs for outside merges in the background, as `GET …/runs` |
 | `GET /api/projects/{repo}/issues/{number}` | → `Issue` (with `body`) | |
 | `POST /api/projects/{repo}/issues` | `{ title, body, kind }` → `Issue` | |
 | `GET /api/projects/{repo}/releases` | → `Release[]` | newest first (`createdAt` desc), each with its issues in order |
@@ -3667,18 +3807,19 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `POST /api/projects/{repo}/sandbox-vm/check` | → `SandboxVmCheck` | admin. Connects, verifies the host key, authenticates, then runs `ready.command` once (60 s) if defined. 409 `sandbox_vm_disabled`, `sandbox_vm_not_approved`, `sandbox_vm_key_missing`. Connection problems are `200` with `ok: false` |
 | `DELETE /api/projects/{repo}/sandbox-vm/lease` | → `SandboxVmStatus` | admin; ends the VM's lease (`reset` runs). 404 when there is none |
 | `POST /api/projects/{repo}/deploy/targets/{name}/check` | → `DeployCheck` | admin. Connects, verifies the host key, authenticates and disconnects; runs no command. 409 `deploy_disabled` (`FACTORY_DEPLOY=off`), `deploy_not_approved`, `deploy_key_missing`, `deploy_busy` (an operation runs on the target); 404 unknown target. Connection problems are `200` with `ok: false` |
-| `GET /api/projects/{repo}/runs` | → `Run[]` | newest first |
+| `GET /api/projects/{repo}/runs` | → `Run[]` | newest first; checks the project's runs for pull requests merged or closed on GitHub in the background (the answer does not wait; §6 "Pull requests merged or closed on GitHub") |
 | `POST /api/projects/{repo}/workspace/labels` | → `{ created: string[]; missing: string[] }` | creates the missing member labels with the caller's token (§5 "Member labels"); 403 `labels_forbidden`, 409 `not_a_workspace` / `workspace_invalid`, 404 when the caller cannot see the project |
-| `POST /api/projects/{repo}/runs` | `{ issueNumber }` → `Run` | needs Claude credential; 409 if the issue has an active run; a workspace project: 409 `workspace_invalid`, `member_label_missing`, `member_label_ambiguous`, 403 `member_not_accessible` (§6 "Workspace runs") |
+| `POST /api/projects/{repo}/runs` | `{ issueNumber }` → `Run` | needs Claude credential; 409 `active_run_exists` if the issue has an active run (after checking once whether that run's pull request was merged or closed on GitHub, which ends it); a workspace project: 409 `workspace_invalid`, `member_label_missing`, `member_label_ambiguous`, 403 `member_not_accessible` (§6 "Workspace runs") |
 | `GET /api/runs?active=true&status=<s>` | → `Run[]` | across visible repos, newest first (max 200). `active=true`: not finished, i.e. `queued`, `spec`, `building`, `reviewing`, `approving`, `waiting_for_checks` or `needs_human`. `status`: only these statuses, repeatable and/or comma list (`?status=needs_human`); unknown status → 400. Both given: both apply |
-| `GET /api/runs/{id}` | → `Run` | |
+| `GET /api/runs/{id}` | → `Run` | reads the run's pull request first (throttled, owner's token) and ends a run whose pull request was merged or closed on GitHub before answering (§6 "Pull requests merged or closed on GitHub") |
 | `GET /api/runs/{id}/screenshots/{sid}` | → image bytes | anyone who may see the run (404 otherwise, and for a screenshot of another run). Served with the sniffed type, `nosniff`, a sandboxing CSP, `Cross-Origin-Resource-Policy: same-origin`, `Cache-Control: private, max-age=31536000, immutable` and `Content-Disposition: inline` (`screenshot-<role>-<id8>.<ext>`). There is no upload or delete route |
-| `POST /api/runs/{id}/approve` | → `Run` | owner only, only in `needs_human`; 409 `merge_on_github` for a run of merge policy `github`, whatever its status (after 404 and 403; §6 "Merge policy"); 409 `review_in_progress`, `agent_busy`, `review_required` (§6 "Conversation at needs human"); evaluates the checks on the pull request's head first and answers the run merged, `needs_human` or `waiting_for_checks` (§6 "Checks before a merge"); a single run whose branch is behind its target, has a migration clash or is refused for a conflict, with update rounds left, is answered `building` with an automatic update round running (§6 "Keeping runs up to date") |
+| `POST /api/runs/{id}/approve` | optional `{ closeIssue?: boolean }` → `Run` | owner only, only in `needs_human`; 409 `merge_on_github` for a run of merge policy `github`, whatever its status (after 404 and 403; §6 "Merge policy"); then a forced outside check: 409 `pull_request_merged` / `pull_request_closed` when the pull request was merged / closed on GitHub, nothing is merged (§6 "Pull requests merged or closed on GitHub"); `closeIssue` `false` keeps the issue open (partial delivery), `true` closes it, absent (also no body) merges as the run is marked; applied after the status and "no pull request" checks with the refusals of `PUT …/partial` (409 `partial_not_supported` for `false` on a release run, 502 on a GitHub failure; §6 "Partial delivery"); 409 `review_in_progress`, `agent_busy`, `review_required` (§6 "Conversation at needs human"); evaluates the checks on the pull request's head first and answers the run merged, `needs_human` or `waiting_for_checks` (§6 "Checks before a merge"); a single run whose branch is behind its target, has a migration clash or is refused for a conflict, with update rounds left, is answered `building` with an automatic update round running (§6 "Keeping runs up to date") |
 | `POST /api/runs/{id}/update` | → `Run` | "Update from base branch" (§6 "Keeping runs up to date"): owner only (403 for everyone else, admins included; 404 when not visible); 422 `claude_credential_required`; 409 `update_unavailable` (not `needs_human`, or `ready` under policy `github`; a release or sync run; limit reached; switched off; no pull request), `base_not_moved` (no round used), `review_in_progress`, `agent_busy`, `run_worktree_missing`, `active_run_exists` and `pull_request_closed` (a `ready` run); answers the same run, now `building` |
-| `POST /api/runs/{id}/merge-anyway` | `{ headSha }` → `Run` | owner only (403); 409 `merge_on_github` for a run of merge policy `github`; merges although the checks on `headSha` have not passed, bound to that commit; 409 `run_not_overridable` (not `needs_human`/`waiting_for_checks`, no pull request, or checks not blocking), `checks_changed` (`headSha` is not the recorded checks' commit), and from `needs_human` `review_required` / `review_in_progress` / `agent_busy`; web only, no MCP tool or chat command (§6 "Checks before a merge") |
+| `POST /api/runs/{id}/merge-anyway` | `{ headSha }` → `Run` | owner only (403); 409 `merge_on_github` for a run of merge policy `github`; merges although the checks on `headSha` have not passed, bound to that commit; 409 `run_not_overridable` (not `needs_human`/`waiting_for_checks`, no pull request, or checks not blocking), `checks_changed` (`headSha` is not the recorded checks' commit), and from `needs_human` `review_required` / `review_in_progress` / `agent_busy`; 409 `pull_request_merged` / `pull_request_closed` after an outside merge or close; web only, no MCP tool or chat command (§6 "Checks before a merge") |
+| `PUT /api/runs/{id}/partial` | `{ partial: boolean }` → `Run` | owner only (404 not visible, 403 `forbidden` for everyone else, admins too); 409 `partial_not_supported` (release or sync run), 409 `run_not_waiting` (not `needs_human`); rewrites the pull request's first line `Closes #N` ↔ `Part of #N` first, 502 `github_error` when GitHub fails (nothing changes); same value: no-op (§6 "Partial delivery") |
 | `POST /api/runs/{id}/conversation` | `{ text }` → 202 `{ status: 'accepted', sessionId }` | owner only (403 for everyone else, admins too), only in `needs_human` (409 `run_not_waiting`). Talks to the run's advisor; the first message creates its session. 400 blank / too long, 409 `review_in_progress`, 409 `agent_busy`, 422 `claude_credential_required`, 409 `too_many_agents`, 409 `run_worktree_missing` |
 | `POST /api/runs/{id}/review` | → `Run` | "Review again": owner only (403 admins too), only in `needs_human`; starts a follow-up review of changes from the conversation. 409 `review_in_progress`, `agent_busy`, `nothing_to_review` (no conversation, or nothing changed since the last completed review); 422 `claude_credential_required` |
-| `POST /api/runs/{id}/cancel` | → `Run` | owner or admin |
+| `POST /api/runs/{id}/cancel` | → `Run` | owner or admin; a forced outside check first: a run that ended that way answers 409 "Run is already merged" / "Run is already cancelled" |
 | `POST /api/runs/{id}/sandbox-vm/preview` | → `Run` | owner or admin (403; 404 when the run is not visible); deploys the run's `HEAD` to its sandbox VM for a human, in the background, and answers at once with the preview `deploying` (§5 "Sandbox VMs"). 409 `run_not_waiting` (not `needs_human`), `sandbox_vm_disabled`, `sandbox_vm_not_approved`, `sandbox_vm_key_missing`, `sandbox_vm_busy` (another lease, or this preview is `deploying`) |
 | `DELETE /api/runs/{id}/sandbox-vm/preview` | → `Run` | owner or admin; ends the preview's lease (`reset` runs), the preview becomes `released`. 404 when there is no active preview |
 | `POST /api/runs/{id}/network/retry` | → `Run` | owner or admin; a run waiting for the network tries again now (§6 "Transient failures"); 409 `run_not_waiting_for_network` |
@@ -4457,7 +4598,23 @@ still read "Waiting for <owner> to approve.". A `ready` run shows the status not
 page updates when it is merged or closed." and no Approve, Cancel or Retry. A `github` run at `needs_human` has no
 Approve button but the note "This project merges on GitHub: Agern does not merge this run. The pull request can be
 reviewed and merged there."; "Talk to the agent" and Cancel remain. A run merged on GitHub reads "Merged on GitHub by
-@<login>" (or "Merged on GitHub"). The `ready` pill reuses the pass tone. In the diagram a `github` run's merge node is
+@<login>" (or "Merged on GitHub"), also for the other policies (§6 "Pull requests merged or closed on GitHub"; the run
+page's `GET /api/runs/{id}` checks it).
+
+**Partial delivery** (§6 "Partial delivery"). A partial single run has the `.rh-meta` entry "delivery: partial — issue
+stays open" and, while active, `ready` or `merged`, a `.run-delivery` notice (`role="note"`, label "Partial delivery"):
+"**Partial delivery.** Issue #N stays open when this is merged." (merged: "… Issue #N was left open."), then
+"Delivered: …" and a "Remaining" list from the plan, or "Marked by <partialSetBy>; the spec names no remaining steps.";
+all plain text. For the owner of a `needs_human` single run (not release, not sync) the notice has "Mark as complete";
+a run that is not partial gets the line `.run-delivery` "Merging closes issue #N." with "Mark as partial delivery".
+Both call `api.setRunPartial` (`PUT /api/runs/{id}/partial`), are disabled while any action is busy, and report errors
+in the page's error alert. Next to "✓ Approve & merge" (unchanged: merges as the run is marked) a single run's owner
+gets the secondary button "Merge & keep issue open" (`closeIssue: false`), or "Merge & close issue" (`closeIssue:
+true`) for a partial run, with the same disabling and `aria-describedby`; release runs have no second choice. With an
+escalation both open the confirmation dialog, which adds the sentence "Issue #N will be closed." / "Issue #N stays
+open (partial delivery)." (release runs: "… stays open until the release is merged.") and whose "Merge anyway"
+performs the chosen action. Mock mode seeds `/p/web-shop` with a `needs_human` partial run (#61, escalated) and a
+merged one (#64). The `ready` pill reuses the pass tone. In the diagram a `github` run's merge node is
 "merge on GitHub": at `ready` pending with "PR #n · waiting on GitHub" (the human node skipped), merged on GitHub done
 with "merged on GitHub"; an `owner_approves` run that merged shows the human node "approved by owner" whatever the
 approver said. On the release page a `github` project replaces "Approve and release" with "This project merges on

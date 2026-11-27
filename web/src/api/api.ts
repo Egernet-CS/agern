@@ -245,7 +245,13 @@ export interface Api {
   /** `active`: not finished (incl. needs_human). `status`: only these statuses. Both given: both apply. */
   runs(filter?: { active?: boolean; status?: RunStatus[] }): Promise<Run[]>;
   run(id: string): Promise<Run>;
-  approveRun(id: string): Promise<Run>;
+  approveRun(id: string, closeIssue?: boolean): Promise<Run>;
+  /**
+   * Owner only (403, admins included): marks a `needs_human` run as a partial delivery (the issue stays open after the
+   * merge) or a complete one; rewrites the pull request's first line. 409 `run_not_waiting` / `partial_not_supported`
+   * (release and sync runs); 502 when GitHub fails (nothing changes).
+   */
+  setRunPartial(id: string, partial: boolean): Promise<Run>;
   /**
    * "Update from base branch", owner only: an update round on the same run (now `building`). 409 `update_unavailable` /
    * `base_not_moved` / `review_in_progress` / `agent_busy` / `run_worktree_missing` / `active_run_exists` /
