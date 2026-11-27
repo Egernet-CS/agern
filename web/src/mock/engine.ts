@@ -336,6 +336,62 @@ class Player {
   }
 }
 
+// ---------------------------------------------------------------- context usage and compaction
+
+/** The size of each session's context in tokens, as the CLI would report it (docs/ARCHITECTURE.md §10 "context meter"). */
+const contextTokens = new Map<string, number>();
+const CONTEXT_WINDOW = 1_000_000;
+
+/** The main-thread `usage` of the next assistant message: the context grows a little with every message. */
+function nextUsage(sid: string, output: number) {
+  const ctx = (contextTokens.get(sid) ?? 18_000) + 3_500;
+  contextTokens.set(sid, ctx);
+  return { input_tokens: 6, cache_read_input_tokens: ctx - 2_006, cache_creation_input_tokens: 2_000, output_tokens: output };
+}
+
+/** The `modelUsage` of a result: the model's counters and its context window. */
+function modelUsageOf(sid: string, model: string, costUsd: number) {
+  const ctx = contextTokens.get(sid) ?? 0;
+  return { [model]: { inputTokens: 6, outputTokens: 400, cacheReadInputTokens: Math.max(0, ctx - 2_006), cacheCreationInputTokens: 2_000, webSearchRequests: 0, costUSD: costUsd, contextWindow: CONTEXT_WINDOW, maxOutputTokens: 64_000 } };
+}
+
+/** A `compact_boundary` like the CLI's: the context shrinks to [post] tokens. */
+function emitCompactBoundary(sid: string, trigger: 'auto' | 'manual', ts: string, post: number, userContext?: string) {
+  const pre = contextTokens.get(sid) ?? 18_000;
+  emit(sid, 'claude', { type: 'system', subtype: 'compact_boundary', session_id: `c-${sid.slice(0, 8)}`, uuid: uid(), compact_metadata: { trigger, pre_tokens: pre, post_tokens: post, ...(userContext ? { user_context: userContext } : {}) } }, ts);
+  contextTokens.set(sid, post);
+}
+
+/** The CLI's `/compact [what to keep]` in a chat: a short running phase that compacts, then idle (like fake-claude). */
+function compactChat(s: AgentSession, text: string, by: User) {
+  const focus = text.trim().slice('/compact'.length).trim();
+  const sid = s.id;
+  const claudeSid = `c-${sid.slice(0, 8)}`;
+  const p = new Player('live', Date.now());
+  db.players.set(sid, p);
+  p.after(0, (ts) => emit(sid, 'user', { text, username: by.username }, ts));
+  p.after(150, (ts) => setStatus(s, 'running', ts));
+  p.after(200, (ts) => emit(sid, 'claude', { type: 'system', subtype: 'status', status: 'compacting', session_id: claudeSid }, ts));
+  p.after(1800, (ts) => {
+    emitCompactBoundary(sid, 'manual', ts, Math.round((contextTokens.get(sid) ?? 18_000) / 10), focus || undefined);
+    emit(sid, 'claude', { type: 'system', subtype: 'status', status: null, compact_result: 'success', session_id: claudeSid }, ts);
+  });
+  const reply = focus ? `Compacted. Focus: ${focus}` : 'Compacted.';
+  p.after(150, (ts) =>
+    emit(sid, 'claude', {
+      type: 'assistant',
+      session_id: claudeSid,
+      parent_tool_use_id: null,
+      message: { id: `msg_${uid().slice(0, 12)}`, role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text: reply }], usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },
+    }, ts),
+  );
+  p.after(100, (ts) => {
+    emit(sid, 'claude', { type: 'result', subtype: 'success', is_error: false, session_id: claudeSid, duration_ms: 2000, num_turns: s.numTurns ?? 0, total_cost_usd: s.costUsd ?? 0, result: reply, local_command: 'compact', modelUsage: {} }, ts);
+    db.players.delete(sid);
+    setStatus(s, 'idle', ts);
+  });
+}
+
 function shortArgs(name: string, input: Record<string, unknown>): string {
   const v = input.command ?? input.file_path ?? input.pattern ?? input.url ?? input.number ?? Object.values(input)[0];
   return `${name.replace(/^mcp__factory__/, '')}: ${String(v ?? '').slice(0, 60)}`;
@@ -397,7 +453,8 @@ function play(
       emit(sid, 'claude', {
         type: 'assistant',
         session_id: claudeSid,
-        message: { id: msgId, role: 'assistant', model, content: [kind === 'text' ? { type: 'text', text } : { type: 'thinking', thinking: text }] },
+        parent_tool_use_id: null,
+        message: { id: msgId, role: 'assistant', model, content: [kind === 'text' ? { type: 'text', text } : { type: 'thinking', thinking: text }], usage: nextUsage(sid, Math.ceil(text.length / 4)) },
       }, ts);
       if (kind === 'text') s.lastActivity = text.split('\n')[0].replace(/[*`#]/g, '').slice(0, 80);
       touchSession(s, ts);
@@ -419,7 +476,8 @@ function play(
         emit(sid, 'claude', {
           type: 'assistant',
           session_id: claudeSid,
-          message: { id: `msg_${uid().slice(0, 12)}`, role: 'assistant', model, content: [{ type: 'tool_use', id: toolId, name: step.name, input: step.input }] },
+          parent_tool_use_id: null,
+          message: { id: `msg_${uid().slice(0, 12)}`, role: 'assistant', model, content: [{ type: 'tool_use', id: toolId, name: step.name, input: step.input }], usage: nextUsage(sid, 60) },
         }, ts);
         s.lastActivity = shortArgs(step.name, step.input);
         touchSession(s, ts);
@@ -468,6 +526,7 @@ function play(
       num_turns: s.numTurns,
       total_cost_usd: s.costUsd,
       result: last && last.kind === 'text' ? last.text : '',
+      modelUsage: modelUsageOf(sid, model, cost),
     }, ts);
     touchSession(s, ts);
     opts.onDone?.(Date.parse(ts));
@@ -591,6 +650,10 @@ export function chatInput(s: AgentSession, text: string, by: User, attachments: 
         systemReply(s, (e as Error).message, 'error');
       }
     }, 250);
+    return;
+  }
+  if (/^\/compact(\s|$)/.test(text.trim())) {
+    compactChat(s, text, by);
     return;
   }
   if (attachments.length) {
@@ -2466,10 +2529,15 @@ function seed() {
   const chat = createChat('web-shop', alice, Date.now() - 50 * 60_000);
   // alice edited a file in her checkout, so the server could not fast-forward it.
   emitCheckout(chat, ago(49), { behind: 3, status: 'behind', reason: 'local_changes' });
+  // A long conversation: the CLI compacted it automatically, and it has filled up again since (the meter warns).
+  contextTokens.set(chat.id, 958_000);
   for (const turn of seededChat) {
     const p = new Player('instant', Date.now() - 48 * 60_000, 20);
     play(chat, turn.steps, p, { userText: turn.user, init: true });
   }
+  emitCompactBoundary(chat.id, 'auto', ago(47), 52_000);
+  contextTokens.set(chat.id, 808_000);
+  play(chat, chatReplies[1].steps, new Player('instant', Date.now() - 46 * 60_000, 20), { userText: 'Which issues are still open?' });
   chat.status = 'idle';
   emit(chat.id, 'status', { status: 'idle' }, ago(45));
 
