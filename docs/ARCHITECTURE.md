@@ -602,6 +602,7 @@ platforms:                                           # optional (at most FACTORY
     image: docker.io/library/eclipse-temurin:17-jdk  # validated like `image`
     setup: |                                         # optional; without the key the top-level setup runs,
       apt-get update                                 # an empty `setup:` runs none
+build: sandbox                                       # optional: `sandbox` (default) or `host` (below)
 ```
 
 Validation is strict and lists every problem with its path (`services.db.ports: unknown key …`):
@@ -613,8 +614,10 @@ in `/workspace`, `/project-files` or a system directory, a `files` value that is
 an entry that is not a valid project file name or one listed twice (case-insensitively), non-positive CPUs, memory below `64m`, platform names that are not
 DNS labels or are `default` (the top-level image's name), more platforms than allowed, a readiness check
 without a command or with a timeout outside 1–600 s, and a `user` that is root (`0`, `root`), a uid
-outside 1–60000 or not a POSIX-style name (`[a-z_][a-z0-9_-]{0,31}`). Definitions written before these
-keys existed are unchanged: without `platforms`, `user` and `ready` everything behaves as before. YAML anchors/aliases and
+outside 1–60000 or not a POSIX-style name (`[a-z_][a-z0-9_-]{0,31}`), and a `build` other than exactly `sandbox` or
+`host` (``build: must be `sandbox` or `host` (default: sandbox)``; an absent or empty `build:` is `sandbox`). Definitions
+written before these keys existed are unchanged: without `platforms`, `user`, `ready` and `build` everything behaves as
+before (and keeps its approval, which covers the file's bytes). YAML anchors/aliases and
 duplicate keys are rejected; the file may be at most 64 KiB and `setup` 32 KiB. No Containerfile
 builds in this step (an image plus a setup script only). The image needs a POSIX `sh`.
 
@@ -644,6 +647,18 @@ it through a change to the default branch and a new approval. With no file, an i
 one paragraph (the spec-writer's: plan the sandbox's use in the spec's Verification section, or — without one — do not
 ask for a sandbox and write no Verification section that needs one). Whether a project has a sandbox stays an admin's
 decision: no tool of any agent can create, change, approve or revoke a definition or an approval.
+
+**Build mode (`build:`).** With `build: sandbox` (the default, also for an absent key) the builder builds and runs every
+test in the sandbox, as described here. With `build: host` the decision is still `approved` (same tools, lifecycle,
+limits, slots, platforms and review sandbox), but the task prompts steer the builder to build, lint and run plain tests on
+the factory host with its toolchain and to use `factory_sandbox_exec` only for tests that need the services, commands on
+platforms, starting the app and the spec's Verification commands that need the sandbox; a tool missing on the host lets
+it run that one command in the sandbox, reported in its summary, never a system-wide install (`factory_request_software`).
+The mode is not enforced. `Run.sandbox.build` records it and the approved `reason` gains ` The project builds on the host
+(build: host): the sandbox is only for commands that need it.` (so the transcript note carries it too); the spec-writer's
+paragraph asks it to say for each Verification command whether it runs on the host or needs the sandbox. Because
+creation is lazy, a host-mode run whose builder runs no sandbox command creates no container, network or service and
+never takes a slot. `build: sandbox` leaves every task prompt byte for byte as before.
 
 **Who gets the tools.** Only when `FACTORY_SANDBOX` is not `off`; with it off no stage gets a sandbox tool,
 note or prompt paragraph.
@@ -835,7 +850,13 @@ interleaved stdout/stderr, whether that is truncated, and the duration. The full
 builder's transcript (`payload.sandbox`, §8, with the platform), so the run page can show it; there is no
 separate log store. When the definition has platforms, the run records the ones commands ran in
 (`Run.sandbox.platformsUsed`) and the builder's task prompt asks it to run the test suite on every platform
-and report the result per platform.
+and report the result per platform. In both build modes every command the builder starts in the build sandbox (once
+its container exists; not setup scripts, not review commands, not calls refused earlier) is recorded on the run in the
+same write: `Run.sandbox.commands` keeps the first 50 (`{ command, platform }`, the first line cut to 200 characters,
+`platform` only when the definition has platforms) and `Run.sandbox.commandCount` counts all; the run is re-emitted so
+the run page follows live. A recording failure is logged and never fails the command. When `prepare` runs again for a
+run (an update round) and finds the same approved hash as the stored approved decision, the usage facts
+`platformsUsed`, `reviewUsed`, `commands` and `commandCount` are carried over; otherwise they start empty.
 
 **Background commands and handles.** Validation and creation happen in the tool call; the command itself runs in a
 job on a coroutine scope owned by `SandboxManager` (the application's), which completes the command's result when the
@@ -1196,7 +1217,9 @@ reaches the default branch only through the owner's approval of the release (§6
   rates, tried fixes marked verified/not verified, open questions), which it omits when there is nothing to report.
   When the run has an approved sandbox it may plan its use in an optional `## Verification` section (between
   `## Tests` and `## Out of scope`): the commands the builder runs in the sandbox and on which platforms, and for UI
-  changes how the UI reviewers start the app in the review sandbox and what they look at. It reads the sandbox with
+  changes how the UI reviewers start the app in the review sandbox and what they look at. When the project builds on
+  the host (`build: host`) the section says for each command whether it runs on the host (plain builds and tests) or
+  needs the sandbox (its services, a platform, the running app). It reads the sandbox with
   `factory_sandbox_info` but cannot run anything in it, and never asks for a sandbox to be enabled or approved.
 - **Blocked on another issue.** When the issue cannot be built before another open issue of the same repository is
   done, `spec-writer.md` has the spec start with the line `Blocked on: #<n>` (several: `Blocked on: #<n>, #<m>`; bold
@@ -1227,7 +1250,10 @@ reaches the default branch only through the owner's approval of the release (§6
   verified fixes before exploring on its own) and to verify the result itself. The orchestrator pushes the branch
   and opens a pull request after the first build. When the run has an approved sandbox (§5 "Sandboxes"),
   the builder builds and tests in it through `factory_sandbox_exec` (running the spec's Verification commands there,
-  when it has some); the sandbox is removed when the build/review loop ends, before the approver runs. Its task and fix prompts name the branch the pull request merges
+  when it has some). With `build: host` it builds, lints and runs plain tests on the host instead and uses the sandbox
+  only for service-dependent tests, platforms, running the app and the Verification commands that need it, so a run may
+  create none; a tool missing on the host may make it run that one command in the sandbox, reported in its summary
+  (never a system-wide install). The sandbox is removed when the build/review loop ends, before the approver runs. Its task and fix prompts name the branch the pull request merges
   into and the rule for migration versions (§6 "Database migrations").
 - **reviewers** run in parallel, cannot edit files (`--disallowedTools Edit,Write,NotebookEdit`),
   and answer through `--json-schema` with
@@ -3322,9 +3348,11 @@ spec-writer (`exec` and `wait` with a plan scope are refused: `The spec-writer c
   `capacity: { inUse, max, heldByThisRun }`, `projectFiles: { path: "/project-files", readOnly: true, env:
   "AGERN_PROJECT_FILES", files: [{ name, size, sha256 }], note }` (the run's snapshot, mounted read-only in every
   command container; §5 "Sandboxes") and, while a command runs, `command: { handle, running: true, elapsedMs }`.
+  For the spec-writer and the builder it also has `build` (`sandbox` or `host`) and, with `host`, a `buildNote` (build
+  and run plain tests on the host; this sandbox only for services, platforms, the running app and Verification commands).
   For the spec-writer it adds `access: "plan"` and a `note` (it cannot run commands; the builder does; the UI reviewers
   get a separate read-only review sandbox) and never creates anything. For a reviewer it describes the review
-  sandbox: no `platforms`/`platformNote`, plus `access: "review"`, `readOnly: true`, `outputDir: { container:
+  sandbox: no `platforms`/`platformNote`, no `build`/`buildNote`, plus `access: "review"`, `readOnly: true`, `outputDir: { container:
   "/run/agern-review", host: ".agern-run/review" }` (or `null` with an `outputNote`) and a `note` on the read-only
   `/workspace`, the output directory, starting an app detached and the other UI reviewer; `created`, `command` and
   `capacity` refer to the review sandbox.
@@ -3637,7 +3665,12 @@ type RunSandbox = { state: 'disabled' | 'none' | 'invalid' | 'unapproved' | 'app
   platformsUsed: string[];   // where the builder ran commands, 'default' and platform names in first-use order
                              // (filled only when there are platforms)
   reviewUsed: boolean;       // a review sandbox of the run was created (the ux and ui-design reviewers used it)
-  files: string[] };         // project files the definition names under `files:` ('approved' only; [] for older runs)
+  files: string[];           // project files the definition names under `files:` ('approved' only; [] for older runs)
+  build: 'sandbox' | 'host'; // the definition's build mode ('sandbox' for older runs and non-approved decisions)
+  commands: { command: string; platform: string | null }[];  // the first 50 commands the builder started in the build
+                             // sandbox: first line, ≤ 200 characters; platform only when the definition has platforms
+  commandCount: number };    // all of them (0 for older runs); kept with the other usage facts over an update round
+                             // with the same approved definition
 
 type SandboxDefinition = { image: string; setup: string | null; env: Record<string, string>;
   services: { name: string; image: string; env: Record<string, string>;
@@ -3649,7 +3682,8 @@ type SandboxDefinition = { image: string; setup: string | null; env: Record<stri
     setup: string | null;    // effective: the platform's own, or the top-level one when setupInherited
     setupInherited: boolean }[];
   user: { name: string | null; uid: number } | null;     // null: commands run as root; name null: given as a uid
-  files: string[] };         // project files the definition needs (`files:`), by name
+  files: string[];           // project files the definition needs (`files:`), by name
+  build: 'sandbox' | 'host' };  // `build:`, 'sandbox' when the key is absent
 type SandboxApproval = { sha256: string; content: string; approvedBy: { username: string; displayName: string }; approvedAt: string };
 type SandboxStatus = { repo: string;
   enabled: boolean;          // FACTORY_SANDBOX is not off
@@ -4885,7 +4919,7 @@ run; its `startRun` refuses with the server's codes and messages.
 changed, approved — and a short line) linking to the project's sandbox page `/p/:repo/sandbox`, a normal scrolling page
 for everyone who can see the project: the state with an explanation (switched off on this server; no definition, with
 an example; the validation errors; waiting for approval; changed since the approved version, by whom and when; approved),
-the definition (image, the user commands run as — "setup runs as root" —, setup script, platforms with their image and
+the definition (image, the build mode — "in the sandbox" or "on the host" with a muted explanation —, the user commands run as — "setup runs as root" —, setup script, platforms with their image and
 whether their setup is their own or the top-level one, environment, services with their readiness check or "no
 readiness check", caches, resources with the server's caps and that each platform in use is another container with
 these limits, and the project files it needs — "none", or each name under `files:` with a "not uploaded" tag for
@@ -4893,12 +4927,18 @@ those in `missingFiles` and a line linking to the Files page), a line diff
 between the approved and the current content when they differ, and the raw file. Admins get "Approve…" — the
 confirmation names every image with its role (default, platform, service) and shows every setup script that will run
 and says plainly that they will run on the factory host for
-every run of the project — and "Revoke…" (confirmation); others see who can approve. The page and the row follow
+every run of the project, plus, for `build: host` only, "Build mode `host`: builds and plain tests run on the factory host
+with the tools installed there; only commands that need the sandbox run in the container." — and "Revoke…" (confirmation); others see who can approve. The page and the row follow
 `sandbox_approval` frames. The run page shows one line under the run's facts: "sandbox" with the image and the approved
 definition's hash prefix and, when the definition has platforms, each platform (marked ✓ once commands ran in it),
 then "review sandbox ✓" when the UI reviewers ran the app in a review sandbox (`reviewUsed`), or
 "none — <why>" (switched off, no definition, not approved, invalid), and a link to the
-sandbox page. In a builder's or UI reviewer's transcript every `system` event with `payload.sandbox` is a collapsible command block
+sandbox page. An approved host-mode run adds "build on host" after the hash, and "sandbox not used" when
+`commandCount` is 0. When the builder ran commands in the build sandbox (either mode), a native `<details>` disclosure
+follows directly below the line (a sibling, not inside it), collapsed: its summary is "sandbox used for N command(s)"
+(host) or "N sandbox command(s)" (sandbox), its body the ordered list of `commands` in `<code>` (the platform as a chip)
+and, when `commandCount` exceeds the list, "and M more: see the builder's transcript"; long commands wrap inside the list
+(`components/sandbox/commands.ts` computes the texts). Older runs without the fields show the line as before. In a builder's or UI reviewer's transcript every `system` event with `payload.sandbox` is a collapsible command block
 (a `review` chip when `review` is set — screen readers hear "Review sandbox command:" —, the platform as a chip when `platform` is set, `$ command` or "setup script", exit code or "timed out", duration,
 "truncated"; failures in red): opened, it shows the
 last 200 lines of the output in the terminal style with "Show all N lines", the full script or multi-line command, and

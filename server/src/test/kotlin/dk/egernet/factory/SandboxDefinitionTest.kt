@@ -66,6 +66,27 @@ class SandboxDefinitionTest {
     }
 
     @Test
+    fun `build chooses where the builder builds, sandbox by default`() {
+        assertEquals("sandbox", valid("image: quay.io/fedora/fedora:41").build)
+        assertFalse(valid("image: quay.io/fedora/fedora:41").buildOnHost)
+        assertEquals("sandbox", valid("image: quay.io/fedora/fedora:41\nbuild:").build)
+        assertEquals("sandbox", valid("image: quay.io/fedora/fedora:41\nbuild: sandbox").build)
+        val host = valid("image: quay.io/fedora/fedora:41\nbuild: host")
+        assertEquals("host", host.build)
+        assertTrue(host.buildOnHost)
+        for (bad in listOf("Host", "fast", "[host]", "{ a: b }")) {
+            val errs = errors("image: quay.io/fedora/fedora:41\nbuild: $bad")
+            assertEquals(1, errs.size, errs.toString())
+            assertTrue(errs.single().startsWith("build:"), errs.toString())
+        }
+        assertEquals("build: must be `sandbox` or `host` (default: sandbox)", errors("image: quay.io/fedora/fedora:41\nbuild: fast").single())
+        // The key is part of the content hash: adding or changing it needs a new approval.
+        val base = "image: quay.io/fedora/fedora:41\n"
+        val hashes = listOf(base, base + "build: host\n", base + "build: sandbox\n").map { SandboxDefinitions.parse(it, cfg).sha256 }
+        assertEquals(3, hashes.toSet().size)
+    }
+
+    @Test
     fun `only image is required and limits default to the server's`() {
         val d = valid("image: quay.io/fedora/fedora:41")
         assertNull(d.setup)

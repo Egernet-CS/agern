@@ -4151,7 +4151,13 @@ class Orchestrator(
      */
     private fun specSandboxLine(c: RunContext): String {
         val sb = c.sandbox?.takeIf { sandboxes.enabled } ?: return ""
-        return if (sb.state == "approved") {
+        return if (sb.state == "approved" && sb.build == dk.egernet.factory.sandbox.SandboxDefinitions.BUILD_HOST) {
+            "Sandbox: this run has one (image ${sb.image}" + (if (sb.platforms.isEmpty()) "" else "; platforms ${sb.platforms.joinToString(", ")}") +
+                "), but the project builds on the host (build: host): the builder builds and runs plain tests on the host and uses the " +
+                "sandbox only for commands that need it. You cannot run commands in it; call factory_sandbox_info for its services, " +
+                "platforms and limits. In the spec's Verification section, say for each command whether it runs on the host or needs " +
+                "the sandbox (its services, a platform, the running app).\n"
+        } else if (sb.state == "approved") {
             "Sandbox: this run has one (image ${sb.image}" + (if (sb.platforms.isEmpty()) "" else "; platforms ${sb.platforms.joinToString(", ")}") +
                 "). You cannot run commands in it; call factory_sandbox_info for its services, platforms and limits and plan its use in " +
                 "the spec's Verification section.\n"
@@ -4164,7 +4170,21 @@ class Orchestrator(
     /** One paragraph for the builder about the run's sandbox (empty line when sandboxes are off). */
     private fun sandboxLine(c: RunContext): String {
         val sb = c.sandbox?.takeIf { sandboxes.enabled } ?: return ""
-        return if (sb.state == "approved") {
+        return if (sb.state == "approved" && sb.build == dk.egernet.factory.sandbox.SandboxDefinitions.BUILD_HOST) {
+            "\nSandbox: this run has one (image `${sb.image}`), but the project builds on the host (`build: host` in `.agern/sandbox.yml`). " +
+                "Build, lint and run plain tests on the host with the tools installed there, as without a sandbox. Use `factory_sandbox_exec` " +
+                "only for commands that need the sandbox: tests that need its services, commands on its platforms, starting and exercising " +
+                "the app, and the sandbox commands of the spec's Verification section (long commands: `background: true`, then " +
+                "`factory_sandbox_wait`); `factory_sandbox_info` lists its services and limits. The sandbox is created by your first sandbox " +
+                "command; when nothing needs it, do not create it. If a tool that a command needs is missing on the host, you may run that " +
+                "one command in the sandbox instead: say in your summary which tool was missing and which commands you ran in the sandbox. " +
+                "Never install system-wide software for it (use `factory_request_software`). When the spec has a Verification section, run " +
+                "each of its commands where the section says (on the host, or in the sandbox on the platforms it names; in the sandbox when " +
+                "it does not say) and report each result in your summary.\n" +
+                (if (sb.platforms.isEmpty()) "" else "Platforms: ${sb.platforms.joinToString(", ") { "`$it`" }} (other images; " +
+                    "`factory_sandbox_exec` with `platform`). Run the test suite on every platform before you finish, and report the result " +
+                    "per platform in your summary.\n")
+        } else if (sb.state == "approved") {
             "\nSandbox: this run has one (image `${sb.image}`). Build and test inside it with `factory_sandbox_exec` instead of on the host " +
                 "(long commands: `background: true`, then `factory_sandbox_wait`); `factory_sandbox_info` lists its services and limits. " +
                 "When the spec has a Verification section, run its commands in the sandbox on the platforms it names and report each " +

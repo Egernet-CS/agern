@@ -630,7 +630,19 @@ data class RunSandboxDto(
     val reviewUsed: Boolean = false,
     /** The project files the definition names under `files:` (`approved` only; empty for older runs). */
     val files: List<String> = emptyList(),
+    /** The definition's `build:` mode, `sandbox` (default, also older runs) or `host` (`approved` only). */
+    val build: String = "sandbox",
+    /** The first [dk.egernet.factory.sandbox.SandboxManager.MAX_RECORDED_COMMANDS] commands the builder started in the build sandbox. */
+    val commands: List<RunSandboxCommandDto> = emptyList(),
+    /** How many commands the builder started in the build sandbox (all of them, also those not in [commands]). */
+    val commandCount: Int = 0,
 )
+
+/**
+ * A command the builder started in the build sandbox: its first line, at most 200 characters. [platform] is the
+ * container (`default` or a platform name) when the definition has platforms, else null.
+ */
+@Serializable data class RunSandboxCommandDto(val command: String, val platform: String? = null)
 
 /** A sidecar's readiness check (`ready:`). */
 @Serializable data class SandboxReadyDto(val command: String, val timeoutSeconds: Int)
@@ -661,6 +673,8 @@ data class SandboxDefinitionDto(
     val user: SandboxUserDto? = null,
     /** Project files the definition needs (`files:`), by name. */
     val files: List<String> = emptyList(),
+    /** `build:`: `sandbox` (default) or `host`. */
+    val build: String = "sandbox",
 )
 
 @Serializable data class SandboxApprovalDto(val sha256: String, val content: String, val approvedBy: OwnerDto, val approvedAt: String)

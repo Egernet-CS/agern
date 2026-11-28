@@ -88,6 +88,7 @@ class SandboxApiTest {
             assertEquals("2.0", limits.str("cpus"))
             assertEquals("8.0", limits.str("requestedCpus"))
             assertEquals("true", limits.str("capped"))
+            assertEquals("sandbox", def.str("build"), "no `build:` key means sandbox")
         }
 
         // Only admins approve, and only the content they saw.
@@ -148,5 +149,23 @@ class SandboxApiTest {
         assertEquals(403, root.post("/api/projects/demo-app/sandbox/approval") {
             contentType(ContentType.Application.Json); setBody("""{"sha256":"$sha1"}""")
         }.status.value)
+    }
+
+    @Test
+    fun `the status carries the definition's build mode`() = testApplication {
+        application { agernModule(s) }
+        val alice = login("alice", "pw-a")
+        world.sandboxFile(v1 + "build: host\n")
+        alice.status().let {
+            assertEquals("pending", it.str("state"))
+            assertEquals("host", it["definition"]!!.jsonObject.str("build"))
+        }
+        world.sandboxFile(v1 + "build: sandbox\n")
+        assertEquals("sandbox", alice.status()["definition"]!!.jsonObject.str("build"))
+        world.sandboxFile(v1 + "build: Host\n")
+        alice.status().let {
+            assertEquals("invalid", it.str("state"))
+            assertEquals(listOf("build: must be `sandbox` or `host` (default: sandbox)"), it["errors"]!!.jsonArray.map { e -> e.jsonPrimitive.content })
+        }
     }
 }

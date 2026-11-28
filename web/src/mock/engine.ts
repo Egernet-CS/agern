@@ -40,7 +40,7 @@ import type {
   Workspace,
 } from '../api/types';
 import { runLeftNeedsHuman, runSandboxVmFor, sandboxVmBuilderSteps } from './sandboxVm';
-import { approverScript, builderScript, chatReplies, reviewSandboxSteps, reviewerScript, sandboxBuilderScript, seededChat, specScript, updateBuilderScript, type Step } from './scripts';
+import { EXEC, approverScript, builderScript, chatReplies, hostBuilderScript, reviewSandboxSteps, reviewerScript, sandboxBuilderScript, seededChat, specScript, updateBuilderScript, type Step } from './scripts';
 
 export const ORG = 'Egernet-CS';
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -761,6 +761,8 @@ type Plan = {
   noScreenshots?: boolean;
   /** The approved merge is refused because the target moved: a migration clash or a merge conflict ("Update and merge"). */
   refuseMerge?: 'migration' | 'conflict';
+  /** `build: host` projects: the commands the first builder round runs in the sandbox (default: the service-dependent tests). */
+  hostSandboxCommands?: string[];
 };
 
 /** Like the backend's warning (docs/ARCHITECTURE.md §6 "Screenshots") for the mock diff of a UI change. */
@@ -855,18 +857,31 @@ function runStage(r: Run, role: StageRole, round: number, plan: Plan, startMs: n
     const upd = r.updates?.find((u) => u.round === round);
     steps = upd
       ? updateBuilderScript(upd.target, upd.migrations.length ? 'migration' : 'conflict')
-      : def ? sandboxBuilderScript(round, def.image, def.setup, def.services.map((x) => x.name), def.platforms) : builderScript(round, prev);
+      : def?.build === 'host'
+        ? hostBuilderScript(round, def.image, def.setup, def.services.map((x) => x.name), plan.hostSandboxCommands ?? ['swift test --filter SyncIntegrationTests'])
+        : def ? sandboxBuilderScript(round, def.image, def.setup, def.services.map((x) => x.name), def.platforms) : builderScript(round, prev);
+    // Like the backend: the run records every command the builder starts in the build sandbox (the first 50; all counted).
+    const execs = steps.flatMap((x) => (x.kind === 'tool' && x.name === EXEC ? [x.input] : []));
+    if (def && sb && execs.length) {
+      const recorded = execs.map((input) => ({
+        command: String(input.command).split('\n')[0].slice(0, 200),
+        platform: def.platforms.length ? (typeof input.platform === 'string' ? input.platform : 'default') : null,
+      }));
+      sb.commands = [...(sb.commands ?? []), ...recorded].slice(0, 50);
+      sb.commandCount = (sb.commandCount ?? 0) + recorded.length;
+    }
     if (upd) steps = [{ kind: 'system', level: 'info', text: `Update round ${upd.number}: merged \`${upd.target}\` (${upd.incomingCount} commits)${upd.conflicts.length ? `; conflicts in ${upd.conflicts.map((c) => `\`${c}\``).join(', ')}` : ''}`, ms: 50 }, ...steps];
     // Like the backend: after committing, a builder with an approved sandbox VM deploys there and checks it (first build only).
     if (round === 0) steps = [...steps, ...sandboxVmBuilderSteps(r)];
     // Like the backend: the builder's transcript starts with the run's sandbox decision.
     if (sb && sb.state !== 'disabled') steps = [{ kind: 'system', level: sb.state === 'approved' ? 'info' : 'warn', text: `Sandbox: ${sb.reason}`, ms: 50 }, ...steps];
-    if (def && !db.runningSandboxes.has(r.id)) {
+    // Like the backend: created by the builder's first sandbox command; a host-mode builder that runs none creates none.
+    if (def && (def.build !== 'host' || execs.length > 0) && !db.runningSandboxes.has(r.id)) {
       const at = iso(Math.min(Date.now(), p.endMs + 4000));
       // Like the backend: one container per image used — the default one, then each platform the builder tests on.
       const containers = [{ platform: 'default', image: def.image, createdAt: at, kind: 'build' as const }, ...def.platforms.map((x) => ({ platform: x.name, image: x.image, createdAt: at, kind: 'build' as const }))];
       db.runningSandboxes.set(r.id, { createdAt: at, builderSessionId: s.id, containers });
-      if (sb && def.platforms.length) sb.platformsUsed = ['default', ...def.platforms.map((x) => x.name)];
+      if (sb && def.platforms.length && def.build !== 'host') sb.platformsUsed = ['default', ...def.platforms.map((x) => x.name)];
       feed({ type: 'sandboxes', runId: r.id, change: 'created' });
     }
     summary = upd ? `Merged ${upd.target} and resolved the ${upd.migrations.length ? 'migration clash' : 'conflict'}; tests green.` : round > 0 ? 'Addressed review findings; tests green.' : 'Implemented the spec; 9 tests added, all green.';
@@ -1338,11 +1353,14 @@ function runSandboxFor(repo: string): RunSandbox {
     case 'approved':
       return {
         state: 'approved',
-        reason: `Sandbox definition ${short} approved by ${st.approval!.approvedBy.username}; image ${st.definition!.image}${st.definition!.platforms.length ? `; platforms ${st.definition!.platforms.map((x) => `${x.name} (${x.image})`).join(', ')}` : ''}. It is created on the builder's first sandbox command.`,
+        reason: `Sandbox definition ${short} approved by ${st.approval!.approvedBy.username}; image ${st.definition!.image}${st.definition!.platforms.length ? `; platforms ${st.definition!.platforms.map((x) => `${x.name} (${x.image})`).join(', ')}` : ''}. It is created on the builder's first sandbox command.${st.definition!.build === 'host' ? ' The project builds on the host (build: host): the sandbox is only for commands that need it.' : ''}`,
         sha256: st.sha256,
         image: st.definition!.image,
         platforms: st.definition!.platforms.map((x) => x.name),
         platformsUsed: [],
+        build: st.definition!.build,
+        commands: [],
+        commandCount: 0,
       };
   }
 }
@@ -2429,6 +2447,7 @@ function seed() {
       limits: { cpus: 2, memory: '4g', requestedCpus: 2, requestedMemory: '4g', capped: false },
       platforms: [{ name: 'jdk17', image: 'docker.io/library/eclipse-temurin:17-jdk', setup: 'apt-get update && apt-get install -y nodejs npm\n', setupInherited: true }],
       user: { name: 'builder', uid: 1000 },
+      build: 'sandbox',
     },
     errors: [],
   });
@@ -2446,6 +2465,7 @@ function seed() {
       limits: { cpus: 2, memory: '4g', requestedCpus: 8, requestedMemory: '16g', capped: true },
       platforms: [],
       user: null,
+      build: 'sandbox',
     },
     errors: [],
   });
@@ -2455,9 +2475,9 @@ function seed() {
     approvedBy: ownerOf(alice),
     approvedAt: ago(60 * 24 * 9),
   });
-  // data-pipeline: a new definition no admin has approved yet.
+  // data-pipeline: a new definition no admin has approved yet (it builds on the host: the approve dialog says so).
   db.sandboxFiles.set('data-pipeline', {
-    content: 'image: docker.io/library/python:3.12-slim\nsetup: pip install -r requirements-dev.txt\nenv: { PYTHONUNBUFFERED: "1" }\nservices:\n  warehouse:\n    image: docker.io/library/postgres:17\n    env: { POSTGRES_PASSWORD: dev, POSTGRES_DB: warehouse }\ncaches: [ /root/.cache/pip ]\n',
+    content: 'image: docker.io/library/python:3.12-slim\nbuild: host\nsetup: pip install -r requirements-dev.txt\nenv: { PYTHONUNBUFFERED: "1" }\nservices:\n  warehouse:\n    image: docker.io/library/postgres:17\n    env: { POSTGRES_PASSWORD: dev, POSTGRES_DB: warehouse }\ncaches: [ /root/.cache/pip ]\n',
     sha256: '5b7e4c2a90d1f3e6b8a7c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4',
     definition: {
       image: 'docker.io/library/python:3.12-slim',
@@ -2468,9 +2488,32 @@ function seed() {
       limits: { cpus: 2, memory: '4g', requestedCpus: null, requestedMemory: null, capped: false },
       platforms: [],
       user: null,
+      build: 'host',
     },
     errors: [],
   });
+  // ios-companion: approved, and it builds on the factory host (`build: host`, the host has the Swift toolchain); the
+  // sandbox is for the sync API stub its integration tests need and for running the app.
+  const iosSandbox =
+    'image: docker.io/library/swift:6.0\nbuild: host\nservices:\n  sync-api:\n    image: docker.io/wiremock/wiremock:3.9.1\n    ready: { command: "wget -qO- http://127.0.0.1:8080/__admin/health", timeoutSeconds: 30 }\ncaches: [ /root/.cache/org.swift.swiftpm ]\n';
+  const iosSha = '7d3a9e1c5b2f4a6e8c0d1b3f5a7c9e2d4f6b8a0c2e4d6f8a1b3c5e7f9a2b4c6d';
+  db.sandboxFiles.set('ios-companion', {
+    content: iosSandbox,
+    sha256: iosSha,
+    definition: {
+      image: 'docker.io/library/swift:6.0',
+      setup: null,
+      env: {},
+      services: [{ name: 'sync-api', image: 'docker.io/wiremock/wiremock:3.9.1', env: {}, ready: { command: 'wget -qO- http://127.0.0.1:8080/__admin/health', timeoutSeconds: 30 } }],
+      caches: ['/root/.cache/org.swift.swiftpm'],
+      limits: { cpus: 2, memory: '4g', requestedCpus: null, requestedMemory: null, capped: false },
+      platforms: [],
+      user: null,
+      build: 'host',
+    },
+    errors: [],
+  });
+  db.sandboxApprovals.set('ios-companion', { sha256: iosSha, content: iosSandbox, approvedBy: ownerOf(alice), approvedAt: ago(60 * 24 * 2) });
   db.sandboxFiles.set('design-system', {
     content: 'image: node:22\nprivileged: true\n',
     sha256: '9e8d7c6b5a4f30211e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a697887',
@@ -2581,6 +2624,13 @@ function seed() {
   failed.endedAt = failed.stages[1].endedAt;
   db.issues['web-shop'].find((i) => i.number === 44)!.activeRunId = null;
   db.issues['web-shop'].find((i) => i.number === 44)!.state = 'open';
+
+  // ios-companion builds on the host: one run needed no sandbox at all, one ran its sync tests and the app there.
+  startRun('ios-companion', 9, alice, null, { changes: {}, liveFrom: never, hostSandboxCommands: [] }, Date.now() - 26 * 60 * 60_000);
+  startRun('ios-companion', 8, alice, null, {
+    changes: {}, liveFrom: never,
+    hostSandboxCommands: ['swift test --filter SyncIntegrationTests', 'swift run PickerServer --port 8080 & sleep 5 && curl -fsS http://127.0.0.1:8080/health'],
+  }, Date.now() - 25 * 60 * 60_000);
 
   // Waiting for a human (alice owns it).
   startRun('billing-service', 17, alice, null, { changes: {}, approver: 'ESCALATE', liveFrom: never }, Date.now() - 40 * 60_000);

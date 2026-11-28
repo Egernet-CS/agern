@@ -91,7 +91,7 @@ export function updateBuilderScript(target: string, kind: 'migration' | 'conflic
 
 // ---------------------------------------------------------------- sandboxes
 
-const EXEC = 'mcp__factory__factory_sandbox_exec';
+export const EXEC = 'mcp__factory__factory_sandbox_exec';
 
 /** A finished sandbox command: its full log (system event) and the JSON the agent gets back (the tail). */
 function sandboxExec(
@@ -197,6 +197,45 @@ export function sandboxBuilderScript(round: number, image: string, setup: string
     }),
     tool('Bash', { command: 'git add -A && git commit -m "Saved carts for signed-in users (#42)"', description: 'Commit' }, '[factory/issue-42-saved-carts a91f3b7] Saved carts for signed-in users (#42)\n 6 files changed, 284 insertions(+), 12 deletions(-)', 600),
     { kind: 'text', text: `Implemented saved carts. Built the frontend and ran the test suite in the sandbox (PostgreSQL sidecar): all green${platforms.length ? ` — default image and ${platforms.map((x) => x.name).join(', ')}` : ''}.` },
+  ];
+}
+
+/**
+ * The builder of a project that builds on the host (`build: host`): builds and runs the plain tests on the host and uses
+ * the sandbox only for [sandboxCommands] (tests that need its services, starting the app), none when nothing needs it.
+ */
+export function hostBuilderScript(round: number, image: string, setup: string | null, services: string[], sandboxCommands: string[]): Step[] {
+  const swiftTest = (n: number) => `Building for debugging...\n[42/42] Linking PickerPackageTests\nTest Suite 'All tests' passed.\n\t Executed ${n} tests, with 0 failures (0 unexpected) in 3.112 seconds`;
+  if (round > 0) {
+    return [
+      { kind: 'text', text: 'Addressing the review findings; building and testing on the host again.' },
+      tool('Edit', { file_path: 'Sources/Picker/PickListStore.swift', old_string: 'refresh()', new_string: 'refresh(after: sync)' }, 'The file Sources/Picker/PickListStore.swift has been updated.', 700),
+      tool('Bash', { command: 'swift test', description: 'Run the tests on the host' }, swiftTest(31), 2400),
+      tool('Bash', { command: 'git commit -am "Address review: refresh after every sync"', description: 'Commit fixes' }, '[factory/issue-9-pick-list 2b4e9c1] Address review: refresh after every sync\n 1 file changed, 6 insertions(+), 2 deletions(-)', 600),
+      { kind: 'text', text: 'Fixed; the test suite is green on the host.' },
+    ];
+  }
+  const created: SystemStep[] = [
+    { kind: 'system', level: 'info', text: `Creating the sandbox: image ${image}${services.length ? `, services ${services.join(', ')}` : ''} …` },
+  ];
+  const setupLogs: SystemStep[] = setup
+    ? [{ kind: 'system', level: 'info', text: 'Sandbox setup script: exit 0 in 12.4 s', sandbox: { kind: 'setup', command: setup, exitCode: 0, timedOut: false, durationMs: 12_400, output: aptOutput, outputTruncated: false, platform: null } }]
+    : [];
+  const ready: SystemStep = { kind: 'system', level: 'info', text: `Sandbox ready in 19.6 s: ${image}, 2 CPUs, 4g memory.` };
+  const inSandbox = sandboxCommands.map((c, i) => sandboxExec(c, 0, i === 0 ? swiftTest(6) : 'Server started at http://0.0.0.0:8080\nGET /health 200', 18_300 + i * 4_000, i === 0 ? [...created, ...setupLogs, ready] : []));
+  return [
+    { kind: 'think', text: 'The project builds on the host (build: host). Build and run the plain tests here; the sandbox only for what needs its services or the running app.' },
+    tool('Edit', { file_path: 'Sources/Picker/PickListStore.swift', old_string: '…', new_string: '…' }, 'The file Sources/Picker/PickListStore.swift has been updated.', 700),
+    tool('Bash', { command: 'swift build', description: 'Build on the host' }, 'Building for debugging...\n[118/118] Compiling Picker PickListStore.swift\nBuild complete! (21.37s)', 2200),
+    tool('Bash', { command: 'swift test --skip SyncIntegrationTests', description: 'Run the plain tests on the host' }, swiftTest(25), 2600),
+    ...inSandbox,
+    tool('Bash', { command: 'git add -A && git commit -m "Refresh the pick list after a sync"', description: 'Commit' }, '[factory/issue-9-pick-list 7c1d0a3] Refresh the pick list after a sync\n 3 files changed, 58 insertions(+), 9 deletions(-)', 600),
+    {
+      kind: 'text',
+      text: sandboxCommands.length
+        ? `Built and ran the plain tests on the host; ran ${sandboxCommands.length === 1 ? 'the sync integration tests' : 'the sync integration tests and the app'} in the sandbox (${services.join(', ')} sidecar). All green.`
+        : 'Built and ran the tests on the host; nothing needed the sandbox, so none was created. All green.',
+    },
   ];
 }
 

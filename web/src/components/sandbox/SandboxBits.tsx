@@ -1,5 +1,6 @@
 import { Link } from 'react-router-dom';
-import type { Run, SandboxStatus } from '../../api/types';
+import type { Run, RunSandbox, SandboxStatus } from '../../api/types';
+import { sandboxUse } from './commands';
 
 export type SandboxTone = 'pass' | 'escalate' | 'fail' | 'idle';
 
@@ -42,35 +43,70 @@ const WHY_NONE: Record<string, string> = {
   invalid: 'its sandbox definition is invalid',
 };
 
-/** One line on the run page: the image the run's builder used (with the approved definition's hash), or why none. */
+/**
+ * One line on the run page: the image the run's builder used (with the approved definition's hash), or why none; for an
+ * approved run also whether the project builds on the host and, below the line, the commands the builder ran in the sandbox.
+ */
 export function RunSandboxLine({ run }: { run: Run }) {
   const sb = run.sandbox;
   if (!sb) return null;
   const approved = sb.state === 'approved';
+  const use = approved ? sandboxUse(sb) : null;
   return (
-    <p className={`run-sbx run-sbx--${approved ? 'on' : 'off'}`} title={sb.reason}>
-      <span className="run-sbx-k">sandbox</span>
-      {approved ? (
-        <>
-          <code className="run-sbx-image">{sb.image}</code>
-          <span className="run-sbx-why">
-            definition <code>{shortHash(sb.sha256)}</code>
-          </span>
-          {(sb.platforms?.length ?? 0) > 0 && <RunPlatforms declared={sb.platforms} used={sb.platformsUsed ?? []} />}
-          {sb.reviewUsed && (
-            <span className="run-sbx-why run-sbx-review" title="The ux and ui-design reviewers ran the app in a read-only review sandbox">
-              review sandbox ✓
+    <>
+      <p className={`run-sbx run-sbx--${approved ? 'on' : 'off'}`} title={sb.reason}>
+        <span className="run-sbx-k">sandbox</span>
+        {approved ? (
+          <>
+            <code className="run-sbx-image">{sb.image}</code>
+            <span className="run-sbx-why">
+              definition <code>{shortHash(sb.sha256)}</code>
             </span>
-          )}
-        </>
-      ) : (
-        <span className="run-sbx-why">none — {WHY_NONE[sb.state] ?? sb.reason}; built and tested on the host</span>
-      )}
-      {/* A workspace run's sandbox is its target member's. */}
-      <Link to={`/p/${run.targetRepo ?? run.repo}/sandbox`} className="run-sbx-link" aria-label={`Sandbox settings of ${run.targetRepo ?? run.repo}`}>
-        settings
-      </Link>
-    </p>
+            {use?.host && (
+              <span className="run-sbx-why run-sbx-host" title="The builder builds and runs plain tests on the host; the sandbox is only for commands that need it">
+                build on host
+              </span>
+            )}
+            {use?.notUsed && (
+              <span className="run-sbx-why" title="The builder ran no command in the sandbox">
+                sandbox not used
+              </span>
+            )}
+            {(sb.platforms?.length ?? 0) > 0 && <RunPlatforms declared={sb.platforms} used={sb.platformsUsed ?? []} />}
+            {sb.reviewUsed && (
+              <span className="run-sbx-why run-sbx-review" title="The ux and ui-design reviewers ran the app in a read-only review sandbox">
+                review sandbox ✓
+              </span>
+            )}
+          </>
+        ) : (
+          <span className="run-sbx-why">none — {WHY_NONE[sb.state] ?? sb.reason}; built and tested on the host</span>
+        )}
+        {/* A workspace run's sandbox is its target member's. */}
+        <Link to={`/p/${run.targetRepo ?? run.repo}/sandbox`} className="run-sbx-link" aria-label={`Sandbox settings of ${run.targetRepo ?? run.repo}`}>
+          settings
+        </Link>
+      </p>
+      {use?.summary && <RunSandboxCommands sb={sb} summary={use.summary} more={use.more} />}
+    </>
+  );
+}
+
+/** The commands the builder ran in the build sandbox, collapsed under their count (a native, keyboard-operable disclosure). */
+function RunSandboxCommands({ sb, summary, more }: { sb: RunSandbox; summary: string; more: number }) {
+  return (
+    <details className="run-sbx-cmds">
+      <summary>{summary}</summary>
+      <ol>
+        {(sb.commands ?? []).map((c, i) => (
+          <li key={i}>
+            <code>{c.command}</code>
+            {c.platform && <span className="sbx-plat">{c.platform}</span>}
+          </li>
+        ))}
+      </ol>
+      {more > 0 && <p className="muted small run-sbx-more">and {more} more: see the builder's transcript</p>}
+    </details>
   );
 }
 

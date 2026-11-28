@@ -57,7 +57,15 @@ data class SandboxDefinition(
     val user: SandboxUser? = null,
     /** Project files the run needs (`files:`), by name; a run fails early when one is not uploaded. */
     val files: List<String> = emptyList(),
+    /**
+     * Where the builder builds and runs plain tests (`build:`): [SandboxDefinitions.BUILD_SANDBOX] (the default) in the
+     * sandbox, [SandboxDefinitions.BUILD_HOST] on the factory host, using the sandbox only for commands that need it.
+     */
+    val build: String = SandboxDefinitions.BUILD_SANDBOX,
 ) {
+    /** True when the project builds on the host (`build: host`). */
+    val buildOnHost: Boolean get() = build == SandboxDefinitions.BUILD_HOST
+
     /** True when the file asked for more than the server allows. */
     val capped: Boolean get() = (requestedCpus != null && requestedCpus > cpus) || (requestedMemoryBytes != null && requestedMemoryBytes > memoryBytes)
 }
@@ -87,8 +95,12 @@ object SandboxDefinitions {
     const val MAX_UID = 60_000
     /** What `factory_sandbox_exec` calls the top-level image when a `platform` is named explicitly. */
     const val DEFAULT_PLATFORM = "default"
+    /** `build: sandbox` (also an absent or empty key): the builder builds and tests in the sandbox. */
+    const val BUILD_SANDBOX = "sandbox"
+    /** `build: host`: the builder builds and runs plain tests on the host; the sandbox is for commands that need it. */
+    const val BUILD_HOST = "host"
 
-    private val TOP_KEYS = listOf("image", "setup", "env", "services", "caches", "resources", "platforms", "user", "files")
+    private val TOP_KEYS = listOf("image", "setup", "env", "services", "caches", "resources", "platforms", "user", "files", "build")
     private val SERVICE_KEYS = listOf("image", "env", "ready")
     private val READY_KEYS = listOf("command", "timeoutSeconds")
     private val PLATFORM_KEYS = listOf("image", "setup")
@@ -265,6 +277,11 @@ object SandboxDefinitions {
             }
         }
 
+        val build = top.get<YamlNode>("build")?.takeUnless { it is YamlNull }?.let { scalar(it, "build", errors) }?.let { b ->
+            if (b == BUILD_SANDBOX || b == BUILD_HOST) b
+            else { errors += "build: must be `$BUILD_SANDBOX` or `$BUILD_HOST` (default: $BUILD_SANDBOX)"; null }
+        } ?: BUILD_SANDBOX
+
         if (errors.isNotEmpty() || image == null) return ParsedDefinition.Invalid(hash, errors.ifEmpty { listOf("image: required") })
         return ParsedDefinition.Valid(
             hash,
@@ -272,7 +289,7 @@ object SandboxDefinitions {
                 image = image, setup = setup, env = env, services = services, caches = caches,
                 requestedCpus = cpus, requestedMemoryBytes = memory,
                 cpus = minOf(cpus ?: cfg.maxCpus, cfg.maxCpus), memoryBytes = minOf(memory ?: cfg.maxMemoryBytes, cfg.maxMemoryBytes),
-                platforms = platforms, user = user, files = files,
+                platforms = platforms, user = user, files = files, build = build,
             ),
         )
     }

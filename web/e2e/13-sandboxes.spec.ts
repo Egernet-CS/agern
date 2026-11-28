@@ -88,6 +88,10 @@ test('a run with an approved sandbox shows its image and the commands it ran', a
   await expect(line).toContainText('docker.io/library/eclipse-temurin:21-jdk');
   const status = await (await page.request.get(`${BASE()}/api/projects/demo-app/sandbox`)).json();
   await expect(line).toContainText(status.sha256.slice(0, 12));
+  // Sandbox mode: no host marker, and the command the builder ran under a closed disclosure.
+  await expect(line).not.toContainText('build on host');
+  const cmds = page.locator('details.run-sbx-cmds');
+  await expect(cmds.locator('summary')).toHaveText('1 sandbox command');
 
   await node(page, 'builder').click();
   const log = page.locator('.stage-detail .chat-log');
@@ -222,4 +226,46 @@ test('platforms: on the sandbox page, in the approval, on the run and live in th
   expect((await page.request.post(`${BASE()}/api/runs/${runId}/cancel`, { headers: mutate })).status()).toBe(200);
   await expect(item).toHaveCount(0, { timeout: 10_000 });
   await expect(card).toContainText('0 of 2 containers in use');
+});
+
+// Last, so the earlier definitions are undisturbed; afterAll removes the definition and the approval.
+const host = v1 + 'build: host\n';
+
+test('build: host — the sandbox page, a run that needs no sandbox and one that uses it', async ({ page }) => {
+  definition(host);
+  await login(page, 'alice');
+  await page.goto(`${BASE()}/p/demo-app/sandbox`);
+  await expect(pill(page)).toHaveText('changed');
+  const grid = page.locator('.sbx-dl-grid');
+  await expect(grid).toContainText('on the host');
+  await page.getByRole('button', { name: 'Approve…' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Approve the sandbox of demo-app?' });
+  await expect(dialog).toContainText('Build mode host: builds and plain tests run on the factory host');
+  await dialog.getByRole('button', { name: 'Approve this version' }).click();
+  await expect(pill(page)).toHaveText('approved');
+
+  // A run whose builder runs nothing in the sandbox.
+  const plain = await startRun(page, `Host build ${tag}`, 'Build it on the host.');
+  await page.goto(`${BASE()}/p/demo-app/runs/${plain}`);
+  await expect(page.locator('.rh-title .pill')).toHaveText('merged', { timeout: 45_000 });
+  const line = page.locator('.run-sbx');
+  await expect(line.locator('.run-sbx-host')).toHaveText('build on host');
+  await expect(line).toContainText('sandbox not used');
+  await expect(page.locator('details.run-sbx-cmds')).toHaveCount(0);
+  const run = await (await page.request.get(`${BASE()}/api/runs/${plain}`)).json();
+  expect(run.sandbox).toMatchObject({ state: 'approved', build: 'host', commandCount: 0 });
+
+  // A run whose builder needs the sandbox for one command.
+  const used = await startRun(page, `Host build with a sandbox command ${tag}`, 'Run the service tests in the sandbox. fake:sandbox');
+  await page.goto(`${BASE()}/p/demo-app/runs/${used}`);
+  await expect(page.locator('.rh-title .pill')).toHaveText('merged', { timeout: 45_000 });
+  await expect(page.locator('.run-sbx')).toContainText('build on host');
+  await expect(page.locator('.run-sbx')).not.toContainText('sandbox not used');
+  const cmds = page.locator('details.run-sbx-cmds');
+  const summary = cmds.locator('summary');
+  await expect(summary).toHaveText('sandbox used for 1 command');
+  await expect(cmds.locator('li')).toBeHidden();
+  await summary.focus();
+  await page.keyboard.press('Enter');
+  await expect(cmds.locator('li code')).toHaveText(['echo built in the sandbox && ls']);
 });

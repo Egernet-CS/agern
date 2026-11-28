@@ -721,7 +721,19 @@ export type RunSandbox = {
   reviewUsed?: boolean;
   /** Project files the definition requires (`files:`); absent for older runs. */
   files?: string[];
+  /** The definition's `build:` mode (`approved` only); absent for older runs, which built in the sandbox. */
+  build?: SandboxBuildMode;
+  /** The first 50 commands the builder started in the build sandbox (first line, at most 200 characters); absent for older runs. */
+  commands?: RunSandboxCommand[];
+  /** How many commands the builder started in the build sandbox, all of them; absent for older runs. */
+  commandCount?: number;
 };
+
+/** `build:` in `.agern/sandbox.yml`: build and test in the sandbox (default) or on the factory host. */
+export type SandboxBuildMode = 'sandbox' | 'host';
+
+/** A command the builder started in the build sandbox. `platform`: the container, only when the definition has platforms. */
+export type RunSandboxCommand = { command: string; platform: string | null };
 
 /** A sidecar's readiness check: run inside the service until it exits 0, for at most `timeoutSeconds`. */
 export type SandboxReady = { command: string; timeoutSeconds: number };
@@ -747,6 +759,8 @@ export type SandboxDefinition = {
   user: SandboxUser | null;
   /** Project files the sandbox needs (`files:`), by name. */
   files?: string[];
+  /** Where the builder builds and runs plain tests (`build:`; `sandbox` when the key is absent). */
+  build: SandboxBuildMode;
 };
 
 export type SandboxApproval = { sha256: string; content: string; approvedBy: Owner; approvedAt: string };

@@ -66,6 +66,10 @@ Sandbox:
   only, own services) in which they can start the app and take screenshots.
 - Plan its use in the Verification section below where that helps. When the run has no sandbox, write
   no Verification section that needs one: the builder and the reviewers work on the host.
+- When your task prompt says the project builds on the host (`build: host`), the builder builds and runs
+  plain tests on the host and uses the sandbox only for commands that need it. In the Verification
+  section, say for each command whether it runs on the host or needs the sandbox (its services, a
+  platform, the running app). Plain build and test commands belong on the host.
 
 Write the spec in Markdown with these sections:
 
@@ -104,6 +108,9 @@ Optional: only when your task prompt says the run has a sandbox and it helps. Th
 runs in the sandbox (tests, migrations against a service, the app's start command) and the platforms
 each runs on. For UI changes, how the UI reviewers start the app in the read-only review sandbox (start
 command, readiness probe, URL, login or seed data) and which screens and states they should look at.
+When your task prompt says the project builds on the host (`build: host`), say for each command
+whether it runs on the host (plain builds and tests) or needs the sandbox (its services, a platform, the
+running app).
 
 ## Out of scope
 Things deliberately not done.
