@@ -3088,6 +3088,58 @@ runs = the default branch); for retries (V16) `continues_run_id` (→
   `"conflict": true` makes its pull requests conflict (reported and refused on merge like `conflicting`) while the
   file says so; the e2e suite uses both.
 
+### Time and cost
+
+How long a run or a release took and what its agents cost (`Totals.kt`, loaded by `db/TotalsStore.kt`), served by
+`GET /api/runs/{id}/totals` and `GET /api/releases/{id}/totals` (§8) and shown on the release page and in the run
+header (§10). Computed on each request from runs and agent sessions; nothing is stored or pushed on the feed.
+
+- **Scope and sessions.** A scope is one run, or every run with `release_id` = the release (issue and sync runs, any
+  status, also failed, cancelled and continued runs and runs of issues taken out of the release). Its sessions are all
+  `agent_sessions` rows whose `run_id` is in the scope (sessions are never deleted, only chats are); a *stage session*
+  is one whose kind is not `advisor`. The release endpoint issues three SQL statements (runs, sessions, update rounds),
+  whatever the number of runs, sessions or issues.
+- **Recorded per session** (migration V35): `round`, the stage round a pipeline session ran in (set by
+  `Orchestrator.stage` through `StageAgentRequest.round`; null for chats and advisors), and `cred_kind`, the kind of
+  Claude credential (`oauth_token` / `api_key`) of the session's last launch (set when a stage agent, chat or advisor
+  is launched; a relaunched advisor that changed kind counts wholly as its last kind). The migration backfilled
+  `round` from the title suffix `round <n>` (else 0) and `cred_kind` from the owner's credential kind at the time of
+  the migration, which is wrong for sessions run before an owner switched kinds.
+- **Cost.** `usd` is the sum of each session's `cost_usd`, which is already the session's total (the CLI's
+  `total_cost_usd` is cumulative per process, §5), so each session counts once; rounded to 6 decimals. `apiKeyUsd` is
+  the part of sessions on an API key (actual API cost), `subscriptionUsd` the rest (OAuth token, and sessions without a
+  recorded kind: the weaker claim, an API-equivalent amount, not what was billed). `turns` sums `num_turns`.
+  `runningSessions`: no cost yet, status `starting`/`running`; `unknownSessions`: no cost and ended (e.g. killed before
+  its first `result`), so `usd` is a lower bound and the UI says "≥ $X (n sessions without a cost)".
+- **Windows.** Run: `created_at` → `ended_at`, or now. Release: `started_at` → `released_at` (`released`), `ended_at`
+  (`cancelled`), `ready_at` (`ready`), otherwise now (`building`, `paused`); never started: `elapsedMs` 0. Issue: the
+  earliest `created_at` of its issue runs in the release → the latest `ended_at` once all have ended, otherwise now;
+  capped by the release window of a released or cancelled release. `running` is true while the window ends now.
+  Released and cancelled releases therefore answer the same numbers on every later call. Work after `ready_at` (a
+  sync run) counts in cost but not in the window until the release builds again or is released.
+- **Working and waiting.** A stage session's interval is `created_at` → `ended_at` (to now while `starting` or
+  `running`; zero length when it ended without an end time). `workingMs` is the length of the union of the scope's
+  stage-session intervals, clipped to the window, so parallel reviewers count once; `waitingMs` = `elapsedMs −
+  workingMs`: everything else — waiting for a person (held or escalated issues, the conversation), for checks, for the
+  network, for a free agent or sandbox slot between agents, a paused release, mechanical steps. Time an agent spends
+  blocked inside its session (waiting for a slot at launch, a long tool call) counts as working. Waiting is not split
+  by reason: no history of run and release states is stored. `working`: a stage session is `starting` or `running`.
+- **Breakdowns.** `byRole` groups by session kind (`spec-writer`, `builder`, `security`, `ux`, `ui-design`, `code`,
+  `approver`, `advisor`, then others alphabetically). `byWork` gives every session one kind of work, the first
+  matching rule winning: its run is a sync run → `sync`; an advisor → `conversation`; its run is a *retry run* (an
+  earlier issue run of the same repository and issue exists in the same release, or both are single runs), or it is
+  not the earliest (`created_at`, then id) session of its (run, kind, round) — a step, network or "finish" retry →
+  `retry`; its round is an update round of the run (`run_updates.round`) → `update`; the run has `follow_up_from` and
+  the round is at least that → `conversation`; round 0 → `build`; otherwise `fix`. Rows are in the order `build`,
+  `fix`, `update`, `retry`, `conversation`, `sync`; empty rows are left out. Each row's `agentMs` adds up its stage
+  sessions' own interval lengths (not a union, not clipped; advisors 0). Both breakdowns add up to the total.
+- **Per issue.** `ReleaseTotals.issues` has one entry per issue in the release, in build order, over that issue's
+  issue runs in the release; `other` covers the release's remaining runs (sync runs, issues taken out), null when there
+  are none.
+- **Visibility.** Whoever can see the run or the release (as `GET /api/runs/{id}` and `GET /api/releases/{id}`). The
+  release aggregate includes runs in member repositories the viewer cannot read; it carries only numbers, role names
+  and run ids, never transcripts, credentials or names.
+
 ### Generated images
 
 Agents can have graphics made by an image AI the user chose (issue #11). Claude does not generate images itself.
@@ -3885,6 +3937,20 @@ type ClaudeUsage = { credentialKind: 'oauth_token' | 'api_key' | null;
   windows: UsageWindow[];                         // ordered by type; [] unless credentialKind is 'oauth_token'
   spend: { todayUsd: number; monthUsd: number; day: string; month: string } };   // 'YYYY-MM-DD', 'YYYY-MM'
 
+// Time and cost (§6 "Time and cost"). USD as numbers, durations in milliseconds; every field is always present.
+type Cost = { usd: number; apiKeyUsd: number; subscriptionUsd: number;   // apiKeyUsd + subscriptionUsd = usd
+  sessions: number; turns: number; runningSessions: number; unknownSessions: number };
+type TotalsTime = { elapsedMs: number; workingMs: number; waitingMs: number;
+  running: boolean;                                // the window ends now (it grows)
+  working: boolean };                              // a stage agent is starting or running
+type TotalsRow = { key: string; cost: Cost; agentMs: number };   // key: a role, or build|fix|update|retry|conversation|sync
+type RunTotals = { runId: string; time: TotalsTime; cost: Cost; byRole: TotalsRow[]; byWork: TotalsRow[] };
+type IssueTotals = { number: number; runs: number; time: TotalsTime; cost: Cost };
+type ReleaseTotals = { releaseId: string; time: TotalsTime; cost: Cost; runs: number; runIds: string[];
+  issues: IssueTotals[];                           // one per issue in the release, in build order
+  other: { runs: number; cost: Cost } | null;      // runs of no listed issue (sync runs, issues taken out)
+  byRole: TotalsRow[]; byWork: TotalsRow[] };
+
 type GitHubStatus = {                                       // GET /api/github/status (§6 "GitHub status")
   verdict: { state: 'working' | 'degraded' | 'down'; reason: string };
   generatedAt: string;
@@ -3966,6 +4032,7 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `GET /api/projects/{repo}/releases` | → `Release[]` | newest first (`createdAt` desc), each with its issues in order |
 | `POST /api/projects/{repo}/releases` | `{ name, description?, mode? }` → 201 `Release` | 400 invalid name, description or mode (`manual` default, `automatic`); 409 `release_name_taken`; 409 `release_mode_not_allowed` (the project's merge policy is not `automatic`, §6 "Merge policy"). Starts nothing |
 | `GET /api/releases/{id}` | → `Release` | 404 unknown or invisible |
+| `GET /api/releases/{id}/totals` | → `ReleaseTotals` | time and cost of the release, in total, per issue and broken down (§6 "Time and cost"); anyone who can see the release (not only the owner or admins), 404 unknown or invisible. A fixed number of SQL statements, whatever the number of runs |
 | `PUT /api/releases/{id}` | `{ name, description }` → `Release` | rename or edit; same validation as create. Started: owner or admin, and a different name → 409 `release_name_locked`; released: 409 `release_not_editable`. Editing a ready release updates its pull request's body |
 | `DELETE /api/releases/{id}` | → 204 | removes the plan and its assignments; the issues are untouched on GitHub. `scheduled` → 409 `release_scheduled`; `building`/`paused`/`ready` → 409 `release_active`; `released` → 409 `release_not_editable`; `cancelled`: owner or admin, the branch stays and its runs keep existing with `releaseId` null |
 | `POST /api/releases/{id}/start` | → `Release` | the caller becomes the owner; creates `release/<name>` and builds (§6 "Releases"). 409 `release_not_planning` (also while scheduled), 422 `claude_credential_required`, 409 `release_empty`, 409 `release_already_building`, 409 `release_branch_exists`, 422 `github_push_denied`, 409 `workspace_invalid` for a workspace whose definition is invalid (also for a scheduled start) |
@@ -4012,6 +4079,7 @@ type CreatedMcpToken = { token: McpToken; secret: string;            // secret: 
 | `POST /api/projects/{repo}/runs` | `{ issueNumber }` → `Run` | needs Claude credential; 409 if the issue has an active run; a workspace project: 409 `workspace_invalid`, `member_label_missing`, `member_label_ambiguous`, 403 `member_not_accessible` (§6 "Workspace runs") |
 | `GET /api/runs?active=true&status=<s>` | → `Run[]` | across visible repos, newest first (max 200). `active=true`: not finished, i.e. `queued`, `spec`, `building`, `reviewing`, `approving`, `waiting_for_checks` or `needs_human`. `status`: only these statuses, repeatable and/or comma list (`?status=needs_human`); unknown status → 400. Both given: both apply |
 | `GET /api/runs/{id}` | → `Run` | |
+| `GET /api/runs/{id}/totals` | → `RunTotals` | time and cost of the run: all stages, rounds, retries and the advisor (§6 "Time and cost"); 404 like `GET /api/runs/{id}` |
 | `GET /api/runs/{id}/screenshots/{sid}` | → image bytes | anyone who may see the run (404 otherwise, and for a screenshot of another run). Served with the sniffed type, `nosniff`, a sandboxing CSP, `Cross-Origin-Resource-Policy: same-origin`, `Cache-Control: private, max-age=31536000, immutable` and `Content-Disposition: inline` (`screenshot-<role>-<id8>.<ext>`). There is no upload or delete route |
 | `POST /api/runs/{id}/approve` | → `Run` | owner only, only in `needs_human`; 409 `merge_on_github` for a run of merge policy `github`, whatever its status (after 404 and 403; §6 "Merge policy"); 409 `review_in_progress`, `agent_busy`, `review_required` (§6 "Conversation at needs human"); evaluates the checks on the pull request's head first and answers the run merged, `needs_human` or `waiting_for_checks` (§6 "Checks before a merge"); a single run whose branch is behind its target, has a migration clash or is refused for a conflict, with update rounds left, is answered `building` with an automatic update round running (§6 "Keeping runs up to date") |
 | `POST /api/runs/{id}/update` | → `Run` | "Update from base branch" (§6 "Keeping runs up to date"): owner only (403 for everyone else, admins included; 404 when not visible); 422 `claude_credential_required`; 409 `update_unavailable` (not `needs_human`, or `ready` under policy `github`; a release or sync run; limit reached; switched off; no pull request), `base_not_moved` (no round used), `review_in_progress`, `agent_busy`, `run_worktree_missing`, `active_run_exists` and `pull_request_closed` (a `ready` run); answers the same run, now `building` |
@@ -4705,6 +4773,27 @@ run") — a waiting issue retried with `continue` or `step` says "Continues from
 comes." / "Retries the failed step of its run when its turn comes."; in a started release moving is owner-only
 among `waiting` issues and removing is for the owner or admins on `waiting`, `held` and `skipped` issues (any issue
 when cancelled); "Add an open issue" shows while planning and, for the owner, while building or paused.
+
+**Time and cost** (§6 "Time and cost"). A started release shows a "Time and cost" section (`<h2>`) right under the
+header: "Time: <elapsed> (so far, while it runs) · agents working <d> · waiting <d>" with the muted note "Waiting is
+all time no agent was running: for a person, checks, the network or a free slot.", and "Cost: <amount> · <n> run(s) ·
+<t> turn(s)" with the credential note as visible text — subscription only "API-equivalent cost reported by Claude
+Code (subscription), not what was billed.", API key only "API cost (API key).", both "$A API-equivalent (subscription,
+not what was billed) + $B API cost (API key)." — and, while agents run, "n agent(s) running; their cost is added when
+they finish.". The amount is `≥ $X (n session(s) without a cost)` when sessions ended without one. A closed
+`<details>` "Breakdown by role and kind of work" holds the captioned tables "By role" and "By kind of work" (name,
+sessions, turns, agent time — `—` for advisor conversations — and cost), a note on what retries and agent time are,
+and, when there are such runs, "Not in the issue list: <amount> in <n> run(s) (…)". Each issue with runs shows
+"<elapsed> · <amount>" and a decorative cost bar relative to the most expensive issue (an `sr-only` label reads
+"Issue #n: … elapsed, … agents working, $x in n runs"); the build order is unchanged. The totals load with "Calculating
+time and cost…", show "Time and cost could not be loaded." with "Try again" when the first load fails, keep the last
+numbers when a reload fails, and reload (debounced ~1 s, `useReleaseTotals` in `web/src/lib/useTotals.ts`) when the
+release changes, when a run of the release or a session of its runs changes on the feed, after a feed reconnect, and
+at least every 60 s while the window runs; in between, elapsed ticks every second (to working while an agent works,
+else to waiting), outside any `aria-live` region. The run header adds "agents working" (ticking while an agent works)
+and "cost" (the amount and a muted short form of the credential note — "API-equivalent", "API cost" or both amounts —
+with the full sentence as `title`) after "took / running for"; both show `—` until loaded (`useRunTotals`, reloaded
+when the run or one of its sessions changes and after a reconnect).
 
 Releasing on the release page (§6 "Releasing"). A `ready` release shows the section "Release pull request" (`<h2>`):
 the link "#<prNumber>" to the pull request (new tab) and `release/<name> → <targetBranch>`, or "No pull request
