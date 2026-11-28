@@ -3,6 +3,7 @@ package dk.egernet.factory.sandbox
 import dk.egernet.factory.AppJson
 import dk.egernet.factory.Config
 import dk.egernet.factory.OwnerDto
+import dk.egernet.factory.RunSandboxCommandDto
 import dk.egernet.factory.RunSandboxDto
 import dk.egernet.factory.RunStatus
 import dk.egernet.factory.SandboxApprovalDto
@@ -41,6 +42,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonObject
@@ -166,6 +168,8 @@ class SandboxManager(
          * stop and waits never take it.
          */
         val lock = Mutex()
+        /** Serialises updates of [info] and their writes to the run (commands, platforms and the review sandbox used). */
+        val infoLock = Mutex()
         /** The command whose job runs now (null between commands). */
         @Volatile var current: Command? = null
         /** The most recently started command: what `factory_sandbox_wait` without a handle waits for. */
@@ -260,8 +264,9 @@ class SandboxManager(
                         RunSandboxDto(
                             "approved",
                             "Sandbox definition ${parsed.sha256.take(12)} approved by ${approval.approvedByUsername}; image ${def.image}$platforms. " +
-                                "It is created on the builder's first sandbox command.",
-                            parsed.sha256, def.image, platforms = def.platforms.map { it.name }, files = def.files,
+                                "It is created on the builder's first sandbox command." +
+                                (if (def.buildOnHost) " The project builds on the host (build: host): the sandbox is only for commands that need it." else ""),
+                            parsed.sha256, def.image, platforms = def.platforms.map { it.name }, files = def.files, build = def.build,
                         ),
                         Plan.Available(def, parsed.sha256), repo, worktree,
                     )
@@ -278,13 +283,31 @@ class SandboxManager(
     }
 
     private suspend fun recordDecision(
-        runId: UUID, info: RunSandboxDto, available: Plan.Available?, repo: String, worktree: Path, runDir: Path, projectFiles: Path?,
+        runId: UUID, decision: RunSandboxDto, available: Plan.Available?, repo: String, worktree: Path, runDir: Path, projectFiles: Path?,
     ): RunSandboxDto {
+        val info = carryOverUsage(runId, decision)
         withContext(Dispatchers.IO) { runs.setSandbox(runId, info) }
         if (enabled) {
             sandboxes[runId] = RunSandbox(runId, repo, worktree, available ?: Plan.Unavailable(info.reason), info, runDir, projectFiles = projectFiles)
         }
         return info
+    }
+
+    /**
+     * [decision] with the usage facts (platforms used, review sandbox used, recorded commands) of the run's stored decision
+     * when both are `approved` with the same hash, i.e. when an update round prepares the same sandbox again; otherwise
+     * [decision] as it is (usage starts empty). Never throws.
+     */
+    private suspend fun carryOverUsage(runId: UUID, decision: RunSandboxDto): RunSandboxDto {
+        if (decision.state != "approved" || decision.sha256 == null) return decision
+        val stored = runCatching {
+            withContext(Dispatchers.IO) { runs.get(runId) }?.sandboxJson?.let { AppJson.decodeFromString(RunSandboxDto.serializer(), it) }
+        }.onFailure { log.warn("Reading the stored sandbox decision of run {} failed: {}", runId, it.message) }.getOrNull()
+        if (stored == null || stored.state != "approved" || stored.sha256 != decision.sha256) return decision
+        return decision.copy(
+            platformsUsed = stored.platformsUsed, reviewUsed = stored.reviewUsed,
+            commands = stored.commands, commandCount = stored.commandCount,
+        )
     }
 
     // ------------------------------------------------------------------ tools
@@ -344,6 +367,10 @@ class SandboxManager(
                             "sandbox. The other UI reviewer may already have started the app: check (e.g. probe its URL) before you start it.")
                     }
                     SandboxScope.BUILD -> {}
+                }
+                if (!review) {
+                    put("build", def.build)
+                    if (def.buildOnHost) put("buildNote", BUILD_HOST_NOTE)
                 }
                 put("image", def.image)
                 put("created", live?.boxes?.containsKey(DEFAULT) == true)
@@ -477,7 +504,7 @@ class SandboxManager(
             if (!rs.boxes.containsKey(key)) create(rs, plan, key, sessionId)?.let { return SandboxAnswer(true, it) }
             val box = rs.boxes[key] ?: return SandboxAnswer(true, STOPPED_WHILE_RUNNING)
             box.lastUsed = System.nanoTime()
-            noteUsed(rs, key)
+            noteUsed(rs, key, command)
             val cmd = Command(newHandle(rs), key, command, sessionId, background, timeoutMs)
             synchronized(rs.commands) { rs.commands[cmd.handle] = cmd }
             rs.latest = cmd
@@ -607,23 +634,38 @@ class SandboxManager(
     /** What the transcript calls the container a command ran in: null when the definition has no platforms (or in review). */
     private fun platformLabel(rs: RunSandbox, def: SandboxDefinition, key: String): String? = if (rs.review || def.platforms.isEmpty()) null else key
 
-    /** Records on the run where the builder ran commands (only when there are platforms), so the run page can say. */
-    private suspend fun noteUsed(rs: RunSandbox, key: String) {
+    /**
+     * Records on the run that the builder started [command] in the build sandbox (the first [MAX_RECORDED_COMMANDS], all
+     * counted) and where it ran (platforms used, only when there are platforms), so the run page can say. One write;
+     * a failure is logged and never fails the command. Review commands are not recorded.
+     */
+    private suspend fun noteUsed(rs: RunSandbox, key: String, command: String) {
         if (rs.review) return
         val def = rs.definition ?: return
-        if (def.platforms.isEmpty() || key in rs.info.platformsUsed) return
-        rs.info = rs.info.copy(platformsUsed = rs.info.platformsUsed + key)
-        runCatching { withContext(Dispatchers.IO) { runs.setSandbox(rs.runId, rs.info) } }
-            .onFailure { log.warn("Recording the platforms used by run {} failed: {}", rs.runId, it.message) }
+        val platforms = def.platforms.isNotEmpty()
+        val entry = RunSandboxCommandDto(recordedCommand(command), if (platforms) key else null)
+        // The review path updates the same entry's info (reviewUsed): never lose one of the two updates.
+        rs.infoLock.withLock {
+            val info = rs.info
+            rs.info = info.copy(
+                platformsUsed = if (platforms && key !in info.platformsUsed) info.platformsUsed + key else info.platformsUsed,
+                commands = if (info.commands.size < MAX_RECORDED_COMMANDS) info.commands + entry else info.commands,
+                commandCount = info.commandCount + 1,
+            )
+            runCatching { withContext(Dispatchers.IO) { runs.setSandbox(rs.runId, rs.info) } }
+                .onFailure { log.warn("Recording a sandbox command of run {} failed: {}", rs.runId, it.message) }
+        }
         emitRun(rs.runId)
     }
 
     /** Records on the run (once) that its UI reviewers had a review sandbox, so the run page can say. */
     private suspend fun noteReviewUsed(build: RunSandbox) {
-        if (build.info.reviewUsed) return
-        build.info = build.info.copy(reviewUsed = true)
-        runCatching { withContext(Dispatchers.IO) { runs.setSandbox(build.runId, build.info) } }
-            .onFailure { log.warn("Recording the review sandbox of run {} failed: {}", build.runId, it.message) }
+        build.infoLock.withLock {
+            if (build.info.reviewUsed) return
+            build.info = build.info.copy(reviewUsed = true)
+            runCatching { withContext(Dispatchers.IO) { runs.setSandbox(build.runId, build.info) } }
+                .onFailure { log.warn("Recording the review sandbox of run {} failed: {}", build.runId, it.message) }
+        }
         emitRun(build.runId)
     }
 
@@ -872,7 +914,7 @@ class SandboxManager(
 
     /** The full log of a setup script or command, kept in the agent's transcript for the run page. */
     private fun logEvent(sessionId: UUID, kind: String, command: String, r: ExecResult, timeoutMs: Long, platform: String?, review: Boolean = false) {
-        val what = if (kind == "setup") "setup script" else "`" + command.lineSequence().first().take(200) + "`"
+        val what = if (kind == "setup") "setup script" else "`" + recordedCommand(command) + "`"
         val where = platform?.let { " [$it]" } ?: ""
         val outcome = if (r.timedOut) "timed out after ${timeoutMs / 1000} s" else "exit ${r.exitCode}"
         publishSystem(sessionId, buildJsonObject {
@@ -1141,6 +1183,7 @@ class SandboxManager(
         platforms = d.platforms.map { SandboxPlatformDto(it.name, it.image, it.setup, it.setupInherited) },
         user = d.user?.let { SandboxUserDto(it.name, it.uid) },
         files = d.files,
+        build = d.build,
         limits = SandboxLimitsDto(
             cpus = d.cpus, memory = SandboxConfig.formatMemory(d.memoryBytes), requestedCpus = d.requestedCpus,
             requestedMemory = d.requestedMemoryBytes?.let { SandboxConfig.formatMemory(it) }, capped = d.capped,
@@ -1271,6 +1314,15 @@ class SandboxManager(
             "The next command creates a new sandbox (the setup script runs again)."
         /** How much of a command's output the agent gets back (the end of it). */
         const val OUTPUT_TAIL_CHARS = 20_000
+        /** How many of the builder's sandbox commands a run keeps on its record ([RunSandboxDto.commands]). */
+        const val MAX_RECORDED_COMMANDS = 50
+        /** What `factory_sandbox_info` adds for the builder and spec-writer when the project builds on the host. */
+        const val BUILD_HOST_NOTE = "The project builds on the host: build and run plain tests on the host. Use this sandbox only for " +
+            "commands that need its services or platforms, the running app, or the spec's Verification commands."
+
+        /** How a command is shown in the transcript's summary line and recorded on the run: its first line, at most 200 characters. */
+        fun recordedCommand(command: String): String = command.lineSequence().first().take(200)
+
         val TOOLS = setOf("factory_sandbox_info", "factory_sandbox_exec", "factory_sandbox_wait")
     }
 }

@@ -214,6 +214,11 @@ class SandboxTest {
         val dto = w.services.runs.toDto(done).sandbox!!
         assertEquals("approved", dto.state)
         assertEquals(SandboxDefinitions.sha256(definition), dto.sha256)
+        assertEquals("sandbox", dto.build)
+        assertEquals("sandbox", info!!["build"]!!.jsonPrimitive.content)
+        assertFalse(info!!.containsKey("buildNote"))
+        assertEquals(listOf(RunSandboxCommandDto("./gradlew test", null), RunSandboxCommandDto("npm test", null)), dto.commands)
+        assertEquals(2, dto.commandCount)
         val texts = systemTexts(w, id)
         assertTrue(texts.first().startsWith("Sandbox: Sandbox definition"), texts.toString())
         assertTrue(texts.any { it.startsWith("Sandbox ready") }, texts.toString())
@@ -1426,5 +1431,287 @@ class SandboxTest {
         assertTrue(a[0].isError && a[1].isError, a.toString())
         assertEquals("ran: echo 2\n", a[2].str("output"))
         assertEquals("ran: echo 21\n", a[3].str("output"))
+    }
+
+    // ---------------------------------------------------------------- build: host
+
+    private val hostDefinition = definition + "build: host\n"
+
+    /** Today's builder paragraph for [definition], verbatim: `build: sandbox` (or no key) must keep it byte for byte. */
+    private val sandboxParagraph = "\nSandbox: this run has one (image `docker.io/library/eclipse-temurin:21-jdk`). Build and test inside it with " +
+        "`factory_sandbox_exec` instead of on the host (long commands: `background: true`, then `factory_sandbox_wait`); " +
+        "`factory_sandbox_info` lists its services and limits. When the spec has a Verification section, run its commands in the sandbox " +
+        "on the platforms it names and report each result in your summary.\n"
+
+    /** Today's spec-writer line for [definition], verbatim. */
+    private val specSandboxParagraph = "Sandbox: this run has one (image docker.io/library/eclipse-temurin:21-jdk). You cannot run commands in it; " +
+        "call factory_sandbox_info for its services, platforms and limits and plan its use in the spec's Verification section.\n"
+
+    private fun hostParagraph(image: String) = "\nSandbox: this run has one (image `$image`), but the project builds on the host (`build: host` in " +
+        "`.agern/sandbox.yml`). Build, lint and run plain tests on the host with the tools installed there, as without a sandbox. Use " +
+        "`factory_sandbox_exec` only for commands that need the sandbox: tests that need its services, commands on its platforms, starting " +
+        "and exercising the app, and the sandbox commands of the spec's Verification section (long commands: `background: true`, then " +
+        "`factory_sandbox_wait`); `factory_sandbox_info` lists its services and limits. The sandbox is created by your first sandbox command; " +
+        "when nothing needs it, do not create it. If a tool that a command needs is missing on the host, you may run that one command in the " +
+        "sandbox instead: say in your summary which tool was missing and which commands you ran in the sandbox. Never install system-wide " +
+        "software for it (use `factory_request_software`). When the spec has a Verification section, run each of its commands where the " +
+        "section says (on the host, or in the sandbox on the platforms it names; in the sandbox when it does not say) and report each result " +
+        "in your summary.\n"
+
+    private fun specHostParagraph(imageAndPlatforms: String) = "Sandbox: this run has one (image $imageAndPlatforms), but the project builds " +
+        "on the host (build: host): the builder builds and runs plain tests on the host and uses the sandbox only for commands that need it. " +
+        "You cannot run commands in it; call factory_sandbox_info for its services, platforms and limits. In the spec's Verification section, " +
+        "say for each command whether it runs on the host or needs the sandbox (its services, a platform, the running app).\n"
+
+    /** Everything a stage was told: its launch prompt and what was written to it. */
+    private fun told(p: FakeProcess) = (p.spec.prompt ?: "") + p.written.joinToString("\n")
+
+    @Test
+    fun `build sandbox and an absent key keep today's builder and spec-writer prompts verbatim, also in a fix round`() {
+        for (content in listOf(definition, definition + "build: sandbox\n")) {
+            val w = world()
+            w.sandboxFile(content)
+            approve(w, content)
+            script(w, changes = { role, r -> role == "code" && r == 0 })
+            val run = start(w)
+            val done = w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
+            assertEquals(RunStatus.MERGED, done.status, done.error)
+            val builders = w.launcher.byRole("builder")
+            assertEquals(2, builders.size, "a build and a fix round")
+            for (b in builders) {
+                assertTrue(told(b).contains(sandboxParagraph), told(b))
+                assertFalse(told(b).contains("builds on the host"), told(b))
+            }
+            assertTrue(told(w.launcher.byRole("spec-writer").single()).contains(specSandboxParagraph))
+            val dto = w.services.runs.toDto(done).sandbox!!
+            assertEquals("sandbox", dto.build)
+            assertFalse(dto.reason.contains("build: host"), dto.reason)
+            assertEquals(0, dto.commandCount)
+            assertTrue(dto.commands.isEmpty())
+        }
+    }
+
+    @Test
+    fun `build host tells the builder to build on the host and creates no sandbox when nothing needs it`() {
+        val w = world()
+        w.sandboxFile(hostDefinition)
+        approve(w, hostDefinition)
+        val rt = w.sandboxRuntime
+        var info: JsonObject? = null
+        var specInfo: JsonObject? = null
+        val inUse = CopyOnWriteArrayList<Int>()
+        script(w, reviewer = { inUse += w.services.sandboxes.inUse() }, changes = { role, r -> role == "code" && r == 0 }) { p ->
+            inUse += w.services.sandboxes.inUse()
+            info = call(w, token(p), "factory_sandbox_info").json
+            inUse += w.services.sandboxes.inUse()
+            "Built and tested on the host."
+        }
+        val inner = w.launcher.stage
+        w.launcher.stage = { p ->
+            if (p.spec.kind == "spec-writer") specInfo = call(w, token(p), "factory_sandbox_info").json
+            inner(p)
+        }
+        val run = start(w)
+        val done = w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
+        assertEquals(RunStatus.MERGED, done.status, done.error)
+
+        // Nothing was ever created and no slot was taken.
+        assertTrue(rt.started.isEmpty() && rt.execs.isEmpty(), rt.calls.toString())
+        assertTrue(rt.calls.none { it.startsWith("network create") }, rt.calls.toString())
+        assertTrue(inUse.all { it == 0 }, inUse.toString())
+        assertEquals(0, w.services.sandboxes.inUse())
+
+        val dto = w.services.runs.toDto(done).sandbox!!
+        assertEquals("approved", dto.state)
+        assertEquals("host", dto.build)
+        assertEquals(0, dto.commandCount)
+        assertTrue(dto.reason.endsWith(" The project builds on the host (build: host): the sandbox is only for commands that need it."), dto.reason)
+        assertTrue(systemTexts(w, run.id).first().contains("The project builds on the host (build: host)"))
+
+        assertEquals("host", info!!["build"]!!.jsonPrimitive.content)
+        assertEquals(SandboxManager.BUILD_HOST_NOTE, info!!["buildNote"]!!.jsonPrimitive.content)
+        assertEquals("host", specInfo!!["build"]!!.jsonPrimitive.content)
+        assertTrue(specInfo!!.containsKey("buildNote"))
+
+        // Build and fix prompts carry the host paragraph instead of today's.
+        val builders = w.launcher.byRole("builder")
+        assertEquals(2, builders.size, "a build and a fix round")
+        for (b in builders) {
+            assertTrue(told(b).contains(hostParagraph("docker.io/library/eclipse-temurin:21-jdk")), told(b))
+            assertFalse(told(b).contains("Build and test inside it"), told(b))
+            assertFalse(told(b).contains("Platforms:"), told(b))
+        }
+        assertTrue(told(w.launcher.byRole("spec-writer").single()).contains(specHostParagraph("docker.io/library/eclipse-temurin:21-jdk")))
+    }
+
+    @Test
+    fun `build host with platforms adds the platform sentence`() {
+        val content = platformDefinition + "build: host\n"
+        val w = world()
+        w.sandboxFile(content)
+        approve(w, content)
+        script(w)
+        val run = start(w)
+        assertEquals(RunStatus.MERGED, w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN).status)
+        val prompt = told(w.launcher.byRole("builder").single())
+        assertTrue(prompt.contains(hostParagraph("docker.io/library/eclipse-temurin:21-jdk") + "Platforms: `jdk17`, `debian12` (other images; " +
+            "`factory_sandbox_exec` with `platform`). Run the test suite on every platform before you finish, and report the result per platform " +
+            "in your summary.\n"), prompt)
+        assertTrue(told(w.launcher.byRole("spec-writer").single()).contains(specHostParagraph("docker.io/library/eclipse-temurin:21-jdk; platforms jdk17, debian12")))
+    }
+
+    @Test
+    fun `build host creates the sandbox lazily on the builder's first command and records it`() {
+        val w = world()
+        w.sandboxFile(hostDefinition)
+        approve(w, hostDefinition)
+        val rt = w.sandboxRuntime
+        var before = -1
+        var answer: ToolAnswer? = null
+        script(w) { p ->
+            before = rt.started.size
+            answer = exec(w, p, "./gradlew integrationTest")
+            "Built on the host; ran the service tests in the sandbox."
+        }
+        val run = start(w)
+        val done = w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
+        assertEquals(RunStatus.MERGED, done.status, done.error)
+        assertEquals(0, before)
+        assertFalse(answer!!.isError, answer!!.text)
+        assertEquals(listOf("agern-run-${run.id}-postgres", "agern-run-${run.id}"), rt.started.map { it.name })
+        assertTrue(rt.containers.isEmpty() && rt.networks.isEmpty())
+        val dto = w.services.runs.toDto(done).sandbox!!
+        assertEquals("host", dto.build)
+        assertEquals(listOf(RunSandboxCommandDto("./gradlew integrationTest", null)), dto.commands)
+        assertEquals(1, dto.commandCount)
+    }
+
+    @Test
+    fun `the review sandbox is the same in both build modes, also when the builder never created a build container`() {
+        for ((content, builderExecs) in listOf(definition to true, hostDefinition to false)) {
+            val w = world()
+            w.sandboxFile(content)
+            approve(w, content)
+            val rt = w.sandboxRuntime
+            val tools = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+            val infos = java.util.concurrent.ConcurrentHashMap<String, JsonObject>()
+            val answers = java.util.concurrent.ConcurrentHashMap<String, ToolAnswer>()
+            script(w, reviewer = { p ->
+                val role = p.spec.kind
+                tools[role] = toolNames(w, token(p))
+                if (role in SCREENSHOT_ROLES) {
+                    infos[role] = call(w, token(p), "factory_sandbox_info").json
+                    answers[role] = exec(w, p, "echo $role")
+                }
+            }) { p -> if (builderExecs) exec(w, p, "make"); "ok" }
+            val run = start(w)
+            val done = w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
+            assertEquals(RunStatus.MERGED, done.status, done.error)
+            val id = run.id
+            for (role in SCREENSHOT_ROLES) {
+                assertEquals(SandboxManager.TOOLS, tools[role]!!.filter { it.startsWith("factory_sandbox") }.toSet(), role)
+                assertTrue(w.launcher.byRole(role).single().spec.prompt!!.contains("Review sandbox: this run has a read-only review sandbox"), role)
+                assertFalse(answers[role]!!.isError, answers[role]!!.text)
+                assertEquals("review", infos[role]!!["access"]!!.jsonPrimitive.content)
+                assertFalse(infos[role]!!.containsKey("build"), content)
+                assertFalse(infos[role]!!.containsKey("buildNote"), content)
+            }
+            val names = rt.started.map { it.name }
+            assertTrue(names.contains("agern-review-$id") && names.contains("agern-review-$id-postgres"), names.toString())
+            assertEquals(builderExecs, names.contains("agern-run-$id"), names.toString())
+            assertTrue(rt.calls.contains("rm agern-review-$id agern-review-$id-postgres"), rt.calls.toString())
+            assertTrue(rt.containers.isEmpty() && rt.networks.isEmpty(), rt.calls.toString())
+            assertEquals(0, w.services.sandboxes.inUse())
+            val dto = w.services.runs.toDto(done).sandbox!!
+            assertTrue(dto.reviewUsed)
+            // Review commands are not recorded as the builder's.
+            assertEquals(if (builderExecs) listOf("make") else emptyList(), dto.commands.map { it.command })
+            assertEquals(if (builderExecs) 1 else 0, dto.commandCount)
+        }
+    }
+
+    @Test
+    fun `the run records the first 50 builder commands, each its first line cut to 200 characters, and counts all`() {
+        val w = world()
+        w.sandboxFile(definition)
+        approve(w)
+        val long = "x".repeat(250)
+        script(w) { p ->
+            exec(w, p, "first line\nsecond line")
+            exec(w, p, long)
+            repeat(49) { exec(w, p, "echo $it") }
+            "ok"
+        }
+        val run = start(w)
+        val done = w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
+        assertEquals(RunStatus.MERGED, done.status, done.error)
+        val dto = w.services.runs.toDto(done).sandbox!!
+        assertEquals(SandboxManager.MAX_RECORDED_COMMANDS, dto.commands.size)
+        assertEquals(51, dto.commandCount)
+        assertEquals("first line", dto.commands[0].command)
+        assertEquals("x".repeat(200), dto.commands[1].command)
+        assertEquals("echo 47", dto.commands.last().command)
+        assertTrue(dto.commands.all { it.platform == null })
+        // The setup script ran but is not a recorded command.
+        assertTrue(w.sandboxRuntime.execs.any { it.second == "echo setting up\n" })
+        assertTrue(dto.commands.none { it.command.contains("setting up") })
+    }
+
+    @Test
+    fun `recorded commands name their platform only when the definition has platforms`() {
+        val w = world { it.copy(sandbox = it.sandbox.copy(maxConcurrent = 3)) }
+        w.sandboxFile(platformDefinition)
+        approve(w, platformDefinition)
+        script(w) { p ->
+            exec(w, p, "./gradlew test")
+            call(w, token(p), "factory_sandbox_exec", buildJsonObject { put("command", "./gradlew test"); put("platform", "jdk17") })
+            call(w, token(p), "factory_sandbox_exec", buildJsonObject { put("command", "x"); put("platform", "windows") })
+            "ok"
+        }
+        val run = start(w)
+        val done = w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
+        assertEquals(RunStatus.MERGED, done.status, done.error)
+        val dto = w.services.runs.toDto(done).sandbox!!
+        assertEquals(listOf(RunSandboxCommandDto("./gradlew test", "default"), RunSandboxCommandDto("./gradlew test", "jdk17")), dto.commands)
+        assertEquals(2, dto.commandCount, "the refused call is not recorded")
+    }
+
+    @Test
+    fun `a second prepare with the same approved definition keeps the usage facts, otherwise they start empty`() {
+        val w = world()
+        w.sandboxFile(definition)
+        approve(w)
+        script(w, reviewer = { p -> if (p.spec.kind == "ux") exec(w, p, "echo ux") }) { p -> exec(w, p, "make"); "ok" }
+        val run = start(w)
+        val done = w.awaitRun(run.id, RunStatus.TERMINAL + RunStatus.NEEDS_HUMAN)
+        assertEquals(RunStatus.MERGED, done.status, done.error)
+        val dir = w.services.workspaces.runDir("alice", "demo-app", run.id)
+        fun prepare() = runBlocking { w.services.sandboxes.prepare(run.id, "demo-app", dir, "origin/main", dir) }
+        fun stored() = w.services.runs.toDto(w.services.runs.get(run.id)!!).sandbox!!
+
+        val before = stored()
+        assertEquals(1, before.commandCount)
+        assertTrue(before.reviewUsed)
+        val again = prepare()
+        assertEquals(listOf(RunSandboxCommandDto("make", null)), again.commands)
+        assertEquals(1, again.commandCount)
+        assertTrue(again.reviewUsed)
+        assertEquals(again, stored())
+
+        // Another (approved) definition: reset.
+        w.sandboxFile(hostDefinition)
+        approve(w, hostDefinition)
+        val changed = prepare()
+        assertEquals("approved", changed.state)
+        assertEquals("host", changed.build)
+        assertEquals(0, changed.commandCount)
+        assertTrue(changed.commands.isEmpty())
+        assertFalse(changed.reviewUsed)
+
+        // Unapproved: reset too (and nothing to carry into a later approved decision of the first hash).
+        w.sandboxFile(definition + "# changed\n")
+        assertEquals("unapproved", prepare().state)
+        assertEquals(0, stored().commandCount)
+        assertFalse(stored().reviewUsed)
     }
 }

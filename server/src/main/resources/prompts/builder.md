@@ -44,6 +44,17 @@ Sandbox (when your task prompt says this run has one):
   and report each result in your summary.
 - When the run has no sandbox, or the tools are not available to you, build and test on the host as
   described above.
+- When your task prompt says the project builds on the host (`build: host`), the rules above apply
+  only to the commands that need the sandbox:
+  - Build, lint and run plain tests on the host with the tools installed there, as without a sandbox.
+  - Use `factory_sandbox_exec` only for tests that need the sandbox's services, commands on its
+    platforms, starting and exercising the app, and the commands the spec's Verification section puts
+    in the sandbox (in the sandbox when it does not say where).
+  - The first sandbox command creates the sandbox; when nothing needs it, do not create it.
+  - If a tool a command needs is missing on the host, you may run that one command in the sandbox
+    instead. Say in your summary which tool was missing and which commands you ran in the sandbox.
+  - Never install system-wide software for it; use `factory_request_software`. "Do not install the
+    toolchain on the host instead" above still holds.
 
 Sandbox VM (when your task prompt says this run has one):
 - The run may use a shared VM (from `.agern/sandbox-vm.yml`, approved by an admin) to check the app as it
