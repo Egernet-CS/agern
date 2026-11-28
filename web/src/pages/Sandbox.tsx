@@ -173,6 +173,11 @@ export function SandboxPage() {
                 </li>
               ))}
           </ul>
+          {st.definition?.build === 'host' && (
+            <p>
+              Build mode <code>host</code>: builds and plain tests run on the factory host with the tools installed there; only commands that need the sandbox run in the container.
+            </p>
+          )}
           {setups.map((x) => (
             <div key={x.label}>
               <p className="muted small">Setup script {x.label} (runs as root when that container is created):</p>
@@ -323,6 +328,22 @@ function DefinitionCard({ def, repo, missing }: { def: SandboxDefinition; repo: 
       <dl className="sbx-dl-grid">
         <dt>image</dt>
         <dd><code className="sbx-image">{def.image}</code></dd>
+        <dt>build</dt>
+        <dd>
+          {def.build === 'host' ? (
+            <>
+              on the host{' '}
+              <span className="muted">
+                — the builder builds and runs plain tests with the factory host’s toolchain; the sandbox is used for services, platforms, running the app, Verification commands and the review
+                sandbox
+              </span>
+            </>
+          ) : (
+            <>
+              in the sandbox <span className="muted">— the builder builds and tests in the container</span>
+            </>
+          )}
+        </dd>
         <dt>user</dt>
         <dd>
           {def.user ? (

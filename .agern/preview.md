@@ -29,7 +29,14 @@ Wait until `http://127.0.0.1:$PORT/` answers (a few seconds), then take screensh
   As `observer` (bob) the member `ios` is marked "no access".
 - Sandboxes: `web-shop` has an approved sandbox. Its merged run of issue #47 shows "review sandbox ✓"
   in the run page's sandbox line; the `ux` stage's transcript has a command block with the `review`
-  chip (the app started in the read-only review sandbox).
+  chip (the app started in the read-only review sandbox). `/p/web-shop/sandbox` shows the build row
+  "in the sandbox"; every `web-shop` run with a builder has the "N sandbox commands" disclosure below
+  its sandbox line (e.g. issue #47's run, from `/p/web-shop`).
+  `ios-companion` builds on the host (`build: host`): `/p/ios-companion/sandbox` shows the build row
+  "on the host". From `/p/ios-companion`, the merged run of issue #9 shows "build on host" and
+  "sandbox not used"; the merged run of issue #8 shows "build on host" and the "sandbox used for
+  2 commands" disclosure (open it to see the commands). `/p/data-pipeline/sandbox` is pending with
+  `build: host`: as an admin (`alice`), "Approve…" opens the dialog with the build-mode sentence.
 - The app is a single-page app: with Chromium's `--screenshot`, pass `--virtual-time-budget=8000`,
   or the page is captured before it renders. With Playwright, wait for `networkidle` and a selector.
 - There is one (dark) theme. Check narrow layouts at 390 px width.
