@@ -71,6 +71,16 @@ caches: [ /root/.gradle ]
   \item Merge it into the default branch. Runs read the file from the commit they start from.
 \end{enumerate}
 
+By default the builder builds and runs every test in the sandbox. If the server already has the
+project's toolchain installed, add \texttt{build: host} to the file: the builder then builds, lints
+and runs plain tests on the server with the tools installed there, as without a sandbox, and uses
+the sandbox only for what needs it: tests against its services, other platforms, starting the app
+and the spec's Verification commands. A run that needs none of these creates no container. The
+review sandbox stays the same. In this mode the server must have the toolchain: when a tool is
+missing, the builder says so in its summary (and may run that one command in the sandbox); it never
+installs software on the server. Like every change of the file, adding \texttt{build: host} needs a
+new approval.
+
 \section{Approve it (as an admin)}\label{sec:sandbox-approve}
 
 A new or changed definition waits for an admin. Until then, runs build and test on the server as
@@ -103,7 +113,10 @@ The run page names the sandbox in its \ui{SANDBOX} line: the image, the version 
 definition and the platforms (you can see it in figure~\ref{fig:run-started} in
 chapter~\ref{ch:run}). Without an approved definition the line says why, for example that its
 sandbox definition is not approved and the run builds and tests on the host. The builder's
-transcript shows each command it runs in the sandbox, with its output.
+transcript shows each command it runs in the sandbox, with its output. Below the line, a collapsed
+list (\ui{N sandbox commands}) names the commands the builder ran in the sandbox; open it to see
+them. For a project with \texttt{build: host} the line also says \ui{build on host}, and either
+\ui{sandbox not used} or \ui{sandbox used for N commands} with the same list.
 
 The spec writer plans the sandbox's use in a \ui{Verification} section of the spec. The ux and
 ui-design reviewers start the app in a separate \term{review sandbox}: a container from the same

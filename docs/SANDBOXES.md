@@ -3,6 +3,9 @@
 A *sandbox* is a container in which Agern's builder agent builds and tests your project during a
 pipeline run. You describe it in your repository, in **`.agern/sandbox.yml`** on the default branch;
 an admin approves that exact file; from then on every run of the project gets its own sandbox.
+A project whose toolchain is already installed on the factory host can keep building there with
+`build: host` and still use the sandbox for its services, other platforms and the review sandbox
+(see "How the builder uses it").
 
 This guide is for the people who write that file. How an admin switches sandboxes on is in
 [INSTALL-LINUX.md §13](INSTALL-LINUX.md#13-sandboxes); the server's exact behaviour and the Podman
@@ -22,6 +25,12 @@ clean environment, without anyone installing that toolchain on the factory host:
   never privileged, and Agern — not your file — decides mounts, network, capabilities and limits;
 - sidecars on a private network of the run, reachable by service name from that run only;
 - per-project cache volumes (Gradle, npm, pip …) that survive between runs.
+
+By default (`build: sandbox`) the builder builds and runs every test in the sandbox. With `build: host`
+it builds, lints and runs plain tests on the factory host with the tools installed there, as without a
+sandbox, and uses the sandbox only for what needs an environment: tests against its services, other
+platforms, starting the app and the spec's Verification commands. The review sandbox is the same in
+both modes.
 
 **It is not:**
 
@@ -111,12 +120,20 @@ platforms:
   jdk17:
     image: docker.io/library/eclipse-temurin:17-jdk
     # no `setup:` key: the top-level setup runs; `setup:` with an empty value: none
+
+# Where the builder builds and runs plain tests: `sandbox` (default, also when the key is absent or
+# empty) or `host` (the factory host's toolchain; the sandbox only for commands that need it). See
+# "How the builder uses it".
+build: sandbox
 ```
 
 Validation is strict: unknown keys (at any level), unqualified images, registries that are not allowed,
 service and platform names that are not lower-case DNS labels (and the reserved ones), and malformed
-values are all errors, listed with their place in the file. The file may be at most 64 KiB; YAML anchors
+values are all errors, listed with their place in the file. `build` accepts exactly `sandbox` or `host`
+(lower-case); anything else is an error at `build`. The file may be at most 64 KiB; YAML anchors
 and duplicate keys are refused. An invalid file means no sandbox (the run proceeds on the host).
+Like every other key, `build` is part of the approved content: adding or changing it needs a new
+approval, and files without it keep their approval and behave as `build: sandbox`.
 
 ## How the builder uses it
 
@@ -140,11 +157,36 @@ on until it ends, reaches its time limit or the sandbox is removed, and a later 
 of the same run) gets its result. When the run's sandbox is removed (the run ended, or an admin stopped
 it), a running command dies with it and its waits end with an error saying so.
 
+**`build: sandbox` (default).** The builder builds and runs all tests in the sandbox, and runs the
+spec's Verification commands there on the platforms they name.
+
+**`build: host`.** The builder builds, lints and runs plain tests on the factory host with the tools
+installed there, exactly as without a sandbox. It uses `factory_sandbox_exec` only for commands that need
+the sandbox: tests against its services, commands on its platforms (the test suite still runs on every
+platform), starting and exercising the app, and the Verification commands the spec puts in the sandbox
+(a Verification command that does not say where it runs goes to the sandbox). The spec writer is told
+the mode and says for each Verification command whether it runs on the host or needs the sandbox. Since
+the sandbox is created by the first sandbox command, a run that needs none of this creates no container
+and takes no slot. If a tool a command needs is missing on the host, the builder may run that one command
+in the sandbox instead and says in its summary which tool was missing and which commands it ran there; it
+never installs system-wide software (it asks for it with `factory_request_software`). The mode steers
+the builder; it is not enforced. `factory_sandbox_info` reports it as `build` (with a `buildNote` in host
+mode).
+
+**On the run page.** The run's sandbox line shows the image and the definition's hash; in host mode
+also "build on host", and "sandbox not used" when the builder ran no command in it. In both modes the
+commands the builder started in the sandbox are listed in a collapsed "N sandbox command(s)" /
+"sandbox used for N command(s)" disclosure below the line: the first 50, each by its first line (at most
+200 characters); the transcript has every command with its full output. Setup scripts and the
+reviewers' commands are not listed.
+
 ## The review sandbox
 
 The `ux` and `ui-design` reviewers of a run with an approved file look at the running app in a review
 sandbox: a container of its own, built from the same approved file, so an app that needs the project's
-toolchain or its database can be started for review. What to know when you write the file:
+toolchain or its database can be started for review. It is the same with `build: sandbox` and
+`build: host`, also when the builder never created a build container. What to know when you write the
+file:
 
 - **Read-only worktree.** `/workspace` is the run's worktree, mounted read-only: every write below it
   fails. An app that writes into its own tree at start (build output, `node_modules`, caches next to the
@@ -317,6 +359,9 @@ A command that uses more memory than the limit is killed by the kernel; the sand
 
 - **The run says "no sandbox":** the file is missing on the default branch, invalid (the reason is on
   the run page and the project's Sandbox page), or not approved in this version.
+- **`build: host` and a build fails with "command not found":** in host mode the factory host needs the
+  project's toolchain. The builder reports a missing tool in its summary (and may run that one command
+  in the sandbox); ask an admin to install it on the host, or switch back to `build: sandbox`.
 - **"Could not create the sandbox: … pull …":** the image name is wrong, the registry is not allowed, or
   Docker Hub's anonymous pull limit was hit; try again later or use another registry.
 - **"The sandbox's setup script failed":** its output is on the run page. Setup runs non-interactively
