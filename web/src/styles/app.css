@@ -3246,6 +3246,166 @@ html.app-locked #root {
   }
 }
 
+/* Releases: time and cost (docs/ARCHITECTURE.md §6 "Time and cost"). */
+.release-totals {
+  max-width: 900px;
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--surface);
+  display: grid;
+  gap: 8px;
+}
+.release-totals h2 {
+  margin: 0;
+  font-size: 0.95rem;
+  color: var(--text-2);
+  font-weight: 600;
+}
+.release-totals p {
+  margin: 0;
+}
+.totals-error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+.totals-lines {
+  margin: 0;
+  display: grid;
+  gap: 8px;
+}
+.totals-lines > div {
+  display: grid;
+  grid-template-columns: 4.5rem 1fr;
+  gap: 2px 12px;
+  align-items: baseline;
+}
+.totals-lines dt {
+  font: 500 0.66rem/1 var(--font-mono);
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+.totals-lines dd {
+  margin: 0;
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.totals-figures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 0;
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  color: var(--text);
+}
+.totals-figures > span + span::before {
+  content: '·';
+  margin: 0 8px;
+  color: var(--text-3);
+}
+.totals-note {
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+.totals-note.muted {
+  color: var(--text-3);
+}
+.totals-breakdown > summary {
+  cursor: pointer;
+  padding: 4px 0;
+  width: fit-content;
+  font: 600 0.8rem var(--font-mono);
+  color: var(--text-2);
+  border-radius: var(--r-sm);
+}
+.totals-breakdown > summary:hover {
+  color: var(--text);
+}
+.totals-breakdown > summary:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+}
+.totals-breakdown[open] {
+  display: grid;
+  gap: 8px;
+}
+.totals-tables {
+  display: grid;
+  gap: 10px;
+}
+.totals-table-wrap {
+  border-radius: var(--r);
+}
+.totals-table caption {
+  text-align: left;
+  padding: 10px 14px 0;
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: var(--text-2);
+}
+.totals-table th,
+.totals-table td {
+  padding: 8px 14px;
+}
+.totals-table tbody th {
+  font: 500 0.86rem var(--font-ui);
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text);
+  border-bottom: 1px solid var(--line);
+}
+.totals-table tr:last-child th {
+  border-bottom: 0;
+}
+.totals-table .num {
+  text-align: right;
+}
+@media (max-width: 640px) {
+  .totals-lines > div {
+    grid-template-columns: 1fr;
+  }
+  .totals-figures {
+    flex-direction: column;
+  }
+  .totals-figures > span + span::before {
+    content: none;
+  }
+  .totals-table th,
+  .totals-table td {
+    padding: 8px;
+  }
+}
+.ro-totals {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  color: var(--text-2);
+}
+.ro-totals-text {
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+.ro-bar {
+  display: block;
+  flex: 0 1 8rem;
+  min-width: 3rem;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+.ro-bar-fill {
+  display: block;
+  height: 100%;
+  background: var(--amber-lo);
+}
+
 /* Releases, releasing: the release pull request, approval, history. */
 .release-pr {
   max-width: 900px;

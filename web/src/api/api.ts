@@ -4,6 +4,8 @@ import type {
   AgentSession,
   Attachment,
   ClaudeUsage,
+  ReleaseTotals,
+  RunTotals,
   ClientConfig,
   CreatedMcpToken,
   McpToken,
@@ -112,6 +114,8 @@ export interface Api {
   /** Newest first, each with its issues in order. */
   releases(repo: string): Promise<Release[]>;
   release(id: string): Promise<Release>;
+  /** Time and cost of the release, in total, per issue and broken down (anyone who can see it; 404 otherwise). */
+  releaseTotals(id: string): Promise<ReleaseTotals>;
   /** 400 invalid name or description, 409 `release_name_taken`. */
   createRelease(repo: string, body: { name: string; description: string; mode?: ReleaseMode }): Promise<Release>;
   updateRelease(id: string, body: { name: string; description: string }): Promise<Release>;
@@ -284,6 +288,8 @@ export interface Api {
   /** `active`: not finished (incl. needs_human). `status`: only these statuses. Both given: both apply. */
   runs(filter?: { active?: boolean; status?: RunStatus[] }): Promise<Run[]>;
   run(id: string): Promise<Run>;
+  /** Time and cost of the run, all stages, rounds and the advisor (404 like `run`). */
+  runTotals(id: string): Promise<RunTotals>;
   approveRun(id: string): Promise<Run>;
   /**
    * "Update from base branch", owner only: an update round on the same run (now `building`). 409 `update_unavailable` /

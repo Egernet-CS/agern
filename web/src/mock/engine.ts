@@ -2697,7 +2697,18 @@ function seed() {
     it.state = run.status === 'merged' ? 'merged' : run.status === 'needs_human' ? 'held' : 'running';
     it.note = it.state === 'held' ? run.error : null;
   };
-  seededRun(53, { liveFrom: never }, 50);
+  // #53 needed two runs: the first one's builder was stopped before it reported a cost, then the issue was retried.
+  const failed53 = startRun('web-shop', 53, alice, null, { changes: {}, liveFrom: never }, Date.now() - 50 * 60_000, building);
+  const firstBuilder53 = failed53.stages.find((x) => x.role === 'builder' && x.round === 0)!;
+  for (const st of failed53.stages.filter((x) => x.role !== 'spec-writer' && x !== firstBuilder53)) {
+    if (st.sessionId) db.sessions.delete(st.sessionId);
+  }
+  failed53.stages = failed53.stages.filter((x) => x.role === 'spec-writer' || x === firstBuilder53);
+  const stopped = db.sessions.get(firstBuilder53.sessionId!)!;
+  Object.assign(stopped, { status: 'failed', costUsd: null, numTurns: null });
+  Object.assign(firstBuilder53, { status: 'failed', verdict: null, summary: null });
+  Object.assign(failed53, { status: 'failed', error: 'builder failed: the agent process exited without a result', prNumber: null, prUrl: null, endedAt: stopped.endedAt });
+  seededRun(53, { liveFrom: never }, 42);
   // Held: its migration clashes with release/1.3 (an update round is offered next to Retry and Remove).
   seededRun(60, { liveFrom: never, refuseMerge: 'migration' }, 35);
   const held60 = building.issues.find((i) => i.number === 60)!;

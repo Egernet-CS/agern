@@ -137,9 +137,10 @@ class FakeProcess(val spec: LaunchSpec, private val onInput: (FakeProcess, Strin
         }
     })
 
-    fun result(text: String?, structured: JsonObject? = null, isError: Boolean = false) = emit(buildJsonObject {
+    /** A `result` line; [cost] is the process's cumulative `total_cost_usd` so far, like the real CLI's. */
+    fun result(text: String?, structured: JsonObject? = null, isError: Boolean = false, cost: Double = 0.01) = emit(buildJsonObject {
         put("type", "result"); put("subtype", if (isError) "error_during_execution" else "success"); put("is_error", isError)
-        put("result", text); put("num_turns", 1); put("total_cost_usd", 0.01)
+        put("result", text); put("num_turns", 1); put("total_cost_usd", cost)
         if (structured != null) put("structured_output", structured)
     })
 

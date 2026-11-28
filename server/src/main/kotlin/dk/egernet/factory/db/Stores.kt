@@ -231,12 +231,13 @@ class SessionStore(private val db: Db) {
     fun create(
         repo: String, kind: String, model: String, status: String, ownerId: UUID, title: String?,
         runId: UUID? = null, parentSessionId: UUID? = null, issueNumber: Int? = null, contextRepos: List<String> = emptyList(),
+        round: Int? = null,
     ): SessionRecord {
         val id = UUID.randomUUID()
         db.update(
-            """INSERT INTO agent_sessions(id, repo, kind, model, status, owner_id, title, run_id, parent_session_id, issue_number, context_repos)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            id, repo, kind, model, status, ownerId, title, runId, parentSessionId, issueNumber, joinRepos(contextRepos),
+            """INSERT INTO agent_sessions(id, repo, kind, model, status, owner_id, title, run_id, parent_session_id, issue_number, context_repos, round)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            id, repo, kind, model, status, ownerId, title, runId, parentSessionId, issueNumber, joinRepos(contextRepos), round,
         )
         return get(id)!!
     }
@@ -286,6 +287,10 @@ class SessionStore(private val db: Db) {
 
     fun setUsage(id: UUID, cost: Double?, turns: Int?) =
         db.update("UPDATE agent_sessions SET cost_usd = ?, num_turns = ?, updated_at = now() WHERE id = ?", cost, turns, id)
+
+    /** The kind of Claude credential (`oauth_token` / `api_key`) the session's process was last launched with. */
+    fun setCredKind(id: UUID, kind: String) =
+        db.update("UPDATE agent_sessions SET cred_kind = ? WHERE id = ?", kind.takeIf { it == "api_key" } ?: "oauth_token", id)
 
     fun setActivity(id: UUID, activity: String?) =
         db.update("UPDATE agent_sessions SET last_activity = ?, updated_at = now() WHERE id = ?", activity, id)

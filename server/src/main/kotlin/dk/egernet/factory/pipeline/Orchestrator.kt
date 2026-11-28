@@ -3062,6 +3062,7 @@ class Orchestrator(
                     jsonSchema = schema, disallowedTools = disallowed, resumeClaudeSessionId = attemptResume,
                     title = "$role · ${ctx.tag}" + if (round > 0) " · round $round" else "",
                     extraTools = extraTools, notes = notes, sandboxScope = sandboxScope, projectFilesDir = ctx.projectFilesDir,
+                    round = round,
                 ),
             ) { session ->
                 runs.startStage(st.id, session.id, session.model)
