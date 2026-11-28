@@ -132,6 +132,8 @@ class Services(
     val attachments = dk.egernet.factory.agent.Attachments(cfg, dk.egernet.factory.db.AttachmentStore(db))
     val preferences = dk.egernet.factory.db.PreferenceStore(db, settings)
     val usage = dk.egernet.factory.db.ClaudeUsageStore(db, clock)
+    /** Time and cost of runs and releases (docs/ARCHITECTURE.md §6 "Time and cost"). */
+    val totals = dk.egernet.factory.db.TotalsStore(db)
     /**
      * Per-project settings set by admins: the merge policy and its reviewers, and the base branch (docs/ARCHITECTURE.md
      * §6 "Merge policy", "Base branch").

@@ -16,6 +16,7 @@ import dk.egernet.factory.Services
 import dk.egernet.factory.SettingsDto
 import dk.egernet.factory.SoftwareRequestDto
 import dk.egernet.factory.SvgIcons
+import dk.egernet.factory.Totals
 import dk.egernet.factory.agent.EventBus
 import dk.egernet.factory.agent.FeedItem
 import dk.egernet.factory.agent.INLINE_IMAGE_TYPES
@@ -789,6 +790,17 @@ private fun Route.runRoutes(s: Services) {
         val u = call.requireUser(s)
         call.respond(s.runs.toDto(s.factory.visibleRun(u, uuidParam("id"))))
     }
+    // Time and cost of the run (docs/ARCHITECTURE.md §6 "Time and cost"): visible to whoever may see the run.
+    get("/runs/{id}/totals") {
+        val u = call.requireUser(s)
+        val run = s.factory.visibleRun(u, uuidParam("id"))
+        val totals = withContext(Dispatchers.IO) {
+            val rows = s.totals.run(run.id)
+            val r = rows.runs.firstOrNull() ?: throw notFound("Run not found")
+            Totals.forRun(r, rows.sessions, s.clock.instant())
+        }
+        call.respond(totals)
+    }
     // A stage screenshot (docs/ARCHITECTURE.md §6 "Screenshots"): visible to whoever may see the run.
     get("/runs/{id}/screenshots/{sid}") {
         val u = call.requireUser(s)
@@ -868,6 +880,17 @@ private fun Route.releaseRoutes(s: Services) {
     get("/releases/{id}") {
         val u = call.requireUser(s)
         call.respond(s.releaseDto(u, s.releases.visible(u, uuidParam("id"))))
+    }
+    // Time and cost of the release, in total and per issue (docs/ARCHITECTURE.md §6 "Time and cost"): visible to whoever
+    // may see the release; an aggregate of numbers only, so member repositories are not filtered out.
+    get("/releases/{id}/totals") {
+        val u = call.requireUser(s)
+        val release = s.releases.visible(u, uuidParam("id"))
+        val totals = withContext(Dispatchers.IO) {
+            val rows = s.totals.release(release.id)
+            Totals.forRelease(release, rows.runs, rows.sessions, s.clock.instant())
+        }
+        call.respond(totals)
     }
     put("/releases/{id}") {
         val u = call.requireUser(s)

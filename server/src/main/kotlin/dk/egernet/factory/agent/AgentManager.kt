@@ -169,6 +169,8 @@ data class StageAgentRequest(
     val contextRepos: List<String> = emptyList(),
     /** The run's project files snapshot, the agent's `AGERN_PROJECT_FILES` (docs/ARCHITECTURE.md §5 "Project files"). */
     val projectFilesDir: Path? = null,
+    /** The stage round the agent runs in, recorded on its session (docs/ARCHITECTURE.md §6 "Time and cost"). */
+    val round: Int = 0,
 )
 
 /**
@@ -641,6 +643,7 @@ class AgentManager(
         var token: String? = null
         try {
             if (s.endedAt != null) sessions.reopen(sessionId)
+            sessions.setCredKind(sessionId, cred.kind)
             setStatus(sessionId, SessionStatus.STARTING)
             val identity = AgentIdentity(owner.username, owner.displayName, owner.githubLogin, access.githubToken(owner), cred)
             val advisor = s.kind == ADVISOR_KIND
@@ -1066,7 +1069,7 @@ class AgentManager(
     suspend fun runStageAgent(req: StageAgentRequest, onSession: (SessionRecord) -> Unit = {}): StageAgentResult {
         val s = sessions.create(
             req.repo, req.role, req.model, SessionStatus.STARTING, req.owner.id, req.title, req.runId, req.parentSessionId, req.issueNumber,
-            contextRepos = req.contextRepos,
+            contextRepos = req.contextRepos, round = req.round,
         )
         publishFeed(s.id)
         onSession(s)
@@ -1077,6 +1080,7 @@ class AgentManager(
         try {
             val cred = access.claudeCredential(req.owner)
                 ?: return finishStage(s, null, "Run owner has no Claude credential", credentialRejected = true)
+            sessions.setCredKind(s.id, cred.kind)
             val mayInstall = settings.get().agentsMayInstallSoftware
             val tools = (if (mayInstall) McpRegistry.STAGE_TOOLS - "factory_request_software" else McpRegistry.STAGE_TOOLS) + req.extraTools
             token = mcp.issue(McpGrant(s.id, req.owner.id, req.repo, req.runId, tools, sandboxScope = req.sandboxScope))

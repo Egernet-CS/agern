@@ -1298,3 +1298,49 @@ data class AdminProjectFilesDto(
 @Serializable data class CreateProjectFileUploadReq(val name: String, val size: Long, val sha256: String? = null, val note: String? = null)
 @Serializable data class UpdateProjectFileReq(val note: String? = null, val downloadable: Boolean? = null)
 @Serializable data class ProjectFileManagersReq(val usernames: List<String> = emptyList())
+
+// ---------------------------------------------------------------- time and cost (docs/ARCHITECTURE.md §6 "Time and cost")
+
+/**
+ * The cost of a set of agent sessions. [usd] is the sum of each session's final `costUsd` (the session's total, so each
+ * session counts once); [apiKeyUsd] is the part launched on an API key, [subscriptionUsd] the rest (OAuth token or no
+ * recorded kind: an API-equivalent amount, not what was billed). [runningSessions] have no cost yet because they are still
+ * running; [unknownSessions] ended without reporting one, so [usd] is a lower bound when it is > 0.
+ */
+@Serializable
+data class CostDto(
+    val usd: Double, val apiKeyUsd: Double, val subscriptionUsd: Double,
+    val sessions: Int, val turns: Int, val runningSessions: Int, val unknownSessions: Int,
+)
+
+/**
+ * The time of a run, an issue or a release: [elapsedMs] is its window, [workingMs] the part in which at least one stage
+ * agent ran (parallel agents count once), [waitingMs] the rest. [running]: the window ends now (it grows); [working]: a
+ * stage agent of the scope is starting or running.
+ */
+@Serializable
+data class TotalsTimeDto(val elapsedMs: Long, val workingMs: Long, val waitingMs: Long, val running: Boolean, val working: Boolean)
+
+/** One row of a breakdown by role or kind of work; [agentMs] adds up each stage agent's own time (not a union). */
+@Serializable data class TotalsRowDto(val key: String, val cost: CostDto, val agentMs: Long)
+
+/** `GET /api/runs/{id}/totals`. */
+@Serializable
+data class RunTotalsDto(
+    val runId: String, val time: TotalsTimeDto, val cost: CostDto,
+    val byRole: List<TotalsRowDto>, val byWork: List<TotalsRowDto>,
+)
+
+/** One issue of a release, over every run of the issue in the release. */
+@Serializable data class IssueTotalsDto(val number: Int, val runs: Int, val time: TotalsTimeDto, val cost: CostDto)
+
+/** The runs of a release that belong to no issue in its list (sync runs, runs of issues taken out). */
+@Serializable data class OtherTotalsDto(val runs: Int, val cost: CostDto)
+
+/** `GET /api/releases/{id}/totals`: [issues] in build order; the other fields cover every run of the release. */
+@Serializable
+data class ReleaseTotalsDto(
+    val releaseId: String, val time: TotalsTimeDto, val cost: CostDto, val runs: Int, val runIds: List<String>,
+    val issues: List<IssueTotalsDto>, val other: OtherTotalsDto?,
+    val byRole: List<TotalsRowDto>, val byWork: List<TotalsRowDto>,
+)
