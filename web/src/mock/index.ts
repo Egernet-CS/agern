@@ -9,6 +9,7 @@ import * as projectFiles from './files';
 import { githubStatus } from './githubStatus';
 import * as images from './images';
 import * as sandboxVm from './sandboxVm';
+import { releaseTotalsOf, runTotalsOf } from './totals';
 
 /**
  * A light-theme sketch of a shop page with an open cart drawer (demo content, 320×200), used for every mock
@@ -482,6 +483,12 @@ export const mockApi: Api = {
       project(r.repo);
       return r;
     }),
+  releaseTotals: (id) =>
+    ok(() => {
+      const r = getRelease(id);
+      project(r.repo);
+      return releaseTotalsOf(r);
+    }),
   createRelease: (repo, body) => ok(() => (project(repo), createRelease(repo, body, me()))),
   updateRelease: (id, body) =>
     ok(() => {
@@ -579,6 +586,7 @@ export const mockApi: Api = {
         : [],
     ),
   run: (id) => ok(() => (needGithub(), run(id))),
+  runTotals: (id) => ok(() => (needGithub(), runTotalsOf(run(id)))),
   approveRun: (id) =>
     ok(() => {
       const r = run(id);

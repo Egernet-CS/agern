@@ -1219,6 +1219,58 @@ export type ClaudeUsage = {
   spend: { todayUsd: number; monthUsd: number; day: string; month: string };
 };
 
+// ---------------------------------------------------------------- time and cost (docs/ARCHITECTURE.md §6 "Time and cost")
+
+/**
+ * The cost of a set of agent sessions: the sum of each session's final `costUsd`, counted once. `apiKeyUsd` is the part
+ * launched on an API key (actual API cost); `subscriptionUsd` the rest (OAuth token: API-equivalent, not what was
+ * billed). `runningSessions` have no cost yet; `unknownSessions` ended without one, so `usd` is then a lower bound.
+ */
+export type Cost = {
+  usd: number;
+  apiKeyUsd: number;
+  subscriptionUsd: number;
+  sessions: number;
+  turns: number;
+  runningSessions: number;
+  unknownSessions: number;
+};
+
+/** Elapsed time of a run, issue or release; working = some stage agent ran (parallel ones once), waiting = the rest. */
+export type TotalsTime = {
+  elapsedMs: number;
+  workingMs: number;
+  waitingMs: number;
+  /** The window ends now: it grows. */
+  running: boolean;
+  /** A stage agent is starting or running. */
+  working: boolean;
+};
+
+/** A breakdown row; `key` is a role or a kind of work. `agentMs` adds up each agent's own time. */
+export type TotalsRow = { key: string; cost: Cost; agentMs: number };
+
+export type WorkKind = 'build' | 'fix' | 'update' | 'retry' | 'conversation' | 'sync';
+
+/** `GET /api/runs/{id}/totals`. */
+export type RunTotals = { runId: string; time: TotalsTime; cost: Cost; byRole: TotalsRow[]; byWork: TotalsRow[] };
+
+export type IssueTotals = { number: number; runs: number; time: TotalsTime; cost: Cost };
+
+/** `GET /api/releases/{id}/totals`: `issues` in build order; the rest covers every run of the release. */
+export type ReleaseTotals = {
+  releaseId: string;
+  time: TotalsTime;
+  cost: Cost;
+  runs: number;
+  runIds: string[];
+  issues: IssueTotals[];
+  /** Runs that belong to no issue in the list (sync runs, issues taken out); null when there are none. */
+  other: { runs: number; cost: Cost } | null;
+  byRole: TotalsRow[];
+  byWork: TotalsRow[];
+};
+
 export type SoftwareRequest = {
   id: string;
   name: string;

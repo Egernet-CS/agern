@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, ApiError, BLOCKING_CHECK_STATES, isRunActive, isRunWorking, isSyncRun, runRef, type AgentSession, type GeneratedImage, type Run, type RunCheckItem, type RunUpdate, type Screenshot, type StageRole } from '../api';
+import { api, ApiError, BLOCKING_CHECK_STATES, type RunTotals, isRunActive, isRunWorking, isSyncRun, runRef, type AgentSession, type GeneratedImage, type Run, type RunCheckItem, type RunUpdate, type Screenshot, type StageRole } from '../api';
 import { ChatView } from '../components/chat/ChatView';
 import { RunProjectFilesLine } from '../components/files/FilesBits';
 import { RunSandboxLine } from '../components/sandbox/SandboxBits';
@@ -16,9 +16,11 @@ import { GIVE_UP_RUN_TEXT, GiveUpDialog, NetworkWaitBanner } from '../components
 import { Dialog, Empty, ErrorBox, KindBadge, Loading, RunStatusPill, Verdict } from '../components/ui/ui';
 import { useAsync } from '../lib/async';
 import { useMe } from '../lib/auth';
-import { between, bytes, cost, dateTime, modelLabel, shortId, timeAgo } from '../lib/format';
+import { between, bytes, cost, dateTime, duration, modelLabel, shortId, timeAgo } from '../lib/format';
 import { useLiveRun, useLiveSessions } from '../lib/realtime';
 import { useNow } from '../lib/useNow';
+import { amountText, credentialNote, credentialShort, tick } from '../lib/totals';
+import { useRunTotals, type Loaded } from '../lib/useTotals';
 
 const ROLE_ORDER: StageRole[] = ['spec-writer', 'builder', 'security', 'ux', 'ui-design', 'code', 'approver'];
 
@@ -48,6 +50,7 @@ export function RunPage() {
   const navigate = useNavigate();
   const [err, setErr] = useState<string | null>(null);
   const active = run ? isRunActive(run) : false;
+  const totals = useRunTotals(run, sessions);
   const now = useNow(1000, run ? isRunWorking(run) : false);
 
   useEffect(() => {
@@ -236,6 +239,7 @@ export function RunPage() {
           )}
           <div><dt>pull request</dt><dd>{run.prUrl ? <a href={run.prUrl} target="_blank" rel="noreferrer">{run.targetRepo ? `${run.targetRepo}#${run.prNumber}` : `#${run.prNumber}`} ↗</a> : <span className="muted">after first build</span>}</dd></div>
           <div><dt>{run.endedAt ? 'took' : 'running for'}</dt><dd>{between(run.createdAt, run.endedAt, now)}</dd></div>
+          <RunTotalsMeta loaded={totals} />
           <div><dt>started</dt><dd>{timeAgo(run.createdAt, now)}</dd></div>
         </dl>
         <RunSandboxLine run={run} />
@@ -572,6 +576,34 @@ function UpdatesSection({ run, onShowBuilder }: { run: Run; onShowBuilder: (roun
         </article>
       ))}
     </section>
+  );
+}
+
+/**
+ * The run's total agent time and cost in the header (docs/ARCHITECTURE.md §6 "Time and cost"): all stages, rounds and the
+ * advisor. `—` until the totals have loaded.
+ */
+function RunTotalsMeta({ loaded }: { loaded: Loaded<RunTotals> }) {
+  const { data, receivedAt } = loaded;
+  const now = useNow(1000, !!data?.time.working);
+  const time = data ? tick(data.time, receivedAt, data.time.working ? Math.max(now, receivedAt) : receivedAt) : null;
+  return (
+    <>
+      <div><dt>agents working</dt><dd>{time ? duration(time.workingMs) : '—'}</dd></div>
+      <div>
+        <dt>cost</dt>
+        <dd>
+          {data ? (
+            <>
+              {amountText(data.cost)}{' '}
+              <span className="muted small" title={credentialNote(data.cost)}>{credentialShort(data.cost)}</span>
+            </>
+          ) : (
+            '—'
+          )}
+        </dd>
+      </div>
+    </>
   );
 }
 

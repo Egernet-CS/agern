@@ -9,7 +9,10 @@ import { useMe } from '../lib/auth';
 import { dateTime, timeAgo, toDateTimeLocal } from '../lib/format';
 import { issueWaitNote, networkBlockedIssue, releaseNetworkLine, runningWaitLine } from '../lib/networkWait';
 import { useFeed, useFeedReconnects, useLiveRelease, useProjectReleases } from '../lib/realtime';
+import { maxUsd } from '../lib/totals';
+import { useReleaseTotals } from '../lib/useTotals';
 import { useNow } from '../lib/useNow';
+import { IssueTotalsFigure, ReleaseTotalsCard } from '../components/ui/Totals';
 
 /** Codes after which the page's copy of the release is stale: reload it and show the server's message. */
 const STALE_SCHEDULE = new Set(['release_not_scheduled', 'release_not_schedulable', 'release_scheduled']);
@@ -63,6 +66,11 @@ export function ReleasePage() {
     for (const r of all.releases) for (const i of r.issues) m.set(i.number, r);
     return m;
   }, [all.releases]);
+
+  // Time and cost (docs/ARCHITECTURE.md §6 "Time and cost"): only for a started release.
+  const totals = useReleaseTotals(release && release.status !== 'planning' && release.status !== 'scheduled' ? release : null);
+  const issueTotals = useMemo(() => new Map((totals.data?.issues ?? []).map((i) => [i.number, i])), [totals.data]);
+  const costiest = useMemo(() => maxUsd(totals.data?.issues ?? []), [totals.data]);
 
   if (deleted && !deletedByMe.current)
     return (
@@ -377,6 +385,8 @@ export function ReleasePage() {
         </div>
       </header>
 
+      {started && <ReleaseTotalsCard loaded={totals} />}
+
       {statusLine && (
         <p className={`release-status release-status--${status}`} role="status">
           {statusLine}
@@ -450,6 +460,7 @@ export function ReleasePage() {
                       </span>
                     )}
                     {started && i.updateSummary && <span className="ro-note ro-update small muted">{i.updateSummary}</span>}
+                    {started && <IssueTotalsFigure totals={issueTotals.get(i.number)} maxUsd={costiest} />}
                   </span>
                   {i.targetDir && (
                     <span className="tag tag--plain issue-member" title={`Member ${i.targetDir}${i.targetRepo ? ` · ${i.targetRepo}` : ''}`}>

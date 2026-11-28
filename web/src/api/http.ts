@@ -147,6 +147,7 @@ export const httpApi: Api = {
 
   releases: (repo) => get(`/api/projects/${enc(repo)}/releases`),
   release: (id) => get(`/api/releases/${enc(id)}`),
+  releaseTotals: (id) => get(`/api/releases/${enc(id)}/totals`),
   createRelease: (repo, body) => post(`/api/projects/${enc(repo)}/releases`, body),
   updateRelease: (id, body) => put(`/api/releases/${enc(id)}`, body),
   deleteRelease: (id) => del(`/api/releases/${enc(id)}`),
@@ -213,6 +214,7 @@ export const httpApi: Api = {
     return get(`/api/runs${qs ? `?${qs}` : ''}`);
   },
   run: (id) => get(`/api/runs/${enc(id)}`),
+  runTotals: (id) => get(`/api/runs/${enc(id)}/totals`),
   approveRun: (id) => post(`/api/runs/${enc(id)}/approve`),
   updateRun: (id) => post(`/api/runs/${enc(id)}/update`),
   mergeAnywayRun: (id, headSha) => post(`/api/runs/${enc(id)}/merge-anyway`, { headSha }),
